@@ -116,6 +116,8 @@ pub fn run() {
             ipc::agent::agent_start,
             ipc::agent::agent_sessions,
             ipc::agent::agent_send,
+            ipc::agent::agent_status,
+            ipc::agent::agent_complete,
             ipc::plugins::plugin_sandbox,
             ipc::plugins::plugin_conformance,
             ipc::plugins::plugin_list,

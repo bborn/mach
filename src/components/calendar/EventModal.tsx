@@ -9,7 +9,14 @@ import {
   Users,
   Video,
 } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import type { Account, Calendar, CalendarEvent, CalendarId, Rsvp } from "@/types";
 import { Overlay } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -34,7 +41,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { GhostHint, GhostText } from "@/components/ui/ghost";
+import {
+  AddressSuggestions,
+  typeaheadFieldProps,
+  useAddressTypeahead,
+} from "@/components/ui/address-typeahead";
 import { useKeyBindings } from "@/hooks/useKeymap";
+import { useGhostText } from "@/hooks/useGhostText";
+import type { Contact } from "@/lib/contacts";
 import { anyPopupOpen } from "@/lib/popups";
 import type { EventScope } from "@/lib/data";
 import { calendarFill, toneFor, type HueIndex } from "@/lib/calendar-palette";
@@ -69,6 +84,8 @@ export interface EventModalProps {
   /** Whether this event is one of a series — see `looksRecurring`. */
   recurring: boolean;
   busy: boolean;
+  /** Everyone the app has seen, for completing the guest list. */
+  contacts?: readonly Contact[];
   onClose: () => void;
   onSave: (form: EventForm, scope: EventScope) => void;
   onDelete: (scope: EventScope) => void;
@@ -129,6 +146,7 @@ export function EventModal({
   defaultCalendarId,
   recurring,
   busy,
+  contacts = [],
   onClose,
   onSave,
   onDelete,
@@ -143,6 +161,9 @@ export function EventModal({
   const [scopePrompt, setScopePrompt] = useState<"save" | "delete" | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const titleField = useRef<HTMLInputElement>(null);
+  const guestField = useRef<HTMLTextAreaElement>(null);
+  const [ghostFocus, setGhostFocus] = useState<"title" | "notes" | null>(null);
+  const [caretAtEnd, setCaretAtEnd] = useState(true);
   const ids = useFieldIds();
 
   // Rebuild the form whenever the modal points at something new. Keyed on the
@@ -301,6 +322,69 @@ export function EventModal({
     },
   ]);
 
+  /* ------------------------------------------------------------ completion */
+
+  // Hooks, so they run before the `!form` bail-out below. Both are inert while
+  // the modal is closed: no matches, no requests.
+  const guests = useAddressTypeahead({
+    value: form?.attendees ?? "",
+    contacts,
+    onChange: (attendees) =>
+      setForm((current) => (current ? { ...current, attendees } : current)),
+    fieldRef: guestField,
+    enabled: open && !busy,
+  });
+
+  /** What the model is told about the event whose text it is finishing. */
+  const eventContext = useMemo(() => {
+    if (!form) return undefined;
+    const lines = [`A calendar event on ${form.startDate}, ${form.startTime}–${form.endTime}.`];
+    if (form.location) lines.push(`Location: ${form.location}`);
+    if (form.attendees) lines.push(`Guests: ${form.attendees}`);
+    return lines;
+  }, [form]);
+
+  const titleGhost = useGhostText({
+    kind: "eventTitle",
+    value: form?.title ?? "",
+    context: eventContext,
+    active: open && !busy && ghostFocus === "title" && caretAtEnd,
+  });
+
+  const notesGhost = useGhostText({
+    kind: "eventDescription",
+    value: form?.description ?? "",
+    context: eventContext ? [...eventContext, `Title: ${form?.title ?? ""}`] : undefined,
+    active: open && !busy && ghostFocus === "notes" && caretAtEnd,
+  });
+
+  const trackCaret = (event: { currentTarget: HTMLInputElement | HTMLTextAreaElement }) => {
+    const node = event.currentTarget;
+    setCaretAtEnd(
+      node.selectionStart === node.selectionEnd &&
+        (node.selectionStart ?? 0) === node.value.length,
+    );
+  };
+
+  /** ⇥ takes the grey text; Escape refuses it without closing the modal. */
+  const ghostKeys =
+    (ghost: { suggestion: string; accept: () => string | null; dismiss: () => void }, apply: (value: string) => void) =>
+    (keyEvent: ReactKeyboardEvent) => {
+      if (!ghost.suggestion) return;
+      if (keyEvent.key === "Tab" && !keyEvent.shiftKey && !keyEvent.metaKey && !keyEvent.ctrlKey) {
+        keyEvent.preventDefault();
+        keyEvent.stopPropagation();
+        const next = ghost.accept();
+        if (next !== null) apply(next);
+        return;
+      }
+      if (keyEvent.key === "Escape") {
+        keyEvent.preventDefault();
+        keyEvent.stopPropagation();
+        ghost.dismiss();
+      }
+    };
+
   if (!open || !form) return null;
 
   const account = event ? accounts.find((a) => a.id === event.accountId) : null;
@@ -325,21 +409,43 @@ export function EventModal({
             repeats
           </span>
         )}
-        <span className="text-micro text-faint-foreground">
-          <Kbd keys="mod+enter" /> save · <Kbd keys="escape" /> close
+        <span className="inline-flex items-center gap-1.5 text-micro text-faint-foreground">
+          <span>
+            <Kbd keys="mod+enter" /> save · <Kbd keys="escape" /> close
+          </span>
+          <GhostHint shown={titleGhost.suggestion !== "" || notesGhost.suggestion !== ""} />
         </span>
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto p-3">
-        <Input
-          ref={titleField}
-          id={ids.title}
-          value={form.title}
-          placeholder="Add a title"
-          aria-label="Title"
-          className="h-8 text-reading"
-          onChange={(e) => set({ title: e.target.value })}
-        />
+        <div className="relative">
+          <GhostText
+            value={form.title}
+            suggestion={titleGhost.suggestion}
+            typography="text-reading"
+            frame="px-2 border border-transparent flex items-center"
+            multiline={false}
+          />
+          <Input
+            ref={titleField}
+            id={ids.title}
+            value={form.title}
+            placeholder="Add a title"
+            aria-label="Title"
+            className="h-8 text-reading"
+            onChange={(e) => {
+              set({ title: e.target.value });
+              trackCaret(e);
+            }}
+            onSelect={trackCaret}
+            onFocus={(e) => {
+              setGhostFocus("title");
+              trackCaret(e);
+            }}
+            onBlur={() => setGhostFocus((current) => (current === "title" ? null : current))}
+            onKeyDown={ghostKeys(titleGhost, (title) => set({ title }))}
+          />
+        </div>
 
         <FieldGroup>
           <Field orientation="row" data-invalid={timeError !== null || undefined}>
@@ -483,16 +589,20 @@ export function EventModal({
               <Users size={11} strokeWidth={1.75} />
               Who
             </FieldLabel>
-            <Textarea
-              id={ids.attendees}
-              autoSize
-              rows={2}
-              maxRows={5}
-              value={form.attendees}
-              aria-label="Guests"
-              placeholder="ada@example.com, bob@example.com"
-              onChange={(e) => set({ attendees: e.target.value })}
-            />
+            <div className="relative min-w-0 flex-1">
+              <Textarea
+                ref={guestField}
+                id={ids.attendees}
+                autoSize
+                rows={2}
+                maxRows={5}
+                value={form.attendees}
+                aria-label="Guests"
+                placeholder="ada@example.com, bob@example.com"
+                {...typeaheadFieldProps(guests)}
+              />
+              <AddressSuggestions typeahead={guests} />
+            </div>
           </Field>
 
           <Field orientation="row">
@@ -546,16 +656,34 @@ export function EventModal({
 
           <Field orientation="row">
             <FieldLabel htmlFor={ids.notes}>Notes</FieldLabel>
-            <Textarea
-              id={ids.notes}
-              autoSize
-              rows={3}
-              maxRows={10}
-              value={form.description}
-              aria-label="Description"
-              placeholder="Anything else"
-              onChange={(e) => set({ description: e.target.value })}
-            />
+            <div className="relative min-w-0 flex-1">
+              <GhostText
+                value={form.description}
+                suggestion={notesGhost.suggestion}
+                typography="text-body leading-snug"
+                frame="px-2 py-1 border border-transparent"
+              />
+              <Textarea
+                id={ids.notes}
+                autoSize
+                rows={3}
+                maxRows={10}
+                value={form.description}
+                aria-label="Description"
+                placeholder="Anything else"
+                onChange={(e) => {
+                  set({ description: e.target.value });
+                  trackCaret(e);
+                }}
+                onSelect={trackCaret}
+                onFocus={(e) => {
+                  setGhostFocus("notes");
+                  trackCaret(e);
+                }}
+                onBlur={() => setGhostFocus((current) => (current === "notes" ? null : current))}
+                onKeyDown={ghostKeys(notesGhost, (description) => set({ description }))}
+              />
+            </div>
           </Field>
 
           {merged && merged.copies.length > 1 && (

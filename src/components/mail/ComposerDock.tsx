@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMach } from "@/hooks/useMach";
+import { useContacts } from "@/hooks/useContacts";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { Kbd } from "@/components/ui/kbd";
 import { Composer } from "./Composer";
+import { noteSent } from "@/lib/contacts";
 import { clockTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import {
@@ -45,6 +47,7 @@ import {
  */
 export function ComposerDock() {
   const { ui, detail, accounts, actions } = useMach();
+  const contacts = useContacts();
   const threadId = ui.threadId;
   const active = ui.mode === "mail" && !ui.paletteOpen;
 
@@ -213,6 +216,9 @@ export function ComposerDock() {
       void (async () => {
         try {
           const result = await sendDraft(draft, scheduleAt);
+          // Who you write to is the strongest signal the address book has, and
+          // this is the only moment it is true rather than half-typed.
+          noteSent([...draft.to, ...draft.cc, ...draft.bcc]);
           recalled.current = draft;
           setPending(result.entry);
           setDraft(null);
@@ -287,6 +293,27 @@ export function ComposerDock() {
   }, [pending, actions]);
 
   /* ---------------------------------------------------------------- render */
+
+  /**
+   * What the ghost completions are told about the conversation.
+   *
+   * The last message is the thing a reply is actually answering, so it is the
+   * only one sent, truncated — a completion is a clause, and a thread's worth
+   * of quoted history would cost more latency than the suggestion is worth.
+   * Empty when there is no thread, which is exactly right for `c`.
+   */
+  const ghostContext = useMemo(() => {
+    if (!detail) return undefined;
+    const last = detail.messages[detail.messages.length - 1];
+    const lines = [`This is a reply in the conversation "${detail.thread.subject}".`];
+    if (last) {
+      lines.push(
+        `The message being answered, from ${last.from.name || last.from.email}:`,
+        last.bodyText.slice(0, 1200),
+      );
+    }
+    return lines;
+  }, [detail]);
 
   const hasThread = threadId !== null && detail !== null;
   const holding = pending !== null && pending.state === "holding";
@@ -377,6 +404,8 @@ export function ComposerDock() {
     <Composer
       draft={draft}
       busy={busy}
+      contacts={contacts}
+      ghostContext={draft.kind === "new" ? undefined : ghostContext}
       onChange={change}
       onSend={send}
       onClose={() => {

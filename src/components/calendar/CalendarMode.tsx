@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AccountId, CalendarEvent, CalendarId, EventId, Rsvp } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useMach, viewRange, type CalendarView } from "@/hooks/useMach";
+import { useContacts } from "@/hooks/useContacts";
 import {
   describeResult,
   getDataSource,
@@ -80,6 +81,7 @@ export function CalendarMode() {
     calendarById,
   } = useMach();
   const dark = useIsDark();
+  const contacts = useContacts();
 
   const [settings, setSettings] = useState<CalendarSettings>(() => loadSettings());
   const [soloAccount, setSoloAccount] = useState<AccountId | null>(null);
@@ -951,6 +953,7 @@ export function CalendarMode() {
         defaultCalendarId={defaultCalendarId}
         recurring={modalEvent ? looksRecurring(modalEvent, allEvents) : false}
         busy={busy}
+        contacts={contacts}
         onClose={closeModal}
         onSave={saveForm}
         onDelete={(scope) => modalEvent && deleteEvent(modalEvent.id, scope)}
