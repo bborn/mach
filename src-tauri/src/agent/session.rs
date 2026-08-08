@@ -229,6 +229,7 @@ pub struct AgentEngine {
     db: Db,
     dispatcher: Arc<CommandDispatcher>,
     outbox: Arc<Outbox>,
+    plugins: Arc<crate::plugins::PluginRuntime>,
     transport: Arc<dyn ModelTransport>,
     emitter: Arc<dyn SessionEmitter>,
     sessions: Mutex<Vec<Live>>,
@@ -245,6 +246,7 @@ impl AgentEngine {
         db: Db,
         dispatcher: Arc<CommandDispatcher>,
         outbox: Arc<Outbox>,
+        plugins: Arc<crate::plugins::PluginRuntime>,
         transport: Arc<dyn ModelTransport>,
         emitter: Arc<dyn SessionEmitter>,
     ) -> Self {
@@ -252,6 +254,7 @@ impl AgentEngine {
             db,
             dispatcher,
             outbox,
+            plugins,
             transport,
             emitter,
             sessions: Mutex::new(Vec::new()),
@@ -326,6 +329,7 @@ impl AgentEngine {
                 db: self.db.clone(),
                 dispatcher: Arc::clone(&self.dispatcher),
                 outbox: Arc::clone(&self.outbox),
+                plugins: Arc::clone(&self.plugins),
             },
             transport: Arc::clone(&self.transport),
             emitter: Arc::clone(&self.emitter),
@@ -435,9 +439,15 @@ impl SessionTask {
         prompt: String,
         context: Vec<ContextItem>,
     ) -> Result<(), AgentError> {
-        let system = context::system_prompt(&self.db, (self.now)());
-        let tool_defs: Vec<ToolDefinition> =
-            tools::tools().into_iter().map(|t| t.definition).collect();
+        // Read once per session rather than per turn: the tool list the model
+        // was given has to be the list its calls are checked against, and a
+        // plugin installed mid-session must not change the rules underneath it.
+        let plugins = self.tools.plugin_list();
+        let system = context::system_prompt(&self.db, (self.now)(), !plugins.is_empty());
+        let tool_defs: Vec<ToolDefinition> = tools::tools_with(&plugins)
+            .into_iter()
+            .map(|t| t.definition)
+            .collect();
 
         let block = context::render(&self.db, &context)?;
         let mut messages = vec![wire::user_text(format!("{block}{prompt}"))];
@@ -453,7 +463,7 @@ impl SessionTask {
                 messages: messages.clone(),
                 tools: tool_defs.clone(),
             };
-            let turn = self.stream_turn(&request).await?;
+            let turn = self.stream_turn(&request, &plugins).await?;
 
             if self.cancelled.load(Ordering::SeqCst) {
                 return Ok(());
@@ -488,7 +498,7 @@ impl SessionTask {
                 }
             }
 
-            let results = self.run_tools(&turn).await?;
+            let results = self.run_tools(&turn, &plugins).await?;
             if self.cancelled.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -501,7 +511,11 @@ impl SessionTask {
     }
 
     /// One model turn, streamed. Emits deltas as they arrive.
-    async fn stream_turn(&mut self, request: &TurnRequest) -> Result<AssistantTurn, AgentError> {
+    async fn stream_turn(
+        &mut self,
+        request: &TurnRequest,
+        plugins: &[crate::plugins::InstalledPlugin],
+    ) -> Result<AssistantTurn, AgentError> {
         let mut rx = match self
             .transport
             .send(wire::build_call(&self.config, request, self.config.fallbacks))
@@ -534,9 +548,14 @@ impl SessionTask {
                             });
                         }
                         StreamSignal::ToolStarted { id, name } => {
+                            // Attributed the moment it starts: the owner has to
+                            // be able to see *which third party* is touching
+                            // their mailbox, not just that something is.
+                            let summary = super::plugin_tools::running_summary(&plugins, &name)
+                                .unwrap_or_else(|| running_summary(&name));
                             self.push_entry(Entry::Tool {
                                 id,
-                                summary: running_summary(&name),
+                                summary,
                                 name,
                                 state: ToolState::Running,
                             });
@@ -551,7 +570,11 @@ impl SessionTask {
     }
 
     /// Execute every tool the turn asked for, gating the outbound ones.
-    async fn run_tools(&mut self, turn: &AssistantTurn) -> Result<Vec<Value>, AgentError> {
+    async fn run_tools(
+        &mut self,
+        turn: &AssistantTurn,
+        plugins: &[crate::plugins::InstalledPlugin],
+    ) -> Result<Vec<Value>, AgentError> {
         let mut results = Vec::new();
 
         for call in turn.tool_uses() {
@@ -559,8 +582,8 @@ impl SessionTask {
                 return Ok(results);
             }
 
-            if tools::policy_for(&call.name) == ToolPolicy::Approve {
-                match self.await_approval(&call).await {
+            if tools::policy_for_with(&call.name, plugins) == ToolPolicy::Approve {
+                match self.await_approval(&call, plugins).await {
                     Approval::Approved => {}
                     Approval::Denied(reason) => {
                         self.update_tool(&call.id, ToolState::Denied, &reason);
@@ -602,11 +625,15 @@ impl SessionTask {
 
     /// Park until the owner decides. Nothing has run when this is entered and
     /// nothing runs if it returns anything but [`Approval::Approved`].
-    async fn await_approval(&mut self, call: &wire::ToolUse) -> Approval {
+    async fn await_approval(
+        &mut self,
+        call: &wire::ToolUse,
+        plugins: &[crate::plugins::InstalledPlugin],
+    ) -> Approval {
         let pending = PendingApproval {
             tool_use_id: call.id.clone(),
             name: call.name.clone(),
-            summary: approval_summary(&self.tools, &call.name, &call.input),
+            summary: approval_summary(&self.tools, plugins, &call.name, &call.input),
             input: call.input.clone(),
         };
 
@@ -756,7 +783,15 @@ fn running_summary(name: &str) -> String {
 
 /// The sentence the owner approves. It has to name the consequence — "Send" and
 /// "to whom" and "when" — because that is the whole point of asking.
-fn approval_summary(ctx: &ToolContext, name: &str, input: &Value) -> String {
+fn approval_summary(
+    ctx: &ToolContext,
+    plugins: &[crate::plugins::InstalledPlugin],
+    name: &str,
+    input: &Value,
+) -> String {
+    if let Some(summary) = super::plugin_tools::approval_summary(plugins, name) {
+        return summary;
+    }
     if name != tools::SEND_TOOL {
         return format!("Run {name}");
     }

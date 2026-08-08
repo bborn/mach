@@ -171,6 +171,10 @@ pub struct AppState {
     pub dispatcher: Arc<CommandDispatcher>,
     pub sync: Arc<SyncEngine>,
     pub config: AppConfig,
+    /// What is installed, whether the sandbox was verified, and the bridge the
+    /// agent calls plugin actions through. Built even in safe mode, because the
+    /// plugin list has to be able to say *why* nothing is running.
+    pub plugins: Arc<crate::plugins::PluginRuntime>,
     tokens: Option<Arc<Tokens>>,
     /// Accounts whose Keychain entry is gone. Guarded rather than immutable
     /// because completing a sign-in clears an entry from it.
@@ -256,6 +260,16 @@ impl AppState {
     }
 }
 
+/// `--safe-mode`, or `MACH_SAFE_MODE=1`: boot with every plugin disabled.
+///
+/// The single most valuable operational feature in `docs/plugins.md`, and it is
+/// here in v1 rather than added after the first bad week. It disables; it never
+/// uninstalls, so the plugin list still shows what is there and why it is off.
+pub fn safe_mode() -> bool {
+    std::env::args().any(|arg| arg == "--safe-mode")
+        || matches!(std::env::var("MACH_SAFE_MODE").as_deref(), Ok("1") | Ok("true"))
+}
+
 /// A poisoned mutex here means some other command panicked. The data behind it
 /// is a plain map, so recovering is strictly better than propagating a failure
 /// that would make every later command fail too.
@@ -272,6 +286,15 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Does **not** start the sync loop — that needs a Tokio context and an
 /// `AppHandle` to emit from, so it is [`super::events::run`]'s job.
 pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
+    // The plugin directory sits beside the database, so an instance launched
+    // with its own MACH_DATA_DIR gets its own plugins too — QA can install a
+    // plugin without touching the mailbox the owner is reading.
+    let data_dir = config
+        .database_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let plugins = super::plugins::runtime(&data_dir, safe_mode());
     // `Db::open` creates the directory, applies the pragmas and runs migrations.
     let db = Db::open(&config.database_path)?;
 
@@ -313,6 +336,7 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
         dispatcher,
         sync,
         config,
+        plugins,
         tokens,
         needs_reauthorization: Mutex::new(needs_reauthorization),
         pending: Mutex::new(HashMap::new()),

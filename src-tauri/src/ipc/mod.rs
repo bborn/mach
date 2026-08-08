@@ -18,6 +18,7 @@
 //! | `begin_add_account` | — | `{ url, pendingId }` |
 //! | `complete_add_account` | `pendingId` | `Account` |
 //! | `remove_account` | `accountId` | `void` |
+//! | `plugin_*` | see [`plugins`] | the plugin surface |
 //!
 //! Everything is camelCase on the wire; every timestamp is unix milliseconds as
 //! a number. Failures are [`IpcError`] — `{ kind, message }` — never a panic.
@@ -30,6 +31,7 @@
 //! | [`reads`] | the read paths as plain functions over `&Db` |
 //! | [`state`] | boot, the shared state, the add-account flow |
 //! | [`events`] | the two push events |
+//! | [`plugins`] | install, list, the sandbox assets, and the agent's bridge |
 //! | [`types`] | the payload shapes |
 //! | [`error`] | the one error that crosses the boundary |
 //!
@@ -43,6 +45,7 @@ pub mod compose;
 pub mod error;
 pub mod feedback;
 pub mod events;
+pub mod plugins;
 pub mod reads;
 pub mod render;
 pub mod state;

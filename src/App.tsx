@@ -12,12 +12,22 @@ import { ShortcutSheet } from "@/components/chrome/ShortcutSheet";
 import { AddAccountDialog } from "@/components/accounts/AddAccountDialog";
 import { FeedbackDialog } from "@/components/feedback/FeedbackDialog";
 import { AgentDock } from "@/components/agent/AgentDock";
+import { PluginProvider } from "@/hooks/usePlugins";
+import { PluginAskDialog } from "@/components/plugins/PluginAskDialog";
+import { PluginsPanel } from "@/components/plugins/PluginsPanel";
 
 export default function App() {
   return (
     <KeymapProvider>
       <MachProvider>
-        <Shell />
+        {/*
+          Inside `MachProvider` because a plugin acts through the same actions
+          the keyboard does, and outside `Shell` because its ⌘K entries and
+          keybindings have to be registered before anything can reach for them.
+        */}
+        <PluginProvider>
+          <Shell />
+        </PluginProvider>
       </MachProvider>
     </KeymapProvider>
   );
@@ -132,6 +142,8 @@ function Shell() {
       />
       <AddAccountDialog />
       <FeedbackDialog />
+      <PluginAskDialog />
+      <PluginsPanel />
     </div>
   );
 }

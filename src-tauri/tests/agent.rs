@@ -263,6 +263,7 @@ struct Harness {
     google: Arc<FakeGoogle>,
     dispatcher: Arc<CommandDispatcher>,
     outbox: Arc<Outbox>,
+    plugins: Arc<mach_lib::plugins::PluginRuntime>,
     recorder: Arc<Recorder>,
 }
 
@@ -278,11 +279,22 @@ impl Harness {
             CommandDispatcher::new(db.db.clone(), Arc::clone(&clients)).expect("dispatcher"),
         );
         let outbox = Arc::new(Outbox::new(db.db.clone(), clients).expect("outbox"));
+        // A plugin runtime with nowhere to install to and no verified
+        // sandbox: every one of these tests is about the core tools, and an
+        // empty runtime is what "no plugins installed" actually looks like.
+        let plugins = Arc::new(mach_lib::plugins::PluginRuntime::new(
+            Arc::new(mach_lib::plugins::PluginStore::new(
+                &std::env::temp_dir().join(format!("mach-agent-test-{}", std::process::id())),
+                false,
+            )),
+            Vec::new(),
+        ));
         Harness {
             db,
             google,
             dispatcher,
             outbox,
+            plugins,
             recorder: Arc::new(Recorder::default()),
         }
     }
@@ -292,6 +304,7 @@ impl Harness {
             db: self.db.db.clone(),
             dispatcher: Arc::clone(&self.dispatcher),
             outbox: Arc::clone(&self.outbox),
+            plugins: Arc::clone(&self.plugins),
         }
     }
 
@@ -302,6 +315,7 @@ impl Harness {
                 self.db.db.clone(),
                 Arc::clone(&self.dispatcher),
                 Arc::clone(&self.outbox),
+                Arc::clone(&self.plugins),
                 Arc::clone(&model) as Arc<dyn ModelTransport>,
                 Arc::clone(&self.recorder) as Arc<dyn SessionEmitter>,
             )
@@ -1288,7 +1302,8 @@ async fn a_transport_failure_fails_the_session_visibly() {
             harness.db.db.clone(),
             Arc::clone(&harness.dispatcher),
             Arc::clone(&harness.outbox),
-            Arc::new(Broken),
+            Arc::clone(&harness.plugins),
+            Arc::new(Broken) as Arc<dyn ModelTransport>,
             Arc::clone(&harness.recorder) as Arc<dyn SessionEmitter>,
         )
         .with_config(test_config()),

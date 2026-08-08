@@ -535,8 +535,8 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
         .sort((a, b) => a.start - b.start);
     },
 
-    async execute(command: Command): Promise<CommandResult> {
-      const result = await call<Partial<CommandResult>>("execute_command", { command });
+    async execute(command: Command, source?: string): Promise<CommandResult> {
+      const result = await call<Partial<CommandResult>>("execute_command", { command, source });
       // `applied` and `failed` decide what the UI reverts, so neither may be
       // left undefined by a backend that skipped an empty field.
       return {

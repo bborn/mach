@@ -34,6 +34,7 @@ pub mod config;
 pub mod db;
 pub mod google;
 pub mod ipc;
+pub mod plugins;
 pub mod render;
 pub mod sync;
 
@@ -46,6 +47,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        // One origin per plugin: `plugin://<id>/`. The handler serves two
+        // static files and, crucially, the Content-Security-Policy as a
+        // *response header* — see `plugins::protocol`.
+        .register_uri_scheme_protocol(plugins::SCHEME, |_ctx, request| {
+            plugins::protocol::respond(&request)
+        })
         .setup(|app| {
             // MACH_DATA_DIR gives an agent (or a second window) its own store,
             // so QA cannot mutate the mailbox someone is actually reading.
@@ -67,6 +74,15 @@ pub fn run() {
 
             let sync = Arc::clone(&state.sync);
             let start_sync = state.should_start_sync();
+
+            // The agent's bridge needs somewhere to send invoke requests, and
+            // that is the window. Wired after `bootstrap` because it needs the
+            // handle, and before `manage` because the state is moved.
+            state
+                .plugins
+                .set_sink(Arc::new(ipc::plugins::TauriInvokeSink {
+                    app: app.handle().clone(),
+                }));
             app.manage(state);
 
             // The bridge starts the loop and then forwards its progress for the
@@ -100,6 +116,15 @@ pub fn run() {
             ipc::agent::agent_start,
             ipc::agent::agent_sessions,
             ipc::agent::agent_send,
+            ipc::plugins::plugin_sandbox,
+            ipc::plugins::plugin_conformance,
+            ipc::plugins::plugin_list,
+            ipc::plugins::plugin_inspect,
+            ipc::plugins::plugin_install,
+            ipc::plugins::plugin_remove,
+            ipc::plugins::plugin_set_enabled,
+            ipc::plugins::plugin_source,
+            ipc::plugins::plugin_invoke_result,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

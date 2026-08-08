@@ -75,7 +75,16 @@ export type MailFocus = "list" | "rail";
 /** What the status bar says, and how loudly. */
 export interface StatusMessage {
   message: string;
-  undo?: Command;
+  /**
+   * What ⌘Z takes back.
+   *
+   * A list when one gesture was several commands — a plugin action that labels
+   * and then archives is one thing the user did, so it has to be one thing they
+   * can undo. The commands are stored in the order they ran and applied in
+   * reverse, because unarchiving before un-labelling would put the thread back
+   * with the label still on it.
+   */
+  undo?: Command | Command[];
   tone: "info" | "error";
 }
 
@@ -297,6 +306,15 @@ export interface MachActions {
   setFocus: (focus: MailFocus) => void;
   toggleFocus: () => void;
   undo: () => void;
+  /**
+   * Record several inverses as one undoable step.
+   *
+   * The plugin host calls this: it collects the inverse of every `mach.run` an
+   * action made and hands them over as a group labelled with the action's
+   * title. A plugin never constructs an inverse — the command layer already
+   * returned the exact one.
+   */
+  pushUndoGroup: (label: string, inverses: Command[]) => void;
   shiftPeriod: (delta: number) => void;
   goToday: () => void;
   setPalette: (open: boolean) => void;
@@ -854,16 +872,38 @@ export function MachProvider({ children }: { children: ReactNode }) {
       undo: () => {
         const undo = ui.status?.undo;
         if (!undo) return;
+        // Newest first: a group ran in order, so it unwinds in reverse.
+        const commands = (Array.isArray(undo) ? [...undo].reverse() : [undo]);
         // Everything that puts a thread back on screen has to clear the
         // optimistic hide as well as run the command.
-        if (
-          undo.kind === "unarchive" ||
-          undo.kind === "untrash" ||
-          undo.kind === "unsnooze"
-        ) {
-          dispatch({ type: "restore", threadIds: undo.threadIds });
+        for (const command of commands) {
+          if (
+            command.kind === "unarchive" ||
+            command.kind === "untrash" ||
+            command.kind === "unsnooze"
+          ) {
+            dispatch({ type: "restore", threadIds: command.threadIds });
+          }
         }
-        void run(undo);
+        void (async () => {
+          for (const command of commands) await run(command, { quiet: true });
+          dispatch({
+            type: "status",
+            status: { message: "Undone", tone: "info" },
+          });
+        })();
+      },
+
+      pushUndoGroup: (label, inverses) => {
+        if (inverses.length === 0) return;
+        dispatch({
+          type: "status",
+          status: {
+            message: label,
+            undo: inverses.length === 1 ? inverses[0] : inverses,
+            tone: "info",
+          },
+        });
       },
       shiftPeriod: (delta) => {
         const step =

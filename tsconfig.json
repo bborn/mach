@@ -13,6 +13,12 @@
     "baseUrl": ".",
     "paths": { "@/*": ["./src/*"] },
     "resolveJsonModule": true,
+    /*
+     * The reference plugins under `plugins/` are plain ES modules with no build
+     * step — that is the authoring story — and `examples.test.ts` imports them
+     * as published so the tests exercise the real files rather than a copy.
+     */
+    "allowJs": true,
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
@@ -23,6 +29,6 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"],
+  "include": ["src", "plugins"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

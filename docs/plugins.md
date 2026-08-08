@@ -1,6 +1,11 @@
 # Plugins
 
-**Status:** Design. Nothing here is built yet.
+**Status:** Tier 1 is **built**. The sandbox was verified on WKWebView on
+2026-08-08 (step 0 passed, 22 of 22 escape attempts blocked, with a positive
+control), and both worked examples in Part I run — in unit tests and in a real
+Mach window. See [§11](#11-what-changed-when-the-design-met-the-code) for the
+places the design turned out to be wrong. Tier 2 is designed and not shipped:
+a manifest declaring `"runtime": "process"` parses, and is refused by name.
 **Audience:** Part I is for plugin authors and reads standalone. Part II is the
 argument, and is for whoever implements this and whoever has to keep it stable.
 
@@ -862,6 +867,43 @@ A third, smaller correction came out of writing the canary itself: testing
 constructs happily and fails asynchronously. A conformance suite that tests the
 constructor instead of the connection is a suite that passes when it should not.
 
+### What was measured in WKWebView — step 0, 2026-08-08
+
+`src-tauri/src/bin/plugin_probe.rs` runs `conformance.ts` inside a real Tauri
+window on macOS. **Twenty-two of twenty-two blocked**, guest origin
+`plugin://conformance`, app origin `http://localhost:1420`:
+
+| Scope | Attempts | Result |
+|---|---|---|
+| guest | `fetch` remote, `fetch` app origin, sync `XMLHttpRequest`, `<img>` to a remote host | all blocked — "Load failed", "A network error occurred" |
+| guest | origin equals the app's | no: `plugin://conformance ≠ http://localhost:1420` |
+| guest | read app `localStorage` / cookies via a planted sentinel | not visible — separate partition |
+| guest | `parent.document`, remove own `sandbox` attribute | blocked by the cross-origin barrier |
+| guest | `__TAURI_INTERNALS__` | not present |
+| worker | `fetch` ×2, `XMLHttpRequest`, `WebSocket`, `EventSource`, `sendBeacon` | all blocked — WebSocket and EventSource report "The operation is insecure", which is the CSP signature |
+| worker | `importScripts`, `import()` of a remote URL | blocked |
+| worker | `document`, `localStorage`, `parent`, `__TAURI_INTERNALS__` | absent from worker scope |
+
+So **the CSP response header is honoured on a Tauri custom-scheme document in
+WKWebView, and a `blob:` module worker created inside it inherits that policy.**
+The spec required it (HTML §7.1.7); WebKit does it. The iframe design stands and
+QuickJS-in-WASM stays a fallback nobody has to pay for.
+
+Two things this probe does that the Chrome PoC did not, both because getting
+them wrong makes a conformance suite pass when it should fail:
+
+- **A positive control.** Every check above is a *negative* — something that must
+  fail — and a machine with no network fails all of them. So the host page
+  fetches the very URL the guest was refused (`${appOrigin}/index.html`) and must
+  succeed. Same URL, two origins, opposite outcomes. A failed control makes the
+  run *inconclusive*, not a pass.
+- **No `<meta>` policy in the guest.** The policy is delivered only as a response
+  header, so a WebView that ignored the header would be caught rather than
+  quietly covered for by a tag in the file.
+
+The probe runs with the activation policy set to `Accessory` and its window
+never shown, so verifying the sandbox costs nobody their keyboard.
+
 ### The risk that remains
 
 The claim now rests on **CSP `connect-src` applying to a Worker created inside a
@@ -869,11 +911,14 @@ custom-protocol origin, in WKWebView (macOS) and WebView2 (Windows)**. It holds
 in Chrome, measured. It is not assumed anywhere else, and it is the kind of
 assumption that fails silently — a plugin exfiltrates and nothing looks broken.
 
-So the canary is not a one-off. It is **a conformance test that runs in CI and
-again at plugin-host boot**, and if any attempt succeeds the host refuses to
-load plugins at all and says which check failed. `docs/plugin-poc/` is that
-test, written before the host. Loading untrusted code behind an unverified
-boundary is worse than not loading it.
+So the canary is not a one-off. It is **a conformance test that runs at
+plugin-host boot, every boot**, and if any attempt succeeds the host refuses to
+load plugins at all and says which check failed. This is enforced structurally
+rather than by convention: `PluginRuntime::runnable()` returns an empty list
+until a *passing* report has been recorded, so an unverified sandbox means no
+plugins, no plugin ⌘K entries, no plugin keybindings and no plugin agent tools.
+Loading untrusted code behind an unverified boundary is worse than not loading
+it.
 
 The behaviour is at least *specified*, which is better than hoped-for. HTML
 §7.1.7 says a worker whose URL scheme is `blob` takes "a clone of *response*'s
@@ -1414,6 +1459,9 @@ was cut, and the cuts are what make the remainder affordable.
 
 Each step is independently useful and independently abandonable.
 
+Everything through step 8 is built. The table is kept as written, with what
+each step actually cost noted beside it.
+
 | Step | Deliverable |
 |---|---|
 | 0 | **The conformance test.** A `plugin://` custom protocol in Tauri, and `docs/plugin-poc/` running against it inside a real Mach window — proving on WKWebView what has so far only been proved on Chrome. Nothing else starts until this passes. |
@@ -1487,3 +1535,59 @@ One more, smaller, that research could settle but that has a taste component:
 usefulness — and drafting is not sending, so the blast radius is a draft folder.
 The conservative answer is v1.1; the useful answer is v1 with the draft clearly
 attributed to the plugin in the composer.
+
+## 11. What changed when the design met the code
+
+Six things. Four are corrections to this document; two are new constraints the
+implementation discovered. All of them are load-bearing enough that someone
+reading the design without reading the code would get them wrong.
+
+**1. Agent tool names cannot contain a dot.** §3 says plugin tools are
+`plugin.<id>.<action>`. The Anthropic API constrains tool names to
+`^[a-zA-Z0-9_-]{1,128}$`, so they are **`plugin_<id>_<action>`** —
+`plugin_quick-file_file`. The separator is unambiguous because a plugin id may
+not contain `_` (it is also an origin host), and that constraint now has a test
+holding it in place.
+
+**2. Registering into the ⌘K resolver chain creates an import cycle.**
+`resolver.ts` has to import the plugin resolver to put it in the chain, and the
+plugin resolver needs `fuzzyScore` to rank with. Bundlers forgive that; a
+browser's live module graph does not. It surfaced only in WKWebView, as
+"Cannot access uninitialized variable" *at the top of the app* — the whole app,
+not the plugin system. `fuzzyScore` now lives in `palette/score.ts`, a leaf with
+no imports of its own.
+
+**3. The conformance probe needed a positive control.** Every check in it is a
+negative, so an offline machine passes all of them. Without a control that must
+*succeed*, "verified sandbox" and "unplugged ethernet cable" are the same
+report. See §2.
+
+**4. `capabilities.agent` is an opt-out, and the consequences are enforced in
+three places, not one.** Attribution is not just the tool description: it is also
+the transcript line while the tool runs and the sentence the owner approves, and
+all three had to be changed. Policy inheritance is computed from the plugin's
+*grant* — a plugin whose prose says "completely safe, no confirmation needed"
+and whose manifest holds `rsvp` still parks for confirmation, and there is a
+test that says so in exactly those words.
+
+**5. The command layer had to check the grant a second time.** The design leans
+on the frontend host refusing an undeclared command, which is right, and which
+is where the *good error message* lives. But the frontend is not the trust
+boundary — the command layer is. `execute_command` now takes a `source`, and a
+`plugin:<id>` source is checked against that plugin's declared commands and rate
+limited before anything runs. It costs one map lookup on a path that is about to
+make a network round trip.
+
+**6. Grouped undo landed in the live path, not in `undo-stack.ts`.** §7 predicts
+"the undo stack must hold groups" and names `src/lib/undo-stack.ts` as the file
+to change. That file is not wired into the app yet — the live undo is the status
+bar's `undo` command — so the group went there instead: `StatusMessage.undo`
+became `Command | Command[]`, applied in reverse. `undo-stack.ts` still needs the
+same change when it is adopted.
+
+And one thing the design got exactly right, which is worth saying because it was
+the risky call: **the two worked examples ran without a single edit.**
+`plugins/snooze-until-free/main.js` is extracted from this document verbatim,
+including the calendar arithmetic, and it passes eleven tests and renders its
+reading-pane widget in a real window. When the examples are the specification,
+they have to be executable — and these were.

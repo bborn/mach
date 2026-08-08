@@ -131,10 +131,25 @@ In the real app, `guest.html` and `sandbox.js` are served by the protocol
 handler with the CSP as a **response header** rather than a `<meta>` tag — one
 fewer file a plugin could ever influence.
 
+## Answered: WKWebView, 2026-08-08
+
+Step 0 passed. The same checks, plus a positive control and an `<img>` probe,
+now run inside a real Mach window against the real `plugin://` protocol handler
+— **22 of 22 blocked**, guest origin `plugin://conformance`. The measurements
+are in `docs/plugins.md` §2 and the harness is
+`src-tauri/src/bin/plugin_probe.rs`, which is a hidden window with the macOS
+activation policy set to `Accessory`, so running it costs nobody their keyboard:
+
+```sh
+MACH_DATA_DIR=.qa/plugin-probe/data cargo run --bin plugin_probe
+```
+
+This directory stays as the Chrome baseline and as the record of what the PoC
+caught. The living conformance test is `src/lib/plugins/conformance.ts`, which
+runs at plugin-host boot, every boot.
+
 ## What this deliberately does not prove
 
-- **WKWebView.** Everything above is Chrome. Confirming Safari's engine is the
-  entire point of step 0, and the two specific doubts are named in `plugins.md`.
 - **WebView2.** Has to be checked separately before Mach ships on Windows.
 - **Tier 2.** Subprocess plugins have a network by design; nothing here applies.
 - **Denial of service.** A plugin can still spin. The worker keeps it off the UI

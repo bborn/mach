@@ -351,7 +351,16 @@ export interface MachDataSource {
   searchThreads(text: string, limit?: number): Promise<ThreadPage>;
   listEvents(range: TimeRange): Promise<CalendarEvent[]>;
 
-  execute(command: Command): Promise<CommandResult>;
+  /**
+   * Dispatch a command.
+   *
+   * `source` says who asked — `user` (the default), `agent`, or
+   * `plugin:<id>` — and it is not decoration. A plugin source is checked
+   * against that plugin's declared capabilities and rate limit on the Rust
+   * side before anything runs, and it is what makes "what did that plugin do
+   * to my mailbox" an answerable question.
+   */
+  execute(command: Command, source?: string): Promise<CommandResult>;
   commandCatalogue(): Promise<CommandSpec[]>;
 
   syncStatus(): Promise<SyncStatus>;
@@ -461,7 +470,7 @@ export const fixtureSource: MachDataSource = {
       .sort((a, b) => a.start - b.start);
   },
 
-  async execute(command) {
+  async execute(command, _source) {
     // Fixtures do not persist. The optimistic local state in `useMach` is what
     // the user sees; the real source writes to SQLite and echoes back.
     switch (command.kind) {

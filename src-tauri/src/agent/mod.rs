@@ -26,6 +26,7 @@
 //! | [`config`] | `ANTHROPIC_API_KEY`, model, effort — and the sentence when it is missing |
 //! | [`wire`] | the Messages API: request, SSE decoding, turn accumulation |
 //! | [`tools`] | [`Command::catalogue`](crate::commands::Command::catalogue) → tool definitions, and execution |
+//! | [`plugin_tools`] | plugin actions → tools, attributed, with the approval policy they inherit |
 //! | [`context`] | what "this" means, and the system prompt |
 //! | [`session`] | the loop, the approval gate, the registry |
 //! | [`error`] | one `{ kind, message }`, as everywhere else |
@@ -47,6 +48,7 @@
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod plugin_tools;
 pub mod session;
 pub mod tools;
 pub mod wire;

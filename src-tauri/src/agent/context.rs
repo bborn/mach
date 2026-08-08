@@ -193,7 +193,7 @@ pub fn human_time(ms: i64) -> String {
 ///
 /// Written as context rather than commands, and short: the tool descriptions
 /// carry the mechanics, and a long prompt would only compete with them.
-pub fn system_prompt(db: &Db, now_ms: i64) -> String {
+pub fn system_prompt(db: &Db, now_ms: i64, has_plugin_tools: bool) -> String {
     let now = Local.timestamp_millis_opt(now_ms).single();
     let clock = match now {
         Some(dt) => format!(
@@ -214,6 +214,14 @@ pub fn system_prompt(db: &Db, now_ms: i64) -> String {
         })
         .unwrap_or_default();
 
+    // Only when at least one is offered. Standing text about a threat that is
+    // not present is text the model has to read on every unrelated turn.
+    let plugins = if has_plugin_tools {
+        format!("\n\n{}", super::plugin_tools::PLUGIN_PROMPT)
+    } else {
+        String::new()
+    };
+
     format!(
         "You are the agent inside Mach, the user's mail and calendar client. You are talking to \
 them about what is on their screen.\n\n\
@@ -233,6 +241,6 @@ permission in prose beforehand.\n\
 - Match his voice in replies: direct, lowercase-ish, no corporate throat-clearing, no \
 \"I hope this email finds you well\", no signature (the account adds one).\n\
 - Say what you did in one or two sentences. He can see the tool calls; do not narrate them.\n\
-- If something cannot be done, say so plainly and stop."
+- If something cannot be done, say so plainly and stop.{plugins}"
     )
 }

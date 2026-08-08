@@ -79,12 +79,30 @@ pub fn list_events(
 // writes
 // ---------------------------------------------------------------------------
 
+/// Run a command.
+///
+/// `source` is `user` (the default), `agent`, or `plugin:<id>`, and it is not
+/// decoration: a plugin source is **checked against that plugin's declared
+/// capabilities and rate limit before the command runs**. The frontend's sandbox
+/// host refuses an undeclared command first, and with a better message — but the
+/// frontend is not the trust boundary. The command layer is, so the grant is
+/// enforced here too. It costs one map lookup on a path that is about to make a
+/// network round trip.
 #[tauri::command]
 pub async fn execute_command(
     app: AppHandle,
     state: State<'_, AppState>,
     command: Command,
+    source: Option<String>,
 ) -> Result<CommandResult, IpcError> {
+    if let Some(plugin_id) = source.as_deref().and_then(|s| s.strip_prefix("plugin:")) {
+        state
+            .plugins
+            .authorize_command(plugin_id, command.kind(), crate::ipc::compose::now_ms())
+            .map_err(|message| {
+                IpcError::Command(crate::commands::CommandError::Invalid { message })
+            })?;
+    }
     let result = state.dispatcher.execute(command).await?;
     // Even a partial failure has already written and rolled back rows, so the
     // list is stale either way.

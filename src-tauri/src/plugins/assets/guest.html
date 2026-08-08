@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>mach plugin sandbox</title>
+<!--
+  The guest document. One script, no content, never visible.
+
+  There is deliberately no inline Content-Security-Policy meta tag here.
+  The policy arrives as a *response header* from the protocol handler
+  (src-tauri/src/plugins/protocol.rs), which is one fewer thing that lives in a
+  file, and — more importantly — means the conformance probe is testing the
+  mechanism the design actually relies on. A meta tag here would mask a WebView
+  that ignores the header, and a sandbox that passes its own test for the wrong
+  reason is worse than one that fails.
+-->
+<script src="/sandbox.js"></script>

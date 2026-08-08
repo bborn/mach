@@ -1,0 +1,27 @@
+{
+  "id": "quick-file",
+  "name": "Quick File",
+  "version": "1.0.0",
+  "machApi": "1",
+  "description": "Pick a label, apply it to the selected conversations, and archive them.",
+  "author": "mach <plugins@example.com>",
+  "main": "main.js",
+  "capabilities": {
+    "read": ["labels"],
+    "commands": ["label", "archive"],
+    "ui": ["palette"],
+    "store": true,
+    "agent": false
+  },
+  "contributes": {
+    "actions": [
+      {
+        "id": "file",
+        "title": "File to label…",
+        "keywords": "move folder sort archive",
+        "key": "alt+f",
+        "context": "threads"
+      }
+    ]
+  }
+}

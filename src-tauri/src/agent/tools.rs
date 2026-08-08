@@ -38,6 +38,7 @@ use serde_json::{json, Map, Value};
 
 use crate::commands::{Command, CommandDispatcher, CommandSpec, ParamSpec, ParamType};
 use crate::db::Db;
+use crate::plugins::{InstalledPlugin, PluginRuntime};
 use crate::ipc::compose::engine::outbox::Outbox;
 use crate::ipc::compose::{dispatch as compose_dispatch, now_ms};
 use crate::ipc::reads;
@@ -86,7 +87,7 @@ impl Tool {
 /// Names rather than a property on [`CommandSpec`] because "does this reach
 /// someone else" is a judgement about consequences, and the catalogue is owned
 /// by the command layer, not by this module.
-const APPROVAL_COMMANDS: &[&str] = &[
+pub const APPROVAL_COMMANDS: &[&str] = &[
     "rsvp",
     "createEvent",
     "updateEvent",
@@ -102,11 +103,21 @@ pub const DRAFT_TOOL: &str = "draft_reply";
 // Definitions
 // ===========================================================================
 
-/// Everything the agent can do, reads first.
+/// Everything the agent can do, reads first. Core only.
 pub fn tools() -> Vec<Tool> {
     let mut all = read_tools();
     all.extend(command_tools());
     all.extend(compose_tools());
+    all
+}
+
+/// The core tools plus whatever the installed plugins contribute.
+///
+/// Plugins come last so a plugin can never shadow a core tool by name — and it
+/// could not anyway, because every plugin tool is prefixed.
+pub fn tools_with(plugins: &[InstalledPlugin]) -> Vec<Tool> {
+    let mut all = tools();
+    all.extend(super::plugin_tools::plugin_tools(plugins));
     all
 }
 
@@ -116,6 +127,23 @@ pub fn find(name: &str) -> Option<Tool> {
 
 pub fn policy_for(name: &str) -> ToolPolicy {
     find(name).map(|t| t.policy).unwrap_or(ToolPolicy::Auto)
+}
+
+/// The policy for a tool that may be a plugin's.
+///
+/// A plugin tool whose plugin is no longer installed resolves to
+/// [`ToolPolicy::Approve`] rather than `Auto`: an unknown tool is not a safe
+/// tool, and the call is going to fail anyway — better it fails after asking
+/// than before.
+pub fn policy_for_with(name: &str, plugins: &[InstalledPlugin]) -> ToolPolicy {
+    if super::plugin_tools::is_plugin_tool(name) {
+        return super::plugin_tools::plugin_tools(plugins)
+            .into_iter()
+            .find(|t| t.definition.name == name)
+            .map(|t| t.policy)
+            .unwrap_or(ToolPolicy::Approve);
+    }
+    policy_for(name)
 }
 
 /// The command layer, described to something that cannot read Rust.
@@ -399,6 +427,18 @@ pub struct ToolContext {
     pub db: Db,
     pub dispatcher: Arc<CommandDispatcher>,
     pub outbox: Arc<Outbox>,
+    /// What is installed, and the bridge a plugin action runs over. The agent
+    /// gets no privileged path to a plugin either: it asks the same host the
+    /// keyboard asks, in the window, and the answer comes back over IPC.
+    pub plugins: Arc<PluginRuntime>,
+}
+
+impl ToolContext {
+    /// The plugins whose actions may be offered as tools right now — empty
+    /// until the sandbox has been verified in this window.
+    pub fn plugin_list(&self) -> Vec<InstalledPlugin> {
+        self.plugins.runnable()
+    }
 }
 
 /// What a tool run came to. `summary` is the one line the drawer shows.
@@ -420,8 +460,33 @@ pub async fn execute(ctx: &ToolContext, name: &str, input: &Value) -> Result<Too
         "list_accounts" => list_accounts(ctx),
         DRAFT_TOOL => draft_reply(ctx, input).await,
         SEND_TOOL => send_draft(ctx, input).await,
+        other if super::plugin_tools::is_plugin_tool(other) => run_plugin(ctx, other, input).await,
         _ => run_command(ctx, name, input).await,
     }
+}
+
+/// Hand a tool call to a plugin action, in the window, and wait.
+///
+/// The plugin's answer is returned to the model as data — it is a third party's
+/// output, and it is framed as such in the payload so a plugin cannot pretend to
+/// be the app talking.
+async fn run_plugin(ctx: &ToolContext, name: &str, input: &Value) -> Result<ToolOutcome, AgentError> {
+    let (plugin_id, action) = super::plugin_tools::split_tool_name(name)
+        .ok_or_else(|| AgentError::invalid(format!("{name} is not a plugin tool")))?;
+
+    let value = ctx
+        .plugins
+        .invoke(plugin_id, action, input.clone(), "agent")
+        .await
+        .map_err(|e| AgentError::invalid(e.to_string()))?;
+
+    Ok(ToolOutcome {
+        summary: format!("{plugin_id}: {action}"),
+        payload: json!({ "plugin": plugin_id, "action": action, "result": value }),
+        // A plugin action's whole point is dispatching commands, and the UI has
+        // no way to know which ones. Assume the mailbox moved.
+        mutated: true,
+    })
 }
 
 async fn run_command(ctx: &ToolContext, name: &str, input: &Value) -> Result<ToolOutcome, AgentError> {

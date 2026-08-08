@@ -108,6 +108,7 @@ fn engine(app: &AppHandle, state: &AppState) -> Result<Arc<AgentEngine>, IpcErro
         state.db.clone(),
         Arc::clone(&state.dispatcher),
         outbox,
+        Arc::clone(&state.plugins),
         Arc::new(engine::wire::ReqwestModelTransport::new()),
         Arc::new(TauriEmitter { app: app.clone() }),
     ));

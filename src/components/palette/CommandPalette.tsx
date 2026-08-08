@@ -58,6 +58,11 @@ const COMMANDS: PaletteCommand[] = [
   { id: "add-account", title: "Add a Google account", keywords: "account oauth connect google" },
   { id: "sync-now", title: "Sync now", keywords: "sync refresh fetch" },
   { id: "theme", title: "Cycle theme (system / light / dark)", keywords: "dark light theme" },
+  {
+    id: "plugins",
+    title: "Plugins…",
+    keywords: "plugin plugins extensions install add-on sandbox",
+  },
 ];
 
 export function CommandPalette() {
@@ -173,6 +178,11 @@ export function CommandPalette() {
           return actions.syncNow();
         case "theme":
           return actions.cycleTheme();
+        // A window event rather than a call, for the same reason the composer
+        // uses one: the panel lives in another unit's subtree and the palette
+        // must not import it.
+        case "plugins":
+          return window.dispatchEvent(new CustomEvent("mach:plugins"));
       }
     }
   }, [open, query, allThreads, events, people, mailboxes, actions, dispatch]);

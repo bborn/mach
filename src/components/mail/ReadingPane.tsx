@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Hint, Kbd } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ThreadMessage } from "./ThreadMessage";
+import { PluginViews } from "@/components/plugins/PluginView";
 
 /**
  * The conversation.
@@ -112,6 +113,14 @@ export function ReadingPane() {
 
       <ScrollArea>
         <div className="mx-auto max-w-[72ch] px-5 pb-16 pt-2">
+          {/*
+            The one slot a plugin may occupy in the reading pane: a line
+            *above* the conversation, never a transform of the body. The
+            sanitizer's output is tested against 52 attacks and is not a plugin
+            API — see "message-body transforms: never" in docs/plugins.md.
+          */}
+          <PluginViews surface="reading-pane" threadId={thread?.id ?? null} />
+
           {messages.map((message) => (
             <ThreadMessage
               key={message.id}

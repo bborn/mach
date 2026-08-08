@@ -18,8 +18,14 @@
 
 import type { CalendarEvent, EventId, LabelId, Participant, Thread, ThreadId } from "@/types";
 import type { MailboxTarget } from "@/lib/mailboxes";
+import { fuzzyScore } from "./score";
 import { feedbackResolver } from "@/lib/feedback";
 import { agentResolver } from "@/lib/agent";
+import { pluginResolver } from "@/lib/plugins/palette";
+// Re-exported so every existing importer keeps working; it lives in its own
+// module because `plugins/palette.ts` needs it and this file imports *from*
+// there. See the note at the top of `score.ts`.
+export { fuzzyScore } from "./score";
 
 export type PaletteResultKind =
   | "thread"
@@ -74,35 +80,6 @@ export interface PaletteResolver {
   priority: number;
   claims: (query: string) => boolean;
   resolve: (ctx: PaletteContext) => PaletteResult[];
-}
-
-/* -------------------------------------------------------------------------- */
-/* Ranking                                                                     */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Subsequence match with a bias towards prefixes and word starts. Deliberately
- * small: local ranking has to feel instant on every keystroke, and FTS5 does
- * the real work once the Rust side is wired up.
- */
-export function fuzzyScore(haystack: string, needle: string): number {
-  if (!needle) return 1;
-  const hay = haystack.toLowerCase();
-  const pin = needle.toLowerCase();
-
-  const direct = hay.indexOf(pin);
-  if (direct === 0) return 1000;
-  if (direct > 0) return 700 - Math.min(direct, 200) + (hay[direct - 1] === " " ? 100 : 0);
-
-  let score = 0;
-  let cursor = 0;
-  for (const char of pin) {
-    const found = hay.indexOf(char, cursor);
-    if (found === -1) return 0;
-    score += found === 0 || hay[found - 1] === " " ? 8 : 2;
-    cursor = found + 1;
-  }
-  return score;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -261,9 +238,14 @@ function rank<T>(items: { value: T; score: number }[], limit = LOCAL_LIMIT) {
 // `agentResolver` sits last on purpose. Ordinary typing must stay instant and
 // local, so the layer that costs a model round trip ranks below every layer
 // that does not, and it only ever offers — the handoff still needs ⇥ or ⏎.
+// `pluginResolver` is *one* resolver for every installed plugin, not one each,
+// and it matches against static manifest text. Handing `registerResolver`
+// itself to plugins is the thing the design cuts: every resolver runs on every
+// keystroke, and one careless plugin would make ⌘K feel broken.
 const resolvers: PaletteResolver[] = [
   feedbackResolver,
   commandResolver,
+  pluginResolver,
   mailboxResolver,
   localResolver,
   agentResolver,

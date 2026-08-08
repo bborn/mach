@@ -1,0 +1,45 @@
+{
+  "id": "snooze-until-free",
+  "name": "Snooze Until Free",
+  "version": "1.2.0",
+  "machApi": "1",
+  "description": "Snooze a conversation until the next real gap in your calendar, so it comes back when you can actually deal with it.",
+  "author": "mach <plugins@example.com>",
+  "homepage": "https://github.com/you/mach-snooze-until-free",
+  "main": "main.js",
+
+  "capabilities": {
+    "read": ["calendar"],
+    "commands": ["snooze"],
+    "ui": ["palette", "reading-pane"],
+    "agent": ["snooze"],
+    "store": true
+  },
+
+  "contributes": {
+    "actions": [
+      {
+        "id": "snooze",
+        "title": "Snooze until I'm free",
+        "keywords": "later defer gap calendar busy",
+        "key": "shift+h",
+        "context": "threads",
+        "summary": "Hide the conversation until the next gap of at least 45 minutes in the user's working hours, then return it to the inbox.",
+        "params": [
+          {
+            "name": "minimumMinutes",
+            "type": "number",
+            "required": false,
+            "description": "How long a gap has to be to count. Defaults to 45."
+          }
+        ]
+      },
+      {
+        "id": "configure",
+        "title": "Snooze Until Free: working hours…",
+        "context": "global"
+      }
+    ],
+    "views": [{ "id": "next-free", "surface": "reading-pane" }]
+  }
+}
