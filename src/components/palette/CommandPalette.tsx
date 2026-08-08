@@ -307,11 +307,10 @@ export function CommandPalette() {
       priority: 100,
       when: () => open,
       handler: () => {
-        actions.setStatus(
-          query.trim()
-            ? `Agent handoff is a later unit — would ask: “${query.trim()}”`
-            : "Type a question first, then ⇥ hands it to the agent",
-        );
+        // The agent unit registers its own ⇥ resolver at a higher priority and
+        // takes this over. This remains only for the empty-query case, which
+        // that resolver declines to claim.
+        actions.setStatus("Type a question first, then ⇥ hands it to the agent");
       },
     },
   ]);
@@ -390,7 +389,7 @@ export function CommandPalette() {
           <span className="text-micro text-faint-foreground">open</span>
         </span>
         <span className="ml-auto text-micro text-faint-foreground">
-          operators and agent handoff land in a later unit
+          ⇥ asks the agent
         </span>
       </footer>
     </Overlay>

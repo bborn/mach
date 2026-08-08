@@ -5,7 +5,7 @@
  * touches the network:
  *
  *   layer 0  local ranked results (threads, events, people, commands)   ← here
- *   layer 1  operator queries — `from:tawny has:attachment`             ← later unit
+ *   layer 1  operator queries — `from:tawny has:attachment`             ← not built
  *   layer 2  `>` command mode                                          ← here (trivial half)
  *   layer 3  ⇥ hands the sentence to the agent                         ← `lib/agent.ts`
  *

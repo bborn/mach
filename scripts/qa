@@ -201,6 +201,22 @@ cmd_shoot() {
 cmd_state() {
   local pid; pid="$(instance_pid)" || pid=""
   echo "instance: $INSTANCE"
+
+  # A process this script did not start is a process it cannot stop, and one
+  # you can be looking at while `qa down && qa up` restarts a different one.
+  # That is how two and a half hours of Rust changes stayed off screen: the
+  # pidfile named one process and the window belonged to another.
+  local strays=""
+  for other in $(pgrep -x mach 2>/dev/null); do
+    [ "$other" = "$pid" ] || strays="$strays $other"
+  done
+  if [ -n "$strays" ]; then
+    echo "WARNING : untracked mach process(es)$strays — qa cannot stop these," >&2
+    echo "          and one of them may be the window you are looking at." >&2
+    for other in $strays; do
+      echo "          pid $other started $(ps -p "$other" -o lstart= 2>/dev/null | xargs)" >&2
+    done
+  fi
   echo "process : ${pid:+running (pid $pid)}${pid:-NOT RUNNING}"
   echo "vite    : $(curl -sf -o /dev/null http://localhost:1420 && echo up || echo down)"
   echo "store   : $DB"

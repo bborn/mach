@@ -84,7 +84,7 @@ export interface Message {
   to: Participant[];
   cc: Participant[];
   timestamp: number;
-  /** Plaintext body. `bodyHtml` renders in a sandboxed iframe in a later unit. */
+  /** Plaintext body. `bodyHtml` renders in a sandboxed iframe — see MessageFrame. */
   bodyText: string;
   bodyHtml?: string;
   attachments: Attachment[];

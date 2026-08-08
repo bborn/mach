@@ -137,7 +137,7 @@ export function ReadingPane() {
           ))}
 
           <div className="mt-2 flex items-center gap-2 border-t border-border pt-4 text-micro text-faint-foreground">
-            <Kbd keys="r" /> reply — the inline composer lands in a later unit
+            <Kbd keys="r" /> reply · <Kbd keys="a" /> reply all · <Kbd keys="f" /> forward
           </div>
         </div>
       </ScrollArea>
