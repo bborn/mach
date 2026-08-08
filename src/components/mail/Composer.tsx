@@ -4,14 +4,22 @@ import {
   useMemo,
   useRef,
   useState,
-  type Ref,
   type RefObject,
 } from "react";
 import { Paperclip, X } from "lucide-react";
 import { useKeyBindings } from "@/hooks/useKeymap";
+import { useGhostText } from "@/hooks/useGhostText";
 import { Kbd } from "@/components/ui/kbd";
+import { GhostHint, GhostText } from "@/components/ui/ghost";
+import {
+  AddressSuggestions,
+  typeaheadFieldProps,
+  useAddressTypeahead,
+} from "@/components/ui/address-typeahead";
+import { anyPopupOpen } from "@/lib/popups";
 import { cn } from "@/lib/utils";
 import { RichTextEditor, type RichTextEditorHandle } from "./RichTextEditor";
+import type { Contact } from "@/lib/contacts";
 import {
   COMPOSER_KEYS,
   formatRecipients,
@@ -84,7 +92,15 @@ interface ComposerProps {
    * own "first field in the panel" fallback cannot find it.
    */
   bodyRef?: RefObject<HTMLElement | null>;
+  /** Everyone the app has seen, for the address fields. */
+  contacts?: readonly Contact[];
+  /** Lines describing what is being answered, for the ghost completions. */
+  ghostContext?: readonly string[];
 }
+
+/** Shared by the subject field and the ghost mirror behind it. Must not drift. */
+const SUBJECT_TYPE = "text-list font-medium";
+
 
 /**
  * The composer.
@@ -113,6 +129,21 @@ interface ComposerProps {
  *  * **The footer is a legend, not a button bar.** The two exceptions are the
  *    two acts with consequences outside this panel: attaching a file, and
  *    throwing the draft away.
+ *
+ * # Completion
+ *
+ * Two kinds, and they are not the same feature. The address fields complete
+ * from people the app has already seen — local, instant, and always available.
+ * The subject offers a grey continuation from the model, which exists only when
+ * `ANTHROPIC_API_KEY` does; without it that path resolves to the empty string
+ * and the field is exactly what it was. Both are taken with ⇥ and refused by
+ * carrying on typing.
+ *
+ * The body has no ghost text. It offered one while the body was a `<textarea>`
+ * and `GhostText` could mirror its value behind it; the body is a
+ * contenteditable now, which that mirror cannot measure. The model half of the
+ * feature is still here and still wired — see `useGhostText` — so restoring it
+ * is a question of drawing the suggestion inside `RichTextEditor`.
  */
 export function Composer({
   draft,
@@ -134,12 +165,17 @@ export function Composer({
   dropping = false,
   toRef,
   bodyRef,
+  contacts = [],
+  ghostContext,
 }: ComposerProps) {
   const editor = useRef<RichTextEditorHandle>(null);
+  const subjectField = useRef<HTMLInputElement>(null);
   const ownToField = useRef<HTMLInputElement>(null);
   const toField = toRef ?? ownToField;
   const [showCc, setShowCc] = useState(draft.cc.length > 0 || draft.bcc.length > 0);
   const [scheduling, setScheduling] = useState(false);
+  const [focus, setFocus] = useState<"subject" | null>(null);
+  const [caretAtEnd, setCaretAtEnd] = useState(true);
 
   const isReply = draft.kind === "reply" || draft.kind === "replyAll";
   const attachments = draft.attachments ?? [];
@@ -189,6 +225,28 @@ export function Composer({
   const popOut = useCallback(() => {
     onPopOut?.(editor.current?.caret() ?? null);
   }, [onPopOut]);
+
+  /* ------------------------------------------------------------ completion */
+
+  const setField = (which: "to" | "cc" | "bcc") => (value: string) => {
+    setRaw((current) => ({ ...current, [which]: value }));
+    onChange({ ...draft, [which]: parseRecipients(value) });
+  };
+
+  const to = useAddressTypeahead({
+    value: raw.to,
+    contacts,
+    onChange: setField("to"),
+    fieldRef: toField,
+    enabled: !busy,
+  });
+
+  const subjectGhost = useGhostText({
+    kind: "emailSubject",
+    value: draft.subject,
+    context: ghostContext,
+    active: !busy && !isReply && focus === "subject" && caretAtEnd,
+  });
 
   useKeyBindings([
     {
@@ -244,7 +302,10 @@ export function Composer({
       description: "Close, keeping the draft",
       allowInInput: true,
       priority: 120,
-      when: () => active,
+      // A suggestion list is a popup, and the keymap runs in the capture phase
+      // — declining here is what lets one Escape dismiss the list and the next
+      // one close the composer. See `lib/popups.ts`.
+      when: () => active && !anyPopupOpen(),
       handler: () => {
         if (scheduling) setScheduling(false);
         else onClose();
@@ -252,9 +313,28 @@ export function Composer({
     },
   ]);
 
-  const setField = (which: "to" | "cc" | "bcc") => (value: string) => {
-    setRaw((current) => ({ ...current, [which]: value }));
-    onChange({ ...draft, [which]: parseRecipients(value) });
+  /** ⇥ takes the grey text; Escape refuses it without closing anything. */
+  const ghostKeys =
+    (suggestion: string, accept: () => string | null, dismiss: () => void, apply: (v: string) => void) =>
+    (event: React.KeyboardEvent) => {
+      if (!suggestion) return;
+      if (event.key === "Tab" && !event.shiftKey && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        const next = accept();
+        if (next !== null) apply(next);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        dismiss();
+      }
+    };
+
+  const trackCaret = (event: { currentTarget: HTMLInputElement | HTMLTextAreaElement }) => {
+    const node = event.currentTarget;
+    setCaretAtEnd((node.selectionStart ?? 0) === node.value.length && node.selectionStart === node.selectionEnd);
   };
 
   const overlay = presentation === "overlay";
@@ -279,17 +359,42 @@ export function Composer({
               {draft.subject}
             </h2>
           ) : (
-            <input
-              id="composer-subject"
-              value={draft.subject}
-              disabled={busy}
-              onChange={(event) => onChange({ ...draft, subject: event.target.value })}
-              placeholder="Subject"
-              className={cn(
-                "min-w-0 flex-1 bg-transparent text-list font-medium text-foreground",
-                "placeholder:text-faint-foreground focus:outline-none",
-              )}
-            />
+            <div className="relative min-w-0 flex-1">
+              <GhostText
+                value={draft.subject}
+                suggestion={subjectGhost.suggestion}
+                typography={SUBJECT_TYPE}
+                multiline={false}
+              />
+              <input
+                id="composer-subject"
+                ref={subjectField}
+                value={draft.subject}
+                disabled={busy}
+                onChange={(event) => {
+                  onChange({ ...draft, subject: event.target.value });
+                  trackCaret(event);
+                }}
+                onSelect={trackCaret}
+                onFocus={(event) => {
+                  setFocus("subject");
+                  trackCaret(event);
+                }}
+                onBlur={() => setFocus((current) => (current === "subject" ? null : current))}
+                onKeyDown={ghostKeys(
+                  subjectGhost.suggestion,
+                  subjectGhost.accept,
+                  subjectGhost.dismiss,
+                  (value) => onChange({ ...draft, subject: value }),
+                )}
+                placeholder="Subject"
+                className={cn(
+                  "w-full bg-transparent text-foreground",
+                  SUBJECT_TYPE,
+                  "placeholder:text-faint-foreground focus:outline-none",
+                )}
+              />
+            </div>
           )}
           {!showCc && (
             <button
@@ -303,20 +408,21 @@ export function Composer({
         </div>
 
         <div className="mt-2 space-y-1 border-b border-border pb-2">
-          <AddressField
-            label="To"
-            value={raw.to}
-            onChange={setField("to")}
-            disabled={busy}
-            inputRef={toField}
-          />
+          <AddressField label="To" typeahead={to} value={raw.to} disabled={busy} inputRef={toField} />
           {showCc && (
             <>
-              <AddressField label="Cc" value={raw.cc} onChange={setField("cc")} disabled={busy} />
-              <AddressField
+              <CompletedAddressField
+                label="Cc"
+                value={raw.cc}
+                onChange={setField("cc")}
+                contacts={contacts}
+                disabled={busy}
+              />
+              <CompletedAddressField
                 label="Bcc"
                 value={raw.bcc}
                 onChange={setField("bcc")}
+                contacts={contacts}
                 disabled={busy}
               />
             </>
@@ -422,6 +528,8 @@ export function Composer({
               Not in Gmail
             </span>
           )}
+          {/* Not a legend: it says a suggestion is waiting, which is news. */}
+          <GhostHint shown={subjectGhost.suggestion !== ""} />
           <span className="ml-auto truncate">{busy ? "Sending" : null}</span>
         </div>
       </div>
@@ -463,37 +571,76 @@ function AttachmentChip({
   );
 }
 
-function AddressField({
+/**
+ * Cc and Bcc, which unlike To are not held by the parent — each needs its own
+ * typeahead, and a hook cannot be called in a loop, so this is the wrapper that
+ * gives one field one of everything.
+ */
+function CompletedAddressField({
   label,
   value,
   onChange,
+  contacts,
+  disabled,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  contacts: readonly Contact[];
+  disabled?: boolean;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const typeahead = useAddressTypeahead({
+    value,
+    contacts,
+    onChange,
+    fieldRef: inputRef,
+    enabled: !disabled,
+  });
+  return (
+    <AddressField
+      label={label}
+      value={value}
+      typeahead={typeahead}
+      disabled={disabled}
+      inputRef={inputRef}
+    />
+  );
+}
+
+function AddressField({
+  label,
+  value,
+  typeahead,
   disabled,
   inputRef,
 }: {
   label: string;
   value: string;
-  onChange: (value: string) => void;
+  typeahead: ReturnType<typeof useAddressTypeahead>;
   disabled?: boolean;
-  inputRef?: Ref<HTMLInputElement>;
+  inputRef: RefObject<HTMLInputElement | null>;
 }) {
   return (
-    <label className="flex min-w-0 items-baseline gap-2">
-      <span className="w-7 shrink-0 text-micro uppercase tracking-wide text-faint-foreground">
-        {label}
-      </span>
-      <input
-        ref={inputRef}
-        value={value}
-        disabled={disabled}
-        spellCheck={false}
-        autoComplete="off"
-        onChange={(event) => onChange(event.target.value)}
-        placeholder="name@example.com"
-        className={cn(
-          "min-w-0 flex-1 bg-transparent text-body text-foreground",
-          "placeholder:text-faint-foreground focus:outline-none disabled:opacity-60",
-        )}
-      />
-    </label>
+    <div className="relative">
+      <label className="flex min-w-0 items-baseline gap-2">
+        <span className="w-7 shrink-0 text-micro uppercase tracking-wide text-faint-foreground">
+          {label}
+        </span>
+        <input
+          ref={inputRef}
+          value={value}
+          disabled={disabled}
+          spellCheck={false}
+          placeholder="name@example.com"
+          {...typeaheadFieldProps(typeahead)}
+          className={cn(
+            "min-w-0 flex-1 bg-transparent text-body text-foreground",
+            "placeholder:text-faint-foreground focus:outline-none disabled:opacity-60",
+          )}
+        />
+      </label>
+      <AddressSuggestions typeahead={typeahead} className="left-9" />
+    </div>
   );
 }

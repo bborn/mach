@@ -194,7 +194,9 @@ pub fn request_body(config: &AgentConfig, request: &TurnRequest, fallbacks: bool
     body
 }
 
-pub fn build_call(config: &AgentConfig, request: &TurnRequest, fallbacks: bool) -> ModelCall {
+/// Content type, version, credential and betas — everything that is true of
+/// *any* `/v1/messages` call, sessions and one-shot completions alike.
+pub fn call_headers(config: &AgentConfig, fallbacks: bool) -> BTreeMap<String, String> {
     let mut headers = BTreeMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("anthropic-version".to_string(), API_VERSION.to_string());
@@ -217,10 +219,13 @@ pub fn build_call(config: &AgentConfig, request: &TurnRequest, fallbacks: bool) 
     if !betas.is_empty() {
         headers.insert("anthropic-beta".to_string(), betas.join(","));
     }
+    headers
+}
 
+pub fn build_call(config: &AgentConfig, request: &TurnRequest, fallbacks: bool) -> ModelCall {
     ModelCall {
         url: config.messages_url(),
-        headers,
+        headers: call_headers(config, fallbacks),
         body: request_body(config, request, fallbacks).to_string(),
     }
 }

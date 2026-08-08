@@ -4,6 +4,7 @@ import type { AccountId, CalendarEvent, CalendarId, EventId, Rsvp } from "@/type
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useMach, viewRange, type CalendarView } from "@/hooks/useMach";
 import { usePreferences } from "@/components/prefs/PreferencesProvider";
+import { useContacts } from "@/hooks/useContacts";
 import {
   describeResult,
   getDataSource,
@@ -113,6 +114,7 @@ export function CalendarMode() {
   } = useMach();
   const dark = useIsDark();
   const prefs = usePreferences();
+  const contacts = useContacts();
 
   const [settings, setSettings] = useState<CalendarSettings>(() => loadSettings());
   const [soloAccount, setSoloAccount] = useState<AccountId | null>(null);
@@ -1449,6 +1451,7 @@ export function CalendarMode() {
         canEdit={modalEvent ? editable(modalEvent) : true}
         error={failure?.message ?? null}
         busy={busy}
+        contacts={contacts}
         onClose={closeModal}
         onSave={saveForm}
         onDelete={(scope) => modalEvent && deleteEvent(modalEvent.id, scope)}

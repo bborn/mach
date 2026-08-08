@@ -14,7 +14,15 @@ import {
   Users,
   Video,
 } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from "react";
 import type {
   Account,
   Calendar,
@@ -47,7 +55,15 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { GhostHint, GhostText } from "@/components/ui/ghost";
+import {
+  AddressSuggestions,
+  typeaheadFieldProps,
+  useAddressTypeahead,
+} from "@/components/ui/address-typeahead";
 import { useKeyBindings } from "@/hooks/useKeymap";
+import { useGhostText } from "@/hooks/useGhostText";
+import type { Contact } from "@/lib/contacts";
 import { anyPopupOpen } from "@/lib/popups";
 import type { EventScope } from "@/lib/data";
 import { calendarFill, toneFor, type CalendarColor } from "@/lib/calendar-palette";
@@ -108,6 +124,8 @@ export interface EventModalProps {
    */
   error: string | null;
   busy: boolean;
+  /** Everyone the app has seen, for completing the guest list. */
+  contacts?: readonly Contact[];
   onClose: () => void;
   onSave: (form: EventForm, scope: EventScope) => void;
   onDelete: (scope: EventScope) => void;
@@ -167,6 +185,7 @@ export function EventModal({
   canEdit,
   error,
   busy,
+  contacts = [],
   onClose,
   onSave,
   onDelete,
@@ -181,6 +200,9 @@ export function EventModal({
   const [scopePrompt, setScopePrompt] = useState<"save" | "delete" | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const titleField = useRef<HTMLInputElement>(null);
+  const guestField = useRef<HTMLTextAreaElement>(null);
+  const [ghostFocus, setGhostFocus] = useState<"title" | "notes" | null>(null);
+  const [caretAtEnd, setCaretAtEnd] = useState(true);
   const ids = useFieldIds();
 
   // Rebuild the form whenever the modal points at something new. Keyed on the
@@ -339,6 +361,69 @@ export function EventModal({
     },
   ]);
 
+  /* ------------------------------------------------------------ completion */
+
+  // Hooks, so they run before the `!form` bail-out below. Both are inert while
+  // the modal is closed: no matches, no requests.
+  const guests = useAddressTypeahead({
+    value: form?.attendees ?? "",
+    contacts,
+    onChange: (attendees) =>
+      setForm((current) => (current ? { ...current, attendees } : current)),
+    fieldRef: guestField,
+    enabled: open && !busy,
+  });
+
+  /** What the model is told about the event whose text it is finishing. */
+  const eventContext = useMemo(() => {
+    if (!form) return undefined;
+    const lines = [`A calendar event on ${form.startDate}, ${form.startTime}–${form.endTime}.`];
+    if (form.location) lines.push(`Location: ${form.location}`);
+    if (form.attendees) lines.push(`Guests: ${form.attendees}`);
+    return lines;
+  }, [form]);
+
+  const titleGhost = useGhostText({
+    kind: "eventTitle",
+    value: form?.title ?? "",
+    context: eventContext,
+    active: open && !busy && ghostFocus === "title" && caretAtEnd,
+  });
+
+  const notesGhost = useGhostText({
+    kind: "eventDescription",
+    value: form?.description ?? "",
+    context: eventContext ? [...eventContext, `Title: ${form?.title ?? ""}`] : undefined,
+    active: open && !busy && ghostFocus === "notes" && caretAtEnd,
+  });
+
+  const trackCaret = (event: { currentTarget: HTMLInputElement | HTMLTextAreaElement }) => {
+    const node = event.currentTarget;
+    setCaretAtEnd(
+      node.selectionStart === node.selectionEnd &&
+        (node.selectionStart ?? 0) === node.value.length,
+    );
+  };
+
+  /** ⇥ takes the grey text; Escape refuses it without closing the modal. */
+  const ghostKeys =
+    (ghost: { suggestion: string; accept: () => string | null; dismiss: () => void }, apply: (value: string) => void) =>
+    (keyEvent: ReactKeyboardEvent) => {
+      if (!ghost.suggestion) return;
+      if (keyEvent.key === "Tab" && !keyEvent.shiftKey && !keyEvent.metaKey && !keyEvent.ctrlKey) {
+        keyEvent.preventDefault();
+        keyEvent.stopPropagation();
+        const next = ghost.accept();
+        if (next !== null) apply(next);
+        return;
+      }
+      if (keyEvent.key === "Escape") {
+        keyEvent.preventDefault();
+        keyEvent.stopPropagation();
+        ghost.dismiss();
+      }
+    };
+
   if (!open || !form) return null;
 
   const account = event ? accounts.find((a) => a.id === event.accountId) : null;
@@ -403,7 +488,10 @@ export function EventModal({
           <span className="text-micro text-faint-foreground">private</span>
         )}
         {/* `⌘⏎ save · Esc close` sat here. The footer of this same panel draws
-            both as buttons, and the Save button carries the ⌘⏎ chip itself. */}
+            both as buttons, and the Save button carries the ⌘⏎ chip itself.
+            `GhostHint` stays: it reports that a suggestion is waiting, which is
+            news rather than a legend. */}
+        <GhostHint shown={titleGhost.suggestion !== "" || notesGhost.suggestion !== ""} />
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto p-3">
@@ -437,16 +525,40 @@ export function EventModal({
           </p>
         )}
 
-        <Input
-          ref={titleField}
-          id={ids.title}
-          value={form.title}
-          placeholder="Add a title"
-          aria-label="Title"
-          readOnly={!canEdit}
-          className="h-8 text-reading"
-          onChange={(e) => set({ title: e.target.value })}
-        />
+        {/* Ghost text is offered only where a write would be accepted — an
+            organizer's event is read-only, and a suggestion you cannot take is
+            an invitation to a red line at the bottom of the window. */}
+        <div className="relative">
+          {canEdit && (
+            <GhostText
+              value={form.title}
+              suggestion={titleGhost.suggestion}
+              typography="text-reading"
+              frame="px-2 border border-transparent flex items-center"
+              multiline={false}
+            />
+          )}
+          <Input
+            ref={titleField}
+            id={ids.title}
+            value={form.title}
+            placeholder="Add a title"
+            aria-label="Title"
+            readOnly={!canEdit}
+            className="h-8 text-reading"
+            onChange={(e) => {
+              set({ title: e.target.value });
+              trackCaret(e);
+            }}
+            onSelect={trackCaret}
+            onFocus={(e) => {
+              setGhostFocus("title");
+              trackCaret(e);
+            }}
+            onBlur={() => setGhostFocus((current) => (current === "title" ? null : current))}
+            onKeyDown={canEdit ? ghostKeys(titleGhost, (title) => set({ title })) : undefined}
+          />
+        </div>
 
         <FieldGroup>
           <Field orientation="row" data-invalid={timeError !== null || undefined}>
@@ -597,8 +709,10 @@ export function EventModal({
               <Users size={11} strokeWidth={1.75} />
               Who
             </FieldLabel>
-            <div className="flex min-w-0 flex-col gap-2">
+            {/* `relative` is what `AddressSuggestions` positions against. */}
+            <div className="relative flex min-w-0 flex-1 flex-col gap-2">
               <Textarea
+                ref={guestField}
                 id={ids.attendees}
                 autoSize
                 rows={2}
@@ -607,8 +721,11 @@ export function EventModal({
                 aria-label="Guests"
                 placeholder="ada@example.com, bob@example.com"
                 readOnly={!canEdit}
-                onChange={(e) => set({ attendees: e.target.value })}
+                // A read-only field takes no typing, so it needs no change
+                // handler and has nothing to complete against.
+                {...(canEdit ? typeaheadFieldProps(guests) : {})}
               />
+              {canEdit && <AddressSuggestions typeahead={guests} />}
               {event && <GuestList guests={event.guests ?? []} />}
             </div>
           </Field>
@@ -707,17 +824,39 @@ export function EventModal({
 
           <Field orientation="row">
             <FieldLabel htmlFor={ids.notes}>Notes</FieldLabel>
-            <Textarea
-              id={ids.notes}
-              autoSize
-              rows={3}
-              maxRows={10}
-              value={form.description}
-              aria-label="Description"
-              placeholder="Anything else"
-              readOnly={!canEdit}
-              onChange={(e) => set({ description: e.target.value })}
-            />
+            <div className="relative min-w-0 flex-1">
+              {canEdit && (
+                <GhostText
+                  value={form.description}
+                  suggestion={notesGhost.suggestion}
+                  typography="text-body leading-snug"
+                  frame="px-2 py-1 border border-transparent"
+                />
+              )}
+              <Textarea
+                readOnly={!canEdit}
+                id={ids.notes}
+                autoSize
+                rows={3}
+                maxRows={10}
+                value={form.description}
+                aria-label="Description"
+                placeholder="Anything else"
+                onChange={(e) => {
+                  set({ description: e.target.value });
+                  trackCaret(e);
+                }}
+                onSelect={trackCaret}
+                onFocus={(e) => {
+                  setGhostFocus("notes");
+                  trackCaret(e);
+                }}
+                onBlur={() => setGhostFocus((current) => (current === "notes" ? null : current))}
+                onKeyDown={
+                  canEdit ? ghostKeys(notesGhost, (description) => set({ description })) : undefined
+                }
+              />
+            </div>
           </Field>
 
           {merged && merged.copies.length > 1 && (

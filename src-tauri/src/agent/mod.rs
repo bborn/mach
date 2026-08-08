@@ -34,6 +34,7 @@
 //! | [`gate`] | the tool surface, the approval rule, the one door to the mailbox |
 //! | [`config`] | `ANTHROPIC_API_KEY`, model, effort |
 //! | [`wire`] | the Messages API: request, SSE decoding, turn accumulation |
+//! | [`complete`] | one-shot, tool-less, unstreamed completions — the ghost text |
 //! | [`tools`] | [`Command::catalogue`](crate::commands::Command::catalogue) → tool definitions, and execution |
 //! | [`plugin_tools`] | plugin actions → tools, attributed, with the approval policy they inherit |
 //! | [`context`] | what "this" means, and the system prompt |
@@ -66,6 +67,7 @@ pub mod backend;
 pub mod brain;
 pub mod cli;
 pub mod command;
+pub mod complete;
 pub mod config;
 pub mod context;
 pub mod error;

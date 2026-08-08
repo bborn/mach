@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Participant } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useMach } from "@/hooks/useMach";
+import { useContacts } from "@/hooks/useContacts";
 import { mailboxTargets } from "@/lib/mailboxes";
 import {
   KIND_LABELS,
@@ -19,6 +20,7 @@ import {
   save as saveFrecency,
   type FrecencyStore,
 } from "@/lib/palette/frecency";
+import { ghostEnabled, setGhostEnabled } from "@/lib/ghost";
 import { listTime, monthShort, shortTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { Overlay } from "@/components/ui/dialog";
@@ -64,6 +66,11 @@ const COMMANDS: PaletteCommand[] = [
     title: "Plugins…",
     keywords: "plugin plugins extensions install add-on sandbox",
   },
+  {
+    id: "ghost",
+    title: "Ghost completions: on / off",
+    keywords: "ghost autocomplete completion suggestion ai copilot inline",
+  },
 ];
 
 export function CommandPalette() {
@@ -76,25 +83,13 @@ export function CommandPalette() {
   );
 
   // People come from what is loaded, not from a directory: the addresses you
-  // have actually corresponded with are the ones worth ranking.
-  const people = useMemo<Participant[]>(() => {
-    const byEmail = new Map<string, Participant>();
-    for (const thread of allThreads) {
-      for (const participant of thread.participants) {
-        if (participant.email && !byEmail.has(participant.email)) {
-          byEmail.set(participant.email, participant);
-        }
-      }
-    }
-    for (const event of events) {
-      for (const attendee of event.attendees) {
-        if (attendee.email && !byEmail.has(attendee.email)) {
-          byEmail.set(attendee.email, attendee);
-        }
-      }
-    }
-    return [...byEmail.values()];
-  }, [allThreads, events]);
+  // have actually corresponded with are the ones worth ranking. The same index
+  // the composer's To field completes from — one address book, not two.
+  const contacts = useContacts();
+  const people = useMemo<Participant[]>(
+    () => contacts.map((contact) => ({ name: contact.name ?? contact.email, email: contact.email })),
+    [contacts],
+  );
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
@@ -197,6 +192,17 @@ export function CommandPalette() {
         // must not import it.
         case "plugins":
           return window.dispatchEvent(new CustomEvent("mach:plugins"));
+        // Ghost text sends what you are writing to a model. Turning that off
+        // has to be one keystroke away and must not mean unsetting the key the
+        // agent also uses — hence a switch of its own.
+        case "ghost": {
+          const next = !ghostEnabled();
+          setGhostEnabled(next);
+          return actions.setStatus(
+            next ? "Ghost completions on" : "Ghost completions off",
+            "info",
+          );
+        }
       }
     }
   }, [open, query, allThreads, events, people, mailboxes, actions, dispatch]);

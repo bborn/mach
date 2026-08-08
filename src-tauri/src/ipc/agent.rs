@@ -6,6 +6,17 @@
 //! | `agent_sessions` | `sessionId?` | `SessionSnapshot[]` |
 //! | `agent_send` | `sessionId`, `action?`, `message?`, `toolUseId?`, `reason?`, `itemId?` | `{ ok }` or a snapshot |
 //! | `agent_backend_status` | — | which brain would answer, and what else is available |
+//! | `agent_status` | — | `{ configured, message, model, completionModel }` |
+//! | `agent_complete` | `system`, `prompt`, `maxTokens?` | `{ text }` |
+//!
+//! # The last two are not sessions
+//!
+//! `agent_status` and `agent_complete` exist for ghost text, and neither builds
+//! the engine: a completion has no history, no tools and nothing to approve, so
+//! it needs the credential and a socket and nothing else. `agent_status` is the
+//! graceful-fallback half — it answers "is there a key" *without* starting
+//! anything, so a webview can decide to stay quiet instead of discovering the
+//! problem one failed request at a time.
 //!
 //! Push, never poll: everything that happens inside a session arrives on the
 //! `agent-session` Tauri event as a [`SessionEvent`]. `agent_sessions` exists
@@ -59,8 +70,11 @@ use std::sync::{Arc, OnceLock};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
+use engine::complete::{complete, completion_model, CompletionRequest};
+use engine::config::AgentConfig;
 use engine::context::ContextItem;
 use engine::session::{AgentEngine, Input, SessionEmitter, SessionEvent, SessionSnapshot};
+use engine::wire::ReqwestModelTransport;
 use engine::AgentError;
 
 use super::error::IpcError;
@@ -250,6 +264,62 @@ pub async fn agent_send(
         }
         other => Err(invalid(format!("unknown agent action {other:?}"))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// completions
+// ---------------------------------------------------------------------------
+
+/// One HTTP client for every completion, built on first use. Reusing it is what
+/// keeps the TLS handshake off the second keystroke.
+static COMPLETION_TRANSPORT: OnceLock<ReqwestModelTransport> = OnceLock::new();
+
+fn completion_transport() -> &'static ReqwestModelTransport {
+    COMPLETION_TRANSPORT.get_or_init(ReqwestModelTransport::new)
+}
+
+/// Whether the agent has a credential — asked before anything is sent.
+///
+/// Never an error: "not configured" is the answer, not a failure, which is what
+/// lets the webview fall back to no ghost text without a single red pixel.
+#[tauri::command]
+pub async fn agent_status() -> Result<Value, IpcError> {
+    Ok(match AgentConfig::load() {
+        Ok(config) => json!({
+            "configured": true,
+            "message": Value::Null,
+            "model": config.model,
+            "completionModel": completion_model(),
+        }),
+        Err(AgentError::MissingApiKey(message)) => json!({
+            "configured": false,
+            "message": message,
+            "model": Value::Null,
+            "completionModel": Value::Null,
+        }),
+        Err(other) => json!({
+            "configured": false,
+            "message": other.to_string(),
+            "model": Value::Null,
+            "completionModel": Value::Null,
+        }),
+    })
+}
+
+/// One completion, for the grey text under somebody's caret.
+#[tauri::command]
+pub async fn agent_complete(
+    system: String,
+    prompt: String,
+    max_tokens: Option<u32>,
+) -> Result<Value, IpcError> {
+    if prompt.trim().is_empty() {
+        return Ok(json!({ "text": "" }));
+    }
+    let config = AgentConfig::load()?;
+    let request = CompletionRequest::new(system, prompt, max_tokens);
+    let text = complete(completion_transport(), &config, &request).await?;
+    Ok(json!({ "text": text }))
 }
 
 fn required(value: Option<String>, name: &str) -> Result<String, IpcError> {
