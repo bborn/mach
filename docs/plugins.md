@@ -1457,7 +1457,21 @@ already covers most of what people would reach to a service for.
 *Deciding question: would you rather explain a sandbox that holds, or an
 ecosystem that is exciting?*
 
-**2. Should plugin actions be agent tools by default, or opt-in?**
+**2. Should plugin actions be agent tools by default, or opt-in?** — **DECIDED
+2026-08-08: default on.** Owner's call: "agent should have access to
+everything." `capabilities.agent` inverts to an opt-*out* (`agent: false`) for
+an action that would be nonsense to invoke conversationally.
+
+This makes a plugin's description text part of the model's context, so it is an
+injection surface by construction. Two things follow and are not optional:
+plugin-contributed tools must be **attributed** in the transcript (the model and
+the user both see which plugin a tool came from), and they **inherit the
+approval policy** — a plugin action that sends, RSVPs or writes a calendar
+parks for confirmation exactly as a core command does. A plugin cannot widen
+its own authority by describing itself persuasively.
+
+The original framing is kept below for the reasoning.
+
 Automatic exposure is the magic — it is the thing that makes this system feel
 different from every other plugin system, because a plugin author writes an
 action and the assistant can suddenly use it in a sentence. It is also a
