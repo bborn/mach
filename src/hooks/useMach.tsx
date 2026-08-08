@@ -111,6 +111,16 @@ interface UiState {
   /** Threads hidden optimistically, until the command layer confirms. */
   archived: ThreadId[];
   readExtra: ThreadId[];
+  /**
+   * Stars the user has toggled but the store has not confirmed yet.
+   *
+   * Archiving hides the row instantly, so it always felt immediate. Starring
+   * had no equivalent: it waited on the whole round trip — IPC, the local
+   * write, the Gmail call, the threads-changed event and a refetch — before
+   * the star appeared. Same optimistic idea as `readExtra`, applied to a
+   * property rather than to membership of the list.
+   */
+  starOverrides: Record<ThreadId, boolean>;
   status: StatusMessage | null;
 }
 
@@ -138,9 +148,13 @@ type UiAction =
   /** Put optimistically-hidden threads back — undo, or a command that failed. */
   | { type: "restore"; threadIds: ThreadId[] }
   | { type: "read"; threadIds: ThreadId[] }
+  /** Show a star before the store confirms it. */
+  | { type: "star"; threadIds: ThreadId[]; starred: boolean }
+  /** Drop the guess — the store agrees now, or the command failed. */
+  | { type: "unstar"; threadIds: ThreadId[] }
   | { type: "status"; status: UiState["status"] };
 
-const initialUi: UiState = {
+export const initialUi: UiState = {
   mode: "mail",
   calendarView: "week",
   anchor: Date.now(),
@@ -158,10 +172,11 @@ const initialUi: UiState = {
   theme: "system",
   archived: [],
   readExtra: [],
+  starOverrides: {},
   status: null,
 };
 
-function uiReducer(state: UiState, action: UiAction): UiState {
+export function uiReducer(state: UiState, action: UiAction): UiState {
   switch (action.type) {
     case "mode":
       return { ...state, mode: action.mode };
@@ -229,6 +244,18 @@ function uiReducer(state: UiState, action: UiAction): UiState {
       return { ...state, archived: state.archived.filter((id) => !action.threadIds.includes(id)) };
     case "read":
       return { ...state, readExtra: uniq([...state.readExtra, ...action.threadIds]) };
+    case "star": {
+      const next = { ...state.starOverrides };
+      for (const id of action.threadIds) next[id] = action.starred;
+      return { ...state, starOverrides: next };
+    }
+    case "unstar": {
+      // Drops the guess, either because the store now agrees or because the
+      // command failed. Either way the row goes back to whatever it says.
+      const next = { ...state.starOverrides };
+      for (const id of action.threadIds) delete next[id];
+      return { ...state, starOverrides: next };
+    }
     case "status":
       return { ...state, status: action.status };
   }
@@ -511,8 +538,16 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
   const visibleThreads = useMemo(() => {
     const archived = new Set(ui.archived);
-    return allThreads.filter((t) => !archived.has(t.id));
-  }, [allThreads, ui.archived]);
+    const overrides = ui.starOverrides;
+    const rows = allThreads.filter((t) => !archived.has(t.id));
+    // Cheap when nothing is pending, which is almost always.
+    if (Object.keys(overrides).length === 0) return rows;
+    return rows.map((t) =>
+      t.id in overrides && overrides[t.id] !== t.starred
+        ? { ...t, starred: overrides[t.id]! }
+        : t,
+    );
+  }, [allThreads, ui.archived, ui.starOverrides]);
 
   const visibleEvents = useMemo(() => {
     const hidden = new Set(ui.hiddenCalendars);
@@ -633,6 +668,11 @@ export function MachProvider({ children }: { children: ReactNode }) {
         // event puts it back on Google and in SQLite and leaves the grid empty —
         // undo that reports success and visibly does nothing.
         if (!isMailCommand(command)) setEventsKey((k) => k + 1);
+        if (command.kind === "star") {
+          // The refetch that follows carries the truth; keeping the guess past
+          // that point would pin a stale star if Gmail disagreed.
+          dispatch({ type: "unstar", threadIds: command.threadIds });
+        }
         const failed = failedIds(result);
         if (failed.length > 0) {
           dispatch({ type: "restore", threadIds: failed });
@@ -658,6 +698,9 @@ export function MachProvider({ children }: { children: ReactNode }) {
         // optimistic edit, not part of it.
         if (isMailCommand(command)) {
           dispatch({ type: "restore", threadIds: command.threadIds });
+          if (command.kind === "star") {
+            dispatch({ type: "unstar", threadIds: command.threadIds });
+          }
         }
         dispatch({
           type: "status",
@@ -858,6 +901,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
         const allStarred =
           commandTargetIds.length > 0 &&
           commandTargetIds.every((id) => byId.get(id)?.starred === true);
+        dispatch({ type: "star", threadIds: commandTargetIds, starred: !allStarred });
         bulk({ kind: "star", threadIds: commandTargetIds, starred: !allStarred }, false);
       },
 
