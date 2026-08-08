@@ -267,9 +267,15 @@ export function createKeymap(mod: ModKey = detectModKey()): Keymap {
       }
 
       for (const binding of live) {
-        if (binding.seq.length === 1 && binding.seq[0] === token && run(binding, event)) {
-          return true;
-        }
+        if (binding.seq.length !== 1) continue;
+        /*
+         * `*` matches any key. It exists for modal surfaces that must swallow
+         * everything while they are up — a reference sheet you read with `j`
+         * should not also scroll the list behind it. Give it a priority below
+         * the Escape that closes the surface, or you cannot get out.
+         */
+        const matches = binding.seq[0] === token || binding.seq[0] === "*";
+        if (matches && run(binding, event)) return true;
       }
 
       // No exact match — does this key open a sequence?

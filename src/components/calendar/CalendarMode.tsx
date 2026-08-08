@@ -1,7 +1,7 @@
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AccountId, CalendarEvent, CalendarId, EventId, Rsvp } from "@/types";
-import { useKeyBindings, useKeymap } from "@/hooks/useKeymap";
+import { useKeyBindings } from "@/hooks/useKeymap";
 import { useMach, viewRange, type CalendarView } from "@/hooks/useMach";
 import {
   describeResult,
@@ -45,7 +45,6 @@ import { TimeGrid, type EventDraft as GridDraft, type EventMove } from "./TimeGr
 import { CalendarSidebar, calendarLabel, type CalendarSettings } from "./CalendarSidebar";
 import { EventModal, type ModalTarget } from "./EventModal";
 import { QuickCreate } from "./QuickCreate";
-import { ShortcutSheet } from "./ShortcutSheet";
 import { useIsDark } from "./use-is-dark";
 
 const VIEWS: { id: CalendarView; label: string; keys: string; alias: string }[] = [
@@ -81,7 +80,6 @@ export function CalendarMode() {
     calendarById,
   } = useMach();
   const dark = useIsDark();
-  const keymap = useKeymap();
 
   const [settings, setSettings] = useState<CalendarSettings>(() => loadSettings());
   const [soloAccount, setSoloAccount] = useState<AccountId | null>(null);
@@ -754,13 +752,6 @@ export function CalendarMode() {
         },
       },
       {
-        keys: "?",
-        group: "Calendar",
-        description: "Keyboard shortcuts",
-        when: () => ui.mode === "calendar" && !ui.paletteOpen && !createOpen && !modalOpen,
-        handler: () => setShortcuts((open) => (open ? null : snapshotBindings())),
-      },
-      {
         keys: "escape",
         priority: 110,
         allowInInput: true,
@@ -842,18 +833,6 @@ export function CalendarMode() {
    * list back in is what makes the sheet a map of the mode rather than a
    * snapshot of one instant.
    */
-  const snapshotBindings = useCallback((): KeyBinding[] => {
-    const seen = new Set<string>();
-    const out: KeyBinding[] = [];
-    for (const binding of [...bindings, ...keymap.active()]) {
-      if (!binding.description) continue;
-      const key = `${binding.group ?? ""}|${binding.keys}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(binding);
-    }
-    return out;
-  }, [bindings, keymap]);
 
   const title =
     ui.calendarView === "day"
@@ -996,11 +975,6 @@ export function CalendarMode() {
         calendars={calendars.map((calendar) => ({ id: calendar.id, name: calendarLabel(calendar) }))}
         onClose={() => setCreateOpen(false)}
         onCreate={onQuickCreate}
-      />
-      <ShortcutSheet
-        open={shortcutsOpen}
-        bindings={shortcuts ?? []}
-        onClose={() => setShortcuts(null)}
       />
     </div>
   );

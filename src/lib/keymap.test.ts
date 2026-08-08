@@ -382,3 +382,37 @@ describe("alt + digits on a Mac layout", () => {
     expect(fired).toBe(false);
   });
 });
+
+describe("the wildcard", () => {
+  it("swallows any key, so a modal surface can block what is behind it", () => {
+    const k = createKeymap("meta");
+    let leaked = false;
+    let swallowed = 0;
+    k.register({ keys: "j", handler: () => { leaked = true; } });
+    k.register({ keys: "*", priority: 119, handler: () => { swallowed++; } });
+
+    k.handle({ key: "j", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false });
+    expect(leaked).toBe(false);
+    expect(swallowed).toBe(1);
+  });
+
+  it("does not trap you — a higher-priority Escape still wins", () => {
+    const k = createKeymap("meta");
+    let closed = false;
+    k.register({ keys: "*", priority: 119, handler: () => {} });
+    k.register({ keys: "escape", priority: 120, handler: () => { closed = true; } });
+
+    k.handle({ key: "Escape", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false });
+    expect(closed).toBe(true);
+  });
+
+  it("is inert when its `when` is false", () => {
+    const k = createKeymap("meta");
+    let fired = false;
+    k.register({ keys: "j", handler: () => { fired = true; } });
+    k.register({ keys: "*", priority: 119, when: () => false, handler: () => {} });
+
+    k.handle({ key: "j", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false });
+    expect(fired).toBe(true);
+  });
+});
