@@ -35,14 +35,15 @@ const ICONS: Record<PaletteResultKind, typeof Mail> = {
 };
 
 const COMMANDS: PaletteCommand[] = [
-  { id: "go-mail", title: "Go to mail", hint: "G then I", keywords: "inbox mail" },
+  { id: "compose", title: "New message", hint: "C", keywords: "compose write new mail send" },
+  { id: "go-mail", title: "Go to mail", hint: "G then M", keywords: "inbox mail" },
   { id: "go-calendar", title: "Go to calendar", hint: "G then C", keywords: "calendar week" },
   { id: "view-day", title: "Calendar: day view", hint: "1", keywords: "day" },
   { id: "view-week", title: "Calendar: week view", hint: "2", keywords: "week" },
   { id: "view-month", title: "Calendar: month view", hint: "3", keywords: "month" },
   { id: "today", title: "Jump to today", hint: "T", keywords: "now today" },
   { id: "archive", title: "Archive conversation", hint: "E", keywords: "archive done" },
-  { id: "snooze", title: "Snooze conversation", hint: "H", keywords: "snooze later" },
+  { id: "snooze", title: "Snooze conversation", hint: "B", keywords: "snooze later" },
   {
     id: "favorite-view",
     title: "Favorite this mailbox",
@@ -139,7 +140,10 @@ export function CommandPalette() {
           actions.setPalette(false);
         },
         composeTo: (email) => {
-          actions.setStatus(`Compose to ${email} — the composer arrives in a later unit`);
+          actions.setMode("mail");
+          window.dispatchEvent(
+            new CustomEvent("mach:compose", { detail: { kind: "new", to: email } }),
+          );
           actions.setPalette(false);
         },
       },
@@ -147,6 +151,13 @@ export function CommandPalette() {
 
     function runShellCommand(id: string) {
       switch (id) {
+        // A window event rather than a call, for the same reason `plugins`
+        // uses one: the composer lives in another unit's subtree.
+        case "compose":
+          actions.setMode("mail");
+          return window.dispatchEvent(
+            new CustomEvent("mach:compose", { detail: { kind: "new" } }),
+          );
         case "go-mail":
           return actions.setMode("mail");
         case "go-calendar":
@@ -244,10 +255,27 @@ export function CommandPalette() {
     {
       keys: "mod+k",
       group: "Global",
-      description: "Open search and commands",
+      description: "Search and commands",
       allowInInput: true,
       priority: 200,
       handler: () => actions.setPalette(!open),
+    },
+    {
+      /*
+       * Gmail's `/` focuses its search box. Mach has no search box to focus —
+       * search *is* the palette, and the palette is ⌘K — so `/` opens that
+       * instead of nothing. It is the one Gmail key here that lands somewhere
+       * other than where Gmail puts it, and it lands on the same intent.
+       *
+       * Not `allowInInput`, so a slash typed into the palette, the composer or
+       * an address field is a slash.
+       */
+      keys: "/",
+      group: "Global",
+      description: "Search mail",
+      priority: 200,
+      when: () => !open,
+      handler: () => actions.setPalette(true),
     },
     {
       keys: "escape",

@@ -12,6 +12,7 @@ import {
   discardDraft,
   flushOutbox,
   loadDraftForThread,
+  newDraft,
   prepareDraft,
   saveDraft,
   sendDraft,
@@ -43,7 +44,7 @@ import {
  * launch — sends it. That is why `flushOutbox()` runs on mount.
  */
 export function ComposerDock() {
-  const { ui, detail, actions } = useMach();
+  const { ui, detail, accounts, actions } = useMach();
   const threadId = ui.threadId;
   const active = ui.mode === "mail" && !ui.paletteOpen;
 
@@ -113,45 +114,83 @@ export function ComposerDock() {
     [threadId, actions],
   );
 
+  /**
+   * `c` — a message to somebody, from nothing.
+   *
+   * This was the one thing the keyboard could not do. Every composer route ran
+   * through a thread: reply, reply-all and forward all need one, so writing to
+   * a person you were not already in a conversation with had no key at all and
+   * no menu item either. Gmail spends `c` on it, and so does this.
+   *
+   * It opens over the reading pane like every other composer here, whether or
+   * not a conversation is open, because the alternative is a window and the
+   * whole point of the inline composer is that there isn't one.
+   */
+  const openNew = useCallback(
+    (to?: string) => {
+      const accountId = ui.accountId ?? accounts[0]?.id;
+      if (accountId === undefined) {
+        actions.setStatus("Add an account before writing a message", "error");
+        return;
+      }
+      const blank = newDraft(accountId);
+      // ⌘K's "write to this person" arrives here with an address already in
+      // hand; `c` arrives with none, and the composer puts the cursor in the
+      // To field for exactly that case.
+      setDraft(to ? { ...blank, to: [{ email: to }] } : blank);
+    },
+    [ui.accountId, accounts, actions],
+  );
+
   // The reading pane's reply button lives in another unit's file, so it asks
   // for the composer through an event rather than a prop.
   useEffect(() => {
     const onRequest = (event: Event) => {
-      const kind = (event as CustomEvent<{ kind?: DraftKind }>).detail?.kind ?? "reply";
-      open(kind);
+      const detail = (event as CustomEvent<{ kind?: DraftKind; to?: string }>).detail;
+      const kind = detail?.kind ?? "reply";
+      if (kind === "new") openNew(detail?.to);
+      else open(kind);
     };
     window.addEventListener("mach:compose", onRequest);
     return () => window.removeEventListener("mach:compose", onRequest);
-  }, [open]);
+  }, [open, openNew]);
 
   useKeyBindings([
     {
+      keys: COMPOSER_KEYS.compose,
+      group: "Write",
+      description: "New message",
+      priority: 5,
+      when: () => active && draft === null,
+      handler: () => openNew(),
+    },
+    {
       keys: COMPOSER_KEYS.reply,
-      group: "Mail",
+      group: "Write",
       description: "Reply",
       priority: 5,
-      when: () => active && threadId !== null && draft === null,
+      when: () => active && draft === null,
       handler: () => open("reply"),
     },
     {
       keys: COMPOSER_KEYS.replyAll,
-      group: "Mail",
+      group: "Write",
       description: "Reply all",
       priority: 5,
-      when: () => active && threadId !== null && draft === null,
+      when: () => active && draft === null,
       handler: () => open("replyAll"),
     },
     {
       keys: COMPOSER_KEYS.forward,
-      group: "Mail",
+      group: "Write",
       description: "Forward",
       priority: 5,
-      when: () => active && threadId !== null && draft === null,
+      when: () => active && draft === null,
       handler: () => open("forward"),
     },
     {
       keys: COMPOSER_KEYS.undoSend,
-      group: "Mail",
+      group: "Write",
       description: "Undo send",
       allowInInput: true,
       priority: 120,
@@ -249,7 +288,13 @@ export function ComposerDock() {
 
   /* ---------------------------------------------------------------- render */
 
-  if (threadId === null || !detail) return null;
+  const hasThread = threadId !== null && detail !== null;
+  const holding = pending !== null && pending.state === "holding";
+
+  // A conversation is no longer the only reason this exists: `c` opens a draft
+  // with no thread behind it, and the undo strip has to survive whatever the
+  // list does next.
+  if (!hasThread && !draft && !holding) return null;
 
   if (pending && pending.state === "holding") {
     const remaining = Math.max(0, Math.ceil((pending.sendAfter - now) / 1000));
@@ -291,9 +336,17 @@ export function ComposerDock() {
   }
 
   if (!draft) {
+    if (!hasThread) return null;
     return (
       <div className="shrink-0 border-t border-border">
         <div className="mx-auto flex max-w-[72ch] items-center gap-3 px-5 py-2 text-micro text-faint-foreground">
+          <button
+            type="button"
+            onClick={() => openNew()}
+            className="inline-flex items-center gap-1.5 hover:text-foreground"
+          >
+            <Kbd keys={COMPOSER_KEYS.compose} /> new
+          </button>
           <button
             type="button"
             onClick={() => open("reply")}

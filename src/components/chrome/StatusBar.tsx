@@ -10,8 +10,9 @@ const MAIL_HINTS: [string[], string][] = [
   [["enter"], "open"],
   [["x"], "select"],
   [["e"], "archive"],
-  [["h"], "snooze"],
+  [["b"], "snooze"],
   [["r"], "reply"],
+  [["c"], "new"],
 ];
 
 const CALENDAR_HINTS: [string[], string][] = [

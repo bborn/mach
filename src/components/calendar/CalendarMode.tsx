@@ -582,7 +582,7 @@ export function CalendarMode() {
       // Creating.
       {
         keys: "c",
-        group: "Calendar",
+        group: "Event",
         description: "Create — type it in words",
         when: () => active,
         handler: () => {
@@ -592,7 +592,7 @@ export function CalendarMode() {
       },
       {
         keys: "shift+c",
-        group: "Calendar",
+        group: "Event",
         description: "Create — full editor",
         when: () => active,
         handler: () => openCreate(),
@@ -601,7 +601,7 @@ export function CalendarMode() {
       // Opening and editing the focused event.
       {
         keys: "e",
-        group: "Calendar",
+        group: "Event",
         description: "Open the event",
         when: () => active,
         handler: () => (ui.eventId === null ? step(1) : openEvent(ui.eventId)),
@@ -613,7 +613,7 @@ export function CalendarMode() {
       },
       {
         keys: "backspace",
-        group: "Calendar",
+        group: "Event",
         description: "Delete the event",
         when: () => active,
         handler: withEvent((event) =>
@@ -636,56 +636,56 @@ export function CalendarMode() {
       // Alt moves one edge — the same two gestures the pointer offers.
       {
         keys: "shift+down",
-        group: "Calendar",
+        group: "Event",
         description: "Move 15 minutes later",
         when: () => active,
         handler: () => nudgeSelected({ kind: "move", axis: "time", steps: 1 }),
       },
       {
         keys: "shift+up",
-        group: "Calendar",
+        group: "Event",
         description: "Move 15 minutes earlier",
         when: () => active,
         handler: () => nudgeSelected({ kind: "move", axis: "time", steps: -1 }),
       },
       {
         keys: "shift+right",
-        group: "Calendar",
+        group: "Event",
         description: "Move to the next day",
         when: () => active,
         handler: () => nudgeSelected({ kind: "move", axis: "day", days: 1 }),
       },
       {
         keys: "shift+left",
-        group: "Calendar",
+        group: "Event",
         description: "Move to the previous day",
         when: () => active,
         handler: () => nudgeSelected({ kind: "move", axis: "day", days: -1 }),
       },
       {
         keys: "alt+down",
-        group: "Calendar",
+        group: "Event",
         description: "Make it 15 minutes longer",
         when: () => active,
         handler: () => nudgeSelected({ kind: "resize", edge: "end", steps: 1 }),
       },
       {
         keys: "alt+up",
-        group: "Calendar",
+        group: "Event",
         description: "Make it 15 minutes shorter",
         when: () => active,
         handler: () => nudgeSelected({ kind: "resize", edge: "end", steps: -1 }),
       },
       {
         keys: "shift+alt+up",
-        group: "Calendar",
+        group: "Event",
         description: "Start 15 minutes earlier",
         when: () => active,
         handler: () => nudgeSelected({ kind: "resize", edge: "start", steps: -1 }),
       },
       {
         keys: "shift+alt+down",
-        group: "Calendar",
+        group: "Event",
         description: "Start 15 minutes later",
         when: () => active,
         handler: () => nudgeSelected({ kind: "resize", edge: "start", steps: 1 }),
@@ -699,7 +699,7 @@ export function CalendarMode() {
       // missing instead, the way every other event binding here does.
       {
         keys: "mod+c",
-        group: "Calendar",
+        group: "Event",
         description: "Copy the event",
         when: () => active,
         handler: withEvent((event) => {
@@ -709,7 +709,7 @@ export function CalendarMode() {
       },
       {
         keys: "mod+v",
-        group: "Calendar",
+        group: "Event",
         description: "Paste onto the day in view",
         when: () => active,
         handler: () => {
@@ -722,14 +722,14 @@ export function CalendarMode() {
       },
       {
         keys: "shift+d",
-        group: "Calendar",
+        group: "Event",
         description: "Duplicate the event",
         when: () => active,
         handler: withEvent(duplicate),
       },
       {
         keys: "o",
-        group: "Calendar",
+        group: "Event",
         description: "Open in Google Calendar",
         when: () => active,
         handler: withEvent((event) =>
@@ -741,7 +741,7 @@ export function CalendarMode() {
 
       {
         keys: "z",
-        group: "Calendar",
+        group: "Event",
         description: "Undo",
         when: () => active,
         handler: () => actions.undo(),
@@ -769,7 +769,7 @@ export function CalendarMode() {
       // spirit of `g d`.
       ...Array.from({ length: 9 }, (_, i) => ({
         keys: `v ${i + 1}`,
-        group: i === 0 ? "Calendar" : undefined,
+        group: i === 0 ? "Calendars" : undefined,
         description: i === 0 ? "Show or hide calendar 1–9" : undefined,
         when: () => active,
         handler: () => toggleCalendarAt(i),
@@ -787,7 +787,7 @@ export function CalendarMode() {
       })),
       ...Array.from({ length: 5 }, (_, i) => ({
         keys: `s ${i + 1}`,
-        group: i === 0 ? "Calendar" : undefined,
+        group: i === 0 ? "Calendars" : undefined,
         description: i === 0 ? "Show only account 1–5" : undefined,
         when: () => active,
         handler: () => soloAccountAt(i),

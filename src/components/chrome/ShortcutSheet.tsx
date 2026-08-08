@@ -13,7 +13,57 @@ import type { KeyBinding } from "@/lib/keymap";
  *
  * Google's shortcuts are off by default and buried in settings, which §8 names
  * as a failure mode. Mach's are on, and one key away.
+ *
+ * # Why this reads the way it does
+ *
+ * It is a reference card. You do not read a reference card, you *find* one row
+ * on it, and everything here serves that:
+ *
+ *   * **Order is chosen, not incidental.** `active()` hands bindings back in
+ *     precedence order — recency first, with priority jumping the queue — which
+ *     put Mail's twenty keys on the page as "Esc, Forward, Reply all, Reply,
+ *     All accounts, …". Groups run in the order below; rows inside a group run
+ *     in the order the feature declared them, which is the order somebody
+ *     chose. See `KeyBinding.order`.
+ *   * **The key column is fixed.** Chips are between one and eight characters
+ *     wide (`?` … `G then I`), so a chip-then-text row leaves the descriptions
+ *     on a ragged edge that the eye cannot run down. The chips are right-set in
+ *     a column of their own and every description starts at the same x.
+ *   * **Columns balance by content, not by group.** Two columns of sections,
+ *     laid out with CSS multi-column so the browser splits them by height:
+ *     Global's five rows no longer sit beside Mail's twenty.
+ *   * **Nothing is truncated.** A description too long for the column wraps
+ *     under itself. Truncation on a reference card hides the one word you
+ *     opened it for.
  */
+
+/**
+ * The order the groups print in: what you are looking at, where you go, what
+ * you do there, and then the surfaces you are not in.
+ *
+ * Anything not named here sorts alphabetically after everything that is, so a
+ * new group — a plugin's, say — appears rather than disappearing.
+ */
+const GROUP_ORDER = [
+  "Global",
+  "Go to",
+  "Mail",
+  "Actions",
+  "Selection",
+  "Write",
+  "Composer",
+  "Accounts",
+  "Sidebar",
+  "Calendar",
+  "Event",
+  "Calendars",
+];
+
+interface SheetRow {
+  keys: string;
+  description: string;
+}
+
 export function ShortcutSheet({
   open,
   bindings,
@@ -24,8 +74,15 @@ export function ShortcutSheet({
   onClose: () => void;
 }) {
   const groups = useMemo(() => {
-    const byGroup = new Map<string, { keys: string; description: string }[]>();
-    for (const binding of bindings) {
+    const byGroup = new Map<string, SheetRow[]>();
+
+    // Registration order, not precedence order. `order` is stamped by the
+    // registry; a binding without one sorts last rather than sorting randomly.
+    const declared = [...bindings].sort(
+      (a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER),
+    );
+
+    for (const binding of declared) {
       if (!binding.description) continue;
       const group = binding.group ?? "Other";
       const list = byGroup.get(group) ?? [];
@@ -34,33 +91,58 @@ export function ShortcutSheet({
       }
       byGroup.set(group, list);
     }
-    return [...byGroup.entries()].sort(([a], [b]) => a.localeCompare(b));
+
+    const rank = (name: string) => {
+      const index = GROUP_ORDER.indexOf(name);
+      return index === -1 ? GROUP_ORDER.length : index;
+    };
+    return [...byGroup.entries()].sort(
+      ([a], [b]) => rank(a) - rank(b) || a.localeCompare(b),
+    );
   }, [bindings]);
 
   return (
-    <Overlay open={open} onClose={onClose} align="center" className="max-w-[32rem]">
-      <div className="flex items-baseline justify-between border-b border-border px-3 py-2">
+    <Overlay open={open} onClose={onClose} align="center" className="max-w-[42rem] max-h-[84vh]">
+      <div className="flex items-baseline justify-between border-b border-border px-4 py-2.5">
         <h2 className="text-list font-medium text-foreground">Keyboard</h2>
         <span className="text-micro text-faint-foreground">Esc to close</span>
       </div>
-      <div className="grid grid-cols-2 items-start gap-x-4 overflow-y-auto p-3">
-        {groups.map(([group, list]) => (
-          <section key={group} className="mb-3">
-            <h3 className="mb-1 text-micro uppercase tracking-[0.06em] text-faint-foreground">
-              {group}
-            </h3>
-            <ul className="flex flex-col gap-1">
-              {list.map((binding) => (
-                <li key={binding.keys} className="flex items-baseline gap-2">
-                  <Kbd keys={binding.keys} />
-                  <span className="min-w-0 flex-1 truncate text-micro text-muted-foreground">
-                    {binding.description}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </section>
-        ))}
+
+      {/*
+        `columns` rather than a grid: a grid would need to be told which group
+        goes in which column, and the answer changes with the mode and with how
+        many accounts are connected. The browser balances by height for free.
+        One column when the window is too narrow to give each two a description
+        wide enough to read.
+      */}
+      <div className="overflow-y-auto px-4 py-3">
+        <div className="columns-1 gap-x-8 min-[36rem]:columns-2">
+          {groups.map(([group, list]) => (
+            <section key={group} className="mb-4 break-inside-avoid last:mb-0">
+              <h3 className="mb-1.5 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
+                {group}
+              </h3>
+              <ul className="flex flex-col gap-1">
+                {list.map((row) => (
+                  <li key={row.keys} className="flex items-baseline gap-2.5">
+                    {/*
+                      Fixed width, right-set. The chip hugs the gutter and every
+                      description below it starts on the same line, which is the
+                      whole reason the column exists. `G then I` is the widest
+                      thing `formatBinding` produces and it fits.
+                    */}
+                    <span className="flex w-[4.75rem] shrink-0 justify-end">
+                      <Kbd keys={row.keys} />
+                    </span>
+                    <span className="min-w-0 flex-1 text-micro leading-[1.45] text-muted-foreground">
+                      {row.description}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
+        </div>
       </div>
     </Overlay>
   );

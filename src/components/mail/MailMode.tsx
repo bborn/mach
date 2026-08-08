@@ -22,7 +22,13 @@ export function MailMode() {
     [dispatch],
   );
 
+  /*
+   * Declaration order is the order the help sheet prints, so these read down
+   * the page as tasks — move, open, leave; then act; then select — rather than
+   * in whatever order they were added over time.
+   */
   useKeyBindings([
+    /* ------------------------------------------------------------- Mail --- */
     {
       keys: "j",
       group: "Mail",
@@ -54,27 +60,126 @@ export function MailMode() {
       when: () => active,
       handler: () => actions.openSelected(),
     },
-    /* Multi-select. `x` is the Gmail/Superhuman verb and the one his hands
-       already know; ⇧J/⇧K are the same movement keys with the range dragged
-       along behind them. */
+    {
+      // Gmail's second name for Enter. Free here — the calendar's `o` opens the
+      // event in Google Calendar, and the two modes are never live together.
+      keys: "o",
+      when: () => active,
+      handler: () => actions.openSelected(),
+    },
+    {
+      // Gmail's "back to the threadlist". Escape does this too and always has;
+      // `u` is the one a Gmail hand reaches for, and unlike Escape it does not
+      // have to share the key with clearing a selection.
+      keys: "u",
+      group: "Mail",
+      description: "Back to the list",
+      when: () => active,
+      handler: () => actions.closeThread(),
+    },
+    {
+      // The rail and the list are one loop, not two worlds. Tab is unclaimed in
+      // mail mode and is the idiom for exactly this.
+      keys: "tab",
+      group: "Mail",
+      description: "Sidebar or list",
+      when: () => mail,
+      handler: () => actions.toggleFocus(),
+    },
+    {
+      keys: "shift+tab",
+      when: () => mail,
+      handler: () => actions.toggleFocus(),
+    },
+
+    /* ---------------------------------------------------------- Actions --- */
+    // `c`, `r`, `a` and `f` are registered by <ComposerDock/>, which owns the
+    // draft they open. A binding here would have to reach into that state
+    // through the shell to do anything useful.
+    {
+      keys: "e",
+      group: "Actions",
+      description: "Archive",
+      when: () => active,
+      handler: () => actions.archiveSelected(),
+    },
+    {
+      // Gmail's snooze key. Mach shipped `h` — a Superhuman habit — and `b` is
+      // what the Gmail hand this app is for actually presses.
+      keys: "b",
+      group: "Actions",
+      description: "Snooze",
+      when: () => active,
+      handler: () => actions.snoozeSelected(),
+    },
+    {
+      // The old key, kept and undocumented. Nothing else wants `h`, and taking
+      // a working key out from under someone mid-week buys nothing.
+      keys: "h",
+      when: () => active,
+      handler: () => actions.snoozeSelected(),
+    },
+    {
+      keys: "s",
+      group: "Actions",
+      description: "Star",
+      when: () => active,
+      handler: () => actions.starSelected(),
+    },
+    {
+      keys: "#",
+      group: "Actions",
+      description: "Trash",
+      when: () => active,
+      handler: () => actions.trashSelected(),
+    },
+    {
+      /*
+       * ⇧F, not F: `f` is forward, and Superhuman's muscle memory outranks a
+       * new feature's first choice of key. The mnemonic survives the shift.
+       *
+       * Gmail spends ⇧F on "forward in a new window", which is not a thing
+       * this app has — one window, composer inline — so the key is free and
+       * this is a divergence with nothing on the other side of it.
+       */
+      keys: "shift+f",
+      group: "Actions",
+      description: "Favorite the conversation or mailbox",
+      when: () => active,
+      handler: () => actions.toggleFavoriteFocused(),
+    },
+    {
+      keys: "z",
+      group: "Actions",
+      description: "Undo",
+      when: () => mail,
+      handler: () => actions.undo(),
+    },
+
+    /* -------------------------------------------------------- Selection --- */
+    /* `x` is the Gmail/Superhuman verb and the one his hands already know;
+       ⇧J/⇧K are the same movement keys with the range dragged along behind
+       them. Gmail builds its bulk selection out of `*` sequences instead —
+       `* a`, `* u` — which this registry cannot spend, because `*` is its
+       match-anything token. ⌘A and a moving cursor cover the same ground. */
     {
       keys: "x",
-      group: "Mail",
-      description: "Select conversation and move on",
+      group: "Selection",
+      description: "Select, and move on",
       when: () => active,
       handler: () => actions.toggleAtCursor(),
     },
     {
       keys: "shift+j",
-      group: "Mail",
-      description: "Extend selection down",
+      group: "Selection",
+      description: "Extend down",
       when: () => active,
       handler: () => actions.extendCursor(1),
     },
     {
       keys: "shift+k",
-      group: "Mail",
-      description: "Extend selection up",
+      group: "Selection",
+      description: "Extend up",
       when: () => active,
       handler: () => actions.extendCursor(-1),
     },
@@ -84,77 +189,16 @@ export function MailMode() {
       // preventDefault-ed (the registry does that by default) so the WebView
       // does not try anyway.
       keys: "mod+a",
-      group: "Mail",
-      description: "Select all loaded conversations",
+      group: "Selection",
+      description: "Select everything loaded",
       when: () => active,
       handler: () => actions.selectAllThreads(),
-    },
-    {
-      keys: "e",
-      group: "Mail",
-      description: "Archive",
-      when: () => active,
-      handler: () => actions.archiveSelected(),
-    },
-    {
-      keys: "h",
-      group: "Mail",
-      description: "Snooze",
-      when: () => active,
-      handler: () => actions.snoozeSelected(),
-    },
-    {
-      keys: "s",
-      group: "Mail",
-      description: "Star",
-      when: () => active,
-      handler: () => actions.starSelected(),
-    },
-    {
-      keys: "#",
-      group: "Mail",
-      description: "Trash",
-      when: () => active,
-      handler: () => actions.trashSelected(),
-    },
-    // `r`, `a` and `f` are registered by <ComposerDock/>, which owns the draft
-    // they open. A binding here would have to reach into that state through the
-    // shell to do anything useful.
-    {
-      // ⇧F, not F: `f` is forward, and Superhuman's muscle memory outranks a
-      // new feature's first choice of key. The mnemonic survives the shift.
-      keys: "shift+f",
-      group: "Mail",
-      description: "Favorite the conversation, or the mailbox",
-      when: () => active,
-      handler: () => actions.toggleFavoriteFocused(),
-    },
-    {
-      keys: "z",
-      group: "Mail",
-      description: "Undo last action",
-      when: () => mail,
-      handler: () => actions.undo(),
-    },
-    {
-      // The rail and the list are one loop, not two worlds. Tab is unclaimed in
-      // mail mode and is the idiom for exactly this.
-      keys: "tab",
-      group: "Mail",
-      description: "Move between the sidebar and the list",
-      when: () => mail,
-      handler: () => actions.toggleFocus(),
-    },
-    {
-      keys: "shift+tab",
-      when: () => mail,
-      handler: () => actions.toggleFocus(),
     },
     /* Two Escapes, mutually exclusive so the registry sees no conflict: with a
        selection up it drops the selection, otherwise it closes the thread. */
     {
       keys: "escape",
-      group: "Mail",
+      group: "Selection",
       description: "Clear the selection",
       priority: 10,
       when: () => active && selecting,
@@ -162,12 +206,12 @@ export function MailMode() {
     },
     {
       keys: "escape",
-      group: "Mail",
-      description: "Close conversation",
       priority: 10,
       when: () => active && !selecting && ui.threadId !== null,
       handler: () => actions.closeThread(),
     },
+
+    /* --------------------------------------------------------- Accounts --- */
     /*
      * ⌃1–5 filters to an account, ⌃0 clears the filter.
      *
@@ -177,21 +221,24 @@ export function MailMode() {
      * composer is the start of an accented character, not a shortcut. (It was
      * also silently broken until `tokenFromEvent` learned to read `event.code`,
      * because macOS turns ⌥1 into `¡` before the app ever sees it.)
+     *
+     * Gmail has no equivalent — it has no second account — so nothing here is
+     * a divergence, it is a whole axis Gmail does not have.
      */
-    ...accounts.map((account, index) => ({
-      keys: `ctrl+${index + 1}`,
-      group: "Mail",
-      description: `Filter to ${account.name}`,
-      when: () => mail,
-      handler: () => dispatch({ type: "account", accountId: account.id }),
-    })),
     {
       keys: "ctrl+0",
-      group: "Mail",
+      group: "Accounts",
       description: "All accounts",
       when: () => mail,
       handler: () => dispatch({ type: "account", accountId: null }),
     },
+    ...accounts.map((account, index) => ({
+      keys: `ctrl+${index + 1}`,
+      group: "Accounts",
+      description: account.name,
+      when: () => mail,
+      handler: () => dispatch({ type: "account", accountId: account.id }),
+    })),
   ]);
 
   return (

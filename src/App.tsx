@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { KeymapProvider, useKeyBindings, useKeymap } from "@/hooks/useKeymap";
 import type { KeyBinding } from "@/lib/keymap";
+import type { LabelId } from "@/types";
 import { MachProvider, useMach } from "@/hooks/useMach";
 import { cn } from "@/lib/utils";
 import { StatusBar } from "@/components/chrome/StatusBar";
@@ -34,8 +35,35 @@ export default function App() {
 }
 
 function Shell() {
-  const { ui, actions } = useMach();
+  const { ui, actions, dispatch } = useMach();
   const keymap = useKeymap();
+
+  /**
+   * `g <letter>` — Gmail's jump set, and the one place Mach's keymap and
+   * Gmail's genuinely collided.
+   *
+   * Gmail spends `g i` on "go to Inbox". Mach spent it on "go to mail", which
+   * is the same gesture aimed one level higher, so the two could not both be
+   * right. Gmail wins, and loses nothing: `g i` still leaves the calendar, it
+   * just also says which mailbox you land in. Mode switching keeps `g c` for
+   * the calendar and takes `g m` for mail — a letter Gmail does not use — so
+   * "get me back to mail without moving my mailbox" is still one gesture.
+   *
+   * These are global rather than mail-scoped on purpose: `g s` from the
+   * calendar means "show me my starred mail", which is exactly what somebody
+   * with Gmail in their hands expects, and gating it on mail mode would make
+   * the keys work only where you already are.
+   *
+   * The exception is `g d`. The calendar has meant "go to date" by it since
+   * before this, that is the Google Calendar idiom, and a date picker is worth
+   * more than a second route to Drafts on a surface with no drafts on it. So
+   * `g d` is Drafts in mail and Go to date in the calendar — mutually
+   * exclusive `when`s, no tie for `conflicts()` to report.
+   */
+  const goToMailbox = (labelId: LabelId) => {
+    actions.setMode("mail");
+    dispatch({ type: "label", labelId });
+  };
 
   /*
    * `?` is global, not per-mode.
@@ -79,18 +107,6 @@ function Shell() {
       handler: () => {},
     },
     {
-      keys: "g i",
-      group: "Global",
-      description: "Go to mail",
-      handler: () => actions.setMode("mail"),
-    },
-    {
-      keys: "g c",
-      group: "Global",
-      description: "Go to calendar",
-      handler: () => actions.setMode("calendar"),
-    },
-    {
       keys: "mod+1",
       group: "Global",
       description: "Mail",
@@ -99,6 +115,62 @@ function Shell() {
     {
       keys: "mod+2",
       group: "Global",
+      description: "Calendar",
+      handler: () => actions.setMode("calendar"),
+    },
+
+    /* The jump set. Rail order, not Gmail's documentation order — this is the
+       list on screen to the left, and the keys should read down it. */
+    {
+      keys: "g i",
+      group: "Go to",
+      description: "Inbox",
+      handler: () => goToMailbox("INBOX"),
+    },
+    {
+      keys: "g s",
+      group: "Go to",
+      description: "Starred",
+      handler: () => goToMailbox("STARRED"),
+    },
+    {
+      keys: "g b",
+      group: "Go to",
+      description: "Snoozed",
+      handler: () => goToMailbox("SNOOZED"),
+    },
+    {
+      // Mail only. The calendar keeps `g d` for its date picker — see above.
+      keys: "g d",
+      group: "Go to",
+      description: "Drafts",
+      when: () => ui.mode === "mail",
+      handler: () => goToMailbox("DRAFT"),
+    },
+    {
+      keys: "g t",
+      group: "Go to",
+      description: "Sent",
+      handler: () => goToMailbox("SENT"),
+    },
+    {
+      // Gmail calls this "All mail". Mach has no all-mail view — the rail's
+      // Archive is the nearest mailbox to it, so the key goes there and the
+      // sheet says what it actually opens rather than what Gmail calls it.
+      keys: "g a",
+      group: "Go to",
+      description: "Archive",
+      handler: () => goToMailbox("ARCHIVE"),
+    },
+    {
+      keys: "g m",
+      group: "Go to",
+      description: "Mail, same mailbox",
+      handler: () => actions.setMode("mail"),
+    },
+    {
+      keys: "g c",
+      group: "Go to",
       description: "Calendar",
       handler: () => actions.setMode("calendar"),
     },

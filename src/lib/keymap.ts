@@ -60,6 +60,17 @@ export interface KeyBinding {
   priority?: number;
   /** Set false for bindings that should not swallow the browser default. */
   preventDefault?: boolean;
+  /**
+   * Registration order, stamped by the registry — not something a caller sets.
+   *
+   * `active()` hands bindings back in *precedence* order, which is priority
+   * first and recency second, so a list read straight off it comes out
+   * backwards and with the odd binding jumped up the page because it happens to
+   * carry a priority. The help sheet wants neither: it wants the order the
+   * feature declared its keys in, because that is the order somebody chose on
+   * purpose. This is how it gets it.
+   */
+  readonly order?: number;
 }
 
 interface Registered extends KeyBinding {

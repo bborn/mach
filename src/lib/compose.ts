@@ -100,6 +100,36 @@ export async function prepareDraft(threadId: number, kind: DraftKind): Promise<D
   return result.draft;
 }
 
+/**
+ * A blank draft, addressed to nobody, belonging to no conversation.
+ *
+ * Built here rather than asked of Rust because `prepare` exists to read a
+ * *thread* — its from-address, its recipients, its References header — and a
+ * message you are starting has none of that to read. There is nothing to
+ * infer, so there is nothing to make a round trip for. The row is written the
+ * first time autosave fires, by the same `saveDraft` every other draft uses,
+ * and `thread_id` is null all the way down to SQLite.
+ *
+ * The account is the one thing that has to be chosen rather than derived, and
+ * the caller chooses it: whichever account the list is filtered to, or the
+ * first one, which is the same rule the sidebar's own ordering follows.
+ */
+export function newDraft(accountId: number): Draft {
+  return {
+    id: `draft-new-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    accountId,
+    threadId: null,
+    replyToId: null,
+    kind: "new",
+    to: [],
+    cc: [],
+    bcc: [],
+    subject: "",
+    body: "",
+    updatedAt: 0,
+  };
+}
+
 export async function loadDraftForThread(threadId: number): Promise<Draft | null> {
   if (!isTauri()) return localDrafts.get(`thread:${threadId}`) ?? null;
   const result = await call<{ draft: Draft | null }>({ op: "loadDraft", threadId });
@@ -551,6 +581,8 @@ export const COMPOSER_KEYS = {
   close: "escape",
   /** Recall a message inside its window. */
   undoSend: "mod+z",
+  /** Gmail's `c`. Mode-scoped: the calendar's `c` creates an event. */
+  compose: "c",
   reply: "r",
   replyAll: "a",
   forward: "f",
