@@ -5,6 +5,7 @@ import { FlexPane, Pane, Resizer } from "@/components/ui/split";
 import { AccountRail } from "./AccountRail";
 import { ComposerDock } from "./ComposerDock";
 import { ReadingPane } from "./ReadingPane";
+import { SearchView } from "./SearchView";
 import { ThreadList } from "./ThreadList";
 
 export function MailMode() {
@@ -149,6 +150,19 @@ export function MailMode() {
       handler: () => actions.toggleFavoriteFocused(),
     },
     {
+      /*
+       * Gmail's undo key, and ⌘Z's, are one implementation.
+       *
+       * Both call `actions.undo()`, which walks the undo stack — so `z` is no
+       * longer "take back the thing the status bar is still talking about". It
+       * reaches as far back as ⌘Z does. The calendar's `z` is the same call
+       * against the same stack, which is why undoing a drag and undoing an
+       * archive are the same gesture even though they are different modes.
+       *
+       * It stays a bare key, and stays mode-scoped, because that is what a
+       * Gmail hand presses. ⌘Z is the platform's spelling of it and lives in
+       * `App.tsx` where it can be global.
+       */
       keys: "z",
       group: "Actions",
       description: "Undo",
@@ -245,7 +259,12 @@ export function MailMode() {
     <div className="flex h-full min-h-0">
       <AccountRail />
       <Pane width={ui.listWidth}>
-        <ThreadList />
+        {/* Search is a mode of this pane, not a screen of its own: it takes the
+            list over while a query is live and hands it straight back when the
+            query goes away. Its own keys (`/`, ⌘F) live inside it. */}
+        <SearchView>
+          <ThreadList />
+        </SearchView>
       </Pane>
       <Resizer width={ui.listWidth} onResize={onResize} />
       <FlexPane>

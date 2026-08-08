@@ -13,11 +13,19 @@
  *      stable across copies of the same meeting, which makes this exact.
  *   2. Fallback: start, end, all-day flag and normalised title all match.
  *
- * **The `iCalUID` half is dormant.** `CalendarEvent` does not carry the field
- * yet — the SQLite `events` table has no column for it and `list_events` does
- * not return one — so today every merge runs on the fallback. `iCalUidOf` reads
- * it structurally, so the moment the seam grows the field this becomes exact
- * with no change here.
+ * **The `iCalUID` half is no longer dormant.** `events.ical_uid` exists, sync
+ * fills it, a create adopts the one Google mints, and `CalendarEvent` carries
+ * it — so a meeting that reached two accounts collapses to one block by
+ * identity rather than by the title-and-time heuristic that would miss
+ * "Weekly sync" against "Weekly Sync (Alex)".
+ *
+ * That is also the whole of the cross-account dedupe: it happens on render,
+ * where the merge already had to run, rather than as a second pass over the
+ * store. There is nothing cheaper than reusing a key the layout code was
+ * computing anyway.
+ *
+ * `iCalUidOf` still reads defensively, because the fixture source and any row
+ * written before the column existed simply do not have one.
  */
 
 import type { AccountId, CalendarEvent, CalendarId } from "@/types";
@@ -33,9 +41,9 @@ export interface MergedEvent {
   merged: boolean;
 }
 
-/** Google's cross-copy identifier, if the data seam has grown it yet. */
+/** Google's cross-copy identifier, when the row has one. */
 export function iCalUidOf(event: CalendarEvent): string | undefined {
-  const value = (event as CalendarEvent & { iCalUID?: unknown }).iCalUID;
+  const value: unknown = event.iCalUID;
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 

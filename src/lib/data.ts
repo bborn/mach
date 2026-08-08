@@ -29,12 +29,14 @@ import type {
   Thread,
   ThreadDetail,
   ThreadId,
+  ThreadCursor,
   ThreadPage,
   ThreadQuery,
   TimeRange,
   PendingAuthorization,
 } from "@/types";
 import * as fixtures from "./fixtures";
+import { matchesSearchNode, type SearchNode } from "./search-query";
 
 /* -------------------------------------------------------------------------- */
 /* Commands — the write half of the seam                                       */
@@ -339,6 +341,16 @@ export class MachError extends Error {
 
 export type Unsubscribe = () => void;
 
+/** The second half of `searchThreads`: everything the operator search needs. */
+export interface SearchOptions {
+  /** The parsed query. Absent means "rank the raw text", which is what ⌘K does. */
+  filter?: SearchNode | null;
+  /** Scope to one account, as the rail does. Absent searches every account. */
+  accountId?: AccountId | null;
+  /** Keyset resume point, for the next page of results. */
+  cursor?: ThreadCursor | null;
+}
+
 export interface MachDataSource {
   /** Which implementation this is. The UI uses it to say so, honestly. */
   readonly kind: "tauri" | "fixture";
@@ -348,7 +360,15 @@ export interface MachDataSource {
   listCalendars(): Promise<Calendar[]>;
   listThreads(query: ThreadQuery): Promise<ThreadPage>;
   getThread(threadId: ThreadId): Promise<ThreadDetail | null>;
-  searchThreads(text: string, limit?: number): Promise<ThreadPage>;
+  /**
+   * Search.
+   *
+   * With no `options.filter` this is the ⌘K path: a bag of words, ranked by
+   * relevance. With one — the AST `parseSearchQuery` produced from the same
+   * text — it is the operator search behind the search view: compiled to SQL,
+   * newest first, and paginated with the same cursor as the stream.
+   */
+  searchThreads(text: string, limit?: number, options?: SearchOptions): Promise<ThreadPage>;
   listEvents(range: TimeRange): Promise<CalendarEvent[]>;
 
   /**
@@ -452,7 +472,27 @@ export const fixtureSource: MachDataSource = {
     if (!thread) return null;
     return { thread, messages: fixtures.messagesByThread.get(threadId) ?? [] };
   },
-  async searchThreads(text, limit) {
+  async searchThreads(text, limit, options) {
+    /*
+     * The operator path, evaluated in TypeScript — which is exactly what the
+     * real source must never do, and exactly right here. There are two dozen
+     * fixture threads and no SQLite to compile against; the point of this arm
+     * is that `bun run dev` in a browser tab exercises the same parser, the
+     * same AST and the same view as the app does.
+     */
+    if (options?.filter) {
+      const rows = fixtures.threads
+        .filter((t) => options.accountId == null || t.accountId === options.accountId)
+        .filter((t) =>
+          matchesSearchNode(options.filter!, {
+            thread: t,
+            messages: fixtures.messagesByThread.get(t.id) ?? [],
+          }),
+        )
+        .sort(byRecency);
+      return page(rows, { limit, after: options.cursor ?? null });
+    }
+
     const needle = text.trim().toLowerCase();
     if (!needle) return { threads: [], nextCursor: null };
     const rows = fixtures.threads

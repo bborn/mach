@@ -48,11 +48,11 @@
 use serde_json::{json, Map, Value};
 
 use crate::db::command_queries::{self as cq, EventFields};
-use crate::db::models::{Event, NewEvent, Participant, RsvpStatus};
+use crate::db::models::{Event, EventReminder, EventReminders, NewEvent, Participant, RsvpStatus};
 use crate::db::queries;
 use crate::google::types::{
-    EventAttendee, EventDateTime, EventReminderOverride, EventReminders, Event as GoogleEvent,
-    ResponseStatus,
+    EventAttendee, EventDateTime, EventReminderOverride, EventReminders as GoogleReminders,
+    Event as GoogleEvent, ResponseStatus,
 };
 use crate::google::GoogleError;
 
@@ -169,6 +169,19 @@ pub(crate) async fn execute_create(
     // command that never ran, not a local row to clean up afterwards.
     let client = dispatcher.clients.calendar(account_id)?;
 
+    // We are creating this on our own calendar, so we are its organizer — and
+    // saying so up front is what keeps the block editable between the optimistic
+    // write and the first sync that would otherwise be the only source of the
+    // fact. A missing account row is not fatal here: it costs a name on the
+    // organizer line, not the ability to make the event.
+    let organizer = dispatcher
+        .db
+        .read(|conn| cq::account_by_id(conn, account_id))?
+        .map(|account| Participant {
+            name: account.display_name.filter(|n| !n.is_empty()),
+            email: account.email,
+        });
+
     // The placeholder id is unique enough to satisfy
     // `UNIQUE (account_id, calendar_id, google_event_id)` and obvious enough in
     // a database dump to be recognisable if one ever survives a crash between
@@ -189,6 +202,17 @@ pub(crate) async fn execute_create(
         // respond to — an RSVP status here would paint the block as an invite.
         rsvp_status: None,
         recurring_event_id: None,
+        // The rule is written down at the moment we know it. Google will never
+        // tell us again: `singleEvents=true` returns occurrences, and an
+        // occurrence carries no RRULE. Sync's upsert is built to preserve this
+        // rather than overwrite it with the silence of an expanded instance.
+        recurrence: draft.recurrence.clone(),
+        reminders: draft.reminder_minutes.as_deref().map(stored_reminders),
+        // Minted by Google; adopted below once the insert answers.
+        ical_uid: None,
+        organizer,
+        organizer_self: Some(true),
+        guests_can_modify: Some(false),
         status: "confirmed".into(),
         html_link: None,
         updated_at: now_ms(),
@@ -222,6 +246,7 @@ pub(crate) async fn execute_create(
                     &row_id,
                     created.html_link.as_deref(),
                     parent.as_deref(),
+                    created.ical_uid.as_deref(),
                 )
             })?;
 
@@ -289,6 +314,20 @@ pub(crate) async fn execute_update(
         (Some(_), EventScope::All) => EventScope::All,
         _ => EventScope::This,
     };
+
+    // How an event repeats is a property of the series, and Google says so:
+    // `events.patch` on an expanded instance refuses a `recurrence` key
+    // outright. Catching it here turns a 400 the user cannot act on into a
+    // sentence that names the button they need. (The modal forces the choice to
+    // "all of them" whenever the rule changed, so this should be unreachable
+    // from the UI — it is reachable from the agent, and from a plugin.)
+    if effective == EventScope::This && series_parent.is_some() && patch.recurrence.is_some() {
+        return Err(CommandError::Invalid {
+            message: "how an event repeats belongs to the whole series — choose “all of them”, \
+                      or change just this occurrence's time instead"
+                .into(),
+        });
+    }
 
     if effective == EventScope::All && patch.touches_time() {
         return Err(CommandError::Invalid {
@@ -522,7 +561,14 @@ pub(crate) async fn execute_move(
 
     let new_google_id = created.id.clone().unwrap_or_default();
     dispatcher.db.write(|conn| {
-        cq::set_event_identity(conn, event_id, &new_google_id, created.html_link.as_deref(), None)
+        cq::set_event_identity(
+            conn,
+            event_id,
+            &new_google_id,
+            created.html_link.as_deref(),
+            None,
+            created.ical_uid.as_deref(),
+        )
     })?;
 
     // The copy exists. Removing the original is the half that can leave a
@@ -542,6 +588,7 @@ pub(crate) async fn execute_move(
                     &prior_google_id,
                     event.html_link.as_deref(),
                     None,
+                    event.ical_uid.as_deref(),
                 )
             })?;
             return Ok(CommandResult {
@@ -631,8 +678,8 @@ fn attendee_rows(people: &[Participant]) -> Vec<EventAttendee> {
         .collect()
 }
 
-fn reminders_for(minutes: &[i64]) -> EventReminders {
-    EventReminders {
+fn reminders_for(minutes: &[i64]) -> GoogleReminders {
+    GoogleReminders {
         // Naming any override at all means "not the calendar default", so this
         // has to be false even when the list is empty — that is how "no
         // reminder on this one event" is expressed.
@@ -725,6 +772,25 @@ fn patch_body(patch: &EventPatch) -> Value {
     Value::Object(body)
 }
 
+/// The stored form of a patch's reminder offsets.
+///
+/// Naming any override at all means "not the calendar default", which is why
+/// `use_default` is false even for an empty list — that is how "no alert on
+/// this one event" is expressed, and it mirrors [`reminders_for`], the wire
+/// version of the same rule.
+fn stored_reminders(minutes: &[i64]) -> EventReminders {
+    EventReminders {
+        use_default: false,
+        overrides: minutes
+            .iter()
+            .map(|m| EventReminder {
+                method: "popup".into(),
+                minutes: *m,
+            })
+            .collect(),
+    }
+}
+
 /// The stored subset of a patch — what SQLite has columns for.
 fn stored_fields(patch: &EventPatch) -> EventFields {
     EventFields {
@@ -741,19 +807,43 @@ fn stored_fields(patch: &EventPatch) -> EventFields {
         end_ts: patch.end_ts,
         is_all_day: patch.is_all_day,
         attendees: patch.attendees.clone(),
+        // Both of these used to be dropped on the floor here, and everything
+        // downstream inherited the hole: the modal reopened on "does not
+        // repeat", the inverse could not be built, and an edit that changed a
+        // rule looked, on reload, like an edit that had not happened.
+        recurrence: patch.recurrence.clone(),
+        reminders: patch.reminder_minutes.as_deref().map(stored_reminders),
     }
 }
 
 /// The patch that puts `event` back, narrowed to the fields `patch` named.
 ///
-/// Recurrence and reminder offsets are not stored locally, so their prior value
-/// is genuinely unknown. Rather than invent one, a patch that touched either is
-/// reported as having no inverse — the status bar then offers no undo, which is
-/// the honest outcome.
+/// # The one field that still cannot be inverted
+///
+/// Recurrence now round trips: the store keeps the rule, so "make this weekly"
+/// inverts to whatever it was, including the empty list that means "does not
+/// repeat".
+///
+/// Reminders only invert *out of* an explicit setting. Google has three states
+/// — the calendar's default, no alert, and these specific alerts — and
+/// [`EventPatch::reminder_minutes`] can only name the last two. So an event
+/// that was on the calendar default before the edit has a prior state this
+/// vocabulary cannot express, and the honest answer is no inverse at all rather
+/// than an undo that quietly sets "no alert" and calls it the default. The
+/// status bar then offers no undo, which is true.
 fn inverse_patch(patch: &EventPatch, event: &Event) -> Option<EventPatch> {
-    if patch.touches_write_only() {
+    // `Option<Option<_>>`: the outer says whether the patch named reminders at
+    // all, the inner whether the prior state can be spoken.
+    let prior_reminders = patch.reminder_minutes.as_ref().map(|_| {
+        event
+            .reminders
+            .as_ref()
+            .and_then(EventReminders::explicit_minutes)
+    });
+    if matches!(prior_reminders, Some(None)) {
         return None;
     }
+
     let prior = EventPatch {
         title: patch.title.as_ref().map(|_| event.title.clone()),
         description: patch
@@ -770,8 +860,8 @@ fn inverse_patch(patch: &EventPatch, event: &Event) -> Option<EventPatch> {
         end_ts: patch.touches_time().then_some(event.end_ts),
         is_all_day: patch.touches_time().then_some(event.is_all_day),
         attendees: patch.attendees.as_ref().map(|_| event.attendees.clone()),
-        recurrence: None,
-        reminder_minutes: None,
+        recurrence: patch.recurrence.as_ref().map(|_| event.recurrence.clone()),
+        reminder_minutes: prior_reminders.flatten(),
     };
     (!prior.is_empty()).then_some(prior)
 }
@@ -785,8 +875,15 @@ fn draft_from(event: &Event) -> EventDraft {
         end_ts: event.end_ts,
         is_all_day: event.is_all_day,
         attendees: event.attendees.clone(),
-        recurrence: Vec::new(),
-        reminder_minutes: None,
+        // Re-creating a deleted event now re-creates the event, not a
+        // lookalike: the rule and the alerts come back with it. This is the
+        // undo of a delete, and it is also the body of a cross-calendar move —
+        // both of which used to quietly drop both.
+        recurrence: event.recurrence.clone(),
+        reminder_minutes: event
+            .reminders
+            .as_ref()
+            .and_then(EventReminders::explicit_minutes),
     }
 }
 

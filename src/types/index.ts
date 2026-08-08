@@ -104,6 +104,27 @@ export interface Calendar {
 
 export type Rsvp = "accepted" | "declined" | "tentative" | "needsAction";
 
+/** One alert, as an offset in minutes before the event starts. */
+export interface EventReminder {
+  /** Google's `popup`, `email` or `sms`, kept verbatim. */
+  method: string;
+  minutes: number;
+}
+
+/**
+ * An event's alerts, in the shape Google models them.
+ *
+ * `useDefault` is not derivable from the list, and that is why it is here.
+ * There are three states and all three are reachable: follow the calendar's
+ * default, no alert at all (`useDefault: false` with no overrides), and these
+ * specific alerts. A bare list of minutes collapses the first two into "empty",
+ * which is how an event that should have popped up silently stops popping up.
+ */
+export interface EventReminders {
+  useDefault: boolean;
+  overrides: EventReminder[];
+}
+
 export interface CalendarEvent {
   id: EventId;
   calendarId: CalendarId;
@@ -125,6 +146,40 @@ export interface CalendarEvent {
    * Absent on a one-off, and absent on fixture data.
    */
   recurringEventId?: string;
+  /**
+   * The series' RRULE/EXDATE lines, verbatim.
+   *
+   * Google never puts these on an expanded occurrence — the rule lives on the
+   * series master, and `singleEvents=true` returns occurrences — so this is
+   * only ever as good as what the store was told: an event Mach created
+   * recurring, or a sibling occurrence that already knew. Empty means "no rule
+   * is known here", which is *not* the same as "does not repeat".
+   * `recurringEventId` is what answers that.
+   */
+  recurrence?: string[];
+  /** Alerts, or absent when the seam has not said. */
+  reminders?: EventReminders;
+  /**
+   * Google's cross-copy identity, stable when one meeting lands on two of the
+   * owner's accounts. `calendar-merge.ts` uses it to draw one block instead of
+   * two half-width ones.
+   *
+   * Spelled the way Google spells it. A camelCased `iCalUid` would be a third
+   * spelling of the same field between the API, SQLite and here.
+   */
+  iCalUID?: string;
+  /**
+   * Whether the organizer is this account — Google's `organizer.self`, and the
+   * authoritative answer to "may I edit this".
+   *
+   * **Absent is not `false`.** It means the seam never said: fixture data, or a
+   * row written before the store had a column for it. Readers treat that as
+   * permissive, because taking an edit affordance away on a guess is worse than
+   * offering one Google might refuse.
+   */
+  organizerSelf?: boolean;
+  /** The one thing that lets a guest write to an event they do not own. */
+  guestsCanModify?: boolean;
   /** Google's own deep link to this event. Absent on rows created offline. */
   htmlLink?: string;
   /** Set when the event was created from a thread — the mail/calendar link. */

@@ -370,6 +370,7 @@ export function EventChip({
   tone,
   past,
   selected,
+  dimmed = false,
   copies = 1,
   showTime = false,
   style,
@@ -382,6 +383,8 @@ export function EventChip({
   tone: EventTone;
   past: boolean;
   selected: boolean;
+  /** Ruled out by a filter — faded, not hidden, so the month keeps its shape. */
+  dimmed?: boolean;
   copies?: number;
   showTime?: boolean;
   style?: CSSProperties;
@@ -406,7 +409,7 @@ export function EventChip({
         borderRadius: BLOCK_RADIUS,
         background: paint.background,
         color: paint.color,
-        opacity: paint.opacity,
+        opacity: dimmed ? 0.3 : paint.opacity,
         boxShadow: paint.border ? `inset 0 0 0 1px ${paint.border}` : undefined,
         padding: "0 8px",
         fontSize: 12,

@@ -29,8 +29,18 @@ import {
   getDataSource,
   isMailCommand,
   type Command,
+  type CommandResult,
   type MailCommand,
 } from "@/lib/data";
+import {
+  emptyUndo,
+  pushUndo,
+  recordUndo,
+  runRedo,
+  runUndo,
+  type UndoHost,
+  type UndoState,
+} from "@/lib/undo-stack";
 import {
   mailboxState,
   syncProgress,
@@ -65,6 +75,11 @@ import {
 import { mailboxName } from "@/lib/mailboxes";
 import { toMailboxError, useThreadStream } from "@/hooks/useThreadStream";
 import { DAY, addDays, addMonths, startOfWeek } from "@/lib/time";
+import { undoWindowMs, type WeekStart } from "@/lib/prefs";
+import {
+  setPreferenceFromAnywhere,
+  usePreferences,
+} from "@/components/prefs/PreferencesProvider";
 
 export type Mode = "mail" | "calendar";
 export type CalendarView = "day" | "week" | "month";
@@ -76,7 +91,13 @@ export type MailFocus = "list" | "rail";
 export interface StatusMessage {
   message: string;
   /**
-   * What ⌘Z takes back.
+   * The inverse of whatever this message is reporting.
+   *
+   * It is no longer *how* undo works — the stack in `undo-stack.ts` is — but it
+   * is still how an action that did not go through `run` gets onto that stack:
+   * a status carrying an inverse is a claim that something reversible just
+   * happened, and `dispatch` below records one when it sees it. The calendar's
+   * write path and the plugin host both build these.
    *
    * A list when one gesture was several commands — a plugin action that labels
    * and then archives is one thing the user did, so it has to be one thing they
@@ -300,6 +321,14 @@ interface MachValue {
   live: boolean;
   hasMore: boolean;
   loadingMore: boolean;
+  /**
+   * Everything ⌘Z and ⇧⌘Z could do, so the status bar can say which.
+   *
+   * Deliberately the whole stack rather than a pre-rendered string: the status
+   * bar is not the only thing that will want to ask, and `describeUndo` is the
+   * one place that decides how an entry reads.
+   */
+  undoState: UndoState;
   accountById: (id: AccountId) => Account | undefined;
   calendarById: (id: CalendarId) => Calendar | undefined;
   isUnread: (thread: Thread) => boolean;
@@ -332,7 +361,10 @@ export interface MachActions {
   /** Move the keyboard between the rail and the list. */
   setFocus: (focus: MailFocus) => void;
   toggleFocus: () => void;
+  /** ⌘Z, and `z`. Takes back the last recorded action, however long ago. */
   undo: () => void;
+  /** ⇧⌘Z. Re-applies the last thing undo took back. */
+  redo: () => void;
   /**
    * Record several inverses as one undoable step.
    *
@@ -376,7 +408,11 @@ const MachContext = createContext<MachValue | null>(null);
 const CALENDAR_WINDOW = 60 * DAY;
 
 export function MachProvider({ children }: { children: ReactNode }) {
-  const [ui, dispatch] = useReducer(uiReducer, initialUi);
+  // The reducer's own dispatch. Everything outside this file — and almost
+  // everything inside it — goes through the recording `dispatch` defined below
+  // instead; this one is what that wrapper calls, and what `run` uses to avoid
+  // recording an action twice.
+  const [ui, dispatchUi] = useReducer(uiReducer, initialUi);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [labels, setLabels] = useState<Label[]>([]);
   const [calendars, setCalendars] = useState<Calendar[]>([]);
@@ -393,6 +429,51 @@ export function MachProvider({ children }: { children: ReactNode }) {
   // the window. Read once at mount, written back whenever they change.
   const [favorites, setFavorites] = useState<Favorite[]>(() => loadFavorites());
   useEffect(() => saveFavorites(favorites), [favorites]);
+
+  /*
+   * The undo stack.
+   *
+   * Kept in a ref *and* in state. The ref is the truth, because ⌘Z has to be
+   * correct when it arrives twice for one press — a key held down, or the
+   * macOS menu replaying a token behind the real keystroke — and two handlers
+   * reading the same not-yet-rendered React state would both pop the same
+   * entry and dispatch its inverse twice. The state exists so the status bar
+   * re-renders when the stack changes.
+   */
+  const undoRef = useRef<UndoState>(emptyUndo());
+  const [undoState, setUndoState] = useState<UndoState>(undoRef.current);
+  const commitUndo = useCallback((next: UndoState) => {
+    undoRef.current = next;
+    setUndoState(next);
+  }, []);
+
+  /**
+   * The dispatch everything outside `run` uses — and the seam where an action
+   * that happened somewhere else gets onto the undo stack.
+   *
+   * A status message carrying an inverse is a claim that something reversible
+   * just happened, and there are two things that make one without going
+   * anywhere near `run`: the calendar's write path, which dispatches its own
+   * status so that a drag reverses as readily as an archive, and the plugin
+   * host, which hands over a whole action's worth of inverses as one group.
+   * Watching this one action is what covers both without a `pushUndo` call
+   * sitting next to every command in the app.
+   *
+   * `run` deliberately does *not* come through here. It holds the original
+   * command and the result, so it records a better entry than a status message
+   * can carry — and coming through both doors would record it twice.
+   */
+  const dispatch = useCallback(
+    (action: UiAction) => {
+      if (action.type === "status" && action.status?.undo) {
+        commitUndo(
+          recordUndo(undoRef.current, action.status.message, action.status.undo, Date.now()),
+        );
+      }
+      dispatchUi(action);
+    },
+    [commitUndo],
+  );
 
   const stream = useThreadStream(ui.accountId, ui.labelId);
   // Actions close over the stream without being rebuilt on every page it loads.
@@ -514,6 +595,21 @@ export function MachProvider({ children }: { children: ReactNode }) {
     // thing a reload has to refetch.
   }, [ui.threadId, reloadKey]);
 
+  /*
+   * The theme is a preference; `ui.theme` mirrors it.
+   *
+   * Two things read the live theme and neither goes through this state — the
+   * `.dark` class below, and `use-is-dark.ts`, which watches that class to
+   * build the calendar's eight hues. Unifying them on the *preference* rather
+   * than on this field is what makes ⌘, ⌘K and the `t` key all mean the same
+   * thing; keeping `ui.theme` as a mirror is what keeps every existing reader
+   * of it working.
+   */
+  const prefs = usePreferences();
+  useEffect(() => {
+    if (prefs.theme !== ui.theme) dispatch({ type: "theme", theme: prefs.theme });
+  }, [prefs.theme, ui.theme]);
+
   // Theme. The token layer defines both palettes; this decides which is live.
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -527,12 +623,32 @@ export function MachProvider({ children }: { children: ReactNode }) {
     return () => media.removeEventListener("change", apply);
   }, [ui.theme]);
 
-  // Status messages are transient; the undo window is the only reason they linger.
+  /*
+   * Status messages are transient; the undo window is the only reason they
+   * linger — so the preference that names that window is what times them out.
+   *
+   * It used to be a hardcoded six seconds, which was wrong for what it guards:
+   * `bulk()` can archive every selected conversation in one keystroke, and the
+   * only affordance for taking that back was this message. Six seconds is not
+   * long enough to register that fifty rows just left.
+   *
+   * It is no longer the only affordance — the stack does not expire, and ⌘Z
+   * still reaches an archive from an hour ago — and the two are not in tension.
+   * This message is the *offer*: the loud, in-the-eye-line "that just happened,
+   * and here is the button". `undoWindowSeconds` says how long that offer
+   * stands, which is a question about attention rather than about capability.
+   * When it lapses the status bar goes back to naming what ⌘Z would still do,
+   * quietly. The preference shortens the shout, never the memory.
+   */
+  const undoWindow = undoWindowMs(prefs);
   useEffect(() => {
     if (!ui.status) return;
-    const timer = window.setTimeout(() => dispatch({ type: "status", status: null }), 6000);
+    const timer = window.setTimeout(
+      () => dispatchUi({ type: "status", status: null }),
+      undoWindow,
+    );
     return () => window.clearTimeout(timer);
-  }, [ui.status]);
+  }, [ui.status, undoWindow]);
 
   const allThreads = stream.threads;
 
@@ -658,9 +774,22 @@ export function MachProvider({ children }: { children: ReactNode }) {
    * and those three come back *still selected*, so retrying is one keystroke
    * rather than a hunt through the list for which ones did not make it. The
    * status line says so too — `describeResult` refuses to report fifty.
+   *
+   * `quiet` means two things, and they are the same thing: the user is not
+   * told, and it does not go on the undo stack. Opening a conversation marks it
+   * read quietly, and a ⌘Z that answered by marking it unread again would be
+   * answering a question nobody asked. It is also what keeps an undo's own
+   * dispatches off the stack — undo runs quietly, and the entry it moves to the
+   * redo side is already the record of it.
+   *
+   * Returns the result so a traversal can collect the inverses it hands back;
+   * `null` means the command never reached the command layer.
    */
   const run = useCallback(
-    async (command: Command, options: { quiet?: boolean; reselectFailed?: boolean } = {}) => {
+    async (
+      command: Command,
+      options: { quiet?: boolean; reselectFailed?: boolean } = {},
+    ): Promise<CommandResult | null> => {
       try {
         const result = await getDataSource().execute(command);
         // A calendar command's whole effect is rows in the event window, and
@@ -671,44 +800,75 @@ export function MachProvider({ children }: { children: ReactNode }) {
         if (command.kind === "star") {
           // The refetch that follows carries the truth; keeping the guess past
           // that point would pin a stale star if Gmail disagreed.
-          dispatch({ type: "unstar", threadIds: command.threadIds });
+          dispatchUi({ type: "unstar", threadIds: command.threadIds });
         }
         const failed = failedIds(result);
         if (failed.length > 0) {
-          dispatch({ type: "restore", threadIds: failed });
+          dispatchUi({ type: "restore", threadIds: failed });
           if (options.reselectFailed) {
-            dispatch({
+            dispatchUi({
               type: "selection",
               selection: selectOnly(emptySelection, failed, failed),
             });
           }
         }
+        const message = describeResult(result);
         if (!options.quiet || !result.ok) {
-          dispatch({
+          dispatchUi({
             type: "status",
             status: {
-              message: describeResult(result),
+              message,
               undo: result.undo,
               tone: result.ok ? "info" : "error",
             },
           });
         }
+        // Through the reducer's own dispatch above, so this is the only record
+        // made — and it is the better one, because the original command is in
+        // hand here and a status message could only ever carry the inverse.
+        // A partial failure still records: the inverse the command layer
+        // returned covers only the ids that actually applied.
+        if (!options.quiet) {
+          commitUndo(pushUndo(undoRef.current, command, result, message, Date.now()));
+        }
+        return result;
       } catch (caught) {
         // The command never ran, so nothing changed anywhere: undo the whole
         // optimistic edit, not part of it.
         if (isMailCommand(command)) {
-          dispatch({ type: "restore", threadIds: command.threadIds });
+          dispatchUi({ type: "restore", threadIds: command.threadIds });
           if (command.kind === "star") {
-            dispatch({ type: "unstar", threadIds: command.threadIds });
+            dispatchUi({ type: "unstar", threadIds: command.threadIds });
           }
         }
-        dispatch({
+        dispatchUi({
           type: "status",
           status: { message: toMailboxError(caught).message, tone: "error" },
         });
+        return null;
       }
     },
-    [],
+    [commitUndo],
+  );
+
+  /**
+   * What a traversal of the stack is allowed to do to the app.
+   *
+   * Undo is not a special dispatch path: it runs the inverse through the same
+   * `run` every other command goes through, which is what makes a calendar
+   * undo refetch the event window and a mail undo reconcile a partial failure
+   * without either of them knowing they were an undo.
+   */
+  const undoHost = useMemo<UndoHost>(
+    () => ({
+      read: () => undoRef.current,
+      write: commitUndo,
+      execute: (command) => run(command, { quiet: true }),
+      restore: (threadIds) => dispatchUi({ type: "restore", threadIds }),
+      hide: (threadIds) => dispatchUi({ type: "archive", threadIds }),
+      say: (message) => dispatchUi({ type: "status", status: { message, tone: "info" } }),
+    }),
+    [commitUndo, run],
   );
 
   // Opening an unread conversation marks it read — once, and quietly.
@@ -913,30 +1073,17 @@ export function MachProvider({ children }: { children: ReactNode }) {
       // file, so this is the seam between them.
       replySelected: () =>
         window.dispatchEvent(new CustomEvent("mach:compose", { detail: { kind: "reply" } })),
-      undo: () => {
-        const undo = ui.status?.undo;
-        if (!undo) return;
-        // Newest first: a group ran in order, so it unwinds in reverse.
-        const commands = (Array.isArray(undo) ? [...undo].reverse() : [undo]);
-        // Everything that puts a thread back on screen has to clear the
-        // optimistic hide as well as run the command.
-        for (const command of commands) {
-          if (
-            command.kind === "unarchive" ||
-            command.kind === "untrash" ||
-            command.kind === "unsnooze"
-          ) {
-            dispatch({ type: "restore", threadIds: command.threadIds });
-          }
-        }
-        void (async () => {
-          for (const command of commands) await run(command, { quiet: true });
-          dispatch({
-            type: "status",
-            status: { message: "Undone", tone: "info" },
-          });
-        })();
-      },
+      /*
+       * ⌘Z and `z` are the same key.
+       *
+       * Both used to read the inverse off `ui.status`, which meant undo could
+       * only ever reach the last action and only while that message was still
+       * on screen. It reads the stack now, so it reaches as far back as the
+       * user does — and the status message goes back to being what it says it
+       * is, a note about what just happened.
+       */
+      undo: () => void runUndo(undoHost),
+      redo: () => void runRedo(undoHost),
 
       pushUndoGroup: (label, inverses) => {
         if (inverses.length === 0) return;
@@ -987,9 +1134,11 @@ export function MachProvider({ children }: { children: ReactNode }) {
           dispatch({ type: "thread", threadId: favorite.threadId });
         }
       },
+      // Writes the preference rather than the state: the state is a mirror of
+      // it, so setting the mirror would be undone by the next sync from the
+      // thing being mirrored — and would not survive a relaunch either.
       cycleTheme: () =>
-        dispatch({
-          type: "theme",
+        setPreferenceFromAnywhere({
           theme: ui.theme === "system" ? "light" : ui.theme === "light" ? "dark" : "system",
         }),
       loadMore: () => streamRef.current.loadMore(),
@@ -1012,7 +1161,9 @@ export function MachProvider({ children }: { children: ReactNode }) {
   }, [
     ui.mode,
     ui.threadId,
-    ui.status,
+    // `ui.status` was a dependency for as long as undo read the inverse off it.
+    // The stack is the source now, and rebuilding every action on every status
+    // message was only ever the cost of that.
     ui.anchor,
     ui.calendarView,
     ui.theme,
@@ -1026,6 +1177,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
     threadFavorite,
     isFavorite,
     run,
+    undoHost,
   ]);
 
   const value: MachValue = {
@@ -1053,6 +1205,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
     live: getDataSource().kind === "tauri",
     hasMore: stream.hasMore,
     loadingMore: stream.loadingMore,
+    undoState,
     accountById,
     calendarById,
     isUnread,
@@ -1069,9 +1222,24 @@ export function useMach(): MachValue {
   return value;
 }
 
-/** The days a calendar view covers, given the anchor. */
-export function viewRange(view: CalendarView, anchor: number): { start: Date; days: number } {
+/**
+ * The days a calendar view covers, given the anchor.
+ *
+ * `weekStartsOn` is a parameter rather than a module-level setting because both
+ * the week strip and the six-week month grid have to agree with it in the same
+ * render — a mutable global would have them agreeing only until something
+ * re-rendered one of them. It defaults to `startOfWeek`'s own Monday, so every
+ * caller that has no opinion behaves exactly as it did.
+ */
+export function viewRange(
+  view: CalendarView,
+  anchor: number,
+  weekStartsOn?: WeekStart,
+): { start: Date; days: number } {
   if (view === "day") return { start: new Date(new Date(anchor).setHours(0, 0, 0, 0)), days: 1 };
-  if (view === "week") return { start: startOfWeek(anchor), days: 7 };
-  return { start: startOfWeek(new Date(new Date(anchor).setDate(1))), days: 42 };
+  if (view === "week") return { start: startOfWeek(anchor, weekStartsOn), days: 7 };
+  return {
+    start: startOfWeek(new Date(new Date(anchor).setDate(1)), weekStartsOn),
+    days: 42,
+  };
 }

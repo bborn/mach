@@ -638,13 +638,9 @@ pub fn html_to_text(html: &str) -> String {
         }
     }
 
-    let decoded = out
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
+    // Was a chain of `.replace()` calls, which decoded `&amp;lt;` all the way
+    // to `<` by re-reading its own output. See `render::entities`.
+    let decoded = crate::render::entities::decode(&out);
 
     // Collapse the runs of blank lines that stripping a table leaves behind.
     let mut lines: Vec<&str> = Vec::new();

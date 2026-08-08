@@ -185,6 +185,21 @@ interface WireEvent {
   /** `db::models::Event.html_link` — Google's own URL for this event. */
   htmlLink?: Nullable<string>;
   sourceThreadId?: Nullable<number>;
+  /** RRULE lines. Only ever set on a series master; see migration 5. */
+  recurrence?: Nullable<string[]>;
+  /**
+   * Google's three-state shape, kept whole. "The calendar's default" and "no
+   * alert at all" are different answers and a bare minute count cannot tell
+   * them apart.
+   */
+  reminders?: Nullable<{
+    useDefault?: Nullable<boolean>;
+    overrides?: Nullable<{ method?: Nullable<string>; minutes?: Nullable<number> }[]>;
+  }>;
+  /** Stable identity across accounts — what makes cross-account merge exact. */
+  iCalUID?: Nullable<string>;
+  organizerSelf?: Nullable<boolean>;
+  guestsCanModify?: Nullable<boolean>;
 }
 
 interface WireAccountSyncStatus {
@@ -408,6 +423,36 @@ export function mapEvent(wire: WireEvent): CalendarEvent {
     recurringEventId: optional(wire.recurringEventId),
     htmlLink: optional(wire.htmlLink),
     sourceThreadId: typeof wire.sourceThreadId === "number" ? wire.sourceThreadId : undefined,
+    /*
+     * And the same trap again, one migration later. Every field below is
+     * stored, synced, tested and read by the modal — but this function builds a
+     * fresh object literal, so anything not named here is dropped in silence
+     * between Rust and the UI. There is no type error, because `WireEvent` is
+     * our own description of the wire rather than something generated from it.
+     *
+     * That is what makes this mapper the place a column goes to die: adding one
+     * touches the schema, the model, the sync and the component, all of which
+     * fail loudly if you get them wrong, and then this, which does not.
+     */
+    recurrence: wire.recurrence ?? undefined,
+    reminders: wire.reminders
+      ? {
+          // Absent is not the same as false anywhere else in this mapper, but
+          // it is here: Google omits `useDefault` when it is not set.
+          useDefault: wire.reminders.useDefault === true,
+          overrides: (wire.reminders.overrides ?? []).map((r) => ({
+            method: text(r.method, "popup"),
+            minutes: num(r.minutes),
+          })),
+        }
+      : undefined,
+    iCalUID: optional(wire.iCalUID),
+    // `undefined` means "Google did not tell us", which every consumer treats
+    // as permissive. Collapsing it to `false` would make every row written
+    // before migration 5 read-only on first launch.
+    organizerSelf: typeof wire.organizerSelf === "boolean" ? wire.organizerSelf : undefined,
+    guestsCanModify:
+      typeof wire.guestsCanModify === "boolean" ? wire.guestsCanModify : undefined,
   };
 }
 
@@ -518,10 +563,15 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
       };
     },
 
-    async searchThreads(text_, limit) {
-      return mapThreadPage(
-        await call<WireThreadPage>("search_threads", { query: text_, limit }),
-      );
+    async searchThreads(text_, limit, options) {
+      // `filter` is what turns this into the operator search on the Rust side;
+      // without it the command answers exactly as it always has. Absent keys
+      // rather than nulls, so an older backend deserializes the same payload.
+      const args: Record<string, unknown> = { query: text_, limit };
+      if (options?.filter) args.filter = options.filter;
+      if (options?.accountId != null) args.accountId = options.accountId;
+      if (options?.cursor) args.cursor = options.cursor;
+      return mapThreadPage(await call<WireThreadPage>("search_threads", args));
     },
 
     async listEvents(range: TimeRange) {

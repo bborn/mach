@@ -1,8 +1,9 @@
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { AlertTriangle, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AccountId, CalendarEvent, CalendarId, EventId, Rsvp } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useMach, viewRange, type CalendarView } from "@/hooks/useMach";
+import { usePreferences } from "@/components/prefs/PreferencesProvider";
 import {
   describeResult,
   getDataSource,
@@ -13,15 +14,25 @@ import {
 import type { KeyBinding } from "@/lib/keymap";
 import { assignHues, type HueIndex } from "@/lib/calendar-palette";
 import { mergeDuplicates, type MergedEvent } from "@/lib/calendar-merge";
+import {
+  arrowCursor,
+  inReadingOrder,
+  matchEvents,
+  stepCursor,
+  type Arrow,
+  type CursorMove,
+} from "@/lib/calendar-cursor";
 import { parseEventText, type ParsedEvent } from "@/lib/calendar-nlp";
 import { nudge, type DragOutcome } from "@/lib/calendar-drag";
 import {
+  canEditEvent,
   duplicateDraft,
   formDraft,
   formPatch,
   looksRecurring,
   nextSlot,
   pasteDraft,
+  requiresSeriesScope,
   rulesFor,
   type EventForm,
 } from "@/lib/calendar-edit";
@@ -44,6 +55,7 @@ import { MonthGrid } from "./MonthGrid";
 import { TimeGrid, type EventDraft as GridDraft, type EventMove } from "./TimeGrid";
 import { CalendarSidebar, calendarLabel, type CalendarSettings } from "./CalendarSidebar";
 import { EventModal, type ModalTarget } from "./EventModal";
+import { EventFinder } from "./EventFinder";
 import { QuickCreate } from "./QuickCreate";
 import { useIsDark } from "./use-is-dark";
 
@@ -57,6 +69,23 @@ const SETTINGS_KEY = "mach.calendar.settings";
 
 /** ⇧1…⇧5 as the characters a US keyboard actually emits. */
 const SHIFTED_DIGITS = ["!", "@", "#", "$", "%"];
+
+/**
+ * Where a dragged, resized or nudged event has been *put*, before the store
+ * agrees that it is there.
+ *
+ * There is no expiry on it, and none is needed: the command layer writes the
+ * local row to exactly these values before it calls Google, so a successful
+ * write always produces a store that agrees, and agreement is what retires the
+ * guess. A refused write deletes it outright. The only way one could outlive
+ * its usefulness is a later sync moving the event to a third time, which is a
+ * race with a background pass rather than a state this can be in on its own.
+ */
+interface PendingMove {
+  start: number;
+  end: number;
+  allDay: boolean;
+}
 
 const DEFAULT_SETTINGS: CalendarSettings = {
   // §7: merging is the right default. It hides that a meeting exists on two
@@ -80,6 +109,7 @@ export function CalendarMode() {
     calendarById,
   } = useMach();
   const dark = useIsDark();
+  const prefs = usePreferences();
 
   const [settings, setSettings] = useState<CalendarSettings>(() => loadSettings());
   const [soloAccount, setSoloAccount] = useState<AccountId | null>(null);
@@ -91,17 +121,62 @@ export function CalendarMode() {
   /** The event the modal is showing, or the slot it is creating into. */
   const [modal, setModal] = useState<ModalTarget | null>(null);
   const [busy, setBusy] = useState(false);
+  /**
+   * The last write Google refused, and the command that was refused.
+   *
+   * Kept out of `ui.status` on purpose: that message is transient by design
+   * (six seconds, so the undo offer does not linger), and a failure is the one
+   * thing that must not vanish before it has been read. This one stays until it
+   * is dismissed or retried.
+   */
+  const [failure, setFailure] = useState<{ message: string; command: Command } | null>(null);
+  /** Which end of the newly-paged period an arrow key wants to land on. */
+  const [pendingEdge, setPendingEdge] = useState<"first" | "last" | null>(null);
+  /**
+   * The type-to-select bar. `restore` is what Escape puts back, so cancelling a
+   * search leaves the cursor exactly where it was rather than on whichever
+   * match happened to be highlighted when the user changed their mind.
+   */
+  const [finder, setFinder] = useState<{
+    query: string;
+    index: number;
+    restore: EventId | null;
+    /**
+     * The week to come back to. A search that widened past the visible range
+     * moved the view to show its match; cancelling has to undo that too, or
+     * Escape leaves the user three weeks from where they started with nothing
+     * on screen explaining how they got there.
+     */
+    restoreAnchor: number;
+  } | null>(null);
   /** ⌘C parks an event here; ⌘V drops a copy of it on the anchored day. */
   const [clipboard, setClipboard] = useState<CalendarEvent | null>(null);
+  /**
+   * Where a dragged, resized or nudged event has been *put*, before the store
+   * agrees.
+   *
+   * The same idea as `starOverrides` in `useMach`, and for the same reason: the
+   * UI never waits on Google. A drop used to leave the block sitting at its old
+   * time for the length of an IPC round trip, a Google call and a refetch —
+   * a quarter of a second on a good day, and a visible snap-back on a bad one,
+   * which reads as "the drag did not work" rather than as "it is saving".
+   *
+   * Kept here rather than in `useMach` deliberately: it is a fact about the
+   * calendar surface, it is discarded the moment the surface unmounts, and
+   * nothing else in the app needs to know an event is mid-flight.
+   */
+  const [pendingMoves, setPendingMoves] = useState<Record<EventId, PendingMove>>({});
 
   const modalOpen = modal !== null;
-  const active = ui.mode === "calendar" && !ui.paletteOpen && !createOpen && !modalOpen;
+  const finderOpen = finder !== null;
+  const active =
+    ui.mode === "calendar" && !ui.paletteOpen && !createOpen && !modalOpen && !finderOpen;
 
   useEffect(() => {
     window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   }, [settings]);
 
-  const { start, days: dayCount } = viewRange(ui.calendarView, ui.anchor);
+  const { start, days: dayCount } = viewRange(ui.calendarView, ui.anchor, prefs.weekStartsOn);
   const allDays = useMemo(
     () => Array.from({ length: dayCount }, (_, i) => addDays(start, i)),
     [start.getTime(), dayCount],
@@ -122,15 +197,57 @@ export function CalendarMode() {
     [hues],
   );
 
+  /**
+   * The events as the user has just left them.
+   *
+   * A guess is applied only while it still *differs* from the store, which is
+   * the same rule `starOverrides` uses: the moment sync catches up, the
+   * override is a no-op and the row renders from the truth. The effect below
+   * then drops it, so the map cannot accumulate.
+   */
+  const settledEvents = useMemo(() => {
+    if (Object.keys(pendingMoves).length === 0) return visibleEvents;
+    return visibleEvents.map((event) => {
+      const move = pendingMoves[event.id];
+      if (!move) return event;
+      if (move.start === event.start && move.end === event.end && move.allDay === event.allDay) {
+        return event;
+      }
+      return { ...event, start: move.start, end: move.end, allDay: move.allDay };
+    });
+  }, [visibleEvents, pendingMoves]);
+
+  // Drop guesses the store has caught up with, and guesses about events that
+  // are no longer there at all. Without this the map grows for the life of the
+  // session and every render pays for it.
+  useEffect(() => {
+    const ids = Object.keys(pendingMoves);
+    if (ids.length === 0) return;
+    const byId = new Map(visibleEvents.map((e) => [e.id, e] as const));
+    const stale = ids.filter((key) => {
+      const id = Number(key);
+      const event = byId.get(id);
+      if (!event) return true;
+      const move = pendingMoves[id];
+      return move.start === event.start && move.end === event.end && move.allDay === event.allDay;
+    });
+    if (stale.length === 0) return;
+    setPendingMoves((current) => {
+      const next = { ...current };
+      for (const key of stale) delete next[Number(key)];
+      return next;
+    });
+  }, [visibleEvents, pendingMoves]);
+
   const inRange = useMemo(() => {
     const soloed = soloAccount;
-    return visibleEvents.filter((event) => {
+    return settledEvents.filter((event) => {
       if (event.start >= rangeEnd || event.end <= rangeStart) return false;
       if (soloed !== null && event.accountId !== soloed) return false;
       if (!settings.showDeclined && event.rsvp === "declined") return false;
       return true;
     });
-  }, [visibleEvents, rangeStart, rangeEnd, soloAccount, settings.showDeclined]);
+  }, [settledEvents, rangeStart, rangeEnd, soloAccount, settings.showDeclined]);
 
   const merged = useMemo(
     () =>
@@ -148,22 +265,69 @@ export function CalendarMode() {
   }, [merged]);
 
   /** Tab order: the blocks as they read down the week. */
-  const ordered = useMemo(
-    () => [...merged].sort((a, b) => a.event.start - b.event.start || a.event.id - b.event.id),
-    [merged],
+  const ordered = useMemo(() => {
+    const byId = new Map(merged.map((item) => [item.event.id, item] as const));
+    return inReadingOrder(merged.map((item) => item.event)).map((event) => byId.get(event.id)!);
+  }, [merged]);
+
+  /**
+   * The same blocks as plain events — what every cursor and match decision is
+   * made against, so the keyboard can only ever land on something drawn.
+   */
+  const inView = useMemo(() => ordered.map((item) => item.event), [ordered]);
+
+  /**
+   * Apply whatever the cursor resolved to.
+   *
+   * A `page` outcome cannot select anything yet — the events of the period it
+   * is moving to are in `allEvents`, but `ordered` is derived from the anchor
+   * and only recomputes on the next render. So it shifts the range and parks
+   * which edge to land on; the effect below picks it up once the new window
+   * exists. That is what stops the arrow keys from dead-ending at Sunday.
+   */
+  const applyCursor = useCallback(
+    (move: CursorMove) => {
+      if (move.kind === "none") {
+        actions.setStatus("Nothing on screen to select — press C to make something", "info");
+        return;
+      }
+      if (move.kind === "page") {
+        actions.shiftPeriod(move.delta);
+        setPendingEdge(move.edge);
+        return;
+      }
+      dispatch({ type: "event", eventId: move.id });
+      setRevealNonce((n) => n + 1);
+    },
+    [actions, dispatch],
   );
 
   const step = useCallback(
-    (delta: number) => {
-      if (ordered.length === 0) return;
-      const index = ordered.findIndex((m) => m.event.id === ui.eventId);
-      const next = index === -1 ? (delta > 0 ? 0 : ordered.length - 1) : index + delta;
-      const clamped = Math.min(Math.max(next, 0), ordered.length - 1);
-      dispatch({ type: "event", eventId: ordered[clamped].event.id });
-      setRevealNonce((n) => n + 1);
-    },
-    [ordered, ui.eventId, dispatch],
+    (delta: 1 | -1) => applyCursor(stepCursor(inView, ui.eventId, delta)),
+    [applyCursor, inView, ui.eventId],
   );
+
+  const arrow = useCallback(
+    (direction: Arrow) => applyCursor(arrowCursor(inView, ui.eventId, direction)),
+    [applyCursor, inView, ui.eventId],
+  );
+
+  // Land on the edge of the period an arrow key paged into. Runs after the
+  // anchor change has re-derived the window, which is the whole reason the
+  // intent had to be parked rather than acted on immediately.
+  useEffect(() => {
+    if (pendingEdge === null) return;
+    if (ordered.length === 0) {
+      // An empty week is not a reason to stop: keep going the way the key was
+      // pointing rather than stranding the cursor on nothing.
+      setPendingEdge(null);
+      return;
+    }
+    const target = pendingEdge === "first" ? ordered[0] : ordered[ordered.length - 1];
+    dispatch({ type: "event", eventId: target.event.id });
+    setRevealNonce((n) => n + 1);
+    setPendingEdge(null);
+  }, [pendingEdge, ordered, dispatch]);
 
   const goToday = useCallback(() => {
     actions.goToday();
@@ -191,6 +355,7 @@ export function CalendarMode() {
   const run = useCallback(
     async (command: Command) => {
       setBusy(true);
+      setFailure(null);
       try {
         const result = await getDataSource().execute(command);
         // One dispatch, carrying the inverse: `z` reads `ui.status.undo`, so a
@@ -204,22 +369,55 @@ export function CalendarMode() {
             tone: result.ok ? "info" : "error",
           },
         });
+        // The status bar is not enough on its own, and this is the whole reason
+        // a stale binary read as "I tried to create an event and nothing
+        // happened". That rail is 24px tall, it truncates, and it clears itself
+        // after six seconds — a failure there is indistinguishable from a
+        // success you looked away from. A failed write now also parks a banner
+        // that stays until it is dismissed or retried, and keeps the modal open
+        // on top of the values that did not save.
+        if (!result.ok) setFailure({ message: describeResult(result), command });
         actions.reloadEvents();
         return result;
       } catch (error) {
-        dispatch({
-          type: "status",
-          status: {
-            message: error instanceof Error ? error.message : "That did not save",
-            tone: "error",
-          },
-        });
+        const message = error instanceof Error ? error.message : "That did not save";
+        dispatch({ type: "status", status: { message, tone: "error" } });
+        setFailure({ message, command });
         return null;
       } finally {
         setBusy(false);
       }
     },
     [actions, dispatch],
+  );
+
+  /** Whether Google would accept a write to this event at all. */
+  const accountEmails = useMemo(() => accounts.map((a) => a.email), [accounts]);
+  const editable = useCallback(
+    (event: CalendarEvent) => canEditEvent(event, accountEmails),
+    [accountEmails],
+  );
+
+  /**
+   * Refuse a write to an event that is not ours, and say why.
+   *
+   * Google would refuse it too, a round trip later and in less useful words.
+   * Drag, resize and the arrow-key nudges all funnel through here because none
+   * of them go anywhere near the modal, which is where the lock is visible.
+   */
+  const guardEdit = useCallback(
+    (event: CalendarEvent) => {
+      if (editable(event)) return true;
+      const who = event.organizer?.email;
+      actions.setStatus(
+        who
+          ? `Only ${who} can change “${event.title}” — you are a guest on it`
+          : `Only the organizer can change “${event.title}”`,
+        "error",
+      );
+      return false;
+    },
+    [editable, actions],
   );
 
   /** The calendar a new event lands on: the one in view, else the first. */
@@ -234,29 +432,57 @@ export function CalendarMode() {
   );
 
   const create = useCallback(
-    (draft: EventDraft, calendarId: CalendarId | null) => {
+    async (draft: EventDraft, calendarId: CalendarId | null) => {
       const target = calendarId ?? defaultCalendarId;
       const accountId = target === null ? null : accountForCalendar(target);
       if (target === null || accountId === null) {
         actions.setStatus("There is no calendar to create on yet", "error");
-        return;
+        return null;
       }
-      void run({ kind: "createEvent", accountId, calendarId: target, draft });
+      return run({ kind: "createEvent", accountId, calendarId: target, draft });
     },
     [run, defaultCalendarId, accountForCalendar, actions],
   );
 
-  /** A drag or a keyboard nudge — the same command either way. */
+  /**
+   * A drag, a resize or a keyboard nudge — the same command either way, and the
+   * same optimistic shape.
+   *
+   * The block is drawn at its new time *before* the command is dispatched, so
+   * the drop is instant however slow Google is. On failure the guess is dropped
+   * and the block snaps back to where it was — visibly, and with the banner
+   * saying why. A silent snap-back is the worst of both worlds: it looks like
+   * the drag missed, and it teaches the user that dragging is unreliable rather
+   * than that this particular write was refused.
+   */
   const applyMove = useCallback(
     (eventId: EventId, outcome: DragOutcome, allDay: boolean) => {
+      const event = allEvents.find((e) => e.id === eventId);
+      if (event && !guardEdit(event)) return;
+
+      setPendingMoves((current) => ({
+        ...current,
+        [eventId]: { start: outcome.start, end: outcome.end, allDay },
+      }));
+
       void run({
         kind: "updateEvent",
         eventId,
         patch: { startTs: outcome.start, endTs: outcome.end, isAllDay: allDay },
         scope: "this",
+      }).then((result) => {
+        if (result?.ok) return;
+        // Google refused it, or never answered. `run` has already put the
+        // reason on screen; this is the half that puts the block back.
+        setPendingMoves((current) => {
+          if (!(eventId in current)) return current;
+          const next = { ...current };
+          delete next[eventId];
+          return next;
+        });
       });
     },
-    [run],
+    [run, allEvents, guardEdit],
   );
 
   const onGridMove = useCallback(
@@ -280,7 +506,12 @@ export function CalendarMode() {
         | { kind: "move"; axis: "day"; days: number }
         | { kind: "resize"; edge: "start" | "end"; steps: number },
     ) => {
-      const event = selectedEvent;
+      // The *drawn* event, not the stored one. They differ for exactly as long
+      // as an optimistic move is in flight, and nudging from the stored copy
+      // made the second of two quick presses a no-op: it recomputed "fifteen
+      // minutes after 1pm" from a row that still said 1pm, and arrived back at
+      // the time the first press had already moved it to.
+      const event = settledEvents.find((e) => e.id === ui.eventId) ?? selectedEvent;
       if (!event) {
         actions.setStatus("Pick an event first — Tab steps through them", "info");
         return;
@@ -300,8 +531,80 @@ export function CalendarMode() {
       );
       applyMove(event.id, outcome, false);
     },
-    [selectedEvent, applyMove, actions],
+    [selectedEvent, settledEvents, ui.eventId, applyMove, actions],
   );
+
+  /* ---------------------------------------------------------------------- */
+  /* Type to select                                                          */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * What the typed query matches, and whether it had to look past the view.
+   *
+   * The visible week is searched first and wins outright when it has anything,
+   * because "the meeting I can see" is what someone typing at a calendar
+   * usually means. Only when *nothing* on screen matches does it widen to the
+   * whole loaded window — roughly four months around the anchor, already in
+   * memory, so widening costs a filter rather than a fetch.
+   *
+   * Widening rather than reporting "no matches" is a deliberate call: the
+   * alternative is a user who types "dentist", sees nothing, and has to guess
+   * which week to page to before they can type it again. The bar says out loud
+   * when a match came from elsewhere, and the grid follows the highlight there,
+   * so nothing moves without an explanation.
+   */
+  const finderMatches = useMemo(() => {
+    const query = finder?.query ?? "";
+    if (!query.trim()) return { rows: [] as CalendarEvent[], widened: false };
+    const here = matchEvents(inView, query);
+    if (here.length > 0) return { rows: here, widened: false };
+    const anywhere = matchEvents(visibleEvents, query);
+    return { rows: anywhere, widened: anywhere.length > 0 };
+  }, [finder?.query, inView, visibleEvents]);
+
+  const finderMatch = finder ? (finderMatches.rows[finder.index] ?? null) : null;
+
+  /** Everything the query did *not* match, so the grid can dim it. */
+  const dimIds = useMemo(() => {
+    if (!finder || finderMatches.rows.length === 0) return undefined;
+    const matched = new Set(finderMatches.rows.map((e) => e.id));
+    return new Set(inView.filter((e) => !matched.has(e.id)).map((e) => e.id));
+  }, [finder, finderMatches, inView]);
+
+  const openFinder = useCallback(() => {
+    setFinder({ query: "", index: 0, restore: ui.eventId, restoreAnchor: ui.anchor });
+  }, [ui.eventId, ui.anchor]);
+
+  const closeFinder = useCallback(
+    (restore: boolean) => {
+      setFinder((current) => {
+        if (current && restore) {
+          dispatch({ type: "event", eventId: current.restore });
+          dispatch({ type: "anchor", anchor: current.restoreAnchor });
+        }
+        return null;
+      });
+    },
+    [dispatch],
+  );
+
+  // Follow the highlighted match: select it, and bring the view to it when the
+  // match came from outside the week on screen. Doing this as the user types is
+  // what makes the matches "highlight in place" rather than being a list they
+  // then have to act on.
+  useEffect(() => {
+    if (!finder || !finderMatch) return;
+    if (finderMatch.id !== ui.eventId) {
+      dispatch({ type: "event", eventId: finderMatch.id });
+    }
+    if (finderMatch.start < rangeStart || finderMatch.start >= rangeEnd) {
+      dispatch({ type: "anchor", anchor: finderMatch.start });
+    }
+    setRevealNonce((n) => n + 1);
+    // Keyed on the match, not on the whole finder: re-running on every
+    // keystroke that does not change the answer would fight the grid's scroll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finderMatch?.id]);
 
   const openEvent = useCallback(
     (id: EventId) => {
@@ -327,6 +630,10 @@ export function CalendarMode() {
 
   const closeModal = useCallback(() => {
     setModal(null);
+    // Closing the panel is an acknowledgement of whatever it was showing,
+    // including the failure — leaving the banner behind afterwards would nag
+    // about something the user has already walked away from.
+    setFailure(null);
     // Focus goes back to the block it came from, which is where the keyboard
     // cursor already is — the grid scrolls it into view.
     setRevealNonce((n) => n + 1);
@@ -346,6 +653,16 @@ export function CalendarMode() {
     [selectedEvent, ui.anchor],
   );
 
+  /**
+   * Save the modal's form.
+   *
+   * The modal used to close on the way *in* to the command, which is how a
+   * refused save came to look exactly like a successful one: the panel went
+   * away, the grid did not change, and a red line appeared in a rail nobody was
+   * looking at. It now closes only once the write has actually landed — on a
+   * failure it stays up, still holding everything that was typed, with the
+   * reason above the fields.
+   */
   const saveForm = useCallback(
     (form: EventForm, scope: EventScope) => {
       const event = modal?.mode === "view" ? modal.event : null;
@@ -355,14 +672,15 @@ export function CalendarMode() {
           actions.setStatus(draft.error, "error");
           return;
         }
-        setModal(null);
-        create(draft, form.calendarId);
+        void create(draft, form.calendarId).then((result) => {
+          if (result?.ok) setModal(null);
+        });
         return;
       }
+      if (!guardEdit(event)) return;
 
       const patch = formPatch(event, form);
       const moved = form.calendarId !== event.calendarId;
-      setModal(null);
 
       const move = () => {
         const accountId = accountForCalendar(form.calendarId);
@@ -372,38 +690,56 @@ export function CalendarMode() {
           eventId: event.id,
           accountId,
           calendarId: form.calendarId,
+        }).then((result) => {
+          if (result?.ok) setModal(null);
         });
       };
 
       if (!patch) {
         if (moved) move();
+        else setModal(null);
         return;
       }
+      // Changing how an event repeats is a property of the series master, and
+      // `events.patch` on an expanded occurrence refuses a `recurrence` key
+      // outright. The command layer says so in words; catching it here means
+      // the user is never asked a question ("this one, or all of them?") whose
+      // first answer cannot work.
+      const effective: EventScope = requiresSeriesScope(patch) ? "all" : scope;
+
       // A move is insert-into-destination then delete-from-source, so it re-reads
       // the row the patch just wrote. If the patch did *not* land — Google refused
       // it, the account needs reauthorizing — the row was rolled back, and moving
       // on top of that would copy the pre-edit event to the other calendar and
       // report success for a save that never happened.
-      void run({ kind: "updateEvent", eventId: event.id, patch, scope }).then((result) => {
-        if (moved && result?.ok) move();
-      });
+      void run({ kind: "updateEvent", eventId: event.id, patch, scope: effective }).then(
+        (result) => {
+          if (!result?.ok) return;
+          if (moved) move();
+          else setModal(null);
+        },
+      );
     },
-    [modal, run, create, accountForCalendar, actions],
+    [modal, run, create, accountForCalendar, actions, guardEdit],
   );
 
   const deleteEvent = useCallback(
     (id: EventId, scope: EventScope) => {
-      setModal(null);
-      dispatch({ type: "event", eventId: null });
-      void run({ kind: "deleteEvent", eventId: id, scope });
+      const event = allEvents.find((e) => e.id === id);
+      if (event && !guardEdit(event)) return;
+      void run({ kind: "deleteEvent", eventId: id, scope }).then((result) => {
+        if (!result?.ok) return;
+        setModal(null);
+        dispatch({ type: "event", eventId: null });
+      });
     },
-    [run, dispatch],
+    [run, dispatch, allEvents, guardEdit],
   );
 
   const duplicate = useCallback(
     (event: CalendarEvent) => {
       setModal(null);
-      create(duplicateDraft(event), event.calendarId);
+      void create(duplicateDraft(event), event.calendarId);
     },
     [create],
   );
@@ -525,8 +861,14 @@ export function CalendarMode() {
         },
       ]),
 
-      // Range navigation. §4 resolves the Google/Notion conflict in Google's
-      // favour: n/p move the *range*, and event-to-event moves to Tab.
+      // Range navigation — letters only.
+      //
+      // These are Google Calendar's own: `n`/`j` forward, `p`/`k` back, `t` for
+      // today. They used to have the arrow keys too, and that was the problem:
+      // the gesture every hand reaches for first moved the *week* instead of
+      // the cursor, and the events themselves were reachable only by Tab. The
+      // letters are unchanged, so nothing anyone had learned was taken away;
+      // the arrows moved to the events, below.
       {
         keys: "j",
         group: "Calendar",
@@ -543,8 +885,6 @@ export function CalendarMode() {
         handler: () => actions.shiftPeriod(-1),
       },
       { keys: "p", when: () => active, handler: () => actions.shiftPeriod(-1) },
-      { keys: "right", when: () => active, handler: () => actions.shiftPeriod(1) },
-      { keys: "left", when: () => active, handler: () => actions.shiftPeriod(-1) },
       {
         keys: "t",
         group: "Calendar",
@@ -560,8 +900,11 @@ export function CalendarMode() {
         handler: () => setDateOpen(true),
       },
 
-      // Moving between events. Tab is the platform's "next thing"; the bare
-      // arrows are the reflex, and both land on the same step.
+      // Moving between events. Tab is the platform's "next thing"; the arrows
+      // are the reflex. Up and down are the same step as Tab — down a column
+      // and on into the next occupied day — while left and right cross to the
+      // nearest event on another day at about the same time, which is how a
+      // week of standups reads as a row rather than as seven separate columns.
       {
         keys: "tab",
         group: "Calendar",
@@ -576,8 +919,29 @@ export function CalendarMode() {
         when: () => active,
         handler: () => step(-1),
       },
-      { keys: "down", when: () => active, handler: () => step(1) },
-      { keys: "up", when: () => active, handler: () => step(-1) },
+      {
+        keys: "down",
+        group: "Calendar",
+        description: "Next event ↓ ↑, nearest event on another day ← →",
+        when: () => active,
+        handler: () => arrow("down"),
+      },
+      { keys: "up", when: () => active, handler: () => arrow("up") },
+      { keys: "right", when: () => active, handler: () => arrow("right") },
+      { keys: "left", when: () => active, handler: () => arrow("left") },
+
+      // Type to select. `/` is Gmail's search key and the palette claims it
+      // globally at priority 200 — scoped `when: () => !open`, which is true
+      // here, so this has to outrank it rather than merely coexist. In every
+      // other mode the palette still gets the key.
+      {
+        keys: "/",
+        priority: 220,
+        group: "Calendar",
+        description: "Find an event by name",
+        when: () => active,
+        handler: () => openFinder(),
+      },
 
       // Creating.
       {
@@ -762,6 +1126,17 @@ export function CalendarMode() {
         when: () => createOpen,
         handler: () => setCreateOpen(false),
       },
+      {
+        // Above the palette's own `allowInInput` Escape at 100. The finder's
+        // input has an Escape handler of its own, and it never sees the key:
+        // the keymap listens in the capture phase, so whatever it decides
+        // happens first. This is that decision.
+        keys: "escape",
+        priority: 230,
+        allowInInput: true,
+        when: () => finderOpen,
+        handler: () => closeFinder(true),
+      },
 
       // Multi-account (§7). The brief asks for ⌘1–9 here, but ⌘1/⌘2 already mean
       // "switch mode" app-wide and on macOS ⌘<digit> means "switch view" in every
@@ -811,6 +1186,10 @@ export function CalendarMode() {
       openEvent,
       openExternal,
       createOpen,
+      arrow,
+      closeFinder,
+      finderOpen,
+      openFinder,
       soloAccountAt,
       step,
       toggleCalendarAt,
@@ -898,6 +1277,61 @@ export function CalendarMode() {
         </div>
       </header>
 
+      {/* A write Google refused, said out loud and left on screen.
+          Everything on this surface writes without a dialog — a drag, a resize,
+          an arrow-key nudge, ⌘⌫ — so most failures have no modal to appear in,
+          and the status rail clears itself after six seconds. This does not
+          clear itself. It offers the same command again, because "try it again"
+          is the correct response to most of what fails here: a 5xx, a rate
+          limit, a network that came back. */}
+      {failure && !modalOpen && (
+        <div
+          role="alert"
+          className="flex shrink-0 items-center gap-2 border-b border-danger/40 bg-danger/10 px-3 py-1.5"
+        >
+          <AlertTriangle size={12} strokeWidth={1.75} className="shrink-0 text-danger" />
+          <span className="min-w-0 flex-1 truncate text-micro text-danger">{failure.message}</span>
+          <Button size="sm" variant="subtle" disabled={busy} onClick={() => void run(failure.command)}>
+            Try again
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setFailure(null)} aria-label="Dismiss">
+            <X size={12} strokeWidth={1.75} />
+          </Button>
+        </div>
+      )}
+
+      {finder && (
+        <EventFinder
+          query={finder.query}
+          onQuery={(query) => setFinder((current) => (current ? { ...current, query, index: 0 } : current))}
+          count={finderMatches.rows.length}
+          index={finder.index}
+          widened={finderMatches.widened}
+          matchStart={finderMatch?.start ?? null}
+          onEnter={() => {
+            if (!finderMatch) {
+              actions.setStatus(
+                finder.query.trim() ? "Nothing matches that" : "Type part of an event's name",
+                "info",
+              );
+              return;
+            }
+            setFinder(null);
+            openEvent(finderMatch.id);
+          }}
+          onCycle={(delta) =>
+            setFinder((current) => {
+              const total = finderMatches.rows.length;
+              if (!current || total === 0) return current;
+              // Wraps, because a list of three matches you are stepping through
+              // should not need a Shift-Tab to get back to the first one.
+              return { ...current, index: (current.index + delta + total) % total };
+            })
+          }
+          onCancel={() => closeFinder(true)}
+        />
+      )}
+
       <div className="flex min-h-0 flex-1">
         <CalendarSidebar
           accounts={accounts}
@@ -921,6 +1355,7 @@ export function CalendarMode() {
               hueFor={hueFor}
               dark={dark}
               selectedId={ui.eventId}
+              dimIds={dimIds}
               onSelect={openEvent}
             />
           ) : (
@@ -930,6 +1365,7 @@ export function CalendarMode() {
               hueFor={hueFor}
               dark={dark}
               selectedId={ui.eventId}
+              dimIds={dimIds}
               onSelect={(id) => dispatch({ type: "event", eventId: id })}
               onOpen={openEvent}
               onDraft={onGridDraft}
@@ -950,6 +1386,8 @@ export function CalendarMode() {
         merged={modalEvent ? (mergedById.get(modalEvent.id) ?? null) : null}
         defaultCalendarId={defaultCalendarId}
         recurring={modalEvent ? looksRecurring(modalEvent, allEvents) : false}
+        canEdit={modalEvent ? editable(modalEvent) : true}
+        error={failure?.message ?? null}
         busy={busy}
         onClose={closeModal}
         onSave={saveForm}

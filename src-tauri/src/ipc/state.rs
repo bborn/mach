@@ -298,6 +298,18 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
     // `Db::open` creates the directory, applies the pragmas and runs migrations.
     let db = Db::open(&config.database_path)?;
 
+    // Repairs to row *content* live here rather than in `Db::open`, which every
+    // test opens a database through: this is a property of starting the app,
+    // not of having a database. Each repair records its own completion, so this
+    // is a single indexed lookup on every boot after the first.
+    match crate::db::backfill::decode_snippets(&mut db.writer()) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("decoded HTML entities in {n} message snippets"),
+        // A failed repair must not stop the app booting: the symptom is some
+        // rows still reading `&#39;`, which is cosmetic and will be retried.
+        Err(e) => eprintln!("snippet repair failed, will retry next boot: {e}"),
+    }
+
     let tokens = config.client.clone().map(|client| {
         Arc::new(TokenManager::new(
             client,
@@ -323,11 +335,15 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
     let sync_clients = Arc::new(TransportClients::new(Arc::clone(&transport), move |account| {
         provider_for(&sync_tokens, &account.email)
     }));
-    let sync = Arc::new(SyncEngine::new(
-        db.clone(),
-        sync_clients,
-        SyncConfig::default(),
-    )?);
+    // The sync interval is the one preference this side owns, so it is read here
+    // rather than replayed from the frontend after boot — otherwise the first
+    // pass of every launch would run on the default gap regardless of what the
+    // owner chose. An unreadable or unset row leaves `SyncConfig`'s own default.
+    let mut sync_config = SyncConfig::default();
+    if let Ok(Some(interval)) = db.read(super::prefs::sync_interval) {
+        sync_config.poll_interval = interval;
+    }
+    let sync = Arc::new(SyncEngine::new(db.clone(), sync_clients, sync_config)?);
 
     let needs_reauthorization = restore_accounts(&db, &KeychainTokenStore::default())?;
 

@@ -15,6 +15,13 @@ interface ThreadRowProps {
   checked: boolean;
   /** A selection exists somewhere in the list, so the tick column is live. */
   selecting: boolean;
+  /**
+   * A word about where this row came from — the mailbox it lives in, for a
+   * list that is not one mailbox. The search view sets it; the mailbox list
+   * never does, because there the answer is the same on every row and the
+   * space belongs to the subject.
+   */
+  context?: string;
   onSelect: (event: MouseEvent) => void;
   onToggle: () => void;
 }
@@ -44,6 +51,7 @@ export const ThreadRow = memo(function ThreadRow({
   cursor,
   checked,
   selecting,
+  context,
   onSelect,
   onToggle,
 }: ThreadRowProps) {
@@ -132,6 +140,12 @@ export const ThreadRow = memo(function ThreadRow({
         </span>
         <span className="min-w-0 flex-1 truncate text-faint-foreground">{thread.snippet}</span>
       </span>
+
+      {context && (
+        <span className="shrink-0 rounded-[3px] border border-border px-1 text-micro text-faint-foreground">
+          {context}
+        </span>
+      )}
 
       {thread.starred && (
         <Star size={12} strokeWidth={2} className="shrink-0 fill-warning text-warning" />

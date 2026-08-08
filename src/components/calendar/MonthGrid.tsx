@@ -15,6 +15,11 @@ interface MonthGridProps {
   hueFor: (id: CalendarId) => HueIndex;
   dark: boolean;
   selectedId: EventId | null;
+  /**
+   * Events the type-to-select bar ruled out. They stay in place and fade, so
+   * the shape of the month is still readable while the matches stand out of it.
+   */
+  dimIds?: ReadonlySet<EventId>;
   onSelect: (id: EventId) => void;
 }
 
@@ -25,6 +30,7 @@ export function MonthGrid({
   hueFor,
   dark,
   selectedId,
+  dimIds,
   onSelect,
 }: MonthGridProps) {
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -133,6 +139,7 @@ export function MonthGrid({
                   tone={toneFor(item.event.rsvp)}
                   past={item.event.end < now}
                   selected={item.event.id === selectedId}
+                  dimmed={dimIds?.has(item.event.id) ?? false}
                   copies={item.copies.length}
                   showTime={item.event.end - item.event.start < 24 * HOUR}
                   style={{ height: 18, lineHeight: "18px", fontSize: 11, padding: "0 5px" }}

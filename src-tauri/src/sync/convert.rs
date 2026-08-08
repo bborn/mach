@@ -3,7 +3,10 @@
 //! Pure functions, no I/O and no clock, so every mapping decision here is
 //! directly testable. The sync engine calls these; nothing else should need to.
 
-use crate::db::models::{NewAttachment, NewEvent, NewLabel, NewMessage, Participant, RsvpStatus};
+use crate::db::models::{
+    EventReminder, EventReminders, NewAttachment, NewEvent, NewLabel, NewMessage, Participant,
+    RsvpStatus,
+};
 use crate::google::types as g;
 
 /// A message ready to be written, with the pieces that need row ids filled in
@@ -32,11 +35,16 @@ pub fn prepare_message(account_id: i64, msg: &g::Message) -> PreparedMessage {
         .and_then(|raw| parse_address(&raw))
         .unwrap_or_default();
 
-    let snippet = msg
-        .snippet
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| snippet_from_body(&body));
+    // Gmail's `snippet` is HTML-encoded even though it is plain text, so an
+    // apostrophe arrives as `&#39;` and the inbox row reads "Sure I&#39;m free".
+    // Decoded here, at the point the wire shape becomes ours, rather than in
+    // each of the places that display it.
+    let snippet = crate::render::entities::decode(
+        &msg.snippet
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| snippet_from_body(&body)),
+    );
 
     let label_ids = {
         let mut l = msg.label_ids.clone();
@@ -251,6 +259,21 @@ pub fn prepare_event(account_id: i64, calendar_id: &str, event: &g::Event) -> Op
         .and_then(RsvpStatus::parse);
 
     Some(NewEvent {
+        recurrence: event.recurrence.clone(),
+        reminders: event.reminders.as_ref().map(reminders_of),
+        ical_uid: event.ical_uid.clone().filter(|s| !s.is_empty()),
+        organizer: event.organizer.as_ref().and_then(|person| {
+            person.email.clone().map(|email| Participant {
+                name: person.display_name.clone().filter(|n| !n.is_empty()),
+                email,
+            })
+        }),
+        // `organizer.self` is Google's own answer to "is this event mine": it is
+        // true when the organizer is the calendar this copy appears on. Absent
+        // is not false — an event Google described without an organizer block
+        // tells us nothing, and the UI must not read silence as a refusal.
+        organizer_self: event.organizer.as_ref().map(|person| person.is_self),
+        guests_can_modify: event.guests_can_modify,
         account_id,
         calendar_id: calendar_id.to_string(),
         google_event_id,
@@ -270,6 +293,30 @@ pub fn prepare_event(account_id: i64, calendar_id: &str, event: &g::Event) -> Op
         html_link: event.html_link.clone(),
         updated_at: event.updated.as_deref().and_then(rfc3339_ms).unwrap_or(0),
     })
+}
+
+/// Google's reminder block, in the store's own shape.
+///
+/// The method is carried across verbatim rather than normalised to `popup`.
+/// Mach only ever *creates* popups, but an alert someone set to email on the
+/// web is theirs, and rewriting it on the next sync would be a silent edit to
+/// an event the user never opened.
+fn reminders_of(reminders: &g::EventReminders) -> EventReminders {
+    EventReminders {
+        // Google omits `useDefault` on an event that has explicit overrides;
+        // the presence of the block at all with no flag means "not the default".
+        use_default: reminders.use_default.unwrap_or(false),
+        overrides: reminders
+            .overrides
+            .iter()
+            .filter_map(|o| {
+                o.minutes.map(|minutes| EventReminder {
+                    method: o.method.clone().unwrap_or_else(|| "popup".to_string()),
+                    minutes,
+                })
+            })
+            .collect(),
+    }
 }
 
 /// Milliseconds for either flavour of Calendar's start/end union. All-day dates

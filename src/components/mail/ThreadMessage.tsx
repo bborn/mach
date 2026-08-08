@@ -1,7 +1,32 @@
-import { Paperclip } from "lucide-react";
-import type { Message } from "@/types";
+import { useState } from "react";
+import {
+  Download,
+  File,
+  FileArchive,
+  FileAudio,
+  FileCode,
+  FileImage,
+  FileSpreadsheet,
+  FileText,
+  FileVideo,
+  LoaderCircle,
+  Paperclip,
+  ShieldAlert,
+  TriangleAlert,
+} from "lucide-react";
+import type { Attachment, AttachmentId, Message } from "@/types";
 import { clockTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
+import {
+  attachmentKind,
+  attachmentLabel,
+  formatBytes,
+  isExecutable,
+  openAttachment,
+  saveAttachment,
+  type AttachmentKind,
+} from "@/lib/attachments";
+import { errorMessage } from "@/lib/ipc";
 import { MessageBody } from "./MessageBody";
 
 export interface ThreadMessageProps {
@@ -16,7 +41,9 @@ export interface ThreadMessageProps {
  * is only rendered while expanded.
  *
  * Collapsed messages cost nothing — no frame, no IPC, no sanitizing — which is
- * what keeps a forty-message thread cheap to open.
+ * what keeps a forty-message thread cheap to open. Attachments follow the same
+ * rule and take it further: expanding a message renders the chips, and nothing
+ * is downloaded until one of them is activated.
  */
 export function ThreadMessage({ message, live, expanded, onToggle }: ThreadMessageProps) {
   const attachments = message.attachments;
@@ -61,41 +88,183 @@ export function ThreadMessage({ message, live, expanded, onToggle }: ThreadMessa
 
           <MessageBody message={message} live={live} />
 
-          {attachments.length > 0 && (
-            <div className="mt-3 flex flex-wrap gap-2">
-              {attachments.map((attachment) => (
-                <span
-                  key={attachment.id}
-                  className="inline-flex max-w-full items-center gap-1.5 rounded-[var(--radius)] border border-border bg-surface px-2 py-1"
-                >
-                  <Paperclip
-                    size={12}
-                    strokeWidth={1.75}
-                    className="shrink-0 text-faint-foreground"
-                  />
-                  <span className="truncate text-micro text-muted-foreground">
-                    {attachment.filename}
-                  </span>
-                  <span className="shrink-0 font-mono text-micro text-faint-foreground">
-                    {formatBytes(attachment.sizeBytes)}
-                  </span>
-                </span>
-              ))}
-            </div>
-          )}
+          {attachments.length > 0 && <AttachmentRow attachments={attachments} live={live} />}
         </>
       )}
     </article>
   );
 }
 
+/* -------------------------------------------------------------------------- */
+/* Attachments                                                                 */
+/* -------------------------------------------------------------------------- */
+
+export interface AttachmentRowProps {
+  attachments: Attachment[];
+  /** False in `bun run dev` against fixtures, where there is nothing to fetch. */
+  live: boolean;
+}
+
+/**
+ * The chip row under an expanded message.
+ *
+ * # Everything works from the keyboard
+ *
+ * Each attachment is two real `<button>`s, so they are in the tab order for
+ * free, Enter and Space activate them for free, and the focus ring is the app's
+ * own. No `tabIndex`, no `onKeyDown`, no `role="button"` on a div — every one
+ * of those is a way to get *most* of a keyboard affordance and lose the part
+ * that only a screen reader would have told you about.
+ *
+ * The first button opens; the second saves. Opening is the common case and gets
+ * the whole chip; saving is the deliberate one and gets an icon beside it.
+ *
+ * # Failures are shown, not swallowed
+ *
+ * A refusal from Rust — an executable, an attachment too large, an expired
+ * grant — is a sentence the reader needs. It lands under the row rather than in
+ * a console nobody has open.
+ */
+export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
+  const [busy, setBusy] = useState<AttachmentId | null>(null);
+  const [status, setStatus] = useState<{ error: boolean; message: string } | null>(null);
+
+  async function run(id: AttachmentId, action: () => Promise<string | null>) {
+    setBusy(id);
+    setStatus(null);
+    try {
+      const message = await action();
+      setStatus(message ? { error: false, message } : null);
+    } catch (caught: unknown) {
+      setStatus({ error: true, message: errorMessage(caught) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="mt-3">
+      <ul aria-label="Attachments" className="flex list-none flex-wrap gap-2 p-0">
+        {attachments.map((attachment) => {
+          const kind = attachmentKind(attachment.mimeType, attachment.filename);
+          const Icon = ICONS[kind];
+          const label = attachmentLabel(
+            attachment.filename,
+            attachment.mimeType,
+            attachment.sizeBytes,
+          );
+          const working = busy === attachment.id;
+          const program = isExecutable(attachment.filename, attachment.mimeType);
+
+          return (
+            <li key={attachment.id} className="max-w-full">
+              <div className="flex items-stretch overflow-hidden rounded-[var(--radius)] border border-border bg-surface">
+                <button
+                  type="button"
+                  disabled={!live || working}
+                  aria-label={`Open ${label}`}
+                  title={
+                    !live
+                      ? "Attachments need the app; this is the fixture preview"
+                      : program
+                        ? "Mach will not open a program. Save it instead."
+                        : `Open ${attachment.filename}`
+                  }
+                  onClick={() =>
+                    run(attachment.id, async () => {
+                      await openAttachment(attachment.id);
+                      return null;
+                    })
+                  }
+                  className={cn(
+                    "flex min-w-0 items-center gap-1.5 px-2 py-1 text-left",
+                    "hover:bg-row-hover disabled:opacity-60",
+                  )}
+                >
+                  {working ? (
+                    <LoaderCircle
+                      size={12}
+                      strokeWidth={1.75}
+                      className="shrink-0 animate-spin text-faint-foreground"
+                    />
+                  ) : (
+                    <Icon
+                      size={12}
+                      strokeWidth={1.75}
+                      className={cn(
+                        "shrink-0",
+                        program ? "text-danger" : "text-faint-foreground",
+                      )}
+                    />
+                  )}
+                  <span className="truncate text-micro text-muted-foreground">
+                    {attachment.filename}
+                  </span>
+                  <span className="shrink-0 font-mono text-micro text-faint-foreground">
+                    {formatBytes(attachment.sizeBytes)}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!live || working}
+                  aria-label={`Save ${attachment.filename}`}
+                  title={`Save ${attachment.filename}…`}
+                  onClick={() =>
+                    run(attachment.id, async () => {
+                      const saved = await saveAttachment(attachment.id);
+                      return saved.path ? `Saved ${saved.filename}` : null;
+                    })
+                  }
+                  className={cn(
+                    "flex shrink-0 items-center border-l border-border px-1.5",
+                    "hover:bg-row-hover disabled:opacity-60",
+                  )}
+                >
+                  <Download size={12} strokeWidth={1.75} className="text-faint-foreground" />
+                </button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+
+      {status && (
+        <div
+          role="status"
+          className={cn(
+            "mt-1.5 flex items-center gap-1.5 text-micro",
+            status.error ? "text-danger" : "text-muted-foreground",
+          )}
+        >
+          {status.error && <TriangleAlert size={12} strokeWidth={1.75} className="shrink-0" />}
+          <span className="truncate">{status.message}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const ICONS: Record<AttachmentKind, typeof File> = {
+  image: FileImage,
+  audio: FileAudio,
+  video: FileVideo,
+  archive: FileArchive,
+  spreadsheet: FileSpreadsheet,
+  code: FileCode,
+  document: FileText,
+  executable: ShieldAlert,
+  file: File,
+};
+
 /** One line of the body for a collapsed row, from text we already have. */
 function preview(message: Message): string {
   return message.bodyText.replace(/\s+/g, " ").trim().slice(0, 200);
 }
 
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+/**
+ * Re-exported so the existing import site keeps working. The implementation
+ * moved to `src/lib/attachments.ts`, where it can be tested beside the rest of
+ * the attachment display decisions.
+ */
+export { formatBytes };

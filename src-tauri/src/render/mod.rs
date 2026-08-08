@@ -32,6 +32,7 @@
 //!   letting the WebView navigate;
 //! * run rendering off the UI thread, since a pathological body costs CPU.
 
+pub mod entities;
 pub mod quotes;
 pub mod sanitize;
 

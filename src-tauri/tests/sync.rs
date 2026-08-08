@@ -1694,6 +1694,82 @@ async fn an_expired_calendar_sync_token_falls_back_to_a_full_window() {
     assert_eq!(stored.as_deref(), Some("sync-2"));
 }
 
+#[tokio::test]
+async fn calendar_sync_keeps_the_fields_an_event_can_only_be_read_back_from() {
+    // Everything Google says about an event that the UI later has to show or
+    // act on: who owns it, whether a guest may edit it, what its alerts are,
+    // and the uid that ties this copy to the same meeting on another account.
+    // All four were parsed and thrown away until there were columns for them.
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+    let token = format!("tok-{account_id}");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    let mut mine = event_json(
+        "e1",
+        "Standup",
+        "2026-08-10T09:00:00Z",
+        "2026-08-10T09:15:00Z",
+    );
+    mine["iCalUID"] = json!("uid-standup@google.com");
+    mine["organizer"] = json!({ "email": "one@example.com", "displayName": "Me", "self": true });
+    mine["reminders"] = json!({
+        "useDefault": false,
+        "overrides": [{ "method": "email", "minutes": 45 }],
+    });
+
+    let mut theirs = event_json(
+        "e2",
+        "All hands",
+        "2026-08-11T14:00:00Z",
+        "2026-08-11T15:00:00Z",
+    );
+    theirs["iCalUID"] = json!("uid-allhands@google.com");
+    theirs["organizer"] = json!({ "email": "chief@elsewhere.example" });
+    theirs["guestsCanModify"] = json!(false);
+    theirs["reminders"] = json!({ "useDefault": true });
+
+    mailbox.events.insert("primary".into(), vec![mine, theirs]);
+    google.install(&token, mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    let pass = engine.sync_once().await;
+    assert!(pass.account(account_id).unwrap().is_ok());
+
+    let events = db
+        .read(|conn| queries::events_in_range(conn, 0, i64::MAX, None))
+        .unwrap();
+    assert_eq!(events.len(), 2);
+
+    let standup = &events[0];
+    assert_eq!(standup.ical_uid.as_deref(), Some("uid-standup@google.com"));
+    assert_eq!(standup.organizer_self, Some(true));
+    assert_eq!(
+        standup.organizer.as_ref().map(|p| p.email.as_str()),
+        Some("one@example.com")
+    );
+    let reminders = standup.reminders.as_ref().expect("alerts kept");
+    assert!(!reminders.use_default);
+    assert_eq!(reminders.overrides[0].minutes, 45);
+    // Not normalised to `popup`: an alert set to email on the web is theirs.
+    assert_eq!(reminders.overrides[0].method, "email");
+
+    let all_hands = &events[1];
+    // Positively not ours, which is what lets the UI stop offering an edit
+    // Google would refuse — as distinct from `None`, which means "not told".
+    assert_eq!(all_hands.organizer_self, Some(false));
+    assert_eq!(all_hands.guests_can_modify, Some(false));
+    assert_eq!(
+        all_hands.organizer.as_ref().map(|p| p.email.as_str()),
+        Some("chief@elsewhere.example")
+    );
+    assert!(all_hands.reminders.as_ref().unwrap().use_default);
+    // An instance carries no rule of its own, and inventing one would be worse
+    // than the empty list that honestly says "no rule is known here".
+    assert!(all_hands.recurrence.is_empty());
+}
+
 // ===========================================================================
 // cancellation
 // ===========================================================================

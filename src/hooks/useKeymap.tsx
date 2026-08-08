@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { createKeymap, type KeyBinding, type Keymap } from "@/lib/keymap";
+import { connectMenu } from "@/lib/menu";
 
 const KeymapContext = createContext<Keymap | null>(null);
 
@@ -36,6 +37,14 @@ export function KeymapProvider({ children }: { children: ReactNode }) {
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [keymap]);
+
+  /*
+   * The macOS menu bar feeds this same registry rather than calling into the
+   * app separately, so a menu item and its shortcut cannot drift apart. It
+   * lives here because the menu is part of the keymap, not part of the shell.
+   * Outside Tauri it is inert.
+   */
+  useEffect(() => connectMenu(keymap), [keymap]);
 
   /*
    * Shout about conflicting bindings in development.

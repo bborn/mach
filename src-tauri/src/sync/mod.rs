@@ -41,6 +41,7 @@ pub mod convert;
 pub mod mail;
 pub mod status;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -318,6 +319,20 @@ struct Inner {
     /// Global in-flight request bound, shared by every account across every
     /// pass so it actually bounds anything.
     limiter: Arc<Semaphore>,
+    /// The live value of [`SyncConfig::poll_interval`], as milliseconds.
+    ///
+    /// Seeded from the config and then owned by whoever changes the preference.
+    /// It is an atomic rather than a field on the `Arc<SyncConfig>` because the
+    /// loop reads it between passes on a task nobody holds a handle to — there
+    /// is no lock to take and nothing to wake. A change lands on the next tick,
+    /// which is the worst case one old interval away.
+    poll_interval_ms: AtomicU64,
+}
+
+impl Inner {
+    fn poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_interval_ms.load(Ordering::Relaxed))
+    }
 }
 
 /// Start it, read its status, stop it. This is the whole surface the Tauri
@@ -335,6 +350,7 @@ impl SyncEngine {
     ) -> Result<Self, SyncError> {
         db.write(sync_queries::ensure_schema)?;
         let request_concurrency = config.request_concurrency.max(1);
+        let poll_interval_ms = AtomicU64::new(config.poll_interval.as_millis() as u64);
         Ok(Self {
             inner: Arc::new(Inner {
                 db,
@@ -344,6 +360,7 @@ impl SyncEngine {
                 status: StatusSink::new(),
                 wake: Notify::new(),
                 limiter: Arc::new(Semaphore::new(request_concurrency)),
+                poll_interval_ms,
             }),
             loop_handle: Mutex::new(None),
         })
@@ -388,6 +405,23 @@ impl SyncEngine {
     /// Ask the running loop to start a pass now rather than at the next tick.
     pub fn sync_now(&self) {
         self.inner.wake.notify_one();
+    }
+
+    /// The gap the loop is currently sleeping for between passes.
+    pub fn poll_interval(&self) -> Duration {
+        self.inner.poll_interval()
+    }
+
+    /// Change that gap without restarting anything.
+    ///
+    /// This is what the sync-interval preference writes through. It takes effect
+    /// on the next tick rather than interrupting the sleep in progress: waking
+    /// the loop would start a *pass*, and "I made syncing less frequent" should
+    /// not put a request on the wire.
+    pub fn set_poll_interval(&self, interval: Duration) {
+        self.inner
+            .poll_interval_ms
+            .store(interval.as_millis().max(1) as u64, Ordering::Relaxed);
     }
 
     /// Run exactly one pass over every account, inline. This is what the tests
@@ -442,7 +476,7 @@ async fn run_loop(inner: Arc<Inner>) {
             biased;
             () = inner.cancel.cancelled() => break,
             () = inner.wake.notified() => {}
-            () = tokio::time::sleep(inner.config.poll_interval) => {}
+            () = tokio::time::sleep(inner.poll_interval()) => {}
         }
     }
     inner.status.set_running(false);

@@ -30,7 +30,84 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: M3_REPLY_TO,
     },
+    Migration {
+        version: 4,
+        sql: M4_PREFERENCES,
+    },
+    Migration {
+        version: 5,
+        sql: M5_EVENT_ROUND_TRIP,
+    },
 ];
+
+/// Migration 5 — the six event fields that were sent but never kept.
+///
+/// Every column here closes the same kind of hole: something Mach knew at write
+/// time, or that Google told us at read time, which had nowhere to live and was
+/// therefore forgotten before the next render.
+///
+///  * `recurrence` — the RRULE lines. They were write-only, so an event created
+///    as weekly came back as an ordinary meeting, and the modal could neither
+///    show its rule nor leave that rule alone while editing something else.
+///  * `reminders` — the same story for alerts, kept in Google's own shape
+///    (`useDefault` plus overrides) rather than as a bare minute count, because
+///    "the calendar's default" and "no reminder at all" are different states
+///    and one nullable integer cannot tell them apart.
+///  * `ical_uid` — the identity that survives a meeting being copied onto two
+///    accounts. Without it the same invitation on two of the owner's calendars
+///    is two unrelated blocks; `calendar-merge.ts` has been waiting for it.
+///  * `organizer` / `organizer_self` — who owns the event, and whether that is
+///    us. Google refuses a write from a non-organizer, so this is what lets the
+///    UI stop offering an edit that could only ever fail.
+///  * `guests_can_modify` — the one exception to the above, and the reason
+///    ownership on its own is not the whole permission answer.
+///
+/// Every column is nullable, so existing rows migrate with no backfill and read
+/// back as "we do not know" — which each consumer treats as permissive rather
+/// than as a denial. The next sync pass fills them in.
+const M5_EVENT_ROUND_TRIP: &str = r#"
+ALTER TABLE events ADD COLUMN recurrence        TEXT;
+ALTER TABLE events ADD COLUMN reminders         TEXT;
+ALTER TABLE events ADD COLUMN ical_uid          TEXT;
+ALTER TABLE events ADD COLUMN organizer         TEXT;
+ALTER TABLE events ADD COLUMN organizer_self    INTEGER;
+ALTER TABLE events ADD COLUMN guests_can_modify INTEGER;
+
+-- Cross-account identity is a lookup by uid at a given instant, never by uid
+-- alone: two copies of one meeting share a uid *and* a start, while every
+-- occurrence of a series shares its master's uid and differs only in start.
+CREATE INDEX idx_events_ical_uid ON events (ical_uid, start_ts) WHERE ical_uid IS NOT NULL;
+"#;
+
+/// Migration 4 — `preferences`.
+///
+/// One row per setting, the value a JSON document.
+///
+/// A column per preference is the obvious alternative and it is the wrong one.
+/// Every new setting would be a migration, which means the cost of *adding* a
+/// preference is a schema change and a release — and the whole reason this app
+/// had none for so long is that the cost of the first one was never paid. Here
+/// it is an insert.
+///
+/// It also makes the two directions of drift harmless. A database written by a
+/// newer build can hold keys this build has never heard of; the reader ignores
+/// them rather than failing. A preference that is removed leaves a row nobody
+/// reads instead of a column nobody can drop.
+///
+/// The value is JSON in a `TEXT` column because the settings are not one type:
+/// a signature is a string, a week start is a number, working hours are a pair.
+/// One typed column could only hold all three by carrying a discriminator
+/// beside it, which is JSON with extra steps.
+///
+/// `WITHOUT ROWID` because the whole table is its primary key: a handful of
+/// short keys read together at boot, never scanned, never joined.
+const M4_PREFERENCES: &str = r#"
+CREATE TABLE preferences (
+    key        TEXT    NOT NULL PRIMARY KEY,
+    value      TEXT    NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+"#;
 
 /// Migration 3 — `messages.reply_to`.
 ///

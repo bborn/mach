@@ -98,9 +98,22 @@ export function blockHeight(durationMs: number): number {
  * of the viewport, while still showing what just happened. The lower clamp
  * stops an early morning opening on a wall of empty night.
  */
-export function nowScrollTop(now: number, dayStart: number, viewportHeight: number): number {
+export function nowScrollTop(
+  now: number,
+  dayStart: number,
+  viewportHeight: number,
+  /**
+   * The earliest hour worth showing, in hours since midnight.
+   *
+   * 6.5 was the measured default — half an hour of air above a seven o'clock
+   * start. It is a parameter so the working-hours preference can move it: on a
+   * day that starts at ten, opening the grid on half past six wastes a third of
+   * the viewport on hours nothing is ever in.
+   */
+  floorHours = 6.5,
+): number {
   const nowOffset = offsetForTime(now, dayStart);
-  const floor = 6.5 * HOUR_HEIGHT;
+  const floor = floorHours * HOUR_HEIGHT;
   const ceiling = 24 * HOUR_HEIGHT - viewportHeight;
   return clamp(nowOffset - 0.25 * viewportHeight, floor, ceiling);
 }

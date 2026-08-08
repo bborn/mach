@@ -16,20 +16,29 @@ import { AgentDock } from "@/components/agent/AgentDock";
 import { PluginProvider } from "@/hooks/usePlugins";
 import { PluginAskDialog } from "@/components/plugins/PluginAskDialog";
 import { PluginsPanel } from "@/components/plugins/PluginsPanel";
+import { PreferencesProvider } from "@/components/prefs/PreferencesProvider";
+import { PreferencesDialog } from "@/components/prefs/PreferencesDialog";
+import { SessionMemory } from "@/components/prefs/SessionMemory";
 
 export default function App() {
   return (
     <KeymapProvider>
-      <MachProvider>
-        {/*
-          Inside `MachProvider` because a plugin acts through the same actions
-          the keyboard does, and outside `Shell` because its ⌘K entries and
-          keybindings have to be registered before anything can reach for them.
-        */}
-        <PluginProvider>
-          <Shell />
-        </PluginProvider>
-      </MachProvider>
+      {/*
+        Outside `MachProvider` because `useMach` reads it: the theme is a
+        preference now, and `ui.theme` mirrors it rather than owning it.
+      */}
+      <PreferencesProvider>
+        <MachProvider>
+          {/*
+            Inside `MachProvider` because a plugin acts through the same actions
+            the keyboard does, and outside `Shell` because its ⌘K entries and
+            keybindings have to be registered before anything can reach for them.
+          */}
+          <PluginProvider>
+            <Shell />
+          </PluginProvider>
+        </MachProvider>
+      </PreferencesProvider>
     </KeymapProvider>
   );
 }
@@ -105,6 +114,42 @@ function Shell() {
       allowInInput: true,
       when: () => shortcuts !== null,
       handler: () => {},
+    },
+    /*
+     * ⌘Z and ⇧⌘Z — global, because undo is.
+     *
+     * Three things had to be true at once here, and all three are properties
+     * of the registry rather than of this handler:
+     *
+     *  * **Text editing keeps ⌘Z.** No `allowInInput`, so the dispatcher drops
+     *    these bindings entirely while focus is in the composer, an address
+     *    field or the palette — and because nothing matched, nothing calls
+     *    `preventDefault`, so the WebView's own undo handles the keystroke and
+     *    ⌘Z means "un-type that" exactly where it should.
+     *  * **The feedback dialog keeps winning.** Its ⌘Z is registered at
+     *    priority 300 to undo an annotation stroke; the composer's undo-send
+     *    sits at 120 inside its ten seconds. Both outrank this, so this is the
+     *    one that gives way — and because they differ in priority,
+     *    `conflicts()` sees no tie and reports nothing new.
+     *  * **A double fire is harmless.** ⌘Z can arrive from the keyboard and
+     *    from the Edit menu, and `runUndo` pops the stack through a ref before
+     *    it dispatches anything, so the second arrival takes the next entry
+     *    rather than running this one's inverse twice.
+     *
+     * Mode-scoped `z` stays exactly where it was in mail and the calendar —
+     * Gmail's key, the same action, the same stack.
+     */
+    {
+      keys: "mod+z",
+      group: "Global",
+      description: "Undo",
+      handler: () => actions.undo(),
+    },
+    {
+      keys: "shift+mod+z",
+      group: "Global",
+      description: "Redo",
+      handler: () => actions.redo(),
     },
     {
       keys: "mod+1",
@@ -216,6 +261,10 @@ function Shell() {
       <FeedbackDialog />
       <PluginAskDialog />
       <PluginsPanel />
+      <PreferencesDialog />
+      {/* Renders nothing; it is the one place `ui` and the store are both in
+          scope, which is what remembering where the window was needs. */}
+      <SessionMemory />
     </div>
   );
 }

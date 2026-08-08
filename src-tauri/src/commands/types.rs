@@ -56,10 +56,18 @@ impl EventScope {
 
 /// Everything needed to bring an event into being.
 ///
-/// `recurrence` and `reminderMinutes` are write-only: the local store has no
-/// column for either (rows are expanded instances, and reminders are Google's
-/// business), so they can be *sent* but never read back. That asymmetry is why
-/// an [`EventPatch`] inverse never carries them — see [`Command::UpdateEvent`].
+/// `recurrence` and `reminderMinutes` used to be write-only — sendable but with
+/// nowhere local to land, so an event created weekly came back a one-off.
+/// Migration 5 gave both a column and they now round trip; an [`EventPatch`]
+/// inverse can carry a recurrence rule.
+///
+/// One asymmetry survives, and the modal has to say so out loud: Google has
+/// *three* reminder states — the calendar's default, an explicit set of alerts,
+/// and none at all — while `reminderMinutes` is an `Option<i64>` that can only
+/// name two of them. There is no way to spell "go back to the default" here,
+/// which is why a reminder edit only inverts when the prior state was
+/// expressible. Widening this to Google's `{useDefault, overrides}` shape is
+/// the fix, and it belongs with whoever next owns this file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct EventDraft {
@@ -108,8 +116,13 @@ impl EventPatch {
         self.start_ts.is_some() || self.end_ts.is_some() || self.is_all_day.is_some()
     }
 
-    /// True when the patch names something the local store cannot read back,
-    /// and which therefore cannot appear in an inverse.
+    /// True when the patch names something that cannot appear in an inverse.
+    ///
+    /// Since migration 5 both fields *do* read back, so `calendar.rs` no longer
+    /// consults this before building an inverse — it inverts recurrence
+    /// directly and decides about reminders from whether the prior state can be
+    /// spoken (see [`EventDraft`]). Kept because the question it answers is
+    /// still a real one and callers outside the calendar may need it.
     pub fn touches_write_only(&self) -> bool {
         self.recurrence.is_some() || self.reminder_minutes.is_some()
     }

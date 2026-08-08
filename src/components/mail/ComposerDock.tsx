@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
+import { usePreferences } from "@/components/prefs/PreferencesProvider";
+import { composeAccountId, sendDelayMs, signatureFor, withSignature } from "@/lib/prefs";
 import { Kbd } from "@/components/ui/kbd";
 import { Composer } from "./Composer";
 import { clockTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import {
   COMPOSER_KEYS,
-  UNDO_WINDOW_MS,
   createAutosave,
   discardDraft,
   flushOutbox,
@@ -33,7 +34,8 @@ import {
  * # The undo window
  *
  * `⌘⏎` does not send. It queues: Rust builds the RFC822 bytes, commits them to
- * SQLite with a `sendAfter` ten seconds out, and writes the reply into the
+ * SQLite with a `sendAfter` the send-delay preference away — ten seconds unless
+ * ⌘, says otherwise, and zero is a legal answer — and writes the reply into the
  * thread so the conversation repaints immediately. This component then shows a
  * strip with a countdown, and when the countdown reaches zero asks Rust to
  * flush. Undo deletes the row before anything has left, and puts the text back
@@ -45,8 +47,27 @@ import {
  */
 export function ComposerDock() {
   const { ui, detail, accounts, actions } = useMach();
+  const prefs = usePreferences();
   const threadId = ui.threadId;
   const active = ui.mode === "mail" && !ui.paletteOpen;
+
+  /**
+   * Put the account's signature under a draft that has not been written in yet.
+   *
+   * Only an empty body gets one. A draft that came back from SQLite with text
+   * in it has already been signed — or deliberately unsigned — and appending
+   * again would either duplicate the block or undo a decision. `withSignature`
+   * is idempotent as a second line of defence, but the emptiness check is the
+   * one that respects "I deleted my signature on this one".
+   */
+  const signed = useCallback(
+    (draft: Draft): Draft => {
+      const signature = signatureFor(prefs, draft.accountId);
+      if (!signature || draft.body.trim() !== "") return draft;
+      return { ...draft, body: withSignature(draft.body, signature) };
+    },
+    [prefs],
+  );
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [pending, setPending] = useState<OutboxEntry | null>(null);
@@ -108,10 +129,13 @@ export function ComposerDock() {
           actions.setStatus(errorMessage(error), "error");
           return null;
         });
-        if (prepared) setDraft(prepared);
+        // `prepare` reads the thread — its account, its recipients, its
+        // References header — and comes back with an empty body. The signature
+        // is the one thing it cannot know, because it is not in the thread.
+        if (prepared) setDraft(signed(prepared));
       })();
     },
-    [threadId, actions],
+    [threadId, actions, signed],
   );
 
   /**
@@ -128,18 +152,22 @@ export function ComposerDock() {
    */
   const openNew = useCallback(
     (to?: string) => {
-      const accountId = ui.accountId ?? accounts[0]?.id;
+      // The account the list is scoped to, then the preference, then the first
+      // one — see `composeAccountId`. This is the *only* composer route with a
+      // choice to make: every other one is answering a thread that already
+      // belongs to an account.
+      const accountId = composeAccountId(prefs, accounts, ui.accountId);
       if (accountId === undefined) {
         actions.setStatus("Add an account before writing a message", "error");
         return;
       }
-      const blank = newDraft(accountId);
+      const blank = signed(newDraft(accountId));
       // ⌘K's "write to this person" arrives here with an address already in
       // hand; `c` arrives with none, and the composer puts the cursor in the
       // To field for exactly that case.
       setDraft(to ? { ...blank, to: [{ email: to }] } : blank);
     },
-    [ui.accountId, accounts, actions],
+    [ui.accountId, accounts, actions, prefs, signed],
   );
 
   // The reading pane's reply button lives in another unit's file, so it asks
@@ -201,6 +229,9 @@ export function ComposerDock() {
 
   /* --------------------------------------------------------------- sending */
 
+  /** How long a queued message waits before it actually leaves. */
+  const delay = sendDelayMs(prefs);
+
   const send = useCallback(
     (scheduleAt?: number) => {
       if (!draft) return;
@@ -212,7 +243,11 @@ export function ComposerDock() {
       setBusy(true);
       void (async () => {
         try {
-          const result = await sendDraft(draft, scheduleAt);
+          // ⌃S already named an instant; an ordinary send names one too, out of
+          // the preference. Rust falls back to its own ten seconds when no
+          // instant arrives, so passing it explicitly is what makes the setting
+          // the authority rather than a suggestion.
+          const result = await sendDraft(draft, scheduleAt ?? Date.now() + delay);
           recalled.current = draft;
           setPending(result.entry);
           setDraft(null);
@@ -226,7 +261,7 @@ export function ComposerDock() {
         }
       })();
     },
-    [draft, autosave, actions],
+    [draft, autosave, actions, delay],
   );
 
   const recall = useCallback(async () => {
@@ -298,7 +333,18 @@ export function ComposerDock() {
 
   if (pending && pending.state === "holding") {
     const remaining = Math.max(0, Math.ceil((pending.sendAfter - now) / 1000));
-    const scheduled = pending.sendAfter - pending.createdAt > UNDO_WINDOW_MS;
+    /*
+     * Scheduled, or just waiting out its window?
+     *
+     * The difference is what the strip says — a clock time versus a countdown —
+     * and it is decided by comparing the wait against the send delay in force.
+     * The second of slack matters: the delay is applied to a `Date.now()` read
+     * a few milliseconds before Rust reads its own, so an exact comparison
+     * would call every ordinary send a schedule. An entry recovered from a
+     * previous session is measured against today's preference, which is the
+     * best available answer and wrong only in the direction of showing a clock.
+     */
+    const scheduled = pending.sendAfter - pending.createdAt > delay + 1000;
     return (
       <div className="shrink-0 border-t border-border bg-surface">
         <div

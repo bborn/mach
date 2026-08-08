@@ -196,6 +196,54 @@ fn migrations_are_idempotent() {
 }
 
 #[test]
+fn an_older_database_gains_the_new_event_columns_without_losing_its_events() {
+    // The upgrade path, not the fresh-install path: `ALTER TABLE` runs against a
+    // populated `events`, and every new column has to read back as "we were
+    // never told" rather than as a value nobody meant.
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let target = schema::MIGRATIONS
+        .iter()
+        .map(|m| m.version)
+        .filter(|v| *v < schema::LATEST_VERSION)
+        .max()
+        .expect("a version before the newest");
+
+    for migration in schema::MIGRATIONS.iter().filter(|m| m.version <= target) {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.sql).unwrap();
+        tx.pragma_update(None, "user_version", migration.version)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    conn.execute(
+        "INSERT INTO accounts (id, email, token_ref) VALUES (1, 'a@example.com', '')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO events (account_id, calendar_id, google_event_id, title, start_ts, end_ts)
+         VALUES (1, 'primary', 'evt-1', 'Standup', 10, 20)",
+        [],
+    )
+    .unwrap();
+
+    assert_eq!(schema::migrate(&mut conn).unwrap(), schema::LATEST_VERSION);
+
+    let events = q::events_in_range(&conn, 0, 100, None).unwrap();
+    assert_eq!(events.len(), 1, "the row survived the ALTER");
+    assert_eq!(events[0].title, "Standup");
+    assert!(events[0].recurrence.is_empty());
+    assert!(events[0].reminders.is_none());
+    assert!(events[0].ical_uid.is_none());
+    // Not `Some(false)`. "We do not know who organized this" must not read as
+    // "you are not the organizer", or the first launch after the upgrade would
+    // make every pre-existing event uneditable until the next sync.
+    assert_eq!(events[0].organizer_self, None);
+    assert_eq!(events[0].guests_can_modify, None);
+}
+
+#[test]
 fn pragmas_are_configured_for_a_desktop_app() {
     let t = TempDb::new("pragma");
     let conn = t.reader();
@@ -724,6 +772,7 @@ fn deleting_an_account_cascades_to_everything_it_owns() {
                 status: "confirmed".into(),
                 html_link: None,
                 updated_at: 0,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -841,6 +890,7 @@ fn events_in_range_spans_accounts_and_clips_to_the_window() {
                     status: "confirmed".into(),
                     html_link: None,
                     updated_at: 0,
+                    ..Default::default()
                 },
             )
             .unwrap();

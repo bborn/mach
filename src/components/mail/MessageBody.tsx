@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronUp, ImageOff, TriangleAlert } from "lucide-react";
 import type { Message } from "@/types";
 import { errorMessage } from "@/lib/ipc";
@@ -9,8 +9,12 @@ import {
   BLOCK_ALL_REMOTE_IMAGES,
   type RenderedMessage,
 } from "@/lib/message-body";
+import { applyInlineImages, contentIdsIn, fetchInlineImages } from "@/lib/attachments";
 import { Button } from "@/components/ui/button";
 import { MessageFrame } from "./MessageFrame";
+
+/** Nothing resolved yet. Hoisted so it is one stable identity, not a new Map per render. */
+const NO_INLINE_IMAGES: ReadonlyMap<string, string> = new Map();
 
 export interface MessageBodyProps {
   message: Message;
@@ -42,18 +46,31 @@ export interface MessageBodyProps {
  * click buys a read receipt on everything that address sends afterwards.
  * Clicking again costs a click. The choice also resets when the message is
  * closed, because nothing persists it.
+ *
+ * # Inline images are not the same choice
+ *
+ * A `cid:` image is a part of this message. It was delivered with it, fetching
+ * it tells the sender nothing they do not already know, and there is no version
+ * of "load images" a reader should have to click to see the chart in the mail
+ * they are reading. So inline images resolve automatically for an expanded
+ * message, independently of `allowRemoteImages` — which is exactly how the
+ * sanitizer already counts them (see `render::sanitize`, which does *not* put
+ * them in `blockedRemoteImages`).
  */
 export function MessageBody({ message, live }: MessageBodyProps) {
   const [allowRemoteImages, setAllowRemoteImages] = useState(!BLOCK_ALL_REMOTE_IMAGES);
   const [rendered, setRendered] = useState<RenderedMessage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [quotedOverride, setQuotedOverride] = useState<boolean | null>(null);
+  const [inlineImages, setInlineImages] =
+    useState<ReadonlyMap<string, string>>(NO_INLINE_IMAGES);
 
   // A different message is a different decision.
   useEffect(() => {
     setAllowRemoteImages(!BLOCK_ALL_REMOTE_IMAGES);
     setQuotedOverride(null);
     setRendered(null);
+    setInlineImages(NO_INLINE_IMAGES);
   }, [message.id]);
 
   useEffect(() => {
@@ -79,17 +96,56 @@ export function MessageBody({ message, live }: MessageBodyProps) {
     };
   }, [message.id, message.bodyText, allowRemoteImages, live]);
 
-  if (!rendered) {
+  /*
+   * Resolve the `cid:` references the sanitizer left behind.
+   *
+   * Runs only for a message the reader has expanded — this component is not
+   * mounted for a collapsed one — and only when the sanitizer actually found
+   * references, so an ordinary message makes no call at all. Each reference is
+   * settled independently inside `fetchInlineImages`, so one missing part
+   * leaves one placeholder rather than dropping the whole set.
+   */
+  // Only assembled when there is something to look for: a body can be eight
+  // megabytes, and concatenating both halves on every render to find nothing
+  // would be a copy per keystroke elsewhere in the app.
+  const inlineCount = rendered?.inlineCidImages ?? 0;
+  const cidHtml = inlineCount > 0 && rendered ? rendered.html + rendered.quotedHtml : "";
+  useEffect(() => {
+    if (!live || inlineCount === 0) return;
+    const contentIds = contentIdsIn(cidHtml);
+    if (contentIds.length === 0) return;
+
+    let cancelled = false;
+    void fetchInlineImages(message.id, contentIds).then((resolved) => {
+      if (!cancelled && resolved.size > 0) setInlineImages(resolved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [live, message.id, inlineCount, cidHtml]);
+
+  // The body the frame actually renders, with any resolved inline image
+  // substituted for its placeholder pixel.
+  const withImages = useMemo(() => {
+    if (!rendered || inlineImages.size === 0) return rendered;
+    return {
+      ...rendered,
+      html: applyInlineImages(rendered.html, inlineImages),
+      quotedHtml: applyInlineImages(rendered.quotedHtml, inlineImages),
+    };
+  }, [rendered, inlineImages]);
+
+  if (!withImages) {
     return <div className="mt-3 text-list text-faint-foreground">Rendering…</div>;
   }
 
   return (
     <MessageBodyView
-      rendered={rendered}
+      rendered={withImages}
       subject={message.from.name}
       allowRemoteImages={allowRemoteImages}
       onLoadRemoteImages={() => setAllowRemoteImages(true)}
-      quotedOpen={quotedOverride ?? shouldAutoExpandQuote(rendered)}
+      quotedOpen={quotedOverride ?? shouldAutoExpandQuote(withImages)}
       onToggleQuoted={(open) => setQuotedOverride(open)}
       error={error}
     />

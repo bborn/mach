@@ -545,7 +545,10 @@ function localForget(draftId: string): void {
 
 function localSend(draft: Draft, scheduleAt?: number): SendResult {
   const now = Date.now();
-  const sendAfter = scheduleAt && scheduleAt > now ? scheduleAt : now + UNDO_WINDOW_MS;
+  // Mirrors `ipc::compose`: a named instant wins, whatever it is. It used to
+  // have to be in the future, which quietly turned "send with no delay at all"
+  // — a legal setting — back into the default ten seconds in a browser tab.
+  const sendAfter = scheduleAt == null ? now + UNDO_WINDOW_MS : Math.max(scheduleAt, now);
   const entry: OutboxEntry = {
     id: `ob-local-${now}`,
     accountId: draft.accountId,

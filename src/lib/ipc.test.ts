@@ -224,6 +224,61 @@ describe("requests", () => {
     expect(oneOff.htmlLink).toBeUndefined();
   });
 
+  it("carries the round-trip fields migration 5 added", async () => {
+    // This mapper builds a fresh object literal, so a field nobody names is
+    // dropped in silence — no type error, because `WireEvent` is our own
+    // description of the wire rather than something generated from it. It has
+    // now happened twice: once to `recurringEventId`/`htmlLink`, and once to
+    // everything below, which was stored, synced and rendered but never
+    // arrived. This test is the tripwire.
+    const { transport } = fakeTransport({
+      list_events: [
+        {
+          id: 1,
+          accountId: 1,
+          calendarId: "c",
+          title: "Weekly",
+          startTs: 100,
+          endTs: 150,
+          recurrence: ["RRULE:FREQ=WEEKLY"],
+          reminders: { useDefault: false, overrides: [{ method: "popup", minutes: 10 }] },
+          iCalUID: "uid-abc@google.com",
+          organizerSelf: true,
+          guestsCanModify: false,
+        },
+      ],
+    });
+
+    const [event] = await createIpcSource(transport).listEvents({ start: 0, end: 999 });
+
+    expect(event.recurrence).toEqual(["RRULE:FREQ=WEEKLY"]);
+    expect(event.reminders).toEqual({
+      useDefault: false,
+      overrides: [{ method: "popup", minutes: 10 }],
+    });
+    expect(event.iCalUID).toBe("uid-abc@google.com");
+    expect(event.organizerSelf).toBe(true);
+    expect(event.guestsCanModify).toBe(false);
+  });
+
+  it("keeps 'Google did not say' distinct from 'no'", async () => {
+    // Collapsing an absent `organizerSelf` to `false` would make every row
+    // written before migration 5 read-only until it next synced.
+    const { transport } = fakeTransport({
+      list_events: [
+        { id: 1, accountId: 1, calendarId: "c", title: "Old row", startTs: 100, endTs: 150 },
+      ],
+    });
+
+    const [event] = await createIpcSource(transport).listEvents({ start: 0, end: 999 });
+
+    expect(event.organizerSelf).toBeUndefined();
+    expect(event.guestsCanModify).toBeUndefined();
+    expect(event.recurrence).toBeUndefined();
+    expect(event.reminders).toBeUndefined();
+    expect(event.iCalUID).toBeUndefined();
+  });
+
   it("names the thread id argument the way the Tauri command declares it", async () => {
     const { transport, calls } = fakeTransport({
       get_thread: {

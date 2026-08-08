@@ -1,6 +1,6 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useState } from "react";
 import type { Account, Calendar, CalendarId, AccountId } from "@/types";
+import { useUiSession } from "@/components/prefs/PreferencesProvider";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { calendarFill, type HueIndex } from "@/lib/calendar-palette";
@@ -45,7 +45,18 @@ export function CalendarSidebar({
   settings,
   onSettings,
 }: SidebarProps) {
-  const [collapsed, setCollapsed] = useState<AccountId[]>([]);
+  /*
+   * Which account groups are folded up — remembered across launches.
+   *
+   * This was `useState([])`, so a five-account sidebar that had been tidied
+   * down to one open group came back fully expanded every morning. It is
+   * session state, not a setting: nobody would look for it in ⌘,, and the app
+   * simply ought to be where you left it.
+   */
+  const { session, remember } = useUiSession();
+  const collapsed = session.collapsedCalendarAccounts ?? [];
+  const setCollapsed = (next: AccountId[]) =>
+    remember({ collapsedCalendarAccounts: next });
 
   const groups = accounts.map((account) => ({
     account,
@@ -73,10 +84,10 @@ export function CalendarSidebar({
               <button
                 type="button"
                 onClick={() =>
-                  setCollapsed((prev) =>
-                    prev.includes(account.id)
-                      ? prev.filter((id) => id !== account.id)
-                      : [...prev, account.id],
+                  setCollapsed(
+                    collapsed.includes(account.id)
+                      ? collapsed.filter((id) => id !== account.id)
+                      : [...collapsed, account.id],
                   )
                 }
                 className="flex min-w-0 flex-1 items-center gap-1 text-left text-micro text-muted-foreground hover:text-foreground"

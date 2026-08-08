@@ -75,6 +75,32 @@ pub fn search_threads(db: &Db, query: &str, limit: Option<u32>) -> Result<Thread
     Ok(ThreadPage::complete(items))
 }
 
+/// The same box, once it has operators in it.
+///
+/// `search_threads` above is the ⌘K path: a bag of words, ranked by bm25, six
+/// rows deep. This is the search *view*: a parsed query compiled to SQL, in the
+/// same newest-first order as the mailbox next to it, and paginated with the
+/// same keyset cursor — which is why it returns a `paged` page rather than a
+/// `complete` one. The parse arrives from the frontend; see
+/// `db::queries::compile_search` for why the AST rather than the text crosses
+/// the seam.
+pub fn search_threads_filtered(
+    db: &Db,
+    filter: &queries::SearchNode,
+    request: &queries::SearchRequest,
+) -> Result<ThreadPage, IpcError> {
+    let limit = match request.limit {
+        0 => queries::DEFAULT_PAGE_SIZE,
+        n => n.min(queries::MAX_PAGE_SIZE),
+    };
+    let request = queries::SearchRequest {
+        limit,
+        ..request.clone()
+    };
+    let items = db.read(|conn| queries::search_threads_filtered(conn, filter, &request))?;
+    Ok(ThreadPage::paged(items, limit))
+}
+
 /// Every calendar the store holds events for. See [`Calendar`] for why this is
 /// derived rather than stored.
 pub fn list_calendars(db: &Db) -> Result<Vec<Calendar>, IpcError> {

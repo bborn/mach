@@ -23,8 +23,8 @@ use mach_lib::commands::{
     ThreadLabelState,
 };
 use mach_lib::db::models::{
-    Event, LabelType, NewAccount, NewEvent, NewLabel, NewMessage, NewThread, Participant,
-    RsvpStatus,
+    Event, EventReminder, EventReminders, LabelType, NewAccount, NewEvent, NewLabel, NewMessage,
+    NewThread, Participant, RsvpStatus,
 };
 use mach_lib::db::{queries, Db};
 use mach_lib::google::{
@@ -1858,6 +1858,617 @@ async fn an_unknown_event_is_a_typed_error_before_anything_is_written() {
 
     assert_eq!(err.kind(), "unknownEvent");
     assert_eq!(transport.call_count(), 0);
+}
+
+// ======================================= calendar: the fields that round trip
+//
+// Everything below pins the same claim from a different angle: what Mach sends
+// to Google, and what Google says back, is *kept* — so reopening the modal
+// shows the event that was saved rather than a lossy shadow of it. Each of
+// these fields used to be write-only, and each one had a visible symptom:
+// a weekly meeting that reopened as "does not repeat", an alert that vanished,
+// the same invitation drawn twice because nothing tied the two copies together,
+// and an edit offered on someone else's event that Google would only refuse.
+
+#[tokio::test]
+async fn a_recurring_create_stores_the_rule_it_sent() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"series","iCalUID":"uid-weekly@google.com"}"#,
+    ))]);
+    let d = dispatcher(&db, transport.clone());
+
+    d.execute(Command::CreateEvent {
+        account_id: account,
+        calendar_id: "primary".into(),
+        draft: EventDraft {
+            recurrence: vec!["RRULE:FREQ=WEEKLY;BYDAY=FR".into()],
+            reminder_minutes: Some(vec![10]),
+            ..timed_draft("Weekly", NOON, 1)
+        },
+    })
+    .await
+    .unwrap();
+
+    let event = &all_events(&db)[0];
+    // Google will never tell us this again: `singleEvents=true` returns
+    // occurrences, and an occurrence carries no rule. Create time is the only
+    // moment it is knowable, so it is the moment it is written down.
+    assert_eq!(event.recurrence, vec!["RRULE:FREQ=WEEKLY;BYDAY=FR"]);
+    let reminders = event.reminders.as_ref().expect("reminders stored");
+    assert!(!reminders.use_default);
+    assert_eq!(reminders.overrides[0].minutes, 10);
+    assert_eq!(reminders.overrides[0].method, "popup");
+    // The uid is minted by Google and adopted from the insert's answer. It is
+    // what lets the copy of this meeting on another account be recognised as
+    // the same meeting rather than drawn beside it.
+    assert_eq!(event.ical_uid.as_deref(), Some("uid-weekly@google.com"));
+    // We made it, so we own it — and the UI reads that to decide whether to
+    // offer an edit at all.
+    assert_eq!(event.organizer_self, Some(true));
+    assert_eq!(
+        event.organizer.as_ref().map(|p| p.email.as_str()),
+        Some("a@example.com")
+    );
+}
+
+#[tokio::test]
+async fn a_sync_that_expands_a_series_does_not_erase_the_rule_it_expanded() {
+    // The exact shape of "I made it weekly and it came back as a one-off": the
+    // create writes the rule, then the next sync overwrites that row with the
+    // expanded instance — which carries no rule at all.
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let transport =
+        FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"series"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    d.execute(Command::CreateEvent {
+        account_id: account,
+        calendar_id: "primary".into(),
+        draft: EventDraft {
+            recurrence: vec!["RRULE:FREQ=WEEKLY".into()],
+            ..timed_draft("Weekly", NOON, 1)
+        },
+    })
+    .await
+    .unwrap();
+    let created = all_events(&db)[0].google_event_id.clone();
+
+    // Sync, writing the same row back exactly as `events.list` describes it.
+    db.write(|c| {
+        queries::upsert_event(
+            c,
+            &NewEvent {
+                account_id: account,
+                calendar_id: "primary".into(),
+                google_event_id: created.clone(),
+                title: "Weekly".into(),
+                start_ts: NOON,
+                end_ts: NOON + HOUR_MS,
+                recurring_event_id: Some("series".into()),
+                status: "confirmed".into(),
+                ..Default::default()
+            },
+        )
+    })
+    .unwrap();
+
+    assert_eq!(all_events(&db)[0].recurrence, vec!["RRULE:FREQ=WEEKLY"]);
+
+    // And the sibling occurrences Google expands out of the same series inherit
+    // it, so every block of the series agrees about how it repeats.
+    db.write(|c| {
+        queries::upsert_event(
+            c,
+            &NewEvent {
+                account_id: account,
+                calendar_id: "primary".into(),
+                google_event_id: "series_20250815T120000Z".into(),
+                title: "Weekly".into(),
+                start_ts: NOON + 7 * 24 * HOUR_MS,
+                end_ts: NOON + 7 * 24 * HOUR_MS + HOUR_MS,
+                recurring_event_id: Some("series".into()),
+                status: "confirmed".into(),
+                ..Default::default()
+            },
+        )
+    })
+    .unwrap();
+
+    let events = all_events(&db);
+    assert_eq!(events.len(), 2);
+    for event in &events {
+        assert_eq!(
+            event.recurrence,
+            vec!["RRULE:FREQ=WEEKLY"],
+            "occurrence {} lost the series rule",
+            event.google_event_id
+        );
+    }
+}
+
+#[tokio::test]
+async fn changing_the_rule_stores_it_and_inverts_to_the_old_one() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            recurrence: vec!["RRULE:FREQ=DAILY".into()],
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                recurrence: Some(vec!["RRULE:FREQ=WEEKLY".into()]),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(all_events(&db)[0].recurrence, vec!["RRULE:FREQ=WEEKLY"]);
+    assert_eq!(
+        body_json(&transport.requests()[0])["recurrence"][0],
+        "RRULE:FREQ=WEEKLY"
+    );
+    // This is the undo that could not exist before: the prior rule is now a
+    // thing the store knows, so `z` puts it back instead of doing nothing.
+    assert_eq!(
+        result.undo,
+        Some(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                recurrence: Some(vec!["RRULE:FREQ=DAILY".into()]),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+    );
+}
+
+#[tokio::test]
+async fn clearing_the_rule_is_stored_as_cleared_not_as_unknown() {
+    // The one case the sync-side `COALESCE` must not swallow: an edit that says
+    // "does not repeat" genuinely means it.
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            recurrence: vec!["RRULE:FREQ=DAILY".into()],
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    d.execute(Command::UpdateEvent {
+        event_id,
+        patch: EventPatch {
+            recurrence: Some(Vec::new()),
+            ..Default::default()
+        },
+        scope: EventScope::This,
+    })
+    .await
+    .unwrap();
+
+    assert!(all_events(&db)[0].recurrence.is_empty());
+    assert!(body_json(&transport.requests()[0])["recurrence"]
+        .as_array()
+        .expect("an explicit empty list, not an absent key")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn changing_the_rule_of_one_occurrence_is_refused_before_google_can_400() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "series_0".into(),
+            title: "Weekly".into(),
+            recurring_event_id: Some("series".into()),
+            recurrence: vec!["RRULE:FREQ=WEEKLY".into()],
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let err = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                recurrence: Some(vec!["RRULE:FREQ=DAILY".into()]),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .expect_err("an instance has no rule of its own");
+
+    assert_eq!(err.kind(), "invalid");
+    assert_eq!(transport.call_count(), 0);
+    assert_eq!(all_events(&db)[0].recurrence, vec!["RRULE:FREQ=WEEKLY"]);
+}
+
+#[tokio::test]
+async fn a_reminder_edit_inverts_only_when_the_prior_state_can_be_spoken() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+
+    // Prior state: an explicit ten-minute popup. That is expressible, so the
+    // edit has an inverse.
+    let explicit = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            reminders: Some(EventReminders {
+                use_default: false,
+                overrides: vec![EventReminder {
+                    method: "popup".into(),
+                    minutes: 10,
+                }],
+            }),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+    // Prior state: the calendar's own default. `EventPatch` has no way to say
+    // "go back to the default", so claiming an inverse would be a lie.
+    let defaulted = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-2".into(),
+            title: "Retro".into(),
+            reminders: Some(EventReminders {
+                use_default: true,
+                overrides: Vec::new(),
+            }),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+    let patch = EventPatch {
+        reminder_minutes: Some(vec![30]),
+        ..Default::default()
+    };
+
+    let first = d
+        .execute(Command::UpdateEvent {
+            event_id: explicit,
+            patch: patch.clone(),
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        first.undo,
+        Some(Command::UpdateEvent {
+            event_id: explicit,
+            patch: EventPatch {
+                reminder_minutes: Some(vec![10]),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+    );
+
+    let second = d
+        .execute(Command::UpdateEvent {
+            event_id: defaulted,
+            patch,
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+    assert!(second.ok);
+    assert!(
+        second.undo.is_none(),
+        "the calendar default is not something a patch can restore"
+    );
+    // The write still landed — no inverse is not the same as no effect.
+    let stored = all_events(&db)
+        .into_iter()
+        .find(|e| e.id == defaulted)
+        .unwrap();
+    assert_eq!(stored.reminders.unwrap().overrides[0].minutes, 30);
+}
+
+#[tokio::test]
+async fn a_failed_update_restores_the_rule_and_the_alerts_too() {
+    // `restore_event` is a full-row replacement, and a column left out of it
+    // silently reverts to its default on the first rollback that touches the
+    // row. This is the test that fails when a new column is forgotten there.
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            recurrence: vec!["RRULE:FREQ=DAILY".into()],
+            reminders: Some(EventReminders {
+                use_default: false,
+                overrides: vec![EventReminder {
+                    method: "email".into(),
+                    minutes: 60,
+                }],
+            }),
+            ical_uid: Some("uid-1@google.com".into()),
+            organizer: Some(Participant::new("boss@example.com")),
+            organizer_self: Some(false),
+            guests_can_modify: Some(true),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_failing(503, r#"{"error":{"message":"try later"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                title: Some("Renamed".into()),
+                recurrence: Some(vec!["RRULE:FREQ=WEEKLY".into()]),
+                reminder_minutes: Some(vec![5]),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert_eq!(result.failed[0].kind, FailureKind::Server);
+    assert!(result.failed[0].rolled_back);
+
+    let event = &all_events(&db)[0];
+    assert_eq!(event.id, event_id);
+    assert_eq!(event.title, "Standup");
+    assert_eq!(event.recurrence, vec!["RRULE:FREQ=DAILY"]);
+    let reminders = event.reminders.as_ref().expect("reminders survived");
+    assert_eq!(reminders.overrides[0].minutes, 60);
+    // Not rewritten to `popup` on the way back out — an alert someone set to
+    // email on the web is theirs.
+    assert_eq!(reminders.overrides[0].method, "email");
+    assert_eq!(event.ical_uid.as_deref(), Some("uid-1@google.com"));
+    assert_eq!(event.organizer_self, Some(false));
+    assert_eq!(event.guests_can_modify, Some(true));
+    assert_eq!(
+        event.organizer.as_ref().map(|p| p.email.as_str()),
+        Some("boss@example.com")
+    );
+}
+
+#[tokio::test]
+async fn a_failed_delete_puts_the_rule_and_the_uid_back_as_well() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            recurrence: vec!["RRULE:FREQ=MONTHLY".into()],
+            ical_uid: Some("uid-9@google.com".into()),
+            organizer_self: Some(true),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_failing(403, r#"{"error":{"message":"no"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::DeleteEvent {
+            event_id,
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert_eq!(result.failed[0].kind, FailureKind::Forbidden);
+    let event = &all_events(&db)[0];
+    assert_eq!(event.id, event_id);
+    assert_eq!(event.recurrence, vec!["RRULE:FREQ=MONTHLY"]);
+    assert_eq!(event.ical_uid.as_deref(), Some("uid-9@google.com"));
+    assert_eq!(event.organizer_self, Some(true));
+}
+
+#[tokio::test]
+async fn undoing_a_delete_re_creates_the_event_rather_than_a_lookalike() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            recurrence: vec!["RRULE:FREQ=WEEKLY;BYDAY=MO".into()],
+            reminders: Some(EventReminders {
+                use_default: false,
+                overrides: vec![EventReminder {
+                    method: "popup".into(),
+                    minutes: 15,
+                }],
+            }),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(204, "{}"))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::DeleteEvent {
+            event_id,
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    match result.undo {
+        Some(Command::CreateEvent { draft, .. }) => {
+            assert_eq!(draft.recurrence, vec!["RRULE:FREQ=WEEKLY;BYDAY=MO"]);
+            assert_eq!(draft.reminder_minutes, Some(vec![15]));
+        }
+        other => panic!("expected a create as the inverse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_moved_event_keeps_its_alerts_on_the_calendar_it_lands_on() {
+    let db = Db::open_in_memory().unwrap();
+    let from = seed_account(&db, "a@example.com");
+    let to = seed_account(&db, "b@example.com");
+    let event_id = seed_event(
+        &db,
+        from,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            reminders: Some(EventReminders {
+                use_default: false,
+                overrides: vec![EventReminder {
+                    method: "popup".into(),
+                    minutes: 20,
+                }],
+            }),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(
+            200,
+            r#"{"id":"evt-2","iCalUID":"uid-moved@google.com"}"#,
+        )),
+        Ok(HttpResponse::json(204, "{}")),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MoveEvent {
+            event_id,
+            account_id: to,
+            calendar_id: "work".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    // A move is insert-then-delete, so the alerts have to travel in the insert
+    // body or they are simply gone from the copy that survives.
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(body["reminders"]["useDefault"], false);
+    assert_eq!(body["reminders"]["overrides"][0]["minutes"], 20);
+    // The copy is a different event with a different uid, and the row adopts it.
+    assert_eq!(
+        all_events(&db)[0].ical_uid.as_deref(),
+        Some("uid-moved@google.com")
+    );
+}
+
+#[tokio::test]
+async fn a_failed_move_restores_the_identity_it_had_before() {
+    let db = Db::open_in_memory().unwrap();
+    let from = seed_account(&db, "a@example.com");
+    let to = seed_account(&db, "b@example.com");
+    let event_id = seed_event(
+        &db,
+        from,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            ical_uid: Some("uid-original@google.com".into()),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(
+            200,
+            r#"{"id":"evt-2","iCalUID":"uid-copy@google.com"}"#,
+        )),
+        Ok(HttpResponse::json(500, r#"{"error":{"message":"boom"}}"#)),
+        Ok(HttpResponse::json(204, "{}")),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MoveEvent {
+            event_id,
+            account_id: to,
+            calendar_id: "work".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    let event = &all_events(&db)[0];
+    assert_eq!(event.account_id, from);
+    assert_eq!(event.google_event_id, "evt-1");
+    // The uid of the copy that was cleaned up must not be left on the row that
+    // stayed behind — that would make the original look like the copy to every
+    // cross-account merge from here on.
+    assert_eq!(event.ical_uid.as_deref(), Some("uid-original@google.com"));
 }
 
 #[test]

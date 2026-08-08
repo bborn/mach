@@ -36,6 +36,8 @@ pub mod google;
 pub mod ipc;
 pub mod plugins;
 pub mod render;
+pub mod shell;
+pub mod staleness;
 pub mod sync;
 
 use std::sync::Arc;
@@ -44,9 +46,18 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let mut context = tauri::generate_context!();
+    // A QA instance builds its own window in `setup`, unfocused. The configured
+    // one would exist before `setup` ran and would already have taken focus.
+    shell::suppress_configured_window(&mut context);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        // The save panel for attachments. Registered here rather than lazily on
+        // first use; nothing `dialog:` is granted to JavaScript, so the only
+        // reachable operation is "save *this* attachment" via Rust.
+        .plugin(tauri_plugin_dialog::init())
         // One origin per plugin: `plugin://<id>/`. The handler serves two
         // static files and, crucially, the Content-Security-Policy as a
         // *response header* — see `plugins::protocol`.
@@ -54,6 +65,9 @@ pub fn run() {
             plugins::protocol::respond(&request)
         })
         .setup(|app| {
+            // Before anything is shown: a QA instance must never take focus.
+            shell::apply_qa_policy(app)?;
+
             // MACH_DATA_DIR gives an agent (or a second window) its own store,
             // so QA cannot mutate the mailbox someone is actually reading.
             // Unset — the normal case — resolves to the OS app-data dir.
@@ -108,10 +122,15 @@ pub fn run() {
             ipc::commands::begin_add_account,
             ipc::commands::complete_add_account,
             ipc::commands::remove_account,
+            ipc::prefs::get_preferences,
+            ipc::prefs::set_preference,
             ipc::feedback::submit_feedback,
             ipc::feedback::capture_window,
             ipc::render::render_message_body,
             ipc::render::open_external,
+            ipc::attachments::attachment_open,
+            ipc::attachments::attachment_save,
+            ipc::attachments::attachment_inline_image,
             ipc::compose::send_message,
             ipc::agent::agent_start,
             ipc::agent::agent_sessions,
@@ -126,6 +145,25 @@ pub fn run() {
             ipc::plugins::plugin_source,
             ipc::plugins::plugin_invoke_result,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .menu(shell::build_menu)
+        .on_menu_event(|app, event| shell::on_menu_event(app, event.id().as_ref()))
+        // Closing hides the window rather than destroying it, so ⌘W stops
+        // leaving a live process with no way back to it. See `shell`.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if shell::intercept_close(window) {
+                    api.prevent_close();
+                }
+            }
+        })
+        .build(context)
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // A Dock click on an app whose window is hidden. Without this the
+            // window that ⌘W hid would be unreachable for the life of the
+            // process.
+            if let tauri::RunEvent::Reopen { .. } = event {
+                shell::reopen(app);
+            }
+        });
 }

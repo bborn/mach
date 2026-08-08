@@ -1,0 +1,563 @@
+//! Attachments: fetch the bytes, cache them, and hand them to the OS.
+//!
+//! | command | argument | returns |
+//! |---|---|---|
+//! | `attachment_open` | `attachmentId` | [`AttachmentFile`] |
+//! | `attachment_save` | `attachmentId` | [`SavedAttachment`] |
+//! | `attachment_inline_image` | `messageId`, `contentId` | [`InlineImage`] |
+//!
+//! # Nothing here happens on its own
+//!
+//! Every one of these commands is reached from a keystroke or a click on the
+//! attachment the reader is looking at. There is no prefetch, no "download when
+//! the thread opens", and no speculative fetch of inline images for a collapsed
+//! message. That is a security property, not a performance one: the moment
+//! bytes are fetched and written without the reader asking, "did you open the
+//! attachment" stops being a question with an answer, and the only reason this
+//! module is allowed to write attacker-controlled bytes to disk at all is that
+//! a human asked for these specific bytes.
+//!
+//! Opening is stricter still — see [`store::names::is_dangerous`] for what is
+//! refused and why the refusal has no "open anyway".
+//!
+//! # Where the module lives
+//!
+//! The cache and the name sanitizer are `src-tauri/src/attachments/`, declared
+//! below with `#[path]` rather than in `lib.rs`, for exactly the reason
+//! [`super::compose`] does the same thing: `lib.rs` belongs to another unit
+//! while both are being built. Promoting `pub mod attachments;` to the crate
+//! root later is a one-line change that makes `ipc::attachments::store` an
+//! alias.
+
+#[path = "../attachments/mod.rs"]
+pub mod store;
+
+use std::path::{Path, PathBuf};
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+use rusqlite::OptionalExtension;
+use serde::Serialize;
+use tauri::State;
+
+use crate::commands::CommandError;
+use crate::db::Db;
+use crate::google::gmail::{GmailClient, MessageFormat};
+use crate::google::types::AttachmentMeta;
+use crate::google::GoogleError;
+
+use store::names;
+use store::{AttachmentCache, PartKind, MAX_ATTACHMENT_BYTES, MAX_INLINE_IMAGE_BYTES};
+
+use super::error::IpcError;
+use super::state::AppState;
+
+/// Gmail addresses the authorised account as `me`, the same way the command
+/// layer does.
+const USER_ID: &str = "me";
+
+// ===========================================================================
+// Payloads
+// ===========================================================================
+
+/// One attachment, materialised on disk.
+///
+/// `filename` is the **sanitized** name, not the sender's, because it is the
+/// name the file actually has and showing anything else would be showing the
+/// reader a name that does not exist.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentFile {
+    pub attachment_id: i64,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: i64,
+    /// Absolute path inside the cache. Handed to the frontend for diagnostics
+    /// and for the "Copy path" affordance; it is never used to reach back into
+    /// the filesystem from JavaScript, which cannot do that anyway.
+    pub path: String,
+    /// True when the bytes were already on disk — i.e. nothing was downloaded.
+    pub from_cache: bool,
+}
+
+/// The result of a save. `path` is `None` when the user cancelled the panel,
+/// which is an outcome and not an error.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedAttachment {
+    pub path: Option<String>,
+    pub filename: String,
+}
+
+/// One resolved `cid:` image, ready to be spliced into a message frame.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InlineImage {
+    pub content_id: String,
+    /// The **sniffed** type, never the sender's declared one.
+    pub mime_type: String,
+    /// Standard base64 (not base64url) — this becomes a `data:` URL.
+    pub base64: String,
+}
+
+// ===========================================================================
+// Commands
+// ===========================================================================
+
+/// Download if needed, then hand the file to the system handler.
+#[tauri::command(async)]
+pub async fn attachment_open(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    attachment_id: i64,
+) -> Result<AttachmentFile, IpcError> {
+    let file = materialise(&state, attachment_id).await?;
+
+    // Checked here rather than only at fetch time: the refusal is about handing
+    // the path to LaunchServices, and that is what this command does.
+    if names::is_dangerous(&file.filename, &file.mime_type) {
+        return Err(refused(format!(
+            "Mach will not open {} — it is a program, not a document. Save it and open it \
+             from Finder if you are sure.",
+            file.filename
+        )));
+    }
+
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(file.path.clone(), None::<&str>)
+        .map_err(|e| {
+            eprintln!("attachment_open failed for {}: {e}", file.path);
+            IpcError::internal(format!("could not open {}: {e}", file.filename))
+        })?;
+
+    Ok(file)
+}
+
+/// Download if needed, ask where to put it, and copy it there.
+#[tauri::command(async)]
+pub async fn attachment_save(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    attachment_id: i64,
+) -> Result<SavedAttachment, IpcError> {
+    let file = materialise(&state, attachment_id).await?;
+    let source = PathBuf::from(&file.path);
+    let suggested = file.filename.clone();
+
+    let chosen = save_panel(&app, suggested.clone()).await?;
+    let Some(destination) = chosen else {
+        return Ok(SavedAttachment {
+            path: None,
+            filename: suggested,
+        });
+    };
+
+    std::fs::copy(&source, &destination).map_err(|e| {
+        IpcError::internal(format!(
+            "could not write {}: {e}",
+            destination.display()
+        ))
+    })?;
+
+    Ok(SavedAttachment {
+        path: Some(destination.to_string_lossy().into_owned()),
+        filename: suggested,
+    })
+}
+
+/// Resolve one `cid:` reference from a message body to actual image bytes.
+///
+/// The reading pane calls this once per distinct `data-mach-cid` the sanitizer
+/// left behind, for a message the reader has expanded.
+#[tauri::command(async)]
+pub async fn attachment_inline_image(
+    state: State<'_, AppState>,
+    message_id: i64,
+    content_id: String,
+) -> Result<InlineImage, IpcError> {
+    if !names::is_valid_content_id(&content_id) {
+        return Err(refused(format!(
+            "{content_id:?} is not a Content-ID this message could contain"
+        )));
+    }
+
+    let identity = message_identity(&state.db, message_id)?;
+    let cache = cache_for(&state);
+    let key = store::cache_key(
+        identity.account_id,
+        &identity.gmail_message_id,
+        PartKind::Inline,
+        &content_id,
+    );
+
+    if let Some(hit) = cache.find(&key) {
+        if let Some(image) = read_cached_image(&hit.path, &content_id) {
+            return Ok(image);
+        }
+        // The entry is there but is not something we can serve — a stale entry
+        // from a build that stored a type we no longer accept. Fall through and
+        // refetch; `store` clears the directory first.
+    }
+
+    let gmail = gmail_for(&state, identity.account_id)?;
+    let message = gmail
+        .messages_get(USER_ID, &identity.gmail_message_id, MessageFormat::Full)
+        .await
+        .map_err(google)?;
+    let body = message.extract_body();
+
+    let part = body
+        .attachments
+        .iter()
+        .find(|part| matches_content_id(part, &content_id))
+        .ok_or_else(|| {
+            refused(format!(
+                "this message has no part with Content-ID {content_id}"
+            ))
+        })?;
+
+    let bytes = part_bytes(&gmail, &identity.gmail_message_id, part, MAX_INLINE_IMAGE_BYTES).await?;
+
+    // The sender's Content-Type is not consulted. An inline part becomes a
+    // `data:` URL inside the message frame, and `render::sanitize` refuses SVG
+    // there for good reasons; letting a declared type decide would be a way
+    // around that decision rather than an agreement with it.
+    let mime = names::sniff_raster_image(&bytes).ok_or_else(|| {
+        refused(format!(
+            "the part with Content-ID {content_id} is not an image Mach will render inline"
+        ))
+    })?;
+
+    let filename = format!("inline.{}", names::raster_extension(mime));
+    // A cache write failure is not fatal: the image can still be shown, it will
+    // just be fetched again next time.
+    let _ = cache.store(&key, &filename, &bytes);
+
+    Ok(InlineImage {
+        content_id,
+        mime_type: mime.to_string(),
+        base64: STANDARD.encode(&bytes),
+    })
+}
+
+// ===========================================================================
+// The fetch path
+// ===========================================================================
+
+/// The row the commands work from. Joined against `messages` because the Gmail
+/// message id and the account are what a fetch needs and neither lives on the
+/// attachment row.
+#[derive(Debug, Clone)]
+struct AttachmentRow {
+    id: i64,
+    account_id: i64,
+    gmail_message_id: String,
+    gmail_attachment_id: Option<String>,
+    filename: String,
+    mime_type: String,
+    size_bytes: i64,
+}
+
+#[derive(Debug, Clone)]
+struct MessageIdentity {
+    account_id: i64,
+    gmail_message_id: String,
+}
+
+/// Bytes on disk for one attachment, downloading them only if they are not
+/// already there.
+async fn materialise(state: &AppState, attachment_id: i64) -> Result<AttachmentFile, IpcError> {
+    let row = attachment_row(&state.db, attachment_id)?;
+    let filename = names::safe_filename(&row.filename);
+    let cache = cache_for(state);
+
+    // A part with no attachment id had its bytes inlined in the sync response,
+    // so there is no handle to fetch by and the part has to be found in the
+    // message. It still gets a stable key: the part id if Gmail gave one, the
+    // filename and size otherwise, which is the most identity such a part has.
+    let part_id = row
+        .gmail_attachment_id
+        .clone()
+        .unwrap_or_else(|| format!("inline:{}:{}", row.size_bytes, row.filename));
+    let key = store::cache_key(
+        row.account_id,
+        &row.gmail_message_id,
+        PartKind::File,
+        &part_id,
+    );
+
+    if let Some(hit) = cache.find(&key) {
+        return Ok(AttachmentFile {
+            attachment_id: row.id,
+            filename,
+            mime_type: row.mime_type,
+            size_bytes: hit.size_bytes as i64,
+            path: hit.path.to_string_lossy().into_owned(),
+            from_cache: true,
+        });
+    }
+
+    // The cheapest possible refusal: the size we already synced. It came from
+    // the same sender as everything else here, so it is a hint and not a
+    // guarantee — which is why the fetch is capped as well.
+    if row.size_bytes > MAX_ATTACHMENT_BYTES as i64 {
+        return Err(refused(format!(
+            "{} is {} — larger than the {} MiB Mach will download",
+            filename,
+            human_size(row.size_bytes),
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        )));
+    }
+
+    let gmail = gmail_for(state, row.account_id)?;
+    let bytes = match &row.gmail_attachment_id {
+        Some(id) => gmail
+            .attachment_get_capped(USER_ID, &row.gmail_message_id, id, MAX_ATTACHMENT_BYTES)
+            .await
+            .map_err(google)?,
+        None => inline_part_bytes(&gmail, &row).await?,
+    };
+
+    let stored = cache.store(&key, &filename, &bytes).map_err(|e| {
+        IpcError::internal(format!("could not cache {filename}: {e}"))
+    })?;
+
+    Ok(AttachmentFile {
+        attachment_id: row.id,
+        filename,
+        mime_type: row.mime_type,
+        size_bytes: stored.size_bytes as i64,
+        path: stored.path.to_string_lossy().into_owned(),
+        from_cache: false,
+    })
+}
+
+/// The fallback for a part Gmail inlined rather than handing out an id for.
+/// Re-fetches the message and matches on the two things the row still knows.
+async fn inline_part_bytes(gmail: &GmailClient, row: &AttachmentRow) -> Result<Vec<u8>, IpcError> {
+    let message = gmail
+        .messages_get(USER_ID, &row.gmail_message_id, MessageFormat::Full)
+        .await
+        .map_err(google)?;
+    let body = message.extract_body();
+    let part = body
+        .attachments
+        .iter()
+        .find(|part| part.filename == row.filename && part.size == row.size_bytes)
+        .or_else(|| {
+            body.attachments
+                .iter()
+                .find(|part| part.filename == row.filename)
+        })
+        .ok_or_else(|| {
+            refused(format!(
+                "{} is no longer part of this message on Gmail",
+                row.filename
+            ))
+        })?;
+
+    part_bytes(gmail, &row.gmail_message_id, part, MAX_ATTACHMENT_BYTES).await
+}
+
+/// The bytes behind one MIME part, whichever way Gmail chose to deliver them.
+async fn part_bytes(
+    gmail: &GmailClient,
+    gmail_message_id: &str,
+    part: &AttachmentMeta,
+    max_bytes: usize,
+) -> Result<Vec<u8>, IpcError> {
+    if let Some(data) = &part.data {
+        if data.len() > max_bytes {
+            return Err(refused(format!(
+                "{} is larger than the {} MiB Mach will hold",
+                if part.filename.is_empty() {
+                    "that part"
+                } else {
+                    &part.filename
+                },
+                max_bytes / (1024 * 1024)
+            )));
+        }
+        return Ok(data.clone());
+    }
+
+    let id = part.attachment_id.as_deref().ok_or_else(|| {
+        refused("that part of the message carries no bytes and no way to fetch them")
+    })?;
+
+    gmail
+        .attachment_get_capped(USER_ID, gmail_message_id, id, max_bytes)
+        .await
+        .map_err(google)
+}
+
+/// Does this part answer to `content_id`?
+///
+/// Exact first, because a Content-ID is a case-sensitive addr-spec and two
+/// parts in one message can differ only in case. Case-insensitively second,
+/// because plenty of mailers do not know that.
+fn matches_content_id(part: &AttachmentMeta, content_id: &str) -> bool {
+    match part.content_id.as_deref() {
+        Some(id) => id == content_id || id.eq_ignore_ascii_case(content_id),
+        None => false,
+    }
+}
+
+/// A cached inline image, if the file is still one we would serve.
+fn read_cached_image(path: &Path, content_id: &str) -> Option<InlineImage> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    names::raster_mime(&extension)?;
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_INLINE_IMAGE_BYTES as u64 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    // Sniffed again on the way out. The cache directory is ours, but "ours" is
+    // a directory on a disk other processes can write to, and the cost of being
+    // wrong is a `data:` URL in a message frame.
+    let mime = names::sniff_raster_image(&bytes)?;
+    Some(InlineImage {
+        content_id: content_id.to_string(),
+        mime_type: mime.to_string(),
+        base64: STANDARD.encode(&bytes),
+    })
+}
+
+// ===========================================================================
+// The save panel
+// ===========================================================================
+
+/// Show the system save panel and return what the user chose.
+///
+/// # The plugin is registered here, at runtime
+///
+/// Nothing about the panel is reachable from JavaScript: the capability file
+/// grants no `dialog:` permissions, and this calls the Rust API directly. The
+/// only thing the frontend can ask for is "save *this* attachment".
+async fn save_panel(
+    app: &tauri::AppHandle,
+    suggested_name: String,
+) -> Result<Option<PathBuf>, IpcError> {
+    let app = app.clone();
+    // The panel blocks its thread until the user answers, which can be minutes.
+    // A Tokio worker is not the place for that.
+    let chosen = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog()
+            .file()
+            .set_file_name(&suggested_name)
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| IpcError::internal(format!("the save panel did not answer: {e}")))?;
+
+    let Some(chosen) = chosen else {
+        return Ok(None);
+    };
+
+    chosen
+        .into_path()
+        .map(Some)
+        .map_err(|e| IpcError::internal(format!("that is not a path Mach can write to: {e}")))
+}
+
+// ===========================================================================
+// Store access
+// ===========================================================================
+
+fn cache_for(state: &AppState) -> AttachmentCache {
+    // Beside the database, so `MACH_DATA_DIR` scopes the cache the same way it
+    // scopes everything else.
+    let data_dir = state
+        .config
+        .database_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    AttachmentCache::new(data_dir)
+}
+
+fn gmail_for(state: &AppState, account_id: i64) -> Result<GmailClient, IpcError> {
+    state
+        .dispatcher
+        .clients
+        .gmail(account_id)
+        .map_err(IpcError::from)
+}
+
+fn attachment_row(db: &Db, attachment_id: i64) -> Result<AttachmentRow, IpcError> {
+    let found = db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT a.id, m.account_id, m.gmail_message_id, a.gmail_attachment_id, \
+                        a.filename, a.mime_type, a.size_bytes \
+                 FROM attachments a JOIN messages m ON m.id = a.message_id \
+                 WHERE a.id = ?1",
+                [attachment_id],
+                |row| {
+                    Ok(AttachmentRow {
+                        id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        gmail_message_id: row.get(2)?,
+                        gmail_attachment_id: row.get(3)?,
+                        filename: row.get(4)?,
+                        mime_type: row.get(5)?,
+                        size_bytes: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    })?;
+
+    found.ok_or_else(|| IpcError::not_found("attachment", attachment_id))
+}
+
+fn message_identity(db: &Db, message_id: i64) -> Result<MessageIdentity, IpcError> {
+    let found = db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT account_id, gmail_message_id FROM messages WHERE id = ?1",
+                [message_id],
+                |row| {
+                    Ok(MessageIdentity {
+                        account_id: row.get(0)?,
+                        gmail_message_id: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    })?;
+
+    found.ok_or_else(|| IpcError::not_found("message", message_id))
+}
+
+// ===========================================================================
+// Errors
+// ===========================================================================
+
+/// A refusal the user can read and act on. `invalid` rather than `internal`:
+/// nothing broke, the app declined.
+fn refused(message: impl Into<String>) -> IpcError {
+    IpcError::Command(CommandError::Invalid {
+        message: message.into(),
+    })
+}
+
+/// Google's own prose is better than anything this layer could invent —
+/// "google rate limited (429)" and "google auth failed (401)" already say what
+/// happened and what the reader should expect next.
+fn google(error: GoogleError) -> IpcError {
+    IpcError::Command(CommandError::Invalid {
+        message: error.to_string(),
+    })
+}
+
+fn human_size(bytes: i64) -> String {
+    const MIB: i64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{} KB", (bytes / 1024).max(1))
+    }
+}

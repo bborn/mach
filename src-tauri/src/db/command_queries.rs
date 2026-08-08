@@ -29,7 +29,7 @@
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::db::models::{Account, Event, Participant, RsvpStatus};
+use crate::db::models::{Account, Event, EventReminders, Participant, RsvpStatus};
 use crate::db::{queries, Result};
 
 // ---------------------------------------------------------------------------
@@ -250,33 +250,11 @@ pub fn account_by_id(conn: &Connection, account_id: i64) -> Result<Option<Accoun
     Ok(accounts.into_iter().find(|a| a.id == account_id))
 }
 
-const EVENT_COLUMNS: &str = "\
-    id, account_id, calendar_id, google_event_id, title, description, location, \
-    start_ts, end_ts, is_all_day, attendees, rsvp_status, recurring_event_id, \
-    status, html_link, updated_at";
-
-fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
-    let attendees: String = row.get(10)?;
-    let rsvp: Option<String> = row.get(11)?;
-    Ok(Event {
-        id: row.get(0)?,
-        account_id: row.get(1)?,
-        calendar_id: row.get(2)?,
-        google_event_id: row.get(3)?,
-        title: row.get(4)?,
-        description: row.get(5)?,
-        location: row.get(6)?,
-        start_ts: row.get(7)?,
-        end_ts: row.get(8)?,
-        is_all_day: row.get(9)?,
-        attendees: serde_json::from_str::<Vec<Participant>>(&attendees).unwrap_or_default(),
-        rsvp_status: rsvp.as_deref().and_then(RsvpStatus::parse),
-        recurring_event_id: row.get(12)?,
-        status: row.get(13)?,
-        html_link: row.get(14)?,
-        updated_at: row.get(15)?,
-    })
-}
+// The column list and the row mapper are `queries`'. They used to be copied
+// here byte for byte, which held only as long as nobody added a column: a
+// `SELECT` widened in one file and not the other reads a `TEXT` out of an
+// `INTEGER` slot, and that is a runtime panic rather than a compile error.
+use queries::{map_event, EVENT_COLUMNS};
 
 /// One event by row id. `queries::events_in_range` is the window query the week
 /// grid uses; RSVP addresses a single row and must not scan a range to find it.
@@ -303,10 +281,16 @@ pub fn set_event_rsvp(
 
 /// The stored half of an event edit.
 ///
-/// Deliberately *not* `commands::EventPatch`: that type also carries recurrence
-/// and reminder offsets, which have no column here, and `db` must not depend on
-/// `commands`. Every field is `None` for "leave alone"; the two nested options
-/// distinguish "leave alone" from "set to NULL".
+/// Deliberately *not* `commands::EventPatch`: `db` must not depend on
+/// `commands`, and the two types answer different questions — a patch says what
+/// to send Google, this says what to write down. Every field is `None` for
+/// "leave alone"; the nested options distinguish "leave alone" from "set to
+/// NULL".
+///
+/// `recurrence` and `reminders` are here now, and that is the point of them:
+/// they were the two fields a patch could send but the store could not keep, so
+/// an edit that touched either had no honest inverse and no way to be read back
+/// into the modal that made it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventFields {
     pub title: Option<String>,
@@ -316,6 +300,11 @@ pub struct EventFields {
     pub end_ts: Option<i64>,
     pub is_all_day: Option<bool>,
     pub attendees: Option<Vec<Participant>>,
+    /// `Some(vec![])` clears the rule — unlike the sync path, an edit that says
+    /// "does not repeat" genuinely means it, so this one writes SQL `NULL`
+    /// rather than leaving what was there.
+    pub recurrence: Option<Vec<String>>,
+    pub reminders: Option<EventReminders>,
 }
 
 impl EventFields {
@@ -375,6 +364,17 @@ pub fn update_event_fields(conn: &Connection, event_id: i64, fields: &EventField
         let json = serde_json::to_string(attendees).unwrap_or_else(|_| "[]".into());
         push("attendees", Value::Text(json), &mut sets, &mut args);
     }
+    if let Some(recurrence) = &fields.recurrence {
+        let value = match queries::json_if_present(recurrence) {
+            Some(json) => Value::Text(json),
+            None => Value::Null,
+        };
+        push("recurrence", value, &mut sets, &mut args);
+    }
+    if let Some(reminders) = &fields.reminders {
+        let json = serde_json::to_string(reminders).unwrap_or_else(|_| "null".into());
+        push("reminders", Value::Text(json), &mut sets, &mut args);
+    }
 
     args.push(Value::Integer(event_id));
     let sql = format!(
@@ -390,19 +390,36 @@ pub fn update_event_fields(conn: &Connection, event_id: i64, fields: &EventField
 ///
 /// A created event is written locally *before* the insert goes out, under a
 /// placeholder id, so the grid has something to draw. This is the second half:
-/// once Google answers, the row takes on the real id, link and series parent.
+/// once Google answers, the row takes on the real id, link, series parent and
+/// `iCalUID`.
+///
+/// The uid is the one of the four Mach cannot guess. The row id can be derived
+/// (`{master}_{start}`) and the link is cosmetic, but the uid is minted by
+/// Google, and it is the only thing that will let the copy of this meeting that
+/// lands on another of the owner's accounts be recognised as the same meeting
+/// rather than drawn beside it.
 pub fn set_event_identity(
     conn: &Connection,
     event_id: i64,
     google_event_id: &str,
     html_link: Option<&str>,
     recurring_event_id: Option<&str>,
+    ical_uid: Option<&str>,
 ) -> Result<()> {
     conn.execute(
         "UPDATE events
-            SET google_event_id = ?2, html_link = ?3, recurring_event_id = ?4
+            SET google_event_id = ?2,
+                html_link       = ?3,
+                recurring_event_id = ?4,
+                ical_uid        = COALESCE(?5, ical_uid)
           WHERE id = ?1",
-        params![event_id, google_event_id, html_link, recurring_event_id],
+        params![
+            event_id,
+            google_event_id,
+            html_link,
+            recurring_event_id,
+            ical_uid
+        ],
     )?;
     Ok(())
 }
@@ -442,18 +459,30 @@ pub fn events_in_series(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Put a deleted row back exactly as it was, id included.
+/// Put a deleted or edited row back exactly as it was, id included.
 ///
-/// `queries::upsert_event` cannot do this: it lets SQLite assign the id, and a
-/// rollback that changes the id would strand every reference the UI is holding.
+/// `queries::upsert_event` cannot do this, for two reasons. It lets SQLite
+/// assign the id, and a rollback that changes the id would strand every
+/// reference the UI is holding. And it is deliberately *preserving* — its
+/// `COALESCE`s exist so that a lossy sync cannot erase a rule it was never
+/// told about — which is the opposite of what a rollback needs. This is a
+/// verbatim replacement: every column, including the ones whose prior value was
+/// `NULL`, because "the recurrence was cleared and then the save failed" has to
+/// come back as cleared and not as whatever it was two edits ago.
+///
+/// Every column the table has must appear here. A column left out silently
+/// reverts to its default on the first rollback that touches the row, which is
+/// data loss that only shows up on the unhappy path.
 pub fn restore_event(conn: &Connection, event: &Event) -> Result<()> {
     let attendees = serde_json::to_string(&event.attendees).unwrap_or_else(|_| "[]".into());
     conn.execute(
         "INSERT OR REPLACE INTO events
             (id, account_id, calendar_id, google_event_id, title, description, location,
              start_ts, end_ts, is_all_day, attendees, rsvp_status, recurring_event_id,
-             status, html_link, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             status, html_link, updated_at, recurrence, reminders, ical_uid, organizer,
+             organizer_self, guests_can_modify)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             event.id,
             event.account_id,
@@ -471,6 +500,12 @@ pub fn restore_event(conn: &Connection, event: &Event) -> Result<()> {
             event.status,
             event.html_link,
             event.updated_at,
+            queries::json_if_present(&event.recurrence),
+            queries::json_of(event.reminders.as_ref()),
+            event.ical_uid,
+            queries::json_of(event.organizer.as_ref()),
+            event.organizer_self,
+            event.guests_can_modify,
         ],
     )?;
     Ok(())

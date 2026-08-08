@@ -50,6 +50,7 @@ import type { MergedEvent } from "@/lib/calendar-merge";
 import { paintFor, toneFor, type HueIndex } from "@/lib/calendar-palette";
 import { DAY, MINUTE, isToday, shortTime, startOfDay, weekdayShort } from "@/lib/time";
 import { cn } from "@/lib/utils";
+import { usePreferences } from "@/components/prefs/PreferencesProvider";
 import { EventBlock, EventChip } from "./EventBlock";
 
 /** A provisional event, dragged or clicked into being but not yet saved. */
@@ -73,6 +74,12 @@ interface TimeGridProps {
   dark: boolean;
   /** Where the keyboard cursor is. Distinct from "open in the modal". */
   selectedId: EventId | null;
+  /**
+   * Events the type-to-select bar ruled out. They fade rather than disappear:
+   * the week's shape is the context that makes a match mean something, and a
+   * grid that empties itself as you type is a grid you cannot navigate by.
+   */
+  dimIds?: ReadonlySet<EventId>;
   onSelect: (id: EventId) => void;
   /** Click, or Enter on the focused block — show the whole event. */
   onOpen: (id: EventId) => void;
@@ -140,6 +147,7 @@ export function TimeGrid({
   hueFor,
   dark,
   selectedId,
+  dimIds,
   onSelect,
   onOpen,
   onDraft,
@@ -164,12 +172,32 @@ export function TimeGrid({
   /** Non-null while a drag is live — the only state a drag ever sets. */
   const [dragging, setDragging] = useState<DragSession | null>(null);
 
+  /*
+   * The working day, as a preference.
+   *
+   * Two things read it, and they are the two things "working hours" has to
+   * mean in a day grid: where it opens, and which part of the column is lit.
+   * Read here rather than threaded down from `CalendarMode` because it is
+   * purely presentational — no layout, no geometry, nothing a parent has to
+   * agree with — and threading it through `TimeGridProps` and `DayColumnProps`
+   * would put a preference in two prop lists to change a background.
+   */
+  const { workingHours } = usePreferences();
+  // Half an hour of air above the start, which is what the measured 6.5 was
+  // relative to a seven o'clock day.
+  const scrollFloor = Math.max(workingHours.start - 0.5, 0);
+
   // Open on now, a quarter of the way down — not on a fixed 07:00, which is
   // right at nine in the morning and useless after lunch.
   useLayoutEffect(() => {
     const node = scroller.current;
     if (!node) return;
-    node.scrollTop = nowScrollTop(Date.now(), startOfDay(Date.now()).getTime(), node.clientHeight);
+    node.scrollTop = nowScrollTop(
+      Date.now(),
+      startOfDay(Date.now()).getTime(),
+      node.clientHeight,
+      scrollFloor,
+    );
     // Mount only: instant, so there is no visible lurch on open.
   }, []);
 
@@ -178,10 +206,15 @@ export function TimeGrid({
     const node = scroller.current;
     if (!node || todayNonce === 0) return;
     node.scrollTo({
-      top: nowScrollTop(Date.now(), startOfDay(Date.now()).getTime(), node.clientHeight),
+      top: nowScrollTop(
+        Date.now(),
+        startOfDay(Date.now()).getTime(),
+        node.clientHeight,
+        scrollFloor,
+      ),
       behavior: "smooth",
     });
-  }, [todayNonce]);
+  }, [todayNonce, scrollFloor]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 60_000);
@@ -469,6 +502,7 @@ export function TimeGrid({
                     tone={toneFor(event.rsvp)}
                     past={event.end < now}
                     selected={event.id === selectedId}
+                    dimmed={dimIds?.has(event.id) ?? false}
                     copies={bar.merged.copies.length}
                     onSelect={() => onOpen(event.id)}
                     blockRef={(node) => registerBlock(event.id, node)}
@@ -535,6 +569,7 @@ export function TimeGrid({
             hueFor={hueFor}
             dark={dark}
             selectedId={selectedId}
+            dimIds={dimIds}
             draggingId={dragging?.eventId ?? null}
             onSelect={onSelect}
             onOpen={onOpen}
@@ -619,6 +654,7 @@ interface DayColumnProps {
   hueFor: (calendarId: CalendarId) => HueIndex;
   dark: boolean;
   selectedId: EventId | null;
+  dimIds?: ReadonlySet<EventId>;
   draggingId: EventId | null;
   onSelect: (id: EventId) => void;
   onOpen: (id: EventId) => void;
@@ -637,12 +673,37 @@ interface DayColumnProps {
   onCommit: (intent: "save" | "expand", title: string) => void;
 }
 
+/**
+ * The dimmed hours either side of the working day, for one column.
+ *
+ * Renders nothing when the working day is the whole day, which is a real
+ * setting and not a degenerate one — some people genuinely do not want the
+ * grid to have an opinion about when they work.
+ */
+function WorkingHoursWash() {
+  const { workingHours } = usePreferences();
+  if (workingHours.start <= 0 && workingHours.end >= 24) return null;
+
+  const wash = "pointer-events-none absolute inset-x-0 bg-surface-raised/55";
+  return (
+    <>
+      {workingHours.start > 0 && (
+        <div className={wash} style={{ top: 0, height: workingHours.start * HOUR_HEIGHT }} />
+      )}
+      {workingHours.end < 24 && (
+        <div className={wash} style={{ top: workingHours.end * HOUR_HEIGHT, bottom: 0 }} />
+      )}
+    </>
+  );
+}
+
 function DayColumn({
   day,
   events,
   hueFor,
   dark,
   selectedId,
+  dimIds,
   draggingId,
   onSelect,
   onOpen,
@@ -767,6 +828,21 @@ function DayColumn({
         backgroundImage: `repeating-linear-gradient(to bottom, var(--border) 0 1px, transparent 1px ${HOUR_HEIGHT}px)`,
       }}
     >
+      {/*
+        The hours outside the working day, dimmed.
+
+        Shading the *outside* rather than lighting the inside is the way round
+        that survives both themes: the working day is already the page, and a
+        lit band would have to be a second background colour that reads as a
+        highlight in light mode and as a hole in dark. A wash over the rest
+        reads as "quieter" in both.
+
+        It sits above the hour lines and below everything interactive — no
+        pointer events, no z-index, so DOM order alone keeps it under the
+        blocks and under the drag surface.
+      */}
+      <WorkingHoursWash />
+
       {/* Google leaves a 13px strip clear on the right of every column so there
           is always somewhere to drag-create even on a full day. Copy it. */}
       <div
@@ -805,7 +881,7 @@ function DayColumn({
                 tone={toneFor(event.rsvp)}
                 past={event.end < now}
                 selected={event.id === selectedId}
-                dimmed={event.id === draggingId}
+                dimmed={event.id === draggingId || (dimIds?.has(event.id) ?? false)}
                 copies={merged.copies.length}
                 height={height}
                 width={expanded ? width : (width * span) / columns}

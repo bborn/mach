@@ -3,24 +3,86 @@ import { describe, expect, it } from "vitest";
 import type { Command, CommandResult } from "./data";
 import {
   MAX_DEPTH,
+  describeRedo,
   describeUndo,
   emptyUndo,
+  hidesThreads,
   peekRedo,
   peekUndo,
   popRedo,
   popUndo,
   pushUndo,
+  recordUndo,
+  redoSteps,
+  refineRedo,
+  refineUndo,
   restoreUndo,
   restoresThreads,
+  runRedo,
+  runUndo,
+  undoSteps,
+  type UndoHost,
+  type UndoState,
 } from "./undo-stack";
 
 const NOW = 1_800_000_000_000;
 
 const archive = (ids: number[]): Command => ({ kind: "archive", threadIds: ids });
 const unarchive = (ids: number[]): Command => ({ kind: "unarchive", threadIds: ids });
+const label = (ids: number[], add: boolean): Command => ({
+  kind: "label",
+  threadIds: ids,
+  labelId: "Label_7",
+  add,
+});
 
 function ok(applied: number[], undo?: Command): CommandResult {
   return { ok: true, message: "", applied, failed: [], undo };
+}
+
+function failed(undo?: Command): CommandResult {
+  return {
+    ok: false,
+    message: "Google is rate limiting",
+    applied: [],
+    failed: [{ ids: [1], kind: "rateLimited", message: "", retriable: true, rolledBack: true }],
+    undo,
+  };
+}
+
+/**
+ * A stand-in for the app, recording everything a traversal asks of it in the
+ * order it asks — which is the half of undo that ordering bugs live in.
+ */
+function fakeHost(
+  initial: UndoState,
+  answer: (command: Command) => CommandResult | null = () => ok([1]),
+) {
+  let state = initial;
+  const events: string[] = [];
+  const ran: Command[] = [];
+  const host: UndoHost = {
+    read: () => state,
+    write: (next) => {
+      state = next;
+    },
+    execute: async (command) => {
+      ran.push(command);
+      events.push(`run:${command.kind}`);
+      return answer(command);
+    },
+    restore: (ids) => void events.push(`restore:${ids.join(",")}`),
+    hide: (ids) => void events.push(`hide:${ids.join(",")}`),
+    say: (message) => void events.push(`say:${message}`),
+  };
+  return {
+    host,
+    events,
+    ran,
+    get state() {
+      return state;
+    },
+  };
 }
 
 describe("pushUndo", () => {
@@ -134,13 +196,259 @@ describe("restoresThreads", () => {
   });
 });
 
+describe("hidesThreads", () => {
+  it("is true for the commands that take rows off the list", () => {
+    expect(hidesThreads(archive([1]))).toBe(true);
+    expect(hidesThreads({ kind: "trash", threadIds: [1] })).toBe(true);
+    expect(hidesThreads({ kind: "snooze", threadIds: [1], until: 5 })).toBe(true);
+  });
+
+  it("is false for the ones that leave the list alone", () => {
+    expect(hidesThreads(unarchive([1]))).toBe(false);
+    expect(hidesThreads({ kind: "star", threadIds: [1], starred: true })).toBe(false);
+  });
+});
+
 describe("describeUndo", () => {
   it("reads as a menu item", () => {
     const s = pushUndo(emptyUndo(), archive([1, 2, 3]), ok([1, 2, 3], unarchive([1, 2, 3])), "Archived 3 conversations", NOW);
     expect(describeUndo(peekUndo(s))).toBe("Undo archived 3 conversations");
   });
 
+  it("lowercases the sentence, not the words inside it", () => {
+    // The calendar really does label an entry `Created “Lunch with Dana”`, and
+    // "Undo created “lunch with dana”" is a different, worse sentence.
+    const s = recordUndo(emptyUndo(), "Created “Lunch with Dana”", archive([1]), NOW);
+    expect(describeUndo(peekUndo(s))).toBe("Undo created “Lunch with Dana”");
+  });
+
   it("is null when there is nothing to undo", () => {
     expect(describeUndo(null)).toBeNull();
+    expect(describeRedo(null)).toBeNull();
   });
 });
+
+describe("recordUndo", () => {
+  it("records an action known only by its inverse", () => {
+    // What the calendar's write path and the plugin host both have: they know
+    // what they did and how to take it back, and there is no CommandResult.
+    const s = recordUndo(emptyUndo(), "Moved the event", { kind: "moveEvent", eventId: 4, accountId: 1, calendarId: "cal-a" }, NOW);
+    expect(peekUndo(s)?.label).toBe("Moved the event");
+  });
+
+  it("refuses to guess how to re-apply it", () => {
+    // Redo is learned from the undo's own answer, never invented here.
+    const s = recordUndo(emptyUndo(), "Archived", unarchive([1]), NOW);
+    expect(peekUndo(s)?.original).toBeUndefined();
+    expect(redoSteps(peekUndo(s)!)).toEqual([]);
+  });
+
+  it("ignores a group that turned out to be empty", () => {
+    expect(recordUndo(emptyUndo(), "Did nothing", [], NOW).done).toHaveLength(0);
+  });
+});
+
+describe("steps", () => {
+  it("unwinds a group backwards", () => {
+    // The action labelled and *then* archived; unarchiving before removing the
+    // label would put the thread back with the label still on it.
+    const s = recordUndo(emptyUndo(), "Filed", [label([1], false), unarchive([1])], NOW);
+    expect(undoSteps(peekUndo(s)!)).toEqual([unarchive([1]), label([1], false)]);
+  });
+
+  it("keeps a single command single", () => {
+    const s = recordUndo(emptyUndo(), "Archived", unarchive([1]), NOW);
+    expect(undoSteps(peekUndo(s)!)).toEqual([unarchive([1])]);
+  });
+});
+
+describe("refining an entry", () => {
+  it("teaches the undone entry how to re-apply itself", () => {
+    let s = recordUndo(emptyUndo(), "Archived", unarchive([1]), NOW);
+    const id = peekUndo(s)!.id;
+    s = popUndo(s)!.state;
+    s = refineRedo(s, id, [archive([1])]);
+    expect(redoSteps(peekRedo(s)!)).toEqual([archive([1])]);
+  });
+
+  it("re-reverses a refined group, so undo → redo → undo keeps its order", () => {
+    let s = recordUndo(emptyUndo(), "Filed", [label([1], false), unarchive([1])], NOW);
+    const id = peekUndo(s)!.id;
+    s = popUndo(s)!.state;
+    // Collected in the order the undo dispatched them.
+    s = refineRedo(s, id, [archive([1]), label([1], true)]);
+    expect(redoSteps(peekRedo(s)!)).toEqual([label([1], true), archive([1])]);
+  });
+
+  it("teaches the redone entry how to take itself back", () => {
+    let s = recordUndo(emptyUndo(), "Archived", unarchive([1]), NOW);
+    const id = peekUndo(s)!.id;
+    s = popUndo(s)!.state;
+    s = refineRedo(s, id, [archive([1])]);
+    s = popRedo(s)!.state;
+    s = refineUndo(s, id, [unarchive([1, 2])]);
+    expect(undoSteps(peekUndo(s)!)).toEqual([unarchive([1, 2])]);
+  });
+});
+
+describe("runUndo", () => {
+  const archived = () =>
+    pushUndo(emptyUndo(), archive([1, 2]), ok([1, 2], unarchive([1, 2])), "Archived 2 conversations", NOW);
+
+  it("dispatches the inverse and says what it took back", async () => {
+    const app = fakeHost(archived(), () => ok([1, 2], archive([1, 2])));
+    const outcome = await runUndo(app.host);
+
+    expect(outcome.ok).toBe(true);
+    expect(app.ran).toEqual([unarchive([1, 2])]);
+    expect(app.events).toContain("say:Undid archived 2 conversations");
+    expect(peekUndo(app.state)).toBeNull();
+  });
+
+  it("clears the list's optimistic hide before it runs anything", async () => {
+    // The rows were hidden the instant they were archived. Putting the threads
+    // back in the store without clearing that hide would restore them
+    // invisibly — an undo that reports success and shows nothing.
+    const app = fakeHost(archived(), () => ok([1, 2], archive([1, 2])));
+    await runUndo(app.host);
+    expect(app.events.slice(0, 2)).toEqual(["restore:1,2", "run:unarchive"]);
+  });
+
+  it("hides the rows again when the inverse is the one that removes them", async () => {
+    const s = recordUndo(emptyUndo(), "Moved back to the inbox", archive([3]), NOW);
+    const app = fakeHost(s, () => ok([3], unarchive([3])));
+    await runUndo(app.host);
+    expect(app.events.slice(0, 2)).toEqual(["hide:3", "run:archive"]);
+  });
+
+  it("puts the entry back when the undo itself fails", async () => {
+    // The affordance must not vanish because the network blipped: the whole
+    // point of a stack that does not expire is that ⌘Z is still there.
+    const app = fakeHost(archived(), () => failed());
+    const outcome = await runUndo(app.host);
+
+    expect(outcome.ok).toBe(false);
+    expect(peekUndo(app.state)?.label).toBe("Archived 2 conversations");
+    expect(peekRedo(app.state)).toBeNull();
+    // And it does not claim to have done anything.
+    expect(app.events.some((e) => e.startsWith("say:"))).toBe(false);
+  });
+
+  it("puts the entry back when the command never reached the layer", async () => {
+    const app = fakeHost(archived(), () => null);
+    await runUndo(app.host);
+    expect(peekUndo(app.state)?.label).toBe("Archived 2 conversations");
+  });
+
+  it("learns the exact redo from the undo's own answer", async () => {
+    /*
+     * The calendar is the case that makes this necessary. The inverse of
+     * "delete this event" is a create carrying the whole event, and the event
+     * it creates has a new id — so the only honest way to re-delete it is the
+     * inverse the create itself handed back.
+     */
+    const remade: Command = { kind: "deleteEvent", eventId: 99 };
+    const s = recordUndo(emptyUndo(), "Deleted the event", { kind: "createEvent", accountId: 1, calendarId: "cal-a", draft: draft() }, NOW);
+    const app = fakeHost(s, () => ok([99], remade));
+
+    await runUndo(app.host);
+    expect(redoSteps(peekRedo(app.state)!)).toEqual([remade]);
+  });
+
+  it("leaves redo unavailable when nothing ever said how to re-apply it", async () => {
+    // A calendar entry recorded off its status message starts with no way back,
+    // and an inverse that returns none of its own does not supply one.
+    const s = recordUndo(emptyUndo(), "Sent an RSVP", { kind: "rsvp", eventId: 3, response: "accepted" }, NOW);
+    const app = fakeHost(s, () => ok([3], undefined));
+    await runUndo(app.host);
+    expect(redoSteps(peekRedo(app.state)!)).toEqual([]);
+  });
+
+  it("runs a group backwards and stops at the first failure", async () => {
+    const s = recordUndo(emptyUndo(), "Filed", [label([1], false), unarchive([1])], NOW);
+    const app = fakeHost(s, (command) => (command.kind === "unarchive" ? ok([1]) : failed()));
+    const outcome = await runUndo(app.host);
+
+    expect(app.ran.map((c) => c.kind)).toEqual(["unarchive", "label"]);
+    expect(outcome.ok).toBe(false);
+    expect(peekUndo(app.state)?.label).toBe("Filed");
+  });
+
+  it("is a no-op on an empty stack", async () => {
+    const app = fakeHost(emptyUndo());
+    expect((await runUndo(app.host)).entry).toBeNull();
+    expect(app.ran).toHaveLength(0);
+  });
+
+  it("takes the next entry when ⌘Z fires twice for one press", async () => {
+    /*
+     * ⌘Z can arrive from the keyboard and from the Edit menu for a single
+     * press. The pop happens through the host's state before anything is
+     * dispatched, so the second arrival can only ever reach the *next* entry —
+     * what it must never do is run this one's inverse a second time.
+     */
+    let s = pushUndo(emptyUndo(), archive([1]), ok([1], unarchive([1])), "one", NOW);
+    s = pushUndo(s, archive([2]), ok([2], unarchive([2])), "two", NOW + 1);
+    const app = fakeHost(s, () => ok([1]));
+
+    await Promise.all([runUndo(app.host), runUndo(app.host)]);
+    expect(app.ran).toEqual([unarchive([2]), unarchive([1])]);
+  });
+});
+
+describe("runRedo", () => {
+  async function undone() {
+    const s = pushUndo(emptyUndo(), archive([1]), ok([1], unarchive([1])), "Archived 1 conversation", NOW);
+    const app = fakeHost(s, () => ok([1], archive([1])));
+    await runUndo(app.host);
+    return app.state;
+  }
+
+  it("re-applies what the undo took back", async () => {
+    const app = fakeHost(await undone(), () => ok([1], unarchive([1])));
+    const outcome = await runRedo(app.host);
+
+    expect(outcome.ok).toBe(true);
+    expect(app.ran).toEqual([archive([1])]);
+    expect(app.events).toContain("say:Redid archived 1 conversation");
+    // And ⌘Z can take it back again, with the inverse the redo just returned.
+    expect(undoSteps(peekUndo(app.state)!)).toEqual([unarchive([1])]);
+  });
+
+  it("says so rather than silently doing nothing when it cannot", async () => {
+    // Nothing was learned on the way through, so there is no honest redo.
+    let s = recordUndo(emptyUndo(), "Archived", unarchive([1]), NOW);
+    s = popUndo(s)!.state;
+    const app = fakeHost(s);
+    const outcome = await runRedo(app.host);
+
+    expect(outcome.ok).toBe(false);
+    expect(app.ran).toHaveLength(0);
+    expect(app.events).toEqual(["say:Cannot redo archived"]);
+    // The entry stays where it is rather than being quietly consumed.
+    expect(peekRedo(app.state)).not.toBeNull();
+  });
+
+  it("puts the entry back when the redo fails", async () => {
+    const app = fakeHost(await undone(), () => failed());
+    await runRedo(app.host);
+    expect(peekRedo(app.state)?.label).toBe("Archived 1 conversation");
+    expect(peekUndo(app.state)).toBeNull();
+  });
+
+  it("is a no-op with nothing to redo", async () => {
+    const app = fakeHost(emptyUndo());
+    expect((await runRedo(app.host)).entry).toBeNull();
+  });
+});
+
+function draft() {
+  return {
+    title: "Lunch",
+    startTs: NOW,
+    endTs: NOW + 3_600_000,
+    isAllDay: false,
+    attendees: [],
+    recurrence: [],
+  };
+}

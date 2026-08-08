@@ -40,12 +40,14 @@
 //! is allowed to hold a decision. `tests/ipc.rs` drives the plain functions.
 
 pub mod agent;
+pub mod attachments;
 pub mod commands;
 pub mod compose;
 pub mod error;
 pub mod feedback;
 pub mod events;
 pub mod plugins;
+pub mod prefs;
 pub mod reads;
 pub mod render;
 pub mod state;

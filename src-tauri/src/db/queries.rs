@@ -603,14 +603,25 @@ pub fn set_attachment_local_path(conn: &Connection, attachment_id: i64, path: Op
 // calendar
 // ---------------------------------------------------------------------------
 
-const EVENT_COLUMNS: &str = "\
+pub(crate) const EVENT_COLUMNS: &str = "\
     id, account_id, calendar_id, google_event_id, title, description, location, \
     start_ts, end_ts, is_all_day, attendees, rsvp_status, recurring_event_id, \
-    status, html_link, updated_at";
+    status, html_link, updated_at, recurrence, reminders, ical_uid, organizer, \
+    organizer_self, guests_can_modify";
 
-fn map_event(row: &Row<'_>) -> rusqlite::Result<Event> {
+/// Read an event row selected with [`EVENT_COLUMNS`].
+///
+/// Shared with `command_queries`, which used to keep a byte-identical copy of
+/// both this and the column list. Two copies of a positional mapper is a bug
+/// waiting for the next column: adding one to a `SELECT` in one file and
+/// forgetting the other reads a `TEXT` out of an `INTEGER` slot at runtime,
+/// which is a panic rather than a compile error.
+pub(crate) fn map_event(row: &Row<'_>) -> rusqlite::Result<Event> {
     let attendees: String = row.get(10)?;
     let rsvp: Option<String> = row.get(11)?;
+    let recurrence: Option<String> = row.get(16)?;
+    let reminders: Option<String> = row.get(17)?;
+    let organizer: Option<String> = row.get(19)?;
     Ok(Event {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -625,10 +636,47 @@ fn map_event(row: &Row<'_>) -> rusqlite::Result<Event> {
         attendees: people_from_json(&attendees),
         rsvp_status: rsvp.as_deref().and_then(RsvpStatus::parse),
         recurring_event_id: row.get(12)?,
+        recurrence: json_or_default(recurrence.as_deref()),
+        reminders: reminders.as_deref().and_then(json_opt),
+        ical_uid: row.get(18)?,
+        organizer: organizer.as_deref().and_then(json_opt),
+        organizer_self: row.get(20)?,
+        guests_can_modify: row.get(21)?,
         status: row.get(13)?,
         html_link: row.get(14)?,
         updated_at: row.get(15)?,
     })
+}
+
+/// Decode a JSON column, falling back to the type's default.
+///
+/// A column that will not parse is treated as absent rather than fatal: these
+/// hold display data written by an older build, and refusing to render a week
+/// because one event's reminder blob is malformed would be the wrong trade.
+pub(crate) fn json_or_default<T: serde::de::DeserializeOwned + Default>(raw: Option<&str>) -> T {
+    raw.and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn json_opt<T: serde::de::DeserializeOwned>(raw: &str) -> Option<T> {
+    serde_json::from_str(raw).ok()
+}
+
+/// JSON for a value worth storing, or `None` for one that is not.
+///
+/// Empty lists become SQL `NULL` rather than `"[]"` so that the upsert's
+/// `COALESCE` can tell "Google said nothing about this" from "Google said
+/// there is nothing" — which is the whole mechanism that keeps a series' rule
+/// alive across the expanded instances that never carry it.
+pub(crate) fn json_if_present<T: serde::Serialize>(value: &[T]) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    serde_json::to_string(value).ok()
+}
+
+pub(crate) fn json_of<T: serde::Serialize>(value: Option<&T>) -> Option<String> {
+    value.and_then(|v| serde_json::to_string(v).ok())
 }
 
 /// Every event overlapping `[from_ts, to_ts)`, across accounts unless one is
@@ -655,12 +703,42 @@ pub fn events_in_range(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Write an event row, or bring the existing one up to date.
+///
+/// # Why five of the columns are `COALESCE`d rather than overwritten
+///
+/// This is the statement sync runs for every event on every pass, and sync's
+/// view of an event is *lossier than the store's*. `events.list` is called with
+/// `singleEvents=true`, which returns concrete occurrences — and an occurrence
+/// carries no `recurrence`, because the rule lives on the series master that
+/// the expansion never returns. A plain `excluded.recurrence` would therefore
+/// erase the rule of every series on the first sync after it was created, which
+/// is exactly the "I made it weekly and it came back as a one-off" symptom.
+///
+/// So: a `NULL` from the caller means "I was not told", not "there is none",
+/// and leaves what is already there alone. `json_if_present` is what turns an
+/// empty list into that `NULL`. Clearing a rule for real is an `UPDATE` from
+/// the command layer, which knows the difference and says so explicitly.
+///
+/// The series subquery is the other half. A recurring create writes the rule
+/// onto one row; Google then expands the series into twenty siblings, none of
+/// which know it. Reading the rule off any sibling that does costs one indexed
+/// lookup and makes every occurrence of a series agree about how it repeats.
 pub fn upsert_event(conn: &Connection, new: &NewEvent) -> Result<i64> {
     let id = conn.query_row(
         "INSERT INTO events (account_id, calendar_id, google_event_id, title, description,
                              location, start_ts, end_ts, is_all_day, attendees, rsvp_status,
-                             recurring_event_id, status, html_link, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                             recurring_event_id, status, html_link, updated_at,
+                             recurrence, reminders, ical_uid, organizer, organizer_self,
+                             guests_can_modify)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                 COALESCE(?16, (SELECT sibling.recurrence FROM events sibling
+                                 WHERE sibling.account_id = ?1
+                                   AND sibling.calendar_id = ?2
+                                   AND sibling.recurring_event_id = ?12
+                                   AND sibling.recurrence IS NOT NULL
+                                 LIMIT 1)),
+                 ?17, ?18, ?19, ?20, ?21)
          ON CONFLICT(account_id, calendar_id, google_event_id) DO UPDATE SET
              title              = excluded.title,
              description        = excluded.description,
@@ -673,7 +751,13 @@ pub fn upsert_event(conn: &Connection, new: &NewEvent) -> Result<i64> {
              recurring_event_id = excluded.recurring_event_id,
              status             = excluded.status,
              html_link          = excluded.html_link,
-             updated_at         = excluded.updated_at
+             updated_at         = excluded.updated_at,
+             recurrence         = COALESCE(excluded.recurrence, events.recurrence),
+             reminders          = COALESCE(excluded.reminders, events.reminders),
+             ical_uid           = COALESCE(excluded.ical_uid, events.ical_uid),
+             organizer          = COALESCE(excluded.organizer, events.organizer),
+             organizer_self     = COALESCE(excluded.organizer_self, events.organizer_self),
+             guests_can_modify  = COALESCE(excluded.guests_can_modify, events.guests_can_modify)
          RETURNING id",
         params![
             new.account_id,
@@ -691,6 +775,12 @@ pub fn upsert_event(conn: &Connection, new: &NewEvent) -> Result<i64> {
             new.status,
             new.html_link,
             new.updated_at,
+            json_if_present(&new.recurrence),
+            json_of(new.reminders.as_ref()),
+            new.ical_uid,
+            json_of(new.organizer.as_ref()),
+            new.organizer_self,
+            new.guests_can_modify,
         ],
         |row| row.get(0),
     )?;
@@ -784,4 +874,388 @@ pub fn search_thread_summaries(
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// search — the operator language
+// ---------------------------------------------------------------------------
+
+/*
+ * Everything below compiles a parsed Gmail-style query into one SQL statement.
+ *
+ * The query is *parsed* in TypeScript (`src/lib/search-query.ts`) because the
+ * box has to show its own interpretation as you type, and a round trip per
+ * keystroke to find out what you typed would defeat the point. What crosses the
+ * seam is the AST, not the text, so there is exactly one parser and this side
+ * never has to guess what `older_than:2m` meant.
+ *
+ * # Why every predicate is pushed into SQL
+ *
+ * 61k messages. Fetching rows and filtering them in the frontend is not slow,
+ * it is impossible — the page would have to arrive first. So each leaf below
+ * compiles to a predicate SQLite can answer from an index, and the whole tree
+ * becomes one statement with `ORDER BY last_message_at DESC LIMIT n`, which
+ * lets SQLite walk `idx_threads_stream` newest-first and stop as soon as the
+ * page is full.
+ *
+ * # The shapes that matter, measured against the real 61k-message store
+ *
+ *  * Full text goes through `messages_fts`, and the hit set is mapped back to
+ *    threads through a *covering* scan of `idx_messages_thread` rather than by
+ *    reading the matched `messages` rows. Message rows are fat (they hold the
+ *    bodies), so 31k rowid lookups cost ~2.7s cold; the same answer off the
+ *    covering index is ~60ms and does not grow with the number of hits.
+ *  * `from:` is prefiltered on `threads.participants`, which is the sender
+ *    rollup the list already renders, so the expensive per-message check only
+ *    runs on threads that could possibly match.
+ *  * `to:`/`cc:`/`bcc:` have nothing indexed to stand on — an unanchored LIKE
+ *    cannot use a b-tree — so they are the one operator that can still walk the
+ *    message table. Combined with anything else, or with a common address, the
+ *    LIMIT stops it early. See the note on `SEARCH_UNINDEXED_FIELDS`.
+ */
+
+use serde::{Deserialize, Serialize};
+
+/// Operators that carry a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SearchField {
+    From,
+    To,
+    Cc,
+    Bcc,
+    Subject,
+    Label,
+    Filename,
+}
+
+/// Operators that are a state rather than a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SearchFlag {
+    Unread,
+    Read,
+    Starred,
+    Attachment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DateBound {
+    Before,
+    After,
+}
+
+/// The parsed query. Mirrors `SearchNode` in `src/lib/search-query.ts` field
+/// for field; serde's tagged representation is the wire format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum SearchNode {
+    And {
+        nodes: Vec<SearchNode>,
+    },
+    Or {
+        nodes: Vec<SearchNode>,
+    },
+    Not {
+        node: Box<SearchNode>,
+    },
+    /// The identity — what `in:anywhere` compiles to. Never narrows anything.
+    All,
+    Text {
+        value: String,
+        #[serde(default)]
+        prefix: bool,
+    },
+    Field {
+        field: SearchField,
+        value: String,
+        #[serde(default)]
+        prefix: bool,
+    },
+    Flag {
+        flag: SearchFlag,
+    },
+    /// Already an absolute epoch millisecond; the parser resolved `7d` for us.
+    Date {
+        bound: DateBound,
+        ts: i64,
+    },
+}
+
+/// One page of an operator search.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SearchRequest {
+    /// `None` searches every account, which is what Gmail does.
+    pub account_id: Option<i64>,
+    /// `0` means the default page size.
+    pub limit: u32,
+    /// Keyset resume point, same `(last_message_at, id)` order as the stream.
+    pub after: Option<ThreadCursor>,
+}
+
+/// How deep a tree may nest before the rest is ignored.
+///
+/// `((((((…` is a real thing to type, and both sides of the seam recurse over
+/// this structure. The parser caps itself at the same order of magnitude; this
+/// is the backstop for an AST that arrived from somewhere else.
+const MAX_SEARCH_DEPTH: usize = 24;
+
+/// `threads.participants` holds at most this many senders — see
+/// `MAX_THREAD_PARTICIPANTS` in `sync_queries.rs`, which builds the rollup.
+///
+/// It is the reason the `from:` prefilter has to be an *or*: on a thread whose
+/// rollup hit the cap the list is incomplete, so absence from it does not prove
+/// absence from the thread. A rollup holding exactly the cap is precisely the
+/// "might have been truncated" case, and it is rare — 27 threads out of 41,799
+/// in the mailbox this was measured against — so the exact per-message check
+/// still runs on almost nothing.
+///
+/// The `message_count` guard in front of the JSON call is not redundant: it
+/// keeps `json_array_length` off 41,000 rows that cannot possibly have hit the
+/// cap, and it is implied by the JSON test rather than adding to it (ten
+/// distinct senders needs at least ten messages).
+const PARTICIPANT_ROLLUP_CAP: i64 = 10;
+
+/// The operators no index can serve, named so the comment above stays honest.
+pub const SEARCH_UNINDEXED_FIELDS: &[SearchField] = &[SearchField::To, SearchField::Cc, SearchField::Bcc];
+
+/// Quote a user's term as a single FTS5 string literal.
+///
+/// **This is the injection boundary.** Everything inside an FTS5 double-quoted
+/// string is a literal token sequence: `*`, `NEAR`, `AND`, `OR`, `-`, `^`, `:`
+/// and `(` all lose their meaning there, and the only character that can end
+/// the string is `"`, which is escaped by doubling it. So a term is safe iff it
+/// is wrapped and its quotes are doubled — which is what this does, and what
+/// `tests/search.rs` proves against a corpus built to be broken out of.
+///
+/// Returns `None` when the term contains nothing the tokenizer would index. An
+/// empty match expression is a *syntax error* in FTS5 rather than an empty
+/// result, so callers must treat `None` as "matches nothing" themselves.
+pub fn fts_escape(term: &str, prefix: bool) -> Option<String> {
+    if !term.chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    let escaped = term.replace('"', "\"\"");
+    Some(if prefix {
+        format!("\"{escaped}\"*")
+    } else {
+        format!("\"{escaped}\"")
+    })
+}
+
+/// Escape a value for use inside `LIKE '%…%' ESCAPE '\'`.
+fn like_contains(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// Escape a value for an exact `LIKE` — case-insensitive equality, no wildcards.
+fn like_exact(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+struct Compiler {
+    args: Vec<Value>,
+}
+
+impl Compiler {
+    /// Binds a value and returns the `?N` that refers to it.
+    fn bind(&mut self, value: Value) -> String {
+        self.args.push(value);
+        format!("?{}", self.args.len())
+    }
+
+    fn text(&mut self, value: &str) -> String {
+        self.bind(Value::Text(value.to_string()))
+    }
+
+    /// The set of threads holding a message that matches an FTS expression.
+    ///
+    /// Not correlated: SQLite evaluates it once and reuses it for every row of
+    /// the driving scan. The `INDEXED BY` is load-bearing — without it the
+    /// planner maps message ids back to threads with rowid lookups into the fat
+    /// `messages` table, which is 45x slower on a cold cache. See the module
+    /// note above for the measurements.
+    fn fts_threads(&mut self, expr: &str) -> String {
+        let param = self.text(expr);
+        format!(
+            "t.id IN (SELECT m.thread_id FROM messages m INDEXED BY idx_messages_thread \
+             WHERE m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH {param}))"
+        )
+    }
+
+    fn compile(&mut self, node: &SearchNode, depth: usize) -> String {
+        if depth > MAX_SEARCH_DEPTH {
+            return "1".to_string();
+        }
+        match node {
+            SearchNode::All => "1".to_string(),
+            SearchNode::And { nodes } => self.join(nodes, "AND", depth),
+            SearchNode::Or { nodes } => self.join(nodes, "OR", depth),
+            SearchNode::Not { node } => {
+                let inner = self.compile(node, depth + 1);
+                format!("NOT ({inner})")
+            }
+            SearchNode::Text { value, prefix } => match fts_escape(value, *prefix) {
+                // A term the tokenizer would not index cannot be in the index,
+                // so it matches nothing. Saying so is more honest than dropping
+                // the term and returning the whole mailbox.
+                None => "0".to_string(),
+                Some(expr) => self.fts_threads(&expr),
+            },
+            SearchNode::Flag { flag } => match flag {
+                SearchFlag::Unread => "t.is_unread = 1".to_string(),
+                SearchFlag::Read => "t.is_unread = 0".to_string(),
+                SearchFlag::Attachment => "t.has_attachments = 1".to_string(),
+                SearchFlag::Starred => "EXISTS (SELECT 1 FROM thread_labels tl \
+                     WHERE tl.thread_id = t.id AND tl.gmail_label_id = 'STARRED')"
+                    .to_string(),
+            },
+            SearchNode::Date { bound, ts } => {
+                let param = self.bind(Value::Integer(*ts));
+                match bound {
+                    DateBound::Before => format!("t.last_message_at < {param}"),
+                    DateBound::After => format!("t.last_message_at >= {param}"),
+                }
+            }
+            SearchNode::Field {
+                field,
+                value,
+                prefix,
+            } => self.field(*field, value, *prefix),
+        }
+    }
+
+    fn join(&mut self, nodes: &[SearchNode], op: &str, depth: usize) -> String {
+        if nodes.is_empty() {
+            return "1".to_string();
+        }
+        let parts: Vec<String> = nodes.iter().map(|n| self.compile(n, depth + 1)).collect();
+        format!("({})", parts.join(&format!(" {op} ")))
+    }
+
+    fn field(&mut self, field: SearchField, value: &str, prefix: bool) -> String {
+        match field {
+            SearchField::Subject => match fts_escape(value, prefix) {
+                None => "0".to_string(),
+                // The column filter is our literal and the term is quoted, so
+                // the user cannot reach the `:` that separates them.
+                Some(expr) => self.fts_threads(&format!("subject : {expr}")),
+            },
+            SearchField::From => {
+                let like = self.text(&like_contains(value));
+                format!(
+                    "((t.participants LIKE {like} ESCAPE '\\' \
+                       OR (t.message_count >= {PARTICIPANT_ROLLUP_CAP} \
+                           AND json_array_length(t.participants) >= {PARTICIPANT_ROLLUP_CAP})) \
+                     AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id \
+                       AND (m.from_email LIKE {like} ESCAPE '\\' OR m.from_name LIKE {like} ESCAPE '\\')))"
+                )
+            }
+            SearchField::To | SearchField::Cc | SearchField::Bcc => {
+                let column = match field {
+                    SearchField::To => "to_json",
+                    SearchField::Cc => "cc_json",
+                    _ => "bcc_json",
+                };
+                let like = self.text(&like_contains(value));
+                format!(
+                    "EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id \
+                     AND m.{column} LIKE {like} ESCAPE '\\')"
+                )
+            }
+            SearchField::Filename => {
+                let like = self.text(&like_contains(value));
+                // Driven from `attachments` (a few thousand rows) rather than
+                // per thread, then mapped back through the covering index.
+                format!(
+                    "t.id IN (SELECT m.thread_id FROM messages m INDEXED BY idx_messages_thread \
+                     WHERE m.id IN (SELECT att.message_id FROM attachments att \
+                       WHERE att.filename LIKE {like} ESCAPE '\\'))"
+                )
+            }
+            SearchField::Label => {
+                // A label is either the Gmail id the thread carries (`INBOX`,
+                // `Label_12`) or the name the user gave it, which only the
+                // `labels` table knows. Both spellings are accepted because
+                // `in:inbox` produces one and `label:receipts` the other.
+                let id = self.text(value);
+                let name = self.text(&like_exact(value));
+                format!(
+                    "EXISTS (SELECT 1 FROM thread_labels tl WHERE tl.thread_id = t.id \
+                     AND (tl.gmail_label_id = {id} COLLATE NOCASE \
+                          OR EXISTS (SELECT 1 FROM labels l WHERE l.account_id = t.account_id \
+                                       AND l.gmail_label_id = tl.gmail_label_id \
+                                       AND l.name LIKE {name} ESCAPE '\\')))"
+                )
+            }
+        }
+    }
+}
+
+/// Compile a query to `(sql predicate, bound values)`.
+///
+/// Exposed for tests, which assert on the SQL text rather than only on results
+/// — an injection regression is much easier to see in the statement than in an
+/// empty result set.
+pub fn compile_search(node: &SearchNode) -> (String, Vec<Value>) {
+    let mut compiler = Compiler { args: Vec::new() };
+    let sql = compiler.compile(node, 0);
+    (sql, compiler.args)
+}
+
+/// Run an operator search and hydrate the page.
+///
+/// Ordered newest-first, not by relevance. That is Gmail's order, it is the
+/// order the list next to it is already in, and it is the only one that lets
+/// the query keyset-paginate — `search_threads` above keeps bm25 for ⌘K, where
+/// six results are all that will ever be shown.
+pub fn search_threads_filtered(
+    conn: &Connection,
+    node: &SearchNode,
+    request: &SearchRequest,
+) -> Result<Vec<ThreadSummary>> {
+    let (predicate, mut args) = compile_search(node);
+
+    let mut sql = format!(
+        "SELECT {THREAD_COLUMNS} FROM threads t JOIN accounts a ON a.id = t.account_id \
+         WHERE ({predicate})"
+    );
+
+    if let Some(account_id) = request.account_id {
+        args.push(Value::Integer(account_id));
+        sql.push_str(&format!(" AND t.account_id = ?{}", args.len()));
+    }
+    if let Some(cursor) = request.after {
+        // Same row-value comparison as the stream, so the same index drives it.
+        args.push(Value::Integer(cursor.last_message_at));
+        args.push(Value::Integer(cursor.id));
+        sql.push_str(&format!(
+            " AND (t.last_message_at, t.id) < (?{}, ?{})",
+            args.len() - 1,
+            args.len()
+        ));
+    }
+
+    let limit = match request.limit {
+        0 => DEFAULT_PAGE_SIZE,
+        n => n.min(MAX_PAGE_SIZE),
+    };
+    args.push(Value::Integer(limit as i64));
+    sql.push_str(&format!(
+        " ORDER BY t.last_message_at DESC, t.id DESC LIMIT ?{}",
+        args.len()
+    ));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args.iter()), map_thread)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }

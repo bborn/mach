@@ -482,11 +482,55 @@ impl GmailClient {
     // ---------------------------------------------------------- attachments
 
     /// `users.messages.attachments.get`, decoded to bytes.
+    ///
+    /// Uncapped. Prefer [`attachment_get_capped`](Self::attachment_get_capped)
+    /// for anything whose size a stranger chose.
     pub async fn attachment_get(
         &self,
         user_id: &str,
         message_id: &str,
         attachment_id: &str,
+    ) -> Result<Vec<u8>, GoogleError> {
+        self.attachment_get_capped(user_id, message_id, attachment_id, usize::MAX)
+            .await
+    }
+
+    /// `users.messages.attachments.get`, refusing anything over `max_bytes`.
+    ///
+    /// # Why this buffers, and what is done about it
+    ///
+    /// It would be better to stream this to disk, and it is not possible here.
+    /// The endpoint does not return the file: it returns a JSON envelope,
+    /// `{"size":N,"data":"<base64url>"}`, so there is no useful prefix of the
+    /// response — the bytes cannot be decoded until the field is closed, and the
+    /// field is not closed until the transfer is over. Layered on top of that,
+    /// [`HttpTransport`](super::HttpTransport) hands back an
+    /// [`HttpResponse`](super::HttpResponse) whose body is an owned `Vec<u8>`;
+    /// every client in this crate and both test suites are written against that
+    /// shape, and widening it to a byte stream is a change to the transport
+    /// seam rather than to this endpoint.
+    ///
+    /// So the honest description is: this is a buffered fetch, with the peak
+    /// held down by three things.
+    ///
+    /// 1. **The cap is checked before the body is looked at.** A response whose
+    ///    encoded length could not possibly decode to something under the limit
+    ///    is rejected without being parsed, so a hostile `size` field cannot make
+    ///    us allocate a second copy of a gigabyte.
+    /// 2. **`send` is used rather than `send_json`,** which lets the raw response
+    ///    be dropped the moment the envelope is parsed instead of being held
+    ///    alive across the decode.
+    /// 3. **The encoded string is dropped before the decoded bytes are
+    ///    returned,** so the two large allocations do not both outlive the call.
+    ///
+    /// Peak is therefore a little over twice the file, transiently, against a
+    /// cap the caller sets — not the unbounded growth a naive version has.
+    pub async fn attachment_get_capped(
+        &self,
+        user_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        max_bytes: usize,
     ) -> Result<Vec<u8>, GoogleError> {
         let url = self.rest.endpoint(&[
             "users",
@@ -496,11 +540,41 @@ impl GmailClient {
             "attachments",
             attachment_id,
         ])?;
-        let body: AttachmentBody = self.rest.send_json(HttpMethod::Get, url, None).await?;
+
+        let response = self.rest.send(HttpMethod::Get, url, None).await?;
+
+        // base64 is four characters per three bytes; the rest of the envelope is
+        // a few dozen. Anything past that ceiling cannot decode to something
+        // within the cap, so it is refused before it is parsed.
+        let ceiling = encoded_ceiling(max_bytes);
+        if response.body.len() > ceiling {
+            return Err(too_large(attachment_id, max_bytes));
+        }
+
+        let body: AttachmentBody =
+            serde_json::from_slice(&response.body).map_err(|e| GoogleError::Deserialize {
+                message: format!("attachment {attachment_id} was not an attachment body: {e}"),
+            })?;
+        drop(response);
+
+        // Google's own declared size, checked before the decode allocates.
+        if body.size > 0 && usize::try_from(body.size).unwrap_or(usize::MAX) > max_bytes {
+            return Err(too_large(attachment_id, max_bytes));
+        }
+
         let data = body.data.unwrap_or_default();
-        super::types::decode_base64url(&data).map_err(|e| GoogleError::Deserialize {
-            message: format!("attachment {attachment_id} was not valid base64url: {e}"),
-        })
+        let bytes =
+            super::types::decode_base64url(&data).map_err(|e| GoogleError::Deserialize {
+                message: format!("attachment {attachment_id} was not valid base64url: {e}"),
+            })?;
+        drop(data);
+
+        // And the truth, in case the envelope lied about both of the above.
+        if bytes.len() > max_bytes {
+            return Err(too_large(attachment_id, max_bytes));
+        }
+
+        Ok(bytes)
     }
 
     // -------------------------------------------------------------- profile
@@ -510,6 +584,28 @@ impl GmailClient {
     pub async fn get_profile(&self, user_id: &str) -> Result<Profile, GoogleError> {
         let url = self.rest.endpoint(&["users", user_id, "profile"])?;
         self.rest.send_json(HttpMethod::Get, url, None).await
+    }
+}
+
+/// The largest response body that could still decode to `max_bytes`.
+///
+/// Four base64 characters per three bytes, plus room for the JSON envelope, the
+/// `size` field and any whitespace Google chooses to pretty-print with.
+/// Saturating, because `usize::MAX` is a legitimate "no cap" argument and must
+/// not wrap around into a cap of nearly zero.
+fn encoded_ceiling(max_bytes: usize) -> usize {
+    max_bytes
+        .saturating_mul(4)
+        .saturating_div(3)
+        .saturating_add(64 * 1024)
+}
+
+fn too_large(attachment_id: &str, max_bytes: usize) -> GoogleError {
+    GoogleError::InvalidRequest {
+        message: format!(
+            "attachment {attachment_id} is larger than the {} MiB Mach will download",
+            max_bytes / (1024 * 1024)
+        ),
     }
 }
 

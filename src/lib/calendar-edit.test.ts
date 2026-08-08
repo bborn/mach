@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { CalendarEvent } from "@/types";
 import {
   attendeesField,
+  canEditEvent,
+  choiceFromRules,
+  describeReminders,
+  describeRules,
+  reminderChoiceId,
+  reminderMinutesOf,
+  requiresSeriesScope,
   dateField,
   duplicateDraft,
   emptyForm,
@@ -240,7 +247,10 @@ describe("formPatch — only what changed", () => {
   });
 
   it("carries a reminder choice, including none at all", () => {
-    expect(formPatch(event, { ...base, reminderMinutes: 10 })?.reminderMinutes).toEqual([10]);
+    expect(formPatch(event, { ...base, reminderMinutes: [10] })?.reminderMinutes).toEqual([10]);
+    // "No alert" is a real setting and a different one from "the calendar's
+    // default", so the empty list has to survive as an empty list.
+    expect(formPatch(event, { ...base, reminderMinutes: [] })?.reminderMinutes).toEqual([]);
   });
 
   it("refuses to build a patch from a form that does not describe a time", () => {
@@ -381,5 +391,164 @@ describe("looksRecurring", () => {
     // one from a repeated title there would only ever be a false positive.
     const reporting = { ...event, id: 9, recurringEventId: "series-xyz", start: NINE + DAY };
     expect(looksRecurring(weekly[1], [...weekly, reporting])).toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The fields that used to be write-only                                       */
+/* -------------------------------------------------------------------------- */
+
+describe("recurrence read-back", () => {
+  it("recognises each rule the picker itself emits", () => {
+    for (const choice of ["daily", "weekdays", "weekly", "monthly", "yearly"] as const) {
+      expect(choiceFromRules(rulesFor(choice, NINE), NINE)).toBe(choice);
+    }
+    expect(choiceFromRules([], NINE)).toBe("none");
+  });
+
+  it("calls anything it did not author custom rather than guessing", () => {
+    // The asymmetry that matters: reading this as "every week" would silently
+    // triple the frequency of somebody's series on the next unrelated save.
+    expect(choiceFromRules(["RRULE:FREQ=WEEKLY;INTERVAL=3"], NINE)).toBe("custom");
+    expect(choiceFromRules(["RRULE:FREQ=WEEKLY", "EXDATE:20260814T090000Z"], NINE)).toBe("custom");
+  });
+
+  it("treats a bare weekly rule as weekly — same meaning, fewer words", () => {
+    expect(choiceFromRules(["RRULE:FREQ=WEEKLY"], NINE)).toBe("weekly");
+  });
+
+  it("anchors the weekly match to the event's own weekday", () => {
+    // 2026-08-07 is a Friday. `BYDAY=TU` on a Friday event is not "every week".
+    expect(choiceFromRules(["RRULE:FREQ=WEEKLY;BYDAY=TU"], NINE)).toBe("custom");
+  });
+
+  it("describes a rule it cannot name in words a human reads", () => {
+    expect(describeRules(["RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE"])).toBe(
+      "Every 2 weeks on Monday, Wednesday",
+    );
+    expect(describeRules(["RRULE:FREQ=DAILY;UNTIL=20261231"])).toBe("Every day, until 2026-12-31");
+    expect(describeRules([])).toBe("Does not repeat");
+  });
+
+  it("opens a recurring event on its own rule rather than on “does not repeat”", () => {
+    const weekly: CalendarEvent = {
+      ...event,
+      recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=FR"],
+      recurringEventId: "series",
+    };
+    const form = formFromEvent(weekly);
+    expect(form.recurrence).toBe("weekly");
+    // And re-saving without touching it sends nothing about recurrence, which
+    // is the bug the old "send it unless it is none" rule could not avoid.
+    expect(formPatch(weekly, form)?.recurrence).toBeUndefined();
+  });
+
+  it("carries a rule it cannot express straight back out again", () => {
+    const odd: CalendarEvent = { ...event, recurrence: ["RRULE:FREQ=WEEKLY;INTERVAL=3"] };
+    const form = formFromEvent(odd);
+    expect(form.recurrence).toBe("custom");
+    expect(formPatch(odd, { ...form, title: "Renamed" })?.recurrence).toBeUndefined();
+    // Picking a real choice is the only way to replace it.
+    expect(formPatch(odd, { ...form, recurrence: "daily" })?.recurrence).toEqual([
+      "RRULE:FREQ=DAILY",
+    ]);
+  });
+
+  it("clears a rule when the user says it does not repeat", () => {
+    const weekly: CalendarEvent = { ...event, recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=FR"] };
+    const form = { ...formFromEvent(weekly), recurrence: "none" as const };
+    expect(formPatch(weekly, form)?.recurrence).toEqual([]);
+  });
+
+  it("says when a save has to take the whole series with it", () => {
+    expect(requiresSeriesScope({ recurrence: ["RRULE:FREQ=DAILY"] })).toBe(true);
+    expect(requiresSeriesScope({ title: "Renamed" })).toBe(false);
+  });
+});
+
+describe("reminder read-back", () => {
+  const withReminder = (minutes: number[]): CalendarEvent => ({
+    ...event,
+    reminders: { useDefault: false, overrides: minutes.map((m) => ({ method: "popup", minutes: m })) },
+  });
+
+  it("keeps the calendar default and “no alert” as different things", () => {
+    expect(reminderMinutesOf({ ...event, reminders: { useDefault: true, overrides: [] } })).toBeNull();
+    expect(reminderMinutesOf(withReminder([]))).toEqual([]);
+    expect(reminderChoiceId(null)).toBe("default");
+    expect(reminderChoiceId([])).toBe("none");
+  });
+
+  it("reads an event's own alert into the picker", () => {
+    expect(formFromEvent(withReminder([30])).reminderMinutes).toEqual([30]);
+    expect(reminderChoiceId([30])).toBe("30");
+  });
+
+  it("labels an alert the picker has no row for", () => {
+    expect(reminderChoiceId([45])).toBe("custom");
+    expect(describeReminders([45])).toBe("45 minutes before");
+    expect(describeReminders([20, 1440])).toBe("20 minutes before and 1 day before");
+    expect(describeReminders([0])).toBe("At start");
+    expect(describeReminders(null)).toBe("Calendar default");
+  });
+
+  it("sends nothing when the alert was not touched", () => {
+    const source = withReminder([10]);
+    expect(formPatch(source, formFromEvent(source))?.reminderMinutes).toBeUndefined();
+  });
+
+  it("cannot express a return to the calendar default, and does not pretend to", () => {
+    // `EventPatch.reminderMinutes` has no "use the default" value, so choosing
+    // it sends nothing rather than sending "no alert" and calling it default.
+    const source = withReminder([10]);
+    const form = { ...formFromEvent(source), reminderMinutes: null };
+    expect(formPatch(source, form)?.reminderMinutes).toBeUndefined();
+  });
+});
+
+describe("canEditEvent", () => {
+  const mine = ["alex@example.com"];
+
+  it("takes nothing away when the seam has not said who owns it", () => {
+    // Fixture data, and every row written before the store had the column. A
+    // guess here turns the editor off for every event on first launch.
+    expect(canEditEvent(event, mine)).toBe(true);
+    expect(canEditEvent({ ...event, organizer: { name: "X", email: "x@y.com" } }, mine)).toBe(true);
+  });
+
+  it("allows an event this account organizes", () => {
+    expect(canEditEvent({ ...event, organizerSelf: true }, mine)).toBe(true);
+  });
+
+  it("refuses an invitation from someone else", () => {
+    expect(
+      canEditEvent(
+        { ...event, organizerSelf: false, organizer: { name: "Chief", email: "chief@elsewhere.com" } },
+        mine,
+      ),
+    ).toBe(false);
+  });
+
+  it("allows it anyway when the organizer let guests modify", () => {
+    expect(
+      canEditEvent(
+        {
+          ...event,
+          organizerSelf: false,
+          guestsCanModify: true,
+          organizer: { name: "Chief", email: "chief@elsewhere.com" },
+        },
+        mine,
+      ),
+    ).toBe(true);
+  });
+
+  it("recognises the owner's other addresses, whatever this copy says", () => {
+    expect(
+      canEditEvent(
+        { ...event, organizerSelf: false, organizer: { name: "Me", email: "ALEX@example.com" } },
+        mine,
+      ),
+    ).toBe(true);
   });
 });

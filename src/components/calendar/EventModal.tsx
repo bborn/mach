@@ -1,8 +1,10 @@
 import {
+  AlertTriangle,
   Calendar as CalendarIcon,
   Copy,
   ExternalLink,
   Layers,
+  Lock,
   MapPin,
   Repeat,
   Trash2,
@@ -43,11 +45,16 @@ import type { MergedEvent } from "@/lib/calendar-merge";
 import {
   REMINDER_CHOICES,
   RECURRENCE_CHOICES,
+  describeReminders,
+  describeRules,
   emptyForm,
   formFromEvent,
   formPatch,
   formTimes,
   isFormError,
+  reminderChoiceById,
+  reminderChoiceId,
+  reminderMinutesOf,
   type EventForm,
 } from "@/lib/calendar-edit";
 import { fullDate } from "@/lib/time";
@@ -68,6 +75,21 @@ export interface EventModalProps {
   defaultCalendarId: CalendarId | null;
   /** Whether this event is one of a series — see `looksRecurring`. */
   recurring: boolean;
+  /**
+   * Whether Google would accept a write to this event at all — see
+   * `canEditEvent`. False turns the modal into a viewer with an RSVP on it.
+   */
+  canEdit: boolean;
+  /**
+   * Why the last save or delete did not happen, if it did not.
+   *
+   * The modal stays open on a failure and says so here. The status bar alone
+   * was not enough: it is a 24px rail, it truncates, it clears itself after six
+   * seconds, and the modal used to close *before* the command ran — so a
+   * refused save looked exactly like a successful one, which is the whole
+   * reason "I tried to create an event and nothing happened" was hard to chase.
+   */
+  error: string | null;
   busy: boolean;
   onClose: () => void;
   onSave: (form: EventForm, scope: EventScope) => void;
@@ -76,9 +98,6 @@ export interface EventModalProps {
   onRsvp: (response: Rsvp) => void;
   onOpenExternal: (url: string) => void;
 }
-
-/** "Calendar default" is a `null` offset; the select needs a string for it. */
-const REMINDER_DEFAULT = "default";
 
 /**
  * The event editor.
@@ -128,6 +147,8 @@ export function EventModal({
   merged,
   defaultCalendarId,
   recurring,
+  canEdit,
+  error,
   busy,
   onClose,
   onSave,
@@ -212,7 +233,7 @@ export function EventModal({
    */
   const [saveNonce, setSaveNonce] = useState(0);
   const submit = () => {
-    if (!form || busy || timeError) return;
+    if (!form || busy || timeError || !canEdit) return;
     const active = document.activeElement;
     if (active instanceof HTMLElement && active !== document.body) active.blur();
     setSaveNonce((n) => n + 1);
@@ -236,7 +257,7 @@ export function EventModal({
   }, [saveNonce]);
 
   const remove = () => {
-    if (!event || busy) return;
+    if (!event || busy || !canEdit) return;
     if (recurring) {
       setScopePrompt("delete");
       return;
@@ -309,6 +330,31 @@ export function EventModal({
   const tone = event ? toneFor(event.rsvp) : "solid";
   const set = (patch: Partial<EventForm>) => setForm((current) => ({ ...current!, ...patch }));
 
+  // A rule this form cannot author still has to be *shown*, and shown as
+  // itself. It leads the list so the trigger has a label, and picking anything
+  // else replaces it — which is the only destructive thing the picker can do
+  // and now the only way to do it.
+  const repeatChoices = RECURRENCE_CHOICES.map((choice) => ({
+    value: choice.id,
+    label: choice.label,
+  }));
+  const repeatItems =
+    form.recurrence === "custom"
+      ? [{ value: "custom", label: describeRules(form.recurrenceRules) }, ...repeatChoices]
+      : repeatChoices;
+
+  const alertChoices = REMINDER_CHOICES.map((choice) => ({
+    value: choice.id,
+    label: choice.label,
+  }));
+  const alertItems =
+    reminderChoiceId(form.reminderMinutes) === "custom"
+      ? [
+          { value: "custom", label: describeReminders(form.reminderMinutes) },
+          ...alertChoices,
+        ]
+      : alertChoices;
+
   return (
     <Overlay open onClose={onClose} align="center" className="max-w-[36rem]" labelledBy="event-title">
       <div className="flex items-center gap-2 border-b border-border px-3 py-2">
@@ -331,12 +377,40 @@ export function EventModal({
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto p-3">
+        {/* A failure gets the top of the panel and stays there. It is the one
+            thing in this modal that must not be missable. */}
+        {error && (
+          <p
+            role="alert"
+            className="flex items-start gap-1.5 rounded-sm border border-danger/40 bg-danger/10 px-2 py-1.5 text-micro text-danger"
+          >
+            <AlertTriangle size={12} strokeWidth={1.75} className="mt-[1px] shrink-0" />
+            <span className="min-w-0">{error}</span>
+          </p>
+        )}
+
+        {/* Google refuses a write from anyone but the organizer, so the modal
+            says why the fields are inert rather than letting the user type into
+            them and discover it from a red line at the bottom of the window. */}
+        {!canEdit && (
+          <p className="flex items-start gap-1.5 rounded-sm border border-border bg-surface-raised px-2 py-1.5 text-micro text-muted-foreground">
+            <Lock size={12} strokeWidth={1.75} className="mt-[1px] shrink-0" />
+            <span className="min-w-0">
+              {event?.organizer?.email
+                ? `${event.organizer.email} organizes this — only they can change it.`
+                : "You are a guest on this event, so only its organizer can change it."}{" "}
+              You can still reply below, or open it in Google Calendar.
+            </span>
+          </p>
+        )}
+
         <Input
           ref={titleField}
           id={ids.title}
           value={form.title}
           placeholder="Add a title"
           aria-label="Title"
+          readOnly={!canEdit}
           className="h-8 text-reading"
           onChange={(e) => set({ title: e.target.value })}
         />
@@ -357,6 +431,7 @@ export function EventModal({
                 time={form.startTime}
                 onTime={(startTime) => set({ startTime })}
                 allDay={form.allDay}
+                disabled={!canEdit}
               />
               <EndRow
                 caption="to"
@@ -367,6 +442,7 @@ export function EventModal({
                 time={form.endTime}
                 onTime={(endTime) => set({ endTime })}
                 allDay={form.allDay}
+                disabled={!canEdit}
               />
               <div className="flex items-center gap-3">
                 <Label className="cursor-pointer gap-1.5 text-micro text-muted-foreground">
@@ -377,6 +453,7 @@ export function EventModal({
                       switched to all-day. */}
                   <Checkbox
                     checked={form.allDay}
+                    disabled={!canEdit}
                     onCheckedChange={(on) => set({ allDay: on })}
                   />
                   All day
@@ -395,8 +472,9 @@ export function EventModal({
               Repeat
             </FieldLabel>
             <Select
-              items={RECURRENCE_CHOICES.map((choice) => ({ value: choice.id, label: choice.label }))}
+              items={repeatItems}
               value={form.recurrence}
+              disabled={!canEdit}
               onValueChange={(value) => {
                 if (value !== null) set({ recurrence: value as EventForm["recurrence"] });
               }}
@@ -405,20 +483,21 @@ export function EventModal({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {RECURRENCE_CHOICES.map((choice) => (
-                  <SelectItem key={choice.id} value={choice.id}>
+                {repeatItems.map((choice) => (
+                  <SelectItem key={choice.value} value={choice.value}>
                     {choice.label}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
-            {/* Recurrence is write-only: the store keeps expanded occurrences, not
-                the rule, so an existing series' rule cannot be read back. Saying
-                so beats showing "does not repeat" over a weekly meeting. */}
-            {recurring && (
+            {/* The rule is read back now, so this no longer has to apologise for
+                showing "does not repeat" over a weekly meeting. What it does say
+                is the thing the picker cannot: that changing the rule is a
+                series-wide act, whichever occurrence you opened. */}
+            {recurring && form.recurrence !== "none" && (
               <FieldDescription>
-                This is one occurrence of a series. Leave this alone to keep the existing rule —
-                choosing one replaces it.
+                Changing how this repeats applies to every occurrence — Google keeps the rule on
+                the series, not on the day you opened.
               </FieldDescription>
             )}
           </Field>
@@ -426,30 +505,34 @@ export function EventModal({
           <Field orientation="row">
             <FieldLabel htmlFor={ids.alert}>Alert</FieldLabel>
             <Select
-              items={REMINDER_CHOICES.map((choice) => ({
-                value: reminderValue(choice.minutes),
-                label: choice.label,
-              }))}
-              value={reminderValue(form.reminderMinutes)}
+              items={alertItems}
+              value={reminderChoiceId(form.reminderMinutes)}
+              disabled={!canEdit}
               onValueChange={(value) => {
                 if (value === null) return;
-                set({ reminderMinutes: value === REMINDER_DEFAULT ? null : Number(value) });
+                const choice = reminderChoiceById(value);
+                // `custom` has no choice behind it — it is the label for what
+                // the event already is, so picking it means "leave it alone".
+                if (choice) set({ reminderMinutes: choice.minutes });
               }}
             >
               <SelectTrigger id={ids.alert} aria-label="Reminder">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {REMINDER_CHOICES.map((choice) => (
-                  <SelectItem
-                    key={reminderValue(choice.minutes)}
-                    value={reminderValue(choice.minutes)}
-                  >
+                {alertItems.map((choice) => (
+                  <SelectItem key={choice.value} value={choice.value}>
                     {choice.label}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
+            {form.reminderMinutes === null && event !== null && reminderMinutesOf(event) !== null && (
+              <FieldDescription>
+                Going back to the calendar's default has to be done in Google Calendar — the API
+                Mach speaks can set an alert or remove it, but cannot say “use the default”.
+              </FieldDescription>
+            )}
           </Field>
 
           <Field orientation="row">
@@ -463,6 +546,7 @@ export function EventModal({
                 value={form.location}
                 placeholder="Add a place, or a call link"
                 aria-label="Location"
+                readOnly={!canEdit}
                 onChange={(e) => set({ location: e.target.value })}
               />
               {conference && (
@@ -491,6 +575,7 @@ export function EventModal({
               value={form.attendees}
               aria-label="Guests"
               placeholder="ada@example.com, bob@example.com"
+              readOnly={!canEdit}
               onChange={(e) => set({ attendees: e.target.value })}
             />
           </Field>
@@ -503,6 +588,7 @@ export function EventModal({
             <Select
               items={calendarItems}
               value={form.calendarId}
+              disabled={!canEdit}
               onValueChange={(value) => {
                 if (value !== null) set({ calendarId: value });
               }}
@@ -554,6 +640,7 @@ export function EventModal({
               value={form.description}
               aria-label="Description"
               placeholder="Anything else"
+              readOnly={!canEdit}
               onChange={(e) => set({ description: e.target.value })}
             />
           </Field>
@@ -606,7 +693,7 @@ export function EventModal({
         />
       ) : (
         <div className="flex items-center gap-1.5 border-t border-border px-3 py-2">
-          {event && (
+          {event && canEdit && (
             <>
               <Button
                 size="sm"
@@ -618,6 +705,14 @@ export function EventModal({
                 <Trash2 size={12} strokeWidth={1.75} />
                 {confirmDelete ? "Really delete" : "Delete"}
               </Button>
+            </>
+          )}
+          {event && (
+            <>
+              {/* Duplicating is always allowed: the copy lands on a calendar the
+                  user owns, so it is a create, not a write to someone else's
+                  event. It is also the way out for a guest who wants their own
+                  version of a meeting they cannot edit. */}
               <Button size="sm" disabled={busy} onClick={onDuplicate} title="Duplicate (⌘D)">
                 <Copy size={12} strokeWidth={1.75} />
                 Duplicate
@@ -634,17 +729,27 @@ export function EventModal({
           )}
           <div className="ml-auto flex items-center gap-1.5">
             <Button size="sm" onClick={onClose}>
-              Cancel
+              {canEdit ? "Cancel" : "Close"}
             </Button>
             {/* Not disabled on `!dirty`. A date field holds its typed text
                 until it commits, so "nothing has changed yet" and "you have not
                 finished typing" look identical from here — and a greyed-out
                 Save is the worst possible answer to the second one. An
-                unchanged event just closes. */}
-            <Button size="sm" variant="default" disabled={busy || Boolean(timeError)} onClick={submit}>
-              {event ? "Save" : "Create"}
-              <Kbd keys="mod+enter" className="border-none bg-transparent px-0" />
-            </Button>
+                unchanged event just closes.
+
+                It *is* absent when the event is not ours: a Save that Google
+                can only refuse is not a control, it is a trap. */}
+            {canEdit && (
+              <Button
+                size="sm"
+                variant="default"
+                disabled={busy || Boolean(timeError)}
+                onClick={submit}
+              >
+                {event ? "Save" : "Create"}
+                <Kbd keys="mod+enter" className="border-none bg-transparent px-0" />
+              </Button>
+            )}
           </div>
         </div>
       )}
@@ -662,6 +767,7 @@ function EndRow({
   time,
   onTime,
   allDay,
+  disabled,
 }: {
   caption: string;
   which: "Start" | "End";
@@ -671,6 +777,7 @@ function EndRow({
   time: string;
   onTime: (value: string) => void;
   allDay: boolean;
+  disabled: boolean;
 }) {
   return (
     <div className="flex items-center gap-1.5">
@@ -680,6 +787,7 @@ function EndRow({
         label={`${which} date`}
         value={date}
         onChange={onDate}
+        disabled={disabled}
         className="min-w-0 flex-1"
       />
       {!allDay && (
@@ -688,6 +796,7 @@ function EndRow({
           label={`${which} time`}
           value={time}
           onChange={onTime}
+          disabled={disabled}
           className="w-[7.5rem] shrink-0"
         />
       )}
@@ -709,10 +818,6 @@ function useFieldIds() {
     calendar: `${base}-calendar`,
     notes: `${base}-notes`,
   };
-}
-
-function reminderValue(minutes: number | null): string {
-  return minutes === null ? REMINDER_DEFAULT : String(minutes);
 }
 
 /**

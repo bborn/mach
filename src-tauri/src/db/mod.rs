@@ -33,6 +33,7 @@
 //! `Db` is `Clone` (it is an `Arc` inside) and `Send + Sync`, so it drops
 //! straight into `tauri::State`.
 
+pub mod backfill;
 pub mod command_queries;
 pub mod models;
 pub mod queries;

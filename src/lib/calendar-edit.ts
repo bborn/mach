@@ -23,8 +23,25 @@ import type { EventDraft, EventPatch } from "./data";
 import { DEFAULT_EVENT_MINUTES } from "./calendar-geometry";
 import { DAY, MINUTE, startOfDay } from "./time";
 
-/** The recurrence rules the modal offers. Anything else is shown, not edited. */
-export type RecurrenceChoice = "none" | "daily" | "weekdays" | "weekly" | "monthly" | "yearly";
+/**
+ * The recurrence rules the modal offers, plus `custom`.
+ *
+ * `custom` is never in the picker — it is what an event whose rule Mach did not
+ * write turns into. Somebody's `FREQ=WEEKLY;INTERVAL=3;UNTIL=…` is a rule this
+ * form cannot express, and the two wrong answers are both worse than admitting
+ * it: showing "does not repeat" makes the next save silently delete the series,
+ * and showing "every week" makes it silently retime one. So the rule is carried
+ * through untouched, described in words, and only replaced if the user picks
+ * something else.
+ */
+export type RecurrenceChoice =
+  | "none"
+  | "daily"
+  | "weekdays"
+  | "weekly"
+  | "monthly"
+  | "yearly"
+  | "custom";
 
 export const RECURRENCE_CHOICES: { id: RecurrenceChoice; label: string }[] = [
   { id: "none", label: "Does not repeat" },
@@ -35,16 +52,85 @@ export const RECURRENCE_CHOICES: { id: RecurrenceChoice; label: string }[] = [
   { id: "yearly", label: "Every year" },
 ];
 
-/** Reminder offsets, in minutes before the start. */
-export const REMINDER_CHOICES: { minutes: number | null; label: string }[] = [
-  { minutes: null, label: "Calendar default" },
-  { minutes: 0, label: "At start" },
-  { minutes: 5, label: "5 minutes before" },
-  { minutes: 10, label: "10 minutes before" },
-  { minutes: 30, label: "30 minutes before" },
-  { minutes: 60, label: "1 hour before" },
-  { minutes: 1440, label: "1 day before" },
+/**
+ * What the alert picker offers.
+ *
+ * `minutes` is a list rather than a number because Google's three states need
+ * three shapes, and collapsing them loses one: `null` follows the calendar's
+ * default, `[]` means no alert at all, and anything else is those offsets. An
+ * event that quietly stops alerting is a bug you find by missing a meeting, so
+ * "default" and "none" are offered as separate rows rather than merged.
+ *
+ * `id` exists because a `<select>` holds a string, not a list.
+ */
+export interface ReminderChoice {
+  id: string;
+  label: string;
+  minutes: number[] | null;
+}
+
+export const REMINDER_CHOICES: ReminderChoice[] = [
+  { id: "default", label: "Calendar default", minutes: null },
+  { id: "none", label: "No alert", minutes: [] },
+  { id: "0", label: "At start", minutes: [0] },
+  { id: "5", label: "5 minutes before", minutes: [5] },
+  { id: "10", label: "10 minutes before", minutes: [10] },
+  { id: "30", label: "30 minutes before", minutes: [30] },
+  { id: "60", label: "1 hour before", minutes: [60] },
+  { id: "1440", label: "1 day before", minutes: [1440] },
 ];
+
+/** The picker row a form's current setting corresponds to. */
+export function reminderChoiceId(minutes: number[] | null): string {
+  if (minutes === null) return "default";
+  if (minutes.length === 0) return "none";
+  return REMINDER_CHOICES.find((c) => sameNumbers(c.minutes, minutes))?.id ?? "custom";
+}
+
+export function reminderChoiceById(id: string): ReminderChoice | undefined {
+  return REMINDER_CHOICES.find((choice) => choice.id === id);
+}
+
+/** "45 minutes before", or "20 minutes and 1 day before" for a set of them. */
+export function describeReminders(minutes: number[] | null): string {
+  if (minutes === null) return "Calendar default";
+  if (minutes.length === 0) return "No alert";
+  // "at start" is already a whole phrase; the others are quantities that need
+  // the word "before" after them, and gluing it onto the first would read
+  // "at start before".
+  const parts = minutes.map((m) => (m === 0 ? "at start" : `${describeOffset(m)} before`));
+  const last = parts.pop()!;
+  const sentence = parts.length === 0 ? last : `${parts.join(", ")} and ${last}`;
+  return sentence.charAt(0).toUpperCase() + sentence.slice(1);
+}
+
+function describeOffset(minutes: number): string {
+  if (minutes % 1440 === 0) return plural(minutes / 1440, "day");
+  if (minutes % 60 === 0) return plural(minutes / 60, "hour");
+  return plural(minutes, "minute");
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+function sameNumbers(a: number[] | null, b: number[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.length === b.length && a.every((value, i) => value === b[i]);
+}
+
+/**
+ * The offsets an event is currently set to alert at, in the form's vocabulary.
+ *
+ * `null` for "the calendar's default", which is also what an event the store
+ * has never been told about reads as — the two are indistinguishable from here,
+ * and both mean "leave it alone", so nothing is lost by conflating them.
+ */
+export function reminderMinutesOf(event: CalendarEvent): number[] | null {
+  const reminders = event.reminders;
+  if (!reminders || reminders.useDefault) return null;
+  return reminders.overrides.map((r) => r.minutes);
+}
 
 export interface EventForm {
   title: string;
@@ -61,8 +147,16 @@ export interface EventForm {
   attendees: string;
   calendarId: CalendarId;
   recurrence: RecurrenceChoice;
-  /** `null` means "leave the calendar's default reminder alone". */
-  reminderMinutes: number | null;
+  /**
+   * The rule the form stands for while `recurrence` is `custom`.
+   *
+   * Ignored for every other choice, which derives its lines from the start
+   * date. It exists so that opening a series Mach did not author, changing its
+   * title and saving does not rewrite how it repeats.
+   */
+  recurrenceRules: string[];
+  /** `null` = the calendar's default; `[]` = no alert; otherwise the offsets. */
+  reminderMinutes: number[] | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -168,6 +262,10 @@ export function rulesFor(choice: RecurrenceChoice, start: number): string[] {
   switch (choice) {
     case "none":
       return [];
+    // A rule this form did not author has no derivation; `rulesOf` carries the
+    // original lines through instead, and that is the only correct answer here.
+    case "custom":
+      return [];
     case "daily":
       return ["RRULE:FREQ=DAILY"];
     case "weekdays":
@@ -182,6 +280,118 @@ export function rulesFor(choice: RecurrenceChoice, start: number): string[] {
 }
 
 const BYDAY = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
+
+/**
+ * The lines a form actually means — the derived ones, or the carried-through
+ * custom rule.
+ */
+export function rulesOf(form: EventForm, start: number): string[] {
+  return form.recurrence === "custom" ? form.recurrenceRules : rulesFor(form.recurrence, start);
+}
+
+/**
+ * Which picker row a stored rule corresponds to, if any.
+ *
+ * Deliberately strict: only the exact lines `rulesFor` emits map back to a
+ * choice. A rule that differs by so much as an `INTERVAL` is `custom`, because
+ * the cost of being wrong is asymmetric — treating an unknown rule as custom
+ * costs a slightly vague label, and treating it as "every week" silently
+ * rewrites somebody's series on the next unrelated save.
+ *
+ * The weekday check is anchored to the event's own start for the same reason
+ * `rulesFor` anchors it: `FREQ=WEEKLY;BYDAY=TU` is "every week" for a Tuesday
+ * meeting and something stranger for a Thursday one.
+ */
+export function choiceFromRules(rules: readonly string[], start: number): RecurrenceChoice {
+  if (rules.length === 0) return "none";
+  if (rules.length > 1) return "custom";
+  const rule = rules[0].trim().toUpperCase();
+  for (const choice of RECURRENCE_CHOICES) {
+    if (choice.id === "none") continue;
+    const [derived] = rulesFor(choice.id, start);
+    if (derived && derived.toUpperCase() === rule) return choice.id;
+  }
+  // `FREQ=WEEKLY` with no BYDAY is what Google stores when the rule was made
+  // somewhere that leaves the weekday implicit. Same meaning, different words.
+  if (rule === "RRULE:FREQ=WEEKLY") return "weekly";
+  return "custom";
+}
+
+/** A human sentence for a rule, for the cases the picker cannot name. */
+export function describeRules(rules: readonly string[]): string {
+  if (rules.length === 0) return "Does not repeat";
+  const rule = rules[0].replace(/^RRULE:/i, "");
+  const freq = /FREQ=([A-Z]+)/i.exec(rule)?.[1]?.toUpperCase();
+  const interval = Number(/INTERVAL=(\d+)/i.exec(rule)?.[1] ?? 1);
+  const unit = { DAILY: "day", WEEKLY: "week", MONTHLY: "month", YEARLY: "year" }[freq ?? ""];
+  if (!unit) return `Custom rule (${rule})`;
+  const every = interval === 1 ? `Every ${unit}` : `Every ${interval} ${unit}s`;
+  const days = /BYDAY=([A-Z,]+)/i.exec(rule)?.[1];
+  const until = /UNTIL=(\d{8})/i.exec(rule)?.[1];
+  const count = /COUNT=(\d+)/i.exec(rule)?.[1];
+  return [
+    days ? `${every} on ${days.split(",").map(dayName).join(", ")}` : every,
+    until ? `until ${until.slice(0, 4)}-${until.slice(4, 6)}-${until.slice(6, 8)}` : null,
+    count ? `${count} times` : null,
+    rules.length > 1 ? "with exceptions" : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
+const DAY_NAMES: Record<string, string> = {
+  SU: "Sunday",
+  MO: "Monday",
+  TU: "Tuesday",
+  WE: "Wednesday",
+  TH: "Thursday",
+  FR: "Friday",
+  SA: "Saturday",
+};
+
+function dayName(code: string): string {
+  return DAY_NAMES[code.trim().toUpperCase()] ?? code;
+}
+
+function sameRules(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((line, i) => line === b[i]);
+}
+
+/* -------------------------------------------------------------------------- */
+/* May this even be edited?                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Whether Google would accept a write to this event from this app.
+ *
+ * Google refuses an `events.patch` from anyone who is not the organizer unless
+ * the organizer ticked "guests can modify". Offering Save on an invitation you
+ * merely received is therefore offering a button whose only possible outcome is
+ * an error, which is a worse experience than not offering it — the user learns
+ * the rule from a red status line instead of from the interface.
+ *
+ * **Silence is permission.** `organizerSelf === undefined` means the seam never
+ * said: fixture data, a row written before the store had the column, an event
+ * created in this session that has not synced back. Reading that as "not yours"
+ * would take the editor away from every event on first launch after the upgrade
+ * and hand it back a minute later, which looks like a bug. So the affordance
+ * only goes away on a positive `false`.
+ *
+ * `accountEmails` is the last resort for the same reason: an event whose
+ * organizer is one of the owner's own addresses is his, whatever `self` says
+ * about the particular copy in front of us.
+ */
+export function canEditEvent(
+  event: CalendarEvent,
+  accountEmails: readonly string[] = [],
+): boolean {
+  if (event.organizerSelf === undefined) return true;
+  if (event.organizerSelf) return true;
+  if (event.guestsCanModify) return true;
+  const organizer = event.organizer?.email?.toLowerCase();
+  if (!organizer) return true;
+  return accountEmails.some((email) => email.toLowerCase() === organizer);
+}
 
 /* -------------------------------------------------------------------------- */
 /* Form ⇄ event                                                                */
@@ -204,6 +414,7 @@ const ALL_DAY_START = "09:00";
 const ALL_DAY_END = "10:00";
 
 export function formFromEvent(event: CalendarEvent): EventForm {
+  const rules = event.recurrence ?? [];
   return {
     title: event.title === "(no title)" ? "" : event.title,
     allDay: event.allDay,
@@ -219,11 +430,14 @@ export function formFromEvent(event: CalendarEvent): EventForm {
     description: event.description ?? "",
     attendees: attendeesField(event.attendees),
     calendarId: event.calendarId,
-    // Recurrence is not stored locally, so an existing event's rule cannot be
-    // read back. The modal says as much rather than showing "does not repeat"
-    // over a weekly meeting — see `isRecurring` in the component.
-    recurrence: "none",
-    reminderMinutes: null,
+    // The rule and the alerts are now read back rather than assumed. They were
+    // write-only for a long time, and the modal papered over it by showing
+    // "does not repeat" and "calendar default" on top of a weekly meeting with
+    // a fifteen-minute alert — so an unrelated title edit re-sent both defaults
+    // and quietly rewrote the event.
+    recurrence: choiceFromRules(rules, event.start),
+    recurrenceRules: [...rules],
+    reminderMinutes: reminderMinutesOf(event),
   };
 }
 
@@ -249,6 +463,7 @@ export function emptyForm(options: {
     attendees: "",
     calendarId: options.calendarId,
     recurrence: "none",
+    recurrenceRules: [],
     reminderMinutes: null,
   };
 }
@@ -324,10 +539,31 @@ export function formPatch(event: CalendarEvent, form: EventForm): EventPatch | u
     patch.isAllDay = times.allDay;
   }
 
-  if (form.recurrence !== "none") patch.recurrence = rulesFor(form.recurrence, times.start);
-  if (form.reminderMinutes !== null) patch.reminderMinutes = [form.reminderMinutes];
+  // Both of these used to be "send it if it is not the default", which sent the
+  // rule on every save of a recurring event and could never clear one. Now that
+  // the store reads them back they are diffed like every other field: named
+  // only when they actually moved.
+  const rules = rulesOf(form, times.start);
+  if (!sameRules(rules, event.recurrence ?? [])) patch.recurrence = rules;
+
+  const reminders = reminderMinutesOf(event);
+  if (form.reminderMinutes !== null && !sameNumbers(form.reminderMinutes, reminders)) {
+    patch.reminderMinutes = form.reminderMinutes;
+  }
 
   return Object.keys(patch).length > 0 ? patch : undefined;
+}
+
+/**
+ * Whether a save has to address the whole series whatever the user picks.
+ *
+ * How an event repeats belongs to the series master; `events.patch` on an
+ * expanded occurrence refuses a `recurrence` key outright. The command layer
+ * rejects it with a sentence, but the better place to notice is here, before
+ * the user is offered a "this one" button that cannot work.
+ */
+export function requiresSeriesScope(patch: EventPatch): boolean {
+  return patch.recurrence !== undefined;
 }
 
 /** The draft a form describes, for a create. */
@@ -342,8 +578,8 @@ export function formDraft(form: EventForm): EventDraft | { error: string } {
     endTs: times.end,
     isAllDay: times.allDay,
     attendees: parseAttendees(form.attendees),
-    recurrence: rulesFor(form.recurrence, times.start),
-    reminderMinutes: form.reminderMinutes === null ? undefined : [form.reminderMinutes],
+    recurrence: rulesOf(form, times.start),
+    reminderMinutes: form.reminderMinutes ?? undefined,
   };
 }
 

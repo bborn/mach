@@ -329,6 +329,45 @@ pub struct NewAttachment {
 // calendar
 // ---------------------------------------------------------------------------
 
+/// One alert, as an offset in minutes before the event starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventReminder {
+    /// Google's `popup`, `email` or `sms`. Kept verbatim rather than as an enum:
+    /// we only ever create `popup`, but we must not silently rewrite an alert
+    /// someone set to something else on the web.
+    pub method: String,
+    pub minutes: i64,
+}
+
+/// An event's alerts, in the shape Google models them.
+///
+/// `use_default` is not decoration and not derivable from the list. Google has
+/// three states, and all three are reachable from the UI: follow the calendar's
+/// default (`use_default: true`), no alert at all (`use_default: false` with an
+/// empty `overrides`), and these specific alerts. A bare `Vec<i64>` collapses
+/// the first two into "empty", which is how an event that should have popped up
+/// silently stops popping up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventReminders {
+    pub use_default: bool,
+    #[serde(default)]
+    pub overrides: Vec<EventReminder>,
+}
+
+impl EventReminders {
+    /// The offsets an [`crate::commands::EventPatch`] can name — i.e. the
+    /// explicit ones. `None` when the event is on the calendar's default, which
+    /// the patch vocabulary has no way to express and must not pretend to.
+    pub fn explicit_minutes(&self) -> Option<Vec<i64>> {
+        if self.use_default {
+            return None;
+        }
+        Some(self.overrides.iter().map(|r| r.minutes).collect())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Event {
@@ -346,6 +385,41 @@ pub struct Event {
     pub rsvp_status: Option<RsvpStatus>,
     /// Set on instances expanded from a recurring series (`singleEvents=true`).
     pub recurring_event_id: Option<String>,
+    /// The series' RRULE/EXDATE lines, verbatim.
+    ///
+    /// Google never puts these on an expanded instance — the rule lives on the
+    /// master, and `singleEvents=true` returns instances — so this is filled
+    /// from the only two places that do know it: an event Mach itself created
+    /// recurring, and any sibling occurrence of the same series that already
+    /// carries it. Empty therefore means "no rule is known here", which is not
+    /// the same as "does not repeat"; `recurring_event_id` is what answers that.
+    #[serde(default)]
+    pub recurrence: Vec<String>,
+    /// Alerts, or `None` when Google did not say (a row written before the
+    /// column existed, or an event created offline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminders: Option<EventReminders>,
+    /// The identity that survives a meeting being copied onto another account.
+    ///
+    /// Serialized as `iCalUID` because that is what Google calls it, what the
+    /// merge code in `calendar-merge.ts` already reads for, and because a
+    /// camelCased `iCalUid` would be a third spelling of the same thing.
+    #[serde(default, rename = "iCalUID", skip_serializing_if = "Option::is_none")]
+    pub ical_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organizer: Option<Participant>,
+    /// Google's `organizer.self`: whether the organizer is the calendar this
+    /// copy of the event appears on. The authoritative "do I own this".
+    ///
+    /// `None` means the store has never been told — an old row, or one Mach
+    /// wrote itself before this column existed. Readers treat that as permissive
+    /// rather than as a denial: taking an edit affordance away on a guess is
+    /// worse than offering one Google might refuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organizer_self: Option<bool>,
+    /// The one thing that lets a guest write to an event they do not own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guests_can_modify: Option<bool>,
     pub status: String,
     pub html_link: Option<String>,
     pub updated_at: i64,
@@ -366,6 +440,18 @@ pub struct NewEvent {
     pub attendees: Vec<Participant>,
     pub rsvp_status: Option<RsvpStatus>,
     pub recurring_event_id: Option<String>,
+    #[serde(default)]
+    pub recurrence: Vec<String>,
+    #[serde(default)]
+    pub reminders: Option<EventReminders>,
+    #[serde(default, rename = "iCalUID")]
+    pub ical_uid: Option<String>,
+    #[serde(default)]
+    pub organizer: Option<Participant>,
+    #[serde(default)]
+    pub organizer_self: Option<bool>,
+    #[serde(default)]
+    pub guests_can_modify: Option<bool>,
     pub status: String,
     pub html_link: Option<String>,
     pub updated_at: i64,

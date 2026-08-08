@@ -12,7 +12,8 @@
 use tauri::{AppHandle, State};
 
 use crate::commands::{Command, CommandResult, CommandSpec};
-use crate::db::models::{Account, Event, Label};
+use crate::db::models::{Account, Event, Label, ThreadCursor};
+use crate::db::queries::{SearchNode, SearchRequest};
 
 use super::error::IpcError;
 use super::events;
@@ -52,13 +53,38 @@ pub fn get_thread(state: State<'_, AppState>, thread_id: i64) -> Result<ThreadDe
     reads::get_thread(&state.db, thread_id)
 }
 
+/// Search.
+///
+/// Two shapes through one command, because they are one feature. With no
+/// `filter` this is what it always was: the raw text, ranked by bm25, which is
+/// what ⌘K wants. With a `filter` — the AST the frontend parsed out of the same
+/// text — it is the operator search behind the search view, ordered newest
+/// first and keyset-paginated like the mailbox.
+///
+/// Additive on purpose: the extra arguments are all optional, so an older
+/// caller (and every existing test) still compiles and still gets the ranked
+/// answer it asked for.
 #[tauri::command]
 pub fn search_threads(
     state: State<'_, AppState>,
     query: String,
     limit: Option<u32>,
+    filter: Option<SearchNode>,
+    account_id: Option<i64>,
+    cursor: Option<ThreadCursor>,
 ) -> Result<ThreadPage, IpcError> {
-    reads::search_threads(&state.db, &query, limit)
+    match filter {
+        Some(filter) => reads::search_threads_filtered(
+            &state.db,
+            &filter,
+            &SearchRequest {
+                account_id,
+                limit: limit.unwrap_or(0),
+                after: cursor,
+            },
+        ),
+        None => reads::search_threads(&state.db, &query, limit),
+    }
 }
 
 #[tauri::command]
