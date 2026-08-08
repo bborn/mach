@@ -1431,7 +1431,15 @@ Each step is independently useful and independently abandonable.
 
 Two need the owner's judgement rather than more research.
 
-**1. Is any exfiltration risk acceptable at all?**
+**1. Is any exfiltration risk acceptable at all?** — **DECIDED 2026-08-08: yes,
+ship tier 2.** Owner's call. The mechanism in §3 stands: declared host
+allowlist, mandatory written justification for a wildcard, shown verbatim at
+install. The security story is therefore "we told you, in a sentence you had to
+read" — which means the install prompt is now a load-bearing piece of UI, not a
+formality, and should be designed as carefully as the sandbox itself.
+
+The original framing is kept below for the reasoning.
+
 Tier 2 (subprocess plugins with declared network hosts) is what makes the
 genuinely interesting plugins possible — LLM classifiers, CRM enrichment, issue
 trackers, anything that consults a service. It also means a plugin the user
