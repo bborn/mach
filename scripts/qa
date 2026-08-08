@@ -198,6 +198,26 @@ cmd_up() {
 
   echo "up (pid $pid)${DATA_DIR:+  data=$DATA_DIR}"
   echo "qa[$INSTANCE]: running, but no window after ${waited}s — see $LOG" >&2
+  keychain_notice
+}
+
+# Is a Keychain authorization dialog what is actually blocking?
+#
+# It is worth checking by name, because the symptom is otherwise inscrutable: a
+# live process, no window, nothing in the log. A rebuilt binary has a new code
+# signature, so the login keychain stops recognising it and macOS puts up a
+# password prompt — which is a modal panel above the ordinary window layer,
+# hence `--any-layer`. Nobody can guess that from "no window after 60s".
+keychain_notice() {
+  local agent
+  for agent in $(pgrep -x SecurityAgent 2>/dev/null); do
+    if "$REPO/scripts/windowid.py" "$agent" --any-layer >/dev/null 2>&1; then
+      echo "qa[$INSTANCE]: a Keychain dialog is waiting on screen — approve it" >&2
+      echo "               (\"Always Allow\" stops it asking for this build)" >&2
+      return 0
+    fi
+  done
+  return 1
 }
 
 cmd_down() {

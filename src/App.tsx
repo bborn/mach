@@ -5,6 +5,7 @@ import type { LabelId } from "@/types";
 import { MachProvider, useMach } from "@/hooks/useMach";
 import { cn } from "@/lib/utils";
 import { StatusBar } from "@/components/chrome/StatusBar";
+import { Toast } from "@/components/chrome/Toast";
 import { TitleBar } from "@/components/chrome/TitleBar";
 import { CalendarMode } from "@/components/calendar/CalendarMode";
 import { MailMode } from "@/components/mail/MailMode";
@@ -251,6 +252,13 @@ function Shell() {
       <AgentDock />
 
       <StatusBar />
+      {/*
+        A fixed layer rather than a row in this column: a toast that took part
+        in the layout would reflow the panes every time something was archived.
+        Renders nothing until there is a message. See the file for why it is
+        the status message rather than a second one.
+      */}
+      <Toast />
       <CommandPalette />
       <ShortcutSheet
         open={shortcuts !== null}

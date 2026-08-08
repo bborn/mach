@@ -14,7 +14,12 @@ Getting the id needs CoreGraphics. `pyobjc` is not installed and the Swift
 toolchain on this machine has a module conflict, so this calls the framework
 through `ctypes` — no dependency, no build step.
 
-Usage: windowid.py <pid>   → prints the id, or exits 1 if there is no window.
+Usage: windowid.py <pid> [--any-layer]
+       → prints the id, or exits 1 if there is no window.
+
+`--any-layer` also considers panels and dialogs above the ordinary window layer.
+Use it to ask "is this process showing me anything at all", not to screenshot an
+app — see the note on NORMAL_LAYER.
 """
 
 import ctypes
@@ -22,16 +27,25 @@ import ctypes.util
 import sys
 
 # Layer 0 is the ordinary window layer; panels, tooltips and menus sit above it.
+#
+# Restricting to it is right for "screenshot the app", which is what this exists
+# for — a tooltip is not the window. It is wrong for "is anything on screen for
+# this process", and that difference mattered: a Keychain authorization dialog
+# is a modal panel at layer 1000, so asking this script about SecurityAgent
+# answered "no window" while the dialog was sitting on the owner's screen
+# waiting to be clicked. `--any-layer` is for that question.
 NORMAL_LAYER = 0
 # Windows below this size are transient launch artefacts and capture as blank.
 MIN_SIDE = 50
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
-        print("usage: windowid.py <pid>", file=sys.stderr)
+    args = [a for a in sys.argv[1:] if a != "--any-layer"]
+    any_layer = "--any-layer" in sys.argv
+    if len(args) != 1 or not args[0].isdigit():
+        print("usage: windowid.py <pid> [--any-layer]", file=sys.stderr)
         return 2
-    want_pid = int(sys.argv[1])
+    want_pid = int(args[0])
 
     cf_path = ctypes.util.find_library("CoreFoundation")
     cg_path = ctypes.util.find_library("CoreGraphics")
@@ -108,7 +122,7 @@ def main() -> int:
             d = cf.CFArrayGetValueAtIndex(array, i)
             if number(d, "kCGWindowOwnerPID") != want_pid:
                 continue
-            if number(d, "kCGWindowLayer") != NORMAL_LAYER:
+            if not any_layer and number(d, "kCGWindowLayer") != NORMAL_LAYER:
                 continue
             width = bounds_side(d, "Width") or 0
             height = bounds_side(d, "Height") or 0

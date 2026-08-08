@@ -107,7 +107,38 @@ export interface StatusMessage {
    * with the label still on it.
    */
   undo?: Command | Command[];
+  /**
+   * Which traversal button the toast should hold out beside this message.
+   *
+   * Almost nothing sets it. A message carrying an `undo` above is already a
+   * claim that something reversible happened, so the toast offers ⌘Z on the
+   * strength of that alone — see `offerFor` in `chrome/Toast.tsx`. This exists
+   * for the one case the inverse cannot express: a message *produced by* a
+   * traversal. "Undid archived 3 conversations" has no `undo` of its own to
+   * carry, and the thing worth offering after it is ⇧⌘Z.
+   */
+  offer?: "undo" | "redo";
   tone: "info" | "error";
+}
+
+/**
+ * How long a status message stays on screen.
+ *
+ * One clock and one preference. `undoWindowSeconds` answers "how long is the
+ * offer good for", and the toast *is* that offer, so its lifetime is that
+ * number and there is no second timing concept to keep in step with it.
+ *
+ * A failure is the one thing that gets longer, and it is a multiple of the same
+ * preference rather than a constant of its own for exactly that reason. An
+ * error is read twice — once to see that something went wrong, once to work out
+ * what — and a message that leaves at the speed of a confirmation makes the
+ * second reading impossible. Whatever window the user chose for a success, a
+ * failure gets two of them.
+ */
+export const ERROR_HOLD = 2;
+
+export function statusLifetime(status: StatusMessage, undoWindow: number): number {
+  return status.tone === "error" ? undoWindow * ERROR_HOLD : undoWindow;
 }
 
 interface UiState {
@@ -652,17 +683,22 @@ export function MachProvider({ children }: { children: ReactNode }) {
    * It is no longer the only affordance — the stack does not expire, and ⌘Z
    * still reaches an archive from an hour ago — and the two are not in tension.
    * This message is the *offer*: the loud, in-the-eye-line "that just happened,
-   * and here is the button". `undoWindowSeconds` says how long that offer
-   * stands, which is a question about attention rather than about capability.
-   * When it lapses the status bar goes back to naming what ⌘Z would still do,
-   * quietly. The preference shortens the shout, never the memory.
+   * and here is the button", which `chrome/Toast.tsx` renders as a toast above
+   * the status bar. `undoWindowSeconds` says how long that offer stands, which
+   * is a question about attention rather than about capability. When it lapses
+   * the status bar goes back to naming what ⌘Z would still do, quietly. The
+   * preference shortens the shout, never the memory.
+   *
+   * The clock lives here rather than in the toast on purpose: one message, one
+   * owner. The toast reads `ui.status` and nothing else, so a message dismissed
+   * by hand and a message that timed out are the same event to it.
    */
   const undoWindow = undoWindowMs(prefs);
   useEffect(() => {
     if (!ui.status) return;
     const timer = window.setTimeout(
       () => dispatchUi({ type: "status", status: null }),
-      undoWindow,
+      statusLifetime(ui.status, undoWindow),
     );
     return () => window.clearTimeout(timer);
   }, [ui.status, undoWindow]);
@@ -883,7 +919,10 @@ export function MachProvider({ children }: { children: ReactNode }) {
       execute: (command) => run(command, { quiet: true }),
       restore: (threadIds) => dispatchUi({ type: "restore", threadIds }),
       hide: (threadIds) => dispatchUi({ type: "archive", threadIds }),
-      say: (message) => dispatchUi({ type: "status", status: { message, tone: "info" } }),
+      // A traversal's own message carries no inverse — the entry it moved is
+      // the record of it — so it says which button to hold out next instead.
+      say: (message, offer) =>
+        dispatchUi({ type: "status", status: { message, tone: "info", offer } }),
     }),
     [commitUndo, run],
   );

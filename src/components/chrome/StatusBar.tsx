@@ -2,7 +2,6 @@ import { usePendingSequence } from "@/hooks/useKeymap";
 import { useMach } from "@/hooks/useMach";
 import { formatBinding } from "@/lib/keymap";
 import { describeUndo, peekUndo } from "@/lib/undo-stack";
-import { cn } from "@/lib/utils";
 import { Hint, Kbd } from "@/components/ui/kbd";
 import { SyncIndicator } from "./SyncIndicator";
 
@@ -23,9 +22,16 @@ const CALENDAR_HINTS: [string[], string][] = [
 ];
 
 /**
- * The bottom rail carries four things and nothing else: what just happened,
- * what ⌘Z would take back, where a half-typed sequence stands, and the bindings
- * for the current mode.
+ * The bottom rail carries what is *true*, not what just happened: how much is
+ * in front of you, what ⌘Z would take back, where a half-typed sequence stands,
+ * and the bindings for the current mode.
+ *
+ * It used to carry the transient status message as well, and that was the whole
+ * problem — an acknowledgement of something that just moved rows off screen,
+ * set in 11px on a 24px rail beside the sync spinner. `chrome/Toast.tsx` shows
+ * it now, loudly and with the button attached. The rail kept the half that
+ * outlives the message: ⌘Z's own name, quietly, for as long as the stack has
+ * something in it.
  */
 export function StatusBar() {
   const { ui, visibleThreads, hasMore, live, actions, undoState } = useMach();
@@ -55,53 +61,27 @@ export function StatusBar() {
         </span>
       )}
 
-      {ui.status ? (
-        <span className="flex min-w-0 items-center gap-2">
-          <span
-            className={cn(
-              "truncate text-micro",
-              ui.status.tone === "error" ? "text-danger" : "text-foreground",
-            )}
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-faint-foreground">
+          {ui.mode === "mail"
+            ? `${visibleThreads.length}${hasMore ? "+" : ""} conversations`
+            : `${ui.calendarView} view`}
+        </span>
+        {/* The quiet, durable version of the toast's offer — because the toast
+            times out and ⌘Z does not, and a key whose effect is unnamed is a
+            key nobody presses. */}
+        {undoLabel && (
+          <button
+            type="button"
+            title={undoLabel}
+            onClick={actions.undo}
+            className="flex min-w-0 items-center gap-1 text-faint-foreground hover:text-foreground"
           >
-            {ui.status.message}
-          </span>
-          {/* The offer, while the offer stands. It is driven by the stack and
-              not by `ui.status.undo`, so the button is never on screen for an
-              undo that has already been spent. */}
-          {undoLabel && (
-            <button
-              type="button"
-              title={undoLabel}
-              onClick={actions.undo}
-              className="shrink-0 whitespace-nowrap text-micro text-accent hover:underline"
-            >
-              Undo
-            </button>
-          )}
-        </span>
-      ) : (
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-faint-foreground">
-            {ui.mode === "mail"
-              ? `${visibleThreads.length}${hasMore ? "+" : ""} conversations`
-              : `${ui.calendarView} view`}
-          </span>
-          {/* And once the status message has timed out, the quiet version of
-              the same sentence — because ⌘Z still works, and a key whose effect
-              is unnamed is a key nobody presses. */}
-          {undoLabel && (
-            <button
-              type="button"
-              title={undoLabel}
-              onClick={actions.undo}
-              className="flex min-w-0 items-center gap-1 text-faint-foreground hover:text-foreground"
-            >
-              <Kbd keys="mod+z" />
-              <span className="truncate text-micro">{undoLabel}</span>
-            </button>
-          )}
-        </span>
-      )}
+            <Kbd keys="mod+z" />
+            <span className="truncate text-micro">{undoLabel}</span>
+          </button>
+        )}
+      </span>
 
       {pending && (
         <span className="shrink-0 whitespace-nowrap font-mono text-micro text-accent">

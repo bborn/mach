@@ -29,10 +29,11 @@
  * the command layer already handles, because every command is idempotent and
  * reports per-id failure rather than corrupting.
  *
- * The *affordance* is a different thing from the stack and keeps its own
- * clock: the status message that says "Archived 3 conversations · Undo" times
- * out after `undoWindowSeconds`, because a status line is about what just
- * happened. ⌘Z outlives it. See the note on the status timer in `useMach`.
+ * The *offer* is a different thing from the stack and keeps its own clock: the
+ * toast that says "Archived 3 conversations · Undo ⌘Z" times out after
+ * `undoWindowSeconds`, because a note about what just happened is only about
+ * what just happened. ⌘Z outlives it, and the status bar goes on naming what it
+ * would do. See the note on the status timer in `useMach`.
  *
  * # Running one
  *
@@ -343,8 +344,17 @@ export interface UndoHost {
   restore(threadIds: ThreadId[]): void;
   /** Hide rows the way the original action did. */
   hide(threadIds: ThreadId[]): void;
-  /** Say what happened, once it has. */
-  say(message: string): void;
+  /**
+   * Say what happened, once it has.
+   *
+   * `offer` is the button the message should carry: having just undone
+   * something, the useful thing to hold out is the redo, and vice versa. The
+   * traversal is the only thing that knows which way it went — the surface
+   * showing the message would have to read the wording to guess — so it says
+   * so outright. Omitted when there is nothing to hold out, which is what a
+   * refusal like "Cannot redo …" is.
+   */
+  say(message: string, offer?: "undo" | "redo"): void;
 }
 
 export interface UndoOutcome {
@@ -383,7 +393,7 @@ export async function runUndo(host: UndoHost): Promise<UndoOutcome> {
   if (applied.length === steps.length) {
     host.write(refineRedo(host.read(), entry.id, applied));
   }
-  host.say(`Undid ${uncapitalize(entry.label)}`);
+  host.say(`Undid ${uncapitalize(entry.label)}`, "redo");
   return { entry, ok: true };
 }
 
@@ -411,7 +421,7 @@ export async function runRedo(host: UndoHost): Promise<UndoOutcome> {
   if (applied.length === steps.length) {
     host.write(refineUndo(host.read(), entry.id, applied));
   }
-  host.say(`Redid ${uncapitalize(entry.label)}`);
+  host.say(`Redid ${uncapitalize(entry.label)}`, "undo");
   return { entry, ok: true };
 }
 
