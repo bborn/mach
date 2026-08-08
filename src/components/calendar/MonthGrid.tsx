@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import type { CalendarId, EventId } from "@/types";
 import type { MergedEvent } from "@/lib/calendar-merge";
 import { toneFor, type HueIndex } from "@/lib/calendar-palette";
-import { HOUR, isToday, monthShort, startOfDay, weekdayShort } from "@/lib/time";
+import { HOUR, addDays, isToday, monthShort, startOfDay, weekdayShort } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { EventChip } from "./EventBlock";
 
@@ -30,14 +30,37 @@ export function MonthGrid({
   const [expanded, setExpanded] = useState<number | null>(null);
   const now = Date.now();
 
+  /**
+   * Every day each event covers — not only the day it starts on.
+   *
+   * Bucketing by start alone made a week in Lisbon a single chip on the Monday
+   * and nothing for the rest of it, and made a trip that *began* before this
+   * month vanish from the month entirely: its start day is not a key in the
+   * grid, so the row was silently dropped. Both are the calendar lying about
+   * what is on it, which is worse than any amount of clutter.
+   *
+   * Day bounds come from `startOfDay` on each column rather than from adding
+   * 86,400,000 — a DST day is 23 or 25 hours long and arithmetic on the
+   * millisecond value drifts across one.
+   */
   const byDay = useMemo(() => {
-    const map = new Map<number, MergedEvent[]>();
-    for (const day of days) map.set(startOfDay(day).getTime(), []);
+    const bounds = days.map((day) => ({
+      start: startOfDay(day).getTime(),
+      end: startOfDay(addDays(day, 1)).getTime(),
+    }));
+    const map = new Map<number, MergedEvent[]>(bounds.map((b) => [b.start, []]));
     for (const item of events) {
-      const key = startOfDay(item.event.start).getTime();
-      map.get(key)?.push(item);
+      const { start } = item.event;
+      // Overlap, not containment. `start + 1` keeps a zero-length event on its
+      // own day instead of on none.
+      const end = Math.max(item.event.end, start + 1);
+      for (const bound of bounds) {
+        if (start < bound.end && end > bound.start) map.get(bound.start)!.push(item);
+      }
     }
-    for (const list of map.values()) list.sort((a, b) => a.event.start - b.event.start);
+    for (const list of map.values()) {
+      list.sort((a, b) => a.event.start - b.event.start || a.event.id - b.event.id);
+    }
     return map;
   }, [days, events]);
 

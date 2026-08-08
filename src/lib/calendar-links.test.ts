@@ -59,15 +59,32 @@ describe("conferenceLink", () => {
 });
 
 describe("googleCalendarUrl", () => {
-  it("opens the day the event is on", () => {
+  const linked: CalendarEvent = {
+    ...base,
+    htmlLink: "https://www.google.com/calendar/event?eid=abc123",
+  };
+
+  it("uses Google's own link for the event when the row has one", () => {
+    expect(googleCalendarUrl(linked)).toBe(
+      "https://www.google.com/calendar/event?eid=abc123",
+    );
+  });
+
+  it("adds the account to a link that already has a query string", () => {
+    expect(googleCalendarUrl(linked, "alex@example.com")).toBe(
+      "https://www.google.com/calendar/event?eid=abc123&authuser=alex%40example.com",
+    );
+  });
+
+  it("falls back to the day when there is no link — fixtures, and unsynced rows", () => {
     expect(googleCalendarUrl(base)).toBe(
       "https://calendar.google.com/calendar/u/0/r/day/2026/8/7",
     );
   });
 
   it("names the account, so it lands in the right session", () => {
-    expect(googleCalendarUrl(base, "alex@example.com")).toContain(
-      "authuser=alex%40example.com",
+    expect(googleCalendarUrl(base, "alex@example.com")).toBe(
+      "https://calendar.google.com/calendar/u/0/r/day/2026/8/7?authuser=alex%40example.com",
     );
   });
 });

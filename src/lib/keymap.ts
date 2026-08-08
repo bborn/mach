@@ -182,6 +182,13 @@ export interface Keymap {
    *
    * Live means `when()` currently passes, so two bindings scoped to different
    * modes are not a conflict — only ones that can fire at the same moment.
+   *
+   * A *tie* is the thing being reported, so bindings that differ in `priority`
+   * are not one: priority is an explicit statement about which wins, and the
+   * outcome is the same however the two components happen to mount. Reporting
+   * those made Escape look broken every time the shortcut sheet opened over a
+   * calendar with an event selected — a real pair, deliberately ordered, and
+   * behaving exactly as written.
    */
   conflicts(): KeyConflict[];
   clear(): void;
@@ -229,18 +236,17 @@ export function createKeymap(mod: ModKey = detectModKey()): Keymap {
 
     conflicts() {
       const live = candidates();
-      const byKeys = new Map<string, Registered[]>();
+      // Grouped by sequence *and* priority: only same-priority bindings are
+      // ties, and a tie is what this reports. See the doc on `conflicts`.
+      const groups = new Map<string, KeyConflict>();
       for (const b of live) {
-        const key = b.seq.join(" ");
-        const list = byKeys.get(key);
-        if (list) list.push(b);
-        else byKeys.set(key, [b]);
+        const keys = b.seq.join(" ");
+        const slot = keys + " @" + String(b.priority ?? 0);
+        const group = groups.get(slot);
+        if (group) group.bindings.push(b);
+        else groups.set(slot, { keys, bindings: [b] });
       }
-      const out: KeyConflict[] = [];
-      for (const [keys, list] of byKeys) {
-        if (list.length > 1) out.push({ keys, bindings: list });
-      }
-      return out;
+      return [...groups.values()].filter((group) => group.bindings.length > 1);
     },
 
     handle(event, now = Date.now()) {

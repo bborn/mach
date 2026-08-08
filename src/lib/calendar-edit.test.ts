@@ -158,6 +158,27 @@ describe("formFromEvent", () => {
     expect(form.endDate).toBe("2026-08-08");
   });
 
+  it("offers a working hour on an all-day event, not the UTC-midnight artifact", () => {
+    // Reading a wall clock off a UTC-pinned all-day row gives 19:00 or 20:00
+    // west of Greenwich. Unticking "All day" then produced a zero-length event
+    // that evening, and saved it without complaint.
+    const allDay: CalendarEvent = {
+      ...event,
+      allDay: true,
+      start: Date.UTC(2026, 7, 7),
+      end: Date.UTC(2026, 7, 8),
+    };
+    const form = formFromEvent(allDay);
+    expect(form.startTime).toBe("09:00");
+    expect(form.endTime).toBe("10:00");
+
+    const timed = formTimes({ ...form, allDay: false });
+    expect(isFormError(timed)).toBe(false);
+    if (isFormError(timed)) return;
+    expect(timed.end - timed.start).toBe(60 * MINUTE);
+    expect(new Date(timed.start).getHours()).toBe(9);
+  });
+
   it("survives a one-day all-day event without going backwards", () => {
     const oneDay: CalendarEvent = {
       ...event,
@@ -340,5 +361,25 @@ describe("looksRecurring", () => {
     const blank = { ...event, id: 6, title: "" };
     const otherBlank = { ...blank, id: 7, start: NINE + DAY, end: NINE + DAY + 30 * MINUTE };
     expect(looksRecurring(blank, [blank, otherBlank])).toBe(false);
+  });
+
+  it("believes recurringEventId over any inference", () => {
+    const occurrence = { ...event, recurringEventId: "series-abc" };
+    // Alone in the window, with nothing to infer from.
+    expect(looksRecurring(occurrence, [occurrence])).toBe(true);
+  });
+
+  it("treats an empty recurringEventId as a one-off, not as absent", () => {
+    const oneOff = { ...event, recurringEventId: "" };
+    const twin = { ...oneOff, id: 8, start: NINE + DAY, end: NINE + DAY + 30 * MINUTE };
+    expect(looksRecurring(oneOff, [oneOff, twin])).toBe(false);
+  });
+
+  it("stops guessing once anything in the window reports the field", () => {
+    // A backend that answers with `recurringEventId` answers with it on every
+    // row, so a row without one is genuinely not part of a series — inferring
+    // one from a repeated title there would only ever be a false positive.
+    const reporting = { ...event, id: 9, recurringEventId: "series-xyz", start: NINE + DAY };
+    expect(looksRecurring(weekly[1], [...weekly, reporting])).toBe(false);
   });
 });

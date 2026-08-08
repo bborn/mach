@@ -117,6 +117,16 @@ export interface CalendarEvent {
   organizer?: Participant;
   attendees: Participant[];
   rsvp?: Rsvp;
+  /**
+   * The series this occurrence belongs to, when it belongs to one.
+   *
+   * Google expands series with `singleEvents=true`, so every row is a concrete
+   * occurrence and this is the only thing that says "and there are others".
+   * Absent on a one-off, and absent on fixture data.
+   */
+  recurringEventId?: string;
+  /** Google's own deep link to this event. Absent on rows created offline. */
+  htmlLink?: string;
   /** Set when the event was created from a thread — the mail/calendar link. */
   sourceThreadId?: ThreadId;
 }

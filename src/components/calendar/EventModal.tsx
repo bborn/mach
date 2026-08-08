@@ -194,8 +194,32 @@ export function EventModal({
     [calendars, accounts],
   );
 
+  /**
+   * Save — but only after whatever a field is still holding.
+   *
+   * `DateField` and `TimeField` keep the text you typed until it is *committed*,
+   * on Enter or on blur. The keymap listens in the **capture** phase, so `⌘⏎`
+   * stops the event before the field's own Enter handler ever runs: saving
+   * straight from here sent the value from before the last thing typed, closed
+   * the modal, and looked like it had worked. Clicking Save had the same shape —
+   * the button was disabled until the field committed, so the first click only
+   * blurred the field and the second one saved.
+   *
+   * So `submit` does not save. It blurs whatever is focused, which flushes the
+   * field, and bumps a nonce. Both land in the same React batch, so the effect
+   * below runs one render later — against the committed form rather than the
+   * stale one.
+   */
+  const [saveNonce, setSaveNonce] = useState(0);
   const submit = () => {
-    if (!form || busy) return;
+    if (!form || busy || timeError) return;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== document.body) active.blur();
+    setSaveNonce((n) => n + 1);
+  };
+
+  useEffect(() => {
+    if (saveNonce === 0 || !form || busy) return;
     if (timeError) return;
     if (event && !dirty) {
       onClose();
@@ -206,7 +230,10 @@ export function EventModal({
       return;
     }
     onSave(form, "this");
-  };
+    // Only the nonce may start a save; every other value here is read fresh
+    // from the render the nonce caused.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [saveNonce]);
 
   const remove = () => {
     if (!event || busy) return;
@@ -343,11 +370,14 @@ export function EventModal({
               />
               <div className="flex items-center gap-3">
                 <Label className="cursor-pointer gap-1.5 text-micro text-muted-foreground">
+                  {/* The end date means the same thing on both sides of this
+                      tick — the last day the event covers — so it is left
+                      alone. Collapsing it to the start date, which this used
+                      to do, silently shortened every multi-day event that was
+                      switched to all-day. */}
                   <Checkbox
                     checked={form.allDay}
-                    onCheckedChange={(on) =>
-                      set({ allDay: on, endDate: on ? form.startDate : form.endDate })
-                    }
+                    onCheckedChange={(on) => set({ allDay: on })}
                   />
                   All day
                 </Label>
@@ -595,7 +625,7 @@ export function EventModal({
               <Button
                 size="sm"
                 onClick={() => onOpenExternal(googleCalendarUrl(event, account?.email))}
-                title="Open the day in Google Calendar"
+                title="Open in Google Calendar"
               >
                 <ExternalLink size={12} strokeWidth={1.75} />
                 Google
@@ -606,12 +636,12 @@ export function EventModal({
             <Button size="sm" onClick={onClose}>
               Cancel
             </Button>
-            <Button
-              size="sm"
-              variant="default"
-              disabled={busy || Boolean(timeError) || (event !== null && !dirty)}
-              onClick={submit}
-            >
+            {/* Not disabled on `!dirty`. A date field holds its typed text
+                until it commits, so "nothing has changed yet" and "you have not
+                finished typing" look identical from here — and a greyed-out
+                Save is the worst possible answer to the second one. An
+                unchanged event just closes. */}
+            <Button size="sm" variant="default" disabled={busy || Boolean(timeError)} onClick={submit}>
               {event ? "Save" : "Create"}
               <Kbd keys="mod+enter" className="border-none bg-transparent px-0" />
             </Button>

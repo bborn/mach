@@ -100,6 +100,28 @@ export function EventBlock({
 
   const showHandles = resizable && onGrab !== undefined && height >= HANDLE_MIN_HEIGHT;
 
+  /*
+   * The one place §1 and §6 collide.
+   *
+   * §6 draws an unanswered invitation as a white block with a 1px border in the
+   * calendar's colour. §1 draws a 15-minute event as an 11px block whose 15px
+   * line of text deliberately spills out of it. Put together, the block's
+   * bottom edge lands on the text's baseline and the title reads as **struck
+   * through** — which in this palette is what *declined* looks like. An invite
+   * you have not answered was showing up as one you had refused.
+   *
+   * A sliver therefore keeps the white fill and the hue, and spends it on a 2px
+   * bar down the left edge and on the text itself, rather than on a ring that
+   * crosses the words. Nothing new is introduced and nothing is drawn through
+   * the one line the block has.
+   */
+  const sliverOutline = plan.overflow && paint.border !== undefined;
+  const ring = sliverOutline
+    ? `inset 2px 0 0 0 ${paint.border}`
+    : paint.border
+      ? `inset 0 0 0 1px ${paint.border}`
+      : undefined;
+
   return (
     <button
       type="button"
@@ -136,18 +158,31 @@ export function EventBlock({
         // The dragged block stays put and fades: the ghost is the thing under
         // the pointer, and the hole it left is useful context for where it was.
         opacity: dimmed ? 0.35 : paint.opacity,
-        boxShadow: paint.border ? `inset 0 0 0 1px ${paint.border}` : undefined,
+        boxShadow: ring,
         // A dashed border cannot be faked with an inset shadow; tentative
         // events get a real one, inset so it does not change the geometry.
-        outline: paint.borderStyle === "dashed" ? `1px dashed ${paint.border}` : undefined,
-        outlineOffset: paint.borderStyle === "dashed" ? -1 : undefined,
+        // A sliver has no room for one either — see `sliverOutline` above.
+        outline:
+          paint.borderStyle === "dashed" && !sliverOutline
+            ? `1px dashed ${paint.border}`
+            : undefined,
+        outlineOffset: paint.borderStyle === "dashed" && !sliverOutline ? -1 : undefined,
         padding: plan.tier === "full" || plan.tier === "twoLine" ? "2px 6px" : 0,
         touchAction: onGrab ? "none" : undefined,
         ...style,
       }}
     >
       {plan.overflow ? (
-        <SliverLine title={event.title} time={time} plan={plan} paint={paint.timeColor} />
+        <SliverLine
+          title={event.title}
+          time={time}
+          plan={plan}
+          paint={paint.timeColor}
+          // On an outlined sliver the hue is the whole signal, so it carries the
+          // title too — there is no border left to carry it.
+          titleColor={sliverOutline ? paint.timeColor : undefined}
+          strike={paint.strikethrough}
+        />
       ) : (
         <Stacked
           event={event}
@@ -214,11 +249,15 @@ function SliverLine({
   time,
   plan,
   paint,
+  titleColor,
+  strike,
 }: {
   title: string;
   time: string;
   plan: BlockPlan;
   paint: string;
+  titleColor?: string;
+  strike?: boolean;
 }) {
   return (
     <span
@@ -233,7 +272,10 @@ function SliverLine({
         textOverflow: "clip",
       }}
     >
-      <span className="min-w-0 shrink overflow-hidden font-medium" style={{ textOverflow: "ellipsis" }}>
+      <span
+        className={cn("min-w-0 shrink overflow-hidden font-medium", strike && "line-through")}
+        style={{ textOverflow: "ellipsis", color: titleColor }}
+      >
         {title},
       </span>
       <span className="shrink-0 tabular-nums" style={{ color: paint }}>

@@ -54,20 +54,29 @@ function normalise(url: string): string {
 }
 
 /**
- * Google Calendar, open on this event's day, in this event's account.
+ * Google Calendar, open on this event.
  *
- * **Not a deep link to the event itself**, and it cannot be one: the deep-link
- * form is `.../r/eventedit/<base64(googleEventId + " " + calendarId)>`, and the
- * UI never receives `googleEventId` — `mapEvent` in `src/lib/ipc.ts` drops it.
- * The day view for the right account is the closest honest thing, and it lands
- * the user two clicks from the event rather than none.
+ * `htmlLink` is Google's own URL for the event and is what the button should
+ * use — it lands on the event, not near it. It was being dropped by `mapEvent`
+ * in `src/lib/ipc.ts`; now that it is carried, this prefers it.
  *
- * `authuser` is what makes it open in the right account when several Google
- * sessions are signed in, which with several accounts is always.
+ * The day view is the fallback, for the two rows that have no link: fixture
+ * data, and an event created in this session before sync has answered. That is
+ * a worse link but an honest one — it lands the user two clicks from the event
+ * rather than nowhere.
+ *
+ * `authuser` is what makes either open in the right account when several Google
+ * sessions are signed in, which with several accounts is always. Google's own
+ * `htmlLink` never carries it, so it is added here.
  */
 export function googleCalendarUrl(event: CalendarEvent, accountEmail?: string): string {
-  const d = new Date(event.start);
-  const path = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
-  const base = `https://calendar.google.com/calendar/u/0/r/day/${path}`;
-  return accountEmail ? `${base}?authuser=${encodeURIComponent(accountEmail)}` : base;
+  const base = event.htmlLink || dayUrl(event.start);
+  if (!accountEmail) return base;
+  const separator = base.includes("?") ? "&" : "?";
+  return `${base}${separator}authuser=${encodeURIComponent(accountEmail)}`;
+}
+
+function dayUrl(start: number): string {
+  const d = new Date(start);
+  return `https://calendar.google.com/calendar/u/0/r/day/${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
 }

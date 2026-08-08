@@ -85,7 +85,6 @@ export function CalendarMode() {
   const [soloAccount, setSoloAccount] = useState<AccountId | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [createSeed, setCreateSeed] = useState<string | undefined>(undefined);
-  const [shortcuts, setShortcuts] = useState<KeyBinding[] | null>(null);
   const [dateOpen, setDateOpen] = useState(false);
   const [todayNonce, setTodayNonce] = useState(0);
   const [revealNonce, setRevealNonce] = useState(0);
@@ -95,10 +94,8 @@ export function CalendarMode() {
   /** ⌘C parks an event here; ⌘V drops a copy of it on the anchored day. */
   const [clipboard, setClipboard] = useState<CalendarEvent | null>(null);
 
-  const shortcutsOpen = shortcuts !== null;
   const modalOpen = modal !== null;
-  const active =
-    ui.mode === "calendar" && !ui.paletteOpen && !createOpen && !shortcutsOpen && !modalOpen;
+  const active = ui.mode === "calendar" && !ui.paletteOpen && !createOpen && !modalOpen;
 
   useEffect(() => {
     window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -366,31 +363,30 @@ export function CalendarMode() {
       const patch = formPatch(event, form);
       const moved = form.calendarId !== event.calendarId;
       setModal(null);
-      if (patch) {
-        void run({ kind: "updateEvent", eventId: event.id, patch, scope }).then(() => {
-          if (moved) {
-            const accountId = accountForCalendar(form.calendarId);
-            if (accountId !== null) {
-              void run({
-                kind: "moveEvent",
-                eventId: event.id,
-                accountId,
-                calendarId: form.calendarId,
-              });
-            }
-          }
-        });
-      } else if (moved) {
+
+      const move = () => {
         const accountId = accountForCalendar(form.calendarId);
-        if (accountId !== null) {
-          void run({
-            kind: "moveEvent",
-            eventId: event.id,
-            accountId,
-            calendarId: form.calendarId,
-          });
-        }
+        if (accountId === null) return;
+        void run({
+          kind: "moveEvent",
+          eventId: event.id,
+          accountId,
+          calendarId: form.calendarId,
+        });
+      };
+
+      if (!patch) {
+        if (moved) move();
+        return;
       }
+      // A move is insert-into-destination then delete-from-source, so it re-reads
+      // the row the patch just wrote. If the patch did *not* land — Google refused
+      // it, the account needs reauthorizing — the row was rolled back, and moving
+      // on top of that would copy the pre-edit event to the other calendar and
+      // report success for a save that never happened.
+      void run({ kind: "updateEvent", eventId: event.id, patch, scope }).then((result) => {
+        if (moved && result?.ok) move();
+      });
     },
     [modal, run, create, accountForCalendar, actions],
   );
@@ -696,11 +692,16 @@ export function CalendarMode() {
       },
 
       // Copy, paste, duplicate, and out to Google.
+      // Gated on `active` alone, not on there being a selection or a clipboard.
+      // `?` snapshots the *live* bindings, so a binding that gates itself off
+      // until you have already used it can never be discovered from the sheet —
+      // which is the one thing the sheet is for. The handlers say what is
+      // missing instead, the way every other event binding here does.
       {
         keys: "mod+c",
         group: "Calendar",
         description: "Copy the event",
-        when: () => active && ui.eventId !== null,
+        when: () => active,
         handler: withEvent((event) => {
           setClipboard(event);
           actions.setStatus(`Copied “${event.title}” — ⌘V drops it on the day in view`, "info");
@@ -710,9 +711,12 @@ export function CalendarMode() {
         keys: "mod+v",
         group: "Calendar",
         description: "Paste onto the day in view",
-        when: () => active && clipboard !== null,
+        when: () => active,
         handler: () => {
-          if (!clipboard) return;
+          if (!clipboard) {
+            actions.setStatus("Nothing copied yet — ⌘C copies the selected event", "info");
+            return;
+          }
           create(pasteDraft(clipboard, ui.anchor), clipboard.calendarId);
         },
       },
@@ -755,11 +759,8 @@ export function CalendarMode() {
         keys: "escape",
         priority: 110,
         allowInInput: true,
-        when: () => shortcutsOpen || createOpen,
-        handler: () => {
-          setShortcuts(null);
-          setCreateOpen(false);
-        },
+        when: () => createOpen,
+        handler: () => setCreateOpen(false),
       },
 
       // Multi-account (§7). The brief asks for ⌘1–9 here, but ⌘1/⌘2 already mean
@@ -809,7 +810,6 @@ export function CalendarMode() {
       openCreate,
       openEvent,
       openExternal,
-      shortcutsOpen,
       createOpen,
       soloAccountAt,
       step,
@@ -823,16 +823,6 @@ export function CalendarMode() {
   );
 
   useKeyBindings(bindings);
-
-  /**
-   * Everything the sheet should list, whether or not it is live right now.
-   *
-   * `keymap.active()` alone answers "almost nothing": most calendar bindings
-   * are gated on there being a selected event or on no dialog being open, so
-   * the moment `?` opens the sheet, half of them go dark. Merging the local
-   * list back in is what makes the sheet a map of the mode rather than a
-   * snapshot of one instant.
-   */
 
   const title =
     ui.calendarView === "day"

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mach plugin sandbox — conformance</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font: 14px/1.55 ui-sans-serif, -apple-system, system-ui, sans-serif;
+        margin: 0 auto; padding: 40px 24px 80px; max-width: 860px;
+      }
+      h1 { font-size: 20px; margin: 0 0 4px; }
+      h2 { font-size: 15px; margin: 36px 0 6px; }
+      p.lede { margin: 0 0 8px; opacity: .7; }
+      table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+      th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); vertical-align: top; }
+      th { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .55; }
+      td.detail { opacity: .6; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+      .tag { font: 600 11px/1.6 ui-monospace, Menlo, monospace; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
+      .ok   { background: color-mix(in srgb, currentColor 10%, transparent); }
+      .bad  { background: #d33; color: #fff; }
+      .verdict { margin-top: 14px; padding: 10px 14px; border-radius: 8px; font-weight: 600; }
+      .verdict.pass { background: color-mix(in srgb, currentColor 8%, transparent); }
+      .verdict.fail { background: #d33; color: #fff; }
+      pre { font-size: 12px; background: color-mix(in srgb, currentColor 6%, transparent); padding: 10px 12px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }
+      code { font-family: ui-monospace, Menlo, monospace; }
+      .note { border-left: 3px solid color-mix(in srgb, currentColor 25%, transparent); padding-left: 12px; opacity: .8; }
+    </style>
+  </head>
+  <body>
+    <h1>Mach plugin sandbox — conformance</h1>
+    <p class="lede">
+      Every escape attempt below must be <strong>BLOCKED</strong>. One ALLOWED row means the tier-1
+      plugin design in <code>docs/plugins.md</code> does not hold on this WebView, and the
+      implementation must stop until it does.
+    </p>
+    <p class="note">
+      The guest runs on <code>http://127.0.0.1</code> while this page runs on
+      <code>http://localhost</code> — different origins served by one static server. In the real
+      app that second origin is a Tauri custom protocol.
+    </p>
+
+    <h2>Escape attempts</h2>
+    <table id="escapes">
+      <thead><tr><th>Scope</th><th>Attempt</th><th>Result</th><th>Detail</th></tr></thead>
+      <tbody><tr><td colspan="4">running…</td></tr></tbody>
+    </table>
+    <div class="verdict" id="verdict">…</div>
+
+    <h2>Channel</h2>
+    <p class="lede">
+      A tiny plugin doing real work through the capability-checked API — including one command it
+      did not declare, which must be refused by name.
+    </p>
+    <pre id="channel">running…</pre>
+
+    <h2>Negative result — opaque origin</h2>
+    <p class="lede">
+      The same guest in a <code>srcdoc</code> frame without <code>allow-same-origin</code>. Kept
+      because it is the design's first draft and it does not work: an opaque origin cannot host a
+      worker, so this must report a failure rather than a pass.
+    </p>
+    <pre id="opaque">running…</pre>
+
+    <script type="module">
+      import { PluginHost } from "./host.js";
+
+      /** The guest's origin. Anything but this page's own. */
+      const GUEST_URL = `${location.protocol}//127.0.0.1:${location.port}/guest.html`;
+
+      const text = (path) => fetch(path).then((r) => r.text());
+
+      const CANARY_MANIFEST = { id: "canary", machApi: "1", capabilities: {} };
+      const EXAMPLE_MANIFEST = {
+        id: "example",
+        machApi: "1",
+        capabilities: { read: ["labels"], commands: ["label"], ui: ["reading-pane"] },
+      };
+
+      /** A stand-in for the real host API. Shapes match `docs/plugins.md`. */
+      const api = {
+        "read.labels": async () => [
+          { id: "INBOX", name: "Inbox", kind: "system" },
+          { id: "Label_12", name: "Receipts", kind: "user" },
+        ],
+        run: async (command) => ({
+          ok: true,
+          message: `${command.kind} applied to ${command.threadIds.length}`,
+          applied: command.threadIds,
+          failed: [],
+        }),
+        notify: (message) => console.log("[notify]", message),
+        log: (...args) => console.log("[plugin]", ...args),
+      };
+
+      const [sandboxSource, workerSource, canarySource, exampleSource] = await Promise.all([
+        text("./sandbox.js"),
+        text("./worker.js"),
+        text("./plugins/canary.js"),
+        text("./plugins/example.js"),
+      ]);
+
+      const newHost = () => new PluginHost({ guestUrl: GUEST_URL, sandboxSource, workerSource });
+
+      /* ---------------------------------------------------------------- */
+      /* Escapes                                                          */
+      /* ---------------------------------------------------------------- */
+
+      /*
+       * A sentinel in the app's own storage.
+       *
+       * "Can the guest see localStorage?" is not the question — on its own
+       * origin it can, and that store is empty. "Can the guest see *ours*?" is,
+       * and it needs something of ours to look for.
+       */
+      const SENTINEL_KEY = "mach-sentinel";
+      const SENTINEL = `secret-${Math.random().toString(36).slice(2)}`;
+      localStorage.setItem(SENTINEL_KEY, SENTINEL);
+      document.cookie = `${SENTINEL_KEY}=${SENTINEL}; SameSite=Lax`;
+      const probeCtx = { appOrigin: location.origin, sentinelKey: SENTINEL_KEY, sentinel: SENTINEL };
+
+      const canaryHost = newHost();
+      let rows = [];
+      try {
+        const guest = await canaryHost.probeGuest(probeCtx);
+        await canaryHost.load(CANARY_MANIFEST, canarySource, {});
+        const worker = await canaryHost.invoke("actions", "probe", { appOrigin: location.origin });
+        rows = [...guest, ...worker];
+      } catch (error) {
+        rows = [{ scope: "host", name: "harness", allowed: true, detail: String(error.message) }];
+      }
+      canaryHost.destroy();
+
+      document.querySelector("#escapes tbody").innerHTML = rows
+        .map(
+          (r) => `<tr>
+            <td class="detail">${r.scope}</td>
+            <td>${esc(r.name)}</td>
+            <td><span class="tag ${r.allowed ? "bad" : "ok"}">${r.allowed ? "ALLOWED" : "BLOCKED"}</span></td>
+            <td class="detail">${esc(r.detail)}</td>
+          </tr>`,
+        )
+        .join("");
+
+      const leaks = rows.filter((r) => r.allowed);
+      const verdict = document.getElementById("verdict");
+      verdict.className = `verdict ${leaks.length ? "fail" : "pass"}`;
+      verdict.textContent = leaks.length
+        ? `FAIL — ${leaks.length} escape(s) succeeded: ${leaks.map((l) => l.name).join(", ")}`
+        : `PASS — all ${rows.length} escape attempts blocked. The sandbox holds on this WebView.`;
+
+      /* ---------------------------------------------------------------- */
+      /* Channel                                                          */
+      /* ---------------------------------------------------------------- */
+
+      const exampleHost = newHost();
+      const out = document.getElementById("channel");
+      try {
+        const exports = await exampleHost.load(EXAMPLE_MANIFEST, exampleSource, api);
+        const steps = await exampleHost.invoke("actions", "file", { threadIds: [101, 102] });
+        const view = await exampleHost.invoke("views", "summary", { threadIds: [101, 102] });
+        out.textContent = [
+          `exports  ${JSON.stringify(exports)}`,
+          ...steps.map((s, i) => `step ${i + 1}   ${s}`),
+          `view     ${JSON.stringify(view)}`,
+        ].join("\n");
+      } catch (error) {
+        out.textContent = `FAILED — ${error.message}`;
+      }
+      exampleHost.destroy();
+
+      /* ---------------------------------------------------------------- */
+      /* Negative result                                                  */
+      /* ---------------------------------------------------------------- */
+
+      const opaqueHost = new PluginHost({ sandboxSource, workerSource });
+      const opaque = document.getElementById("opaque");
+      try {
+        await opaqueHost.load(CANARY_MANIFEST, canarySource, {});
+        opaque.textContent =
+          "UNEXPECTED — the opaque-origin guest loaded a plugin. Re-read the design note in host.js;\n" +
+          "if this ever passes, the simpler sandbox is available and should be preferred.";
+      } catch (error) {
+        opaque.textContent = `As expected — ${error.message}`;
+      }
+      opaqueHost.destroy();
+
+      function esc(s) {
+        return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+      }
+    </script>
+  </body>
+</html>

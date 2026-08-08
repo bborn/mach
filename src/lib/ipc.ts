@@ -180,6 +180,10 @@ interface WireEvent {
   attendees?: Nullable<WireParticipant[]>;
   rsvpStatus?: Nullable<string>;
   status?: Nullable<string>;
+  /** `db::models::Event.recurring_event_id` — set on an expanded occurrence. */
+  recurringEventId?: Nullable<string>;
+  /** `db::models::Event.html_link` — Google's own URL for this event. */
+  htmlLink?: Nullable<string>;
   sourceThreadId?: Nullable<number>;
 }
 
@@ -396,6 +400,13 @@ export function mapEvent(wire: WireEvent): CalendarEvent {
     organizer: wire.organizer ? mapParticipant(wire.organizer) : undefined,
     attendees: mapParticipants(wire.attendees),
     rsvp: rsvp && RSVP_VALUES.has(rsvp) ? rsvp : undefined,
+    // These two were dropped here for a long time, and three separate paper
+    // cuts were downstream of it: "is this one of a series?" had to be guessed
+    // from titles and durations, "Open in Google" could only open the *day*,
+    // and the modal could not say what an existing series' rule was. The rows
+    // carried both fields the whole time.
+    recurringEventId: optional(wire.recurringEventId),
+    htmlLink: optional(wire.htmlLink),
     sourceThreadId: typeof wire.sourceThreadId === "number" ? wire.sourceThreadId : undefined,
   };
 }

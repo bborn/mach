@@ -350,6 +350,35 @@ describe("conflicts", () => {
     expect(k.conflicts()).toHaveLength(0);
   });
 
+  it("does not report a pair that priority already orders", () => {
+    // The shortcut sheet's Escape sits above the calendar's on purpose. It is
+    // not a tie, it does not depend on mount order, and reporting it made the
+    // console shout every time the sheet opened over a selected event.
+    const k = createKeymap("meta");
+    k.register({ keys: "escape", priority: 10, handler: () => {} });
+    k.register({ keys: "escape", priority: 120, handler: () => {} });
+    expect(k.conflicts()).toEqual([]);
+  });
+
+  it("still reports a tie among three, and only the tied ones", () => {
+    const k = createKeymap("meta");
+    k.register({ keys: "escape", priority: 120, description: "Sheet", handler: () => {} });
+    k.register({ keys: "escape", description: "Grid", handler: () => {} });
+    k.register({ keys: "escape", description: "Selection", handler: () => {} });
+
+    const conflicts = k.conflicts();
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]!.keys).toBe("escape");
+    expect(conflicts[0]!.bindings.map((b) => b.description)).toEqual(["Selection", "Grid"]);
+  });
+
+  it("keys a multi-token sequence by the whole sequence", () => {
+    const k = createKeymap("meta");
+    k.register({ keys: "g d", description: "Go to date", handler: () => {} });
+    k.register({ keys: "g d", description: "Go to draft", handler: () => {} });
+    expect(k.conflicts()[0]!.keys).toBe("g d");
+  });
+
   it("is quiet when nothing collides", () => {
     const k = createKeymap("meta");
     k.register({ keys: "e", description: "Archive", handler: () => {} });

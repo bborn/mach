@@ -197,6 +197,33 @@ describe("requests", () => {
     expect(events.map((e) => e.title)).toEqual(["Earlier", "Later"]);
   });
 
+  it("carries recurringEventId and htmlLink, which the grid has to have", async () => {
+    const { transport } = fakeTransport({
+      list_events: [
+        {
+          id: 1,
+          accountId: 1,
+          calendarId: "c",
+          title: "Weekly",
+          startTs: 100,
+          endTs: 150,
+          recurringEventId: "series-abc",
+          htmlLink: "https://www.google.com/calendar/event?eid=xyz",
+        },
+        { id: 2, accountId: 1, calendarId: "c", title: "One-off", startTs: 200, endTs: 250 },
+      ],
+    });
+
+    const [weekly, oneOff] = await createIpcSource(transport).listEvents({ start: 0, end: 999 });
+
+    expect(weekly.recurringEventId).toBe("series-abc");
+    expect(weekly.htmlLink).toBe("https://www.google.com/calendar/event?eid=xyz");
+    // Absent on the wire stays absent here, so "not a series" and "the backend
+    // did not say" remain two different answers.
+    expect(oneOff.recurringEventId).toBeUndefined();
+    expect(oneOff.htmlLink).toBeUndefined();
+  });
+
   it("names the thread id argument the way the Tauri command declares it", async () => {
     const { transport, calls } = fakeTransport({
       get_thread: {

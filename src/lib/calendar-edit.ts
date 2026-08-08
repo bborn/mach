@@ -187,18 +187,34 @@ const BYDAY = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
 /* Form ⇄ event                                                                */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The clock an all-day event's time fields show.
+ *
+ * An all-day row is pinned to *UTC* midnight, so reading a wall clock off it
+ * gives 19:00 or 20:00 anywhere west of Greenwich — the previous evening, in
+ * local time, of a day the event does not even cover. Those fields are hidden
+ * while "All day" is ticked, so nobody sees the nonsense; the moment the tick
+ * comes off they become the event's real time, and unticking used to produce a
+ * zero-length meeting at seven in the evening that saved without complaint.
+ *
+ * A working hour is what every calendar offers instead, and it is a guess the
+ * user can see and change before saving.
+ */
+const ALL_DAY_START = "09:00";
+const ALL_DAY_END = "10:00";
+
 export function formFromEvent(event: CalendarEvent): EventForm {
   return {
     title: event.title === "(no title)" ? "" : event.title,
     allDay: event.allDay,
     startDate: event.allDay ? utcDateField(event.start) : dateField(event.start),
-    startTime: timeField(event.start),
+    startTime: event.allDay ? ALL_DAY_START : timeField(event.start),
     // Google's all-day end is exclusive; the field shows the last day the event
     // actually covers, which is the one a human would name.
     endDate: event.allDay
       ? utcDateField(Math.max(event.start, event.end - DAY))
       : dateField(event.end),
-    endTime: timeField(event.end),
+    endTime: event.allDay ? ALL_DAY_END : timeField(event.end),
     location: event.location ?? "",
     description: event.description ?? "",
     attendees: attendeesField(event.attendees),
@@ -225,9 +241,9 @@ export function emptyForm(options: {
     title: "",
     allDay,
     startDate: allDay ? utcDateField(start) : dateField(start),
-    startTime: timeField(start),
+    startTime: allDay ? ALL_DAY_START : timeField(start),
     endDate: allDay ? utcDateField(start) : dateField(end),
-    endTime: timeField(end),
+    endTime: allDay ? ALL_DAY_END : timeField(end),
     location: "",
     description: "",
     attendees: "",
@@ -377,13 +393,17 @@ export function pasteDraft(event: CalendarEvent, targetDay: number): EventDraft 
 /* -------------------------------------------------------------------------- */
 
 /**
- * Whether an event looks like an occurrence of a repeating series.
+ * Whether an event is an occurrence of a repeating series.
  *
- * The honest version of this would read `recurringEventId`, which the store
- * has and `list_events` returns — but `mapEvent` in `src/lib/ipc.ts` (another
- * unit's file) does not carry it onto `CalendarEvent`. So it is inferred:
- * another event, on the same calendar, with the same title and the same
- * duration, on a different day.
+ * `recurringEventId` answers this exactly, and it is now carried onto
+ * `CalendarEvent` by `mapEvent` — so when it is present, that is the answer and
+ * nothing is inferred. A row that has one *is* an occurrence; a row from a
+ * backend that returned the field and left it empty is a one-off.
+ *
+ * The inference below survives for the two cases that have no such field:
+ * fixture data, and a row created in this session that has not been synced back
+ * yet. It looks for another event on the same calendar with the same title and
+ * duration on a different day.
  *
  * **Biased towards saying no**, deliberately. A false negative means the user
  * is not asked "this one or all of them?" and the edit applies to this
@@ -396,6 +416,12 @@ export function looksRecurring(
   event: CalendarEvent,
   others: readonly CalendarEvent[],
 ): boolean {
+  if (event.recurringEventId !== undefined) return event.recurringEventId.length > 0;
+  // A window where *anything* carries the field is a window from a backend that
+  // reports it, so a row without one is genuinely a one-off — guessing on top of
+  // that would only ever produce false positives.
+  if (others.some((other) => other.recurringEventId !== undefined)) return false;
+
   const duration = event.end - event.start;
   const day = startOfDay(event.start).getTime();
   const title = event.title.trim().toLowerCase();
