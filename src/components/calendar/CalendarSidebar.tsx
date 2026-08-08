@@ -1,6 +1,8 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useState } from "react";
 import type { Account, Calendar, CalendarId, AccountId } from "@/types";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 import { calendarFill, type HueIndex } from "@/lib/calendar-palette";
 import { cn } from "@/lib/utils";
 import { formatBinding } from "@/lib/keymap";
@@ -177,27 +179,14 @@ function Toggle({
   on: boolean;
   onChange: (on: boolean) => void;
 }) {
+  // The box used to be a `<button>` wrapping a hand-drawn square: it looked
+  // right and announced itself as a button with no state. Same pixels, real
+  // `role="checkbox"` and `aria-checked`.
   return (
-    <button
-      type="button"
-      title={hint}
-      onClick={() => onChange(!on)}
-      className="flex items-center gap-1.5 rounded-[3px] px-1 py-[3px] text-left hover:bg-row-hover"
-    >
-      <span
-        className={cn(
-          "flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] border",
-          on ? "border-accent bg-accent text-accent-foreground" : "border-border-strong",
-        )}
-      >
-        {on && (
-          <svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true">
-            <path d="M1 4l2 2 4-5" stroke="currentColor" strokeWidth="1.5" fill="none" />
-          </svg>
-        )}
-      </span>
+    <Label title={hint} className="cursor-pointer gap-1.5 rounded-[3px] px-1 py-[3px] hover:bg-row-hover">
+      <Checkbox checked={on} onCheckedChange={onChange} />
       <span className="min-w-0 flex-1 truncate text-micro text-muted-foreground">{label}</span>
-    </button>
+    </Label>
   );
 }
 

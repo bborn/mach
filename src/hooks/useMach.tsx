@@ -923,6 +923,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
         setReloadKey((k) => k + 1);
         streamRef.current.refresh();
       },
+      reloadEvents: () => setEventsKey((k) => k + 1),
     };
   }, [
     ui.mode,

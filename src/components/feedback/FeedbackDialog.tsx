@@ -38,6 +38,7 @@ import { cn } from "@/lib/utils";
 import { Overlay } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
+import { Textarea } from "@/components/ui/textarea";
 import { AnnotationCanvas } from "./AnnotationCanvas";
 
 /**
@@ -276,17 +277,13 @@ export function FeedbackDialog() {
               </Notice>
             )}
 
-            <textarea
+            <Textarea
               autoFocus
               rows={3}
               value={text}
               onChange={(event) => setText(event.target.value)}
               placeholder="What should change? One line is enough — the picture carries the rest."
-              className={cn(
-                "w-full resize-none rounded-[var(--radius)] border border-border bg-background px-2 py-1.5",
-                "text-body text-foreground placeholder:text-faint-foreground",
-                "focus:border-accent focus:outline-none",
-              )}
+              className="py-1.5"
             />
 
             {phase === "failed" && failure && (

@@ -653,6 +653,7 @@ function EndRow({
       />
       {!allDay && (
         <TimeField
+          id={`${dateId}-time`}
           label={`${which} time`}
           value={time}
           onChange={onTime}

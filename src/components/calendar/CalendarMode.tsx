@@ -185,8 +185,10 @@ export function CalendarMode() {
    * The command layer writes to SQLite before it talks to Google, so by the
    * time this resolves the local store is already right — but `useMach` loads
    * the calendar window once per anchor and has no idea a row changed. Asking
-   * it to reload is the seam: `actions.reload()` refetches the window, which is
-   * the only lever this component has into state another unit owns.
+   * it to refetch is the seam: `actions.reloadEvents()` refetches just that
+   * window. It used to be `actions.reload()`, which also refetched accounts,
+   * labels, calendars, the sync snapshot and the entire thread list — a lot of
+   * work, and a visible stutter, to redraw one block fifteen minutes lower.
    *
    * `undo` is threaded into the status bar exactly the way the mail commands
    * do it, so `z` reverses a drag as readily as it reverses an archive.
@@ -207,7 +209,7 @@ export function CalendarMode() {
             tone: result.ok ? "info" : "error",
           },
         });
-        actions.reload();
+        actions.reloadEvents();
         return result;
       } catch (error) {
         dispatch({
