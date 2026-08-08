@@ -1,0 +1,992 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import type {
+  Account,
+  AccountId,
+  Calendar,
+  CalendarEvent,
+  CalendarId,
+  EventId,
+  Label,
+  LabelId,
+  SyncStatus,
+  Thread,
+  ThreadDetail,
+  ThreadId,
+} from "@/types";
+import {
+  describeResult,
+  failedIds,
+  getDataSource,
+  isMailCommand,
+  type Command,
+  type MailCommand,
+} from "@/lib/data";
+import {
+  mailboxState,
+  syncProgress,
+  type MailboxError,
+  type MailboxState,
+  type SyncProgress,
+} from "@/lib/mailbox-state";
+import {
+  favoriteKey,
+  isFavorited,
+  loadFavorites,
+  removeFavorite,
+  saveFavorites,
+  toggleFavorite,
+  type Favorite,
+} from "@/lib/favorites";
+import {
+  clear as clearSelection,
+  commandTargets,
+  emptySelection,
+  extendTo,
+  nextAfterRemoval,
+  prune,
+  reanchor,
+  anchorAt,
+  selectAllMessage,
+  selectOnly,
+  toggle as toggleSelection,
+  toggleAll,
+  type Selection,
+} from "@/lib/selection";
+import { mailboxName } from "@/lib/mailboxes";
+import { toMailboxError, useThreadStream } from "@/hooks/useThreadStream";
+import { DAY, addDays, addMonths, startOfWeek } from "@/lib/time";
+
+export type Mode = "mail" | "calendar";
+export type CalendarView = "day" | "week" | "month";
+export type Theme = "system" | "light" | "dark";
+/** Which pane the keyboard is driving. Mail's `j`/`k` belong to exactly one. */
+export type MailFocus = "list" | "rail";
+
+/** What the status bar says, and how loudly. */
+export interface StatusMessage {
+  message: string;
+  undo?: Command;
+  tone: "info" | "error";
+}
+
+interface UiState {
+  mode: Mode;
+  calendarView: CalendarView;
+  /** The day the calendar is anchored on; views derive their range from it. */
+  anchor: number;
+  accountId: AccountId | null;
+  labelId: LabelId;
+  threadId: ThreadId | null;
+  /** Multi-select. `threadId` is the cursor; this is what a command acts on. */
+  selection: Selection;
+  /** Which mail pane has the keyboard, so `j`/`k` are never ambiguous. */
+  focus: MailFocus;
+  /** Cursor row in the rail. `-1` means "wherever the current mailbox is". */
+  railIndex: number;
+  eventId: EventId | null;
+  paletteOpen: boolean;
+  addAccountOpen: boolean;
+  listWidth: number;
+  hiddenCalendars: CalendarId[];
+  theme: Theme;
+  /** Threads hidden optimistically, until the command layer confirms. */
+  archived: ThreadId[];
+  readExtra: ThreadId[];
+  status: StatusMessage | null;
+}
+
+type UiAction =
+  | { type: "mode"; mode: Mode }
+  | { type: "calendarView"; view: CalendarView }
+  | { type: "anchor"; anchor: number }
+  | { type: "account"; accountId: AccountId | null }
+  | { type: "label"; labelId: LabelId }
+  /**
+   * Move the cursor. `keepAnchor` is what ⇧J/⇧K set: the cursor moves but the
+   * range being dragged still grows from where shift was first pressed.
+   */
+  | { type: "thread"; threadId: ThreadId | null; keepAnchor?: boolean }
+  | { type: "selection"; selection: Selection }
+  | { type: "focus"; focus: MailFocus }
+  | { type: "railIndex"; index: number }
+  | { type: "event"; eventId: EventId | null }
+  | { type: "palette"; open: boolean }
+  | { type: "addAccount"; open: boolean }
+  | { type: "listWidth"; width: number }
+  | { type: "toggleCalendar"; calendarId: CalendarId }
+  | { type: "theme"; theme: Theme }
+  | { type: "archive"; threadIds: ThreadId[] }
+  /** Put optimistically-hidden threads back — undo, or a command that failed. */
+  | { type: "restore"; threadIds: ThreadId[] }
+  | { type: "read"; threadIds: ThreadId[] }
+  | { type: "status"; status: UiState["status"] };
+
+const initialUi: UiState = {
+  mode: "mail",
+  calendarView: "week",
+  anchor: Date.now(),
+  accountId: null,
+  labelId: "INBOX",
+  threadId: null,
+  selection: emptySelection,
+  focus: "list",
+  railIndex: -1,
+  eventId: null,
+  paletteOpen: false,
+  addAccountOpen: false,
+  listWidth: 520,
+  hiddenCalendars: [],
+  theme: "system",
+  archived: [],
+  readExtra: [],
+  status: null,
+};
+
+function uiReducer(state: UiState, action: UiAction): UiState {
+  switch (action.type) {
+    case "mode":
+      return { ...state, mode: action.mode };
+    case "calendarView":
+      return { ...state, calendarView: action.view };
+    case "anchor":
+      return { ...state, anchor: action.anchor };
+    // Changing what the list is *of* invalidates anything selected in it.
+    case "account":
+      return {
+        ...state,
+        accountId: action.accountId,
+        threadId: null,
+        selection: emptySelection,
+      };
+    case "label":
+      return { ...state, labelId: action.labelId, threadId: null, selection: emptySelection };
+    case "thread":
+      return {
+        ...state,
+        threadId: action.threadId,
+        readExtra:
+          action.threadId !== null
+            ? uniq([...state.readExtra, action.threadId])
+            : state.readExtra,
+        // Moving the cursor re-points the anchor without selecting anything:
+        // walking past a row you ticked must never untick it.
+        selection:
+          action.threadId === null || action.keepAnchor
+            ? state.selection
+            : reanchor(state.selection, action.threadId),
+      };
+    case "selection":
+      return { ...state, selection: action.selection };
+    case "focus":
+      return {
+        ...state,
+        focus: action.focus,
+        // Leaving the rail forgets where the cursor was in it, so coming back
+        // starts on the mailbox you are actually in rather than a stale row.
+        railIndex: action.focus === "rail" ? state.railIndex : -1,
+      };
+    case "railIndex":
+      return { ...state, railIndex: action.index };
+    case "event":
+      return { ...state, eventId: action.eventId };
+    case "palette":
+      return { ...state, paletteOpen: action.open };
+    case "addAccount":
+      return { ...state, addAccountOpen: action.open, paletteOpen: false };
+    case "listWidth":
+      return { ...state, listWidth: clamp(action.width, 280, 640) };
+    case "toggleCalendar":
+      return {
+        ...state,
+        hiddenCalendars: state.hiddenCalendars.includes(action.calendarId)
+          ? state.hiddenCalendars.filter((id) => id !== action.calendarId)
+          : [...state.hiddenCalendars, action.calendarId],
+      };
+    case "theme":
+      return { ...state, theme: action.theme };
+    case "archive":
+      return { ...state, archived: uniq([...state.archived, ...action.threadIds]) };
+    case "restore":
+      return { ...state, archived: state.archived.filter((id) => !action.threadIds.includes(id)) };
+    case "read":
+      return { ...state, readExtra: uniq([...state.readExtra, ...action.threadIds]) };
+    case "status":
+      return { ...state, status: action.status };
+  }
+}
+
+function uniq<T>(values: T[]): T[] {
+  return [...new Set(values)];
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+interface MachValue {
+  ui: UiState;
+  accounts: Account[];
+  labels: Label[];
+  calendars: Calendar[];
+  allThreads: Thread[];
+  visibleThreads: Thread[];
+  visibleEvents: CalendarEvent[];
+  events: CalendarEvent[];
+  detail: ThreadDetail | null;
+  detailLoading: boolean;
+  /** What the user pinned to the sidebar, in the order they pinned it. */
+  favorites: Favorite[];
+  /** The mailbox-plus-account-scope favorite the current view would produce. */
+  viewFavorite: Favorite;
+  /** The conversation favorite the open thread would produce, if any. */
+  threadFavorite: Favorite | null;
+  isFavorite: (favorite: Favorite | null) => boolean;
+  selectedIndex: number;
+  /** The ids the next command will act on: the selection, or the cursor row. */
+  commandTargets: ThreadId[];
+  isRowSelected: (id: ThreadId) => boolean;
+  selectedEvent: CalendarEvent | null;
+  /** Which of the four empty/loading situations the mail pane is in. */
+  state: MailboxState;
+  sync: SyncStatus | null;
+  progress: SyncProgress;
+  /** `true` when the app is talking to Rust, `false` on fixture data. */
+  live: boolean;
+  hasMore: boolean;
+  loadingMore: boolean;
+  accountById: (id: AccountId) => Account | undefined;
+  calendarById: (id: CalendarId) => Calendar | undefined;
+  isUnread: (thread: Thread) => boolean;
+  dispatch: (action: UiAction) => void;
+  actions: MachActions;
+}
+
+export interface MachActions {
+  setMode: (mode: Mode) => void;
+  toggleMode: () => void;
+  setCalendarView: (view: CalendarView) => void;
+  moveCursor: (delta: number) => void;
+  openSelected: () => void;
+  closeThread: () => void;
+  selectThread: (id: ThreadId) => void;
+  /** A click on a row, told which modifiers were held. */
+  clickThread: (id: ThreadId, modifiers: { extend: boolean; toggle: boolean }) => void;
+  /** `x`: tick the cursor row and move on. */
+  toggleAtCursor: () => void;
+  /** ⇧J / ⇧K: move the cursor and drag the range with it. */
+  extendCursor: (delta: number) => void;
+  /** ⌘A: select every loaded conversation, or clear if they all already are. */
+  selectAllThreads: () => void;
+  clearSelection: () => void;
+  archiveSelected: () => void;
+  trashSelected: () => void;
+  starSelected: () => void;
+  snoozeSelected: () => void;
+  replySelected: () => void;
+  /** Move the keyboard between the rail and the list. */
+  setFocus: (focus: MailFocus) => void;
+  toggleFocus: () => void;
+  undo: () => void;
+  shiftPeriod: (delta: number) => void;
+  goToday: () => void;
+  setPalette: (open: boolean) => void;
+  setAddAccount: (open: boolean) => void;
+  setStatus: (message: string, tone?: StatusMessage["tone"]) => void;
+  /** Pin or unpin the mailbox being looked at, account scope included. */
+  toggleFavoriteView: () => void;
+  /** Pin or unpin the open conversation. */
+  toggleFavoriteThread: () => void;
+  /** What `f` does: the conversation if one is open, otherwise the mailbox. */
+  toggleFavoriteFocused: () => void;
+  unfavorite: (key: string) => void;
+  openFavorite: (favorite: Favorite) => void;
+  cycleTheme: () => void;
+  loadMore: () => void;
+  syncNow: () => void;
+  /** After an account is added or removed, everything is stale. */
+  reload: () => void;
+  /**
+   * Refetch just the calendar window.
+   *
+   * A calendar write changes one row. `reload()` answers that by refetching
+   * accounts, labels, calendars, the sync snapshot *and* the whole thread list,
+   * which is a lot of work and a visible stutter for redrawing one block.
+   */
+  reloadEvents: () => void;
+}
+
+const MachContext = createContext<MachValue | null>(null);
+
+/** How far either side of the anchor the calendar keeps events loaded. */
+const CALENDAR_WINDOW = 60 * DAY;
+
+export function MachProvider({ children }: { children: ReactNode }) {
+  const [ui, dispatch] = useReducer(uiReducer, initialUi);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [labels, setLabels] = useState<Label[]>([]);
+  const [calendars, setCalendars] = useState<Calendar[]>([]);
+  const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [detail, setDetail] = useState<ThreadDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [sync, setSync] = useState<SyncStatus | null>(null);
+  const [booted, setBooted] = useState(false);
+  const [bootError, setBootError] = useState<MailboxError | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  /** Bumped by anything that writes an event — see `reloadEvents`. */
+  const [eventsKey, setEventsKey] = useState(0);
+  // Favorites are the one piece of state here the user owns, so they outlive
+  // the window. Read once at mount, written back whenever they change.
+  const [favorites, setFavorites] = useState<Favorite[]>(() => loadFavorites());
+  useEffect(() => saveFavorites(favorites), [favorites]);
+
+  const stream = useThreadStream(ui.accountId, ui.labelId);
+  // Actions close over the stream without being rebuilt on every page it loads.
+  const streamRef = useRef(stream);
+  streamRef.current = stream;
+
+  // A backfill can emit `threads-changed` hundreds of times a minute. Coalesce:
+  // one refetch per window, however many events arrived in it.
+  const refreshTimer = useRef<number | null>(null);
+  const scheduleRefresh = useCallback(() => {
+    if (refreshTimer.current !== null) return;
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = null;
+      streamRef.current.refresh();
+    }, 600);
+  }, []);
+  useEffect(
+    () => () => {
+      if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+    },
+    [],
+  );
+
+  // Boot. Accounts, labels, calendars and the current sync snapshot; the thread
+  // list has its own pager, and the calendar its own window.
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      const source = getDataSource();
+      try {
+        const [a, l, c, s] = await Promise.all([
+          source.listAccounts(),
+          source.listLabels(),
+          source.listCalendars(),
+          source.syncStatus(),
+        ]);
+        if (!live) return;
+        setAccounts(a);
+        setLabels(l);
+        setCalendars(c);
+        setSync(s);
+        setBootError(null);
+      } catch (caught) {
+        if (!live) return;
+        setBootError(toMailboxError(caught));
+      } finally {
+        if (live) setBooted(true);
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [reloadKey]);
+
+  // Calendar events for a window around the anchor, refetched when the anchor
+  // leaves it rather than on every arrow key.
+  const windowKey = Math.round(ui.anchor / (30 * DAY));
+  useEffect(() => {
+    let live = true;
+    const centre = windowKey * 30 * DAY;
+    void getDataSource()
+      .listEvents({ start: centre - CALENDAR_WINDOW, end: centre + CALENDAR_WINDOW })
+      .then((rows) => {
+        if (live) setEvents(rows);
+      })
+      .catch(() => {
+        /* the mail half must not go dark because the calendar failed */
+      });
+    return () => {
+      live = false;
+    };
+  }, [windowKey, reloadKey, eventsKey]);
+
+  // Push, not poll: the sync engine tells us where it is, and a sync pass or a
+  // command that changed threads tells us to refetch the list.
+  useEffect(() => {
+    let live = true;
+    const disposers: (() => void)[] = [];
+    const source = getDataSource();
+    const keep = (off: () => void) => {
+      if (live) disposers.push(off);
+      else off();
+    };
+
+    void source.onSyncStatus(setSync).then(keep);
+    void source.onThreadsChanged(scheduleRefresh).then(keep);
+
+    return () => {
+      live = false;
+      for (const off of disposers) off();
+    };
+  }, [reloadKey, scheduleRefresh]);
+
+  useEffect(() => {
+    if (ui.threadId === null) {
+      setDetail(null);
+      setDetailLoading(false);
+      return;
+    }
+    let live = true;
+    setDetailLoading(true);
+    void getDataSource()
+      .getThread(ui.threadId)
+      .then((d) => {
+        if (!live) return;
+        setDetail(d);
+        setDetailLoading(false);
+      })
+      .catch(() => {
+        if (!live) return;
+        setDetail(null);
+        setDetailLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+    // `reloadKey` is a dependency because sending writes an optimistic copy of
+    // the reply straight into SQLite: the open conversation is exactly the
+    // thing a reload has to refetch.
+  }, [ui.threadId, reloadKey]);
+
+  // Theme. The token layer defines both palettes; this decides which is live.
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const apply = () => {
+      const dark = ui.theme === "dark" || (ui.theme === "system" && media.matches);
+      document.documentElement.classList.toggle("dark", dark);
+      document.documentElement.style.colorScheme = dark ? "dark" : "light";
+    };
+    apply();
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [ui.theme]);
+
+  // Status messages are transient; the undo window is the only reason they linger.
+  useEffect(() => {
+    if (!ui.status) return;
+    const timer = window.setTimeout(() => dispatch({ type: "status", status: null }), 6000);
+    return () => window.clearTimeout(timer);
+  }, [ui.status]);
+
+  const allThreads = stream.threads;
+
+  const visibleThreads = useMemo(() => {
+    const archived = new Set(ui.archived);
+    return allThreads.filter((t) => !archived.has(t.id));
+  }, [allThreads, ui.archived]);
+
+  const visibleEvents = useMemo(() => {
+    const hidden = new Set(ui.hiddenCalendars);
+    return events.filter((e) => !hidden.has(e.calendarId));
+  }, [events, ui.hiddenCalendars]);
+
+  const selectedIndex = useMemo(
+    () => visibleThreads.findIndex((t) => t.id === ui.threadId),
+    [visibleThreads, ui.threadId],
+  );
+
+  /** The list, as ids, in the order the rows are painted. */
+  const listIds = useMemo(() => visibleThreads.map((t) => t.id), [visibleThreads]);
+
+  /*
+   * Keep the selection honest against the list under it.
+   *
+   * `threads-changed` fires continuously during a sync and the list is
+   * refetched underneath whatever is selected. Anything that left the mailbox —
+   * archived on the phone, moved by a filter, optimistically hidden here — has
+   * to leave the selection with it, or the count in the status bar describes
+   * rows that no longer exist. `prune` returns the same object when nothing
+   * changed, which is what keeps this from looping.
+   */
+  useEffect(() => {
+    const pruned = prune(ui.selection, listIds);
+    if (pruned !== ui.selection) dispatch({ type: "selection", selection: pruned });
+  }, [ui.selection, listIds]);
+
+  const commandTargetIds = useMemo(
+    () => commandTargets(ui.selection, ui.threadId),
+    [ui.selection, ui.threadId],
+  );
+
+  const isRowSelected = useCallback(
+    (id: ThreadId) => ui.selection.ids.includes(id),
+    [ui.selection],
+  );
+
+  const selectedEvent = useMemo(
+    () => events.find((e) => e.id === ui.eventId) ?? null,
+    [events, ui.eventId],
+  );
+
+  const accountById = useCallback(
+    (id: AccountId) => accounts.find((a) => a.id === id),
+    [accounts],
+  );
+  const calendarById = useCallback(
+    (id: CalendarId) => calendars.find((c) => c.id === id),
+    [calendars],
+  );
+  const isUnread = useCallback(
+    (thread: Thread) => thread.unread && !ui.readExtra.includes(thread.id),
+    [ui.readExtra],
+  );
+
+  // A favorited view is the label *and* the account filter it was pinned
+  // under, so "Inbox" and "Inbox · Personal" can both live in the rail.
+  const viewFavorite = useMemo<Favorite>(() => {
+    const label = labels.find((l) => l.id === ui.labelId);
+    const scope = accounts.find((a) => a.id === ui.accountId);
+    const name = label ? mailboxName(label) : ui.labelId;
+    return {
+      kind: "mailbox",
+      labelId: ui.labelId,
+      accountId: ui.accountId,
+      name: scope ? `${name} · ${scope.name}` : name,
+    };
+  }, [labels, accounts, ui.labelId, ui.accountId]);
+
+  const focusedThread = useMemo(
+    () =>
+      detail?.thread ??
+      (ui.threadId === null ? null : allThreads.find((t) => t.id === ui.threadId)) ??
+      null,
+    [detail, allThreads, ui.threadId],
+  );
+
+  const threadFavorite = useMemo<Favorite | null>(
+    () =>
+      focusedThread
+        ? {
+            kind: "thread",
+            threadId: focusedThread.id,
+            accountId: focusedThread.accountId,
+            name: focusedThread.subject || "(no subject)",
+          }
+        : null,
+    [focusedThread],
+  );
+
+  const isFavorite = useCallback(
+    (favorite: Favorite | null) => (favorite ? isFavorited(favorites, favoriteKey(favorite)) : false),
+    [favorites],
+  );
+
+  /**
+   * Dispatch a command and reconcile the optimistic state with what actually
+   * happened.
+   *
+   * `execute_command` can come back `ok: false` with some ids applied and the
+   * rest rolled back — one account rate-limited out of five, say. The rolled
+   * back ids have to come back on screen, or the user is looking at a list that
+   * disagrees with their mailbox.
+   *
+   * `reselectFailed` is the bulk half of that: archive fifty, three roll back,
+   * and those three come back *still selected*, so retrying is one keystroke
+   * rather than a hunt through the list for which ones did not make it. The
+   * status line says so too — `describeResult` refuses to report fifty.
+   */
+  const run = useCallback(
+    async (command: Command, options: { quiet?: boolean; reselectFailed?: boolean } = {}) => {
+      try {
+        const result = await getDataSource().execute(command);
+        // A calendar command's whole effect is rows in the event window, and
+        // nothing else refetches that window. Without this, `z` on a deleted
+        // event puts it back on Google and in SQLite and leaves the grid empty —
+        // undo that reports success and visibly does nothing.
+        if (!isMailCommand(command)) setEventsKey((k) => k + 1);
+        const failed = failedIds(result);
+        if (failed.length > 0) {
+          dispatch({ type: "restore", threadIds: failed });
+          if (options.reselectFailed) {
+            dispatch({
+              type: "selection",
+              selection: selectOnly(emptySelection, failed, failed),
+            });
+          }
+        }
+        if (!options.quiet || !result.ok) {
+          dispatch({
+            type: "status",
+            status: {
+              message: describeResult(result),
+              undo: result.undo,
+              tone: result.ok ? "info" : "error",
+            },
+          });
+        }
+      } catch (caught) {
+        // The command never ran, so nothing changed anywhere: undo the whole
+        // optimistic edit, not part of it.
+        if (isMailCommand(command)) {
+          dispatch({ type: "restore", threadIds: command.threadIds });
+        }
+        dispatch({
+          type: "status",
+          status: { message: toMailboxError(caught).message, tone: "error" },
+        });
+      }
+    },
+    [],
+  );
+
+  // Opening an unread conversation marks it read — once, and quietly.
+  const markedRead = useRef(new Set<ThreadId>());
+  useEffect(() => {
+    const thread = detail?.thread;
+    if (!thread || !thread.unread || markedRead.current.has(thread.id)) return;
+    markedRead.current.add(thread.id);
+    void run({ kind: "markRead", threadIds: [thread.id], read: true }, { quiet: true });
+  }, [detail, run]);
+
+  const state = useMemo(
+    () =>
+      mailboxState({
+        booted: booted && !stream.loading,
+        error: bootError ?? stream.error,
+        accountCount: accounts.length,
+        threadCount: visibleThreads.length,
+        sync,
+        filtered: ui.accountId !== null || ui.labelId !== "INBOX",
+      }),
+    [
+      booted,
+      stream.loading,
+      stream.error,
+      bootError,
+      accounts.length,
+      visibleThreads.length,
+      sync,
+      ui.accountId,
+      ui.labelId,
+    ],
+  );
+
+  const progress = useMemo(() => syncProgress(sync), [sync]);
+
+  const actions = useMemo<MachActions>(() => {
+    const selectAt = (index: number) => {
+      const next = visibleThreads[clamp(index, 0, Math.max(visibleThreads.length - 1, 0))];
+      if (next) dispatch({ type: "thread", threadId: next.id });
+    };
+
+    /**
+     * Run one command over everything the user pointed at.
+     *
+     * *One* command: the Rust layer groups the ids by (account, label delta)
+     * and issues a single Gmail `batchModify` per group, which it can only do
+     * if the whole set arrives together. Fifty archives dispatched one at a
+     * time would be fifty round trips, fifty status messages, and an undo
+     * stack fifty deep for one gesture.
+     *
+     * `hides` says whether the rows leave the list, which decides whether the
+     * cursor has to move and whether to hide them optimistically.
+     */
+    const bulk = (command: MailCommand, hides: boolean) => {
+      const ids = command.threadIds;
+      if (ids.length === 0) return;
+      if (hides) {
+        const nextFocus = nextAfterRemoval(listIds, ids, ui.threadId);
+        dispatch({ type: "archive", threadIds: ids });
+        if (nextFocus !== ui.threadId) dispatch({ type: "thread", threadId: nextFocus });
+      }
+      dispatch({ type: "selection", selection: clearSelection(ui.selection) });
+      void run(command, { reselectFailed: true });
+    };
+
+    const pin = (favorite: Favorite) => {
+      const pinned = !isFavorite(favorite);
+      setFavorites((list) => toggleFavorite(list, favorite));
+      dispatch({
+        type: "status",
+        status: {
+          message: pinned
+            ? `Added ${favorite.name} to favorites`
+            : `Removed ${favorite.name} from favorites`,
+          tone: "info",
+        },
+      });
+    };
+
+    return {
+      setMode: (mode) => dispatch({ type: "mode", mode }),
+      toggleMode: () =>
+        dispatch({ type: "mode", mode: ui.mode === "mail" ? "calendar" : "mail" }),
+      setCalendarView: (view) => dispatch({ type: "calendarView", view }),
+      moveCursor: (delta) => {
+        const target = selectedIndex === -1 ? 0 : selectedIndex + delta;
+        // Walking off the bottom of the loaded pages is the other half of
+        // infinite scroll: the keyboard has to pull pages too.
+        if (delta > 0 && target >= visibleThreads.length - 5) streamRef.current.loadMore();
+        selectAt(target);
+      },
+      openSelected: () => {
+        if (selectedIndex === -1) selectAt(0);
+      },
+      closeThread: () => dispatch({ type: "thread", threadId: null }),
+      selectThread: (id) => dispatch({ type: "thread", threadId: id }),
+
+      /**
+       * A click on a row. Which of the three gestures it is depends entirely
+       * on the modifiers, exactly as it does in Finder and in Gmail:
+       *
+       *  * plain — read this conversation; any selection goes away.
+       *  * ⇧     — select from the anchor to here, replacing the last range.
+       *  * ⌘/⌃   — tick this one row, leave everything else alone.
+       *
+       * The two modified gestures deliberately do **not** move the cursor into
+       * the clicked row. Opening a conversation marks it read on Google, and a
+       * modifier-click is a statement about selection, not about reading.
+       */
+      clickThread: (id, modifiers) => {
+        // Touching the list is a claim on the keyboard, wherever it was.
+        if (ui.focus !== "list") dispatch({ type: "focus", focus: "list" });
+        if (modifiers.extend) {
+          dispatch({ type: "selection", selection: extendTo(ui.selection, id, listIds) });
+        } else if (modifiers.toggle) {
+          dispatch({ type: "selection", selection: toggleSelection(ui.selection, id) });
+        } else {
+          dispatch({ type: "selection", selection: anchorAt(ui.selection, id) });
+          dispatch({ type: "thread", threadId: id });
+        }
+      },
+
+      // `x` — tick and move on, so a run of them selects a run of rows. The
+      // cursor move re-anchors, which is what makes a following ⇧J extend from
+      // here rather than from the first row of the run.
+      toggleAtCursor: () => {
+        if (ui.threadId === null) {
+          if (visibleThreads.length > 0) selectAt(0);
+          return;
+        }
+        dispatch({ type: "selection", selection: toggleSelection(ui.selection, ui.threadId) });
+        const next = visibleThreads[selectedIndex + 1];
+        if (next) {
+          if (selectedIndex + 1 >= visibleThreads.length - 5) streamRef.current.loadMore();
+          dispatch({ type: "thread", threadId: next.id });
+        }
+      },
+
+      // ⇧J / ⇧K — the cursor moves and the range follows it. `keepAnchor` is
+      // the whole difference from `moveCursor`: the range still grows from
+      // where shift was first pressed, so shrinking it back works.
+      extendCursor: (delta) => {
+        if (visibleThreads.length === 0) return;
+        const from = selectedIndex === -1 ? 0 : selectedIndex;
+        const target = visibleThreads[clamp(from + delta, 0, visibleThreads.length - 1)];
+        if (!target) return;
+        if (delta > 0 && from + delta >= visibleThreads.length - 5) streamRef.current.loadMore();
+        // With no anchor yet, the row being left behind becomes one — ⇧J from a
+        // cold start selects the row you were on *and* the row you land on.
+        const anchored =
+          ui.selection.anchor === null && ui.threadId !== null
+            ? reanchor(ui.selection, ui.threadId)
+            : ui.selection;
+        dispatch({ type: "selection", selection: extendTo(anchored, target.id, listIds) });
+        dispatch({ type: "thread", threadId: target.id, keepAnchor: true });
+      },
+
+      // ⌘A — and it says how much of the mailbox that actually was. The list is
+      // a page of an infinite one; "all" can only ever mean all of what has
+      // been fetched, and claiming otherwise before archiving is a lie.
+      selectAllThreads: () => {
+        if (listIds.length === 0) return;
+        const next = toggleAll(ui.selection, listIds);
+        dispatch({ type: "selection", selection: next });
+        dispatch({
+          type: "status",
+          status: {
+            message:
+              next.ids.length > 0
+                ? selectAllMessage(next.ids.length, streamRef.current.hasMore)
+                : "Selection cleared",
+            tone: "info",
+          },
+        });
+      },
+
+      clearSelection: () =>
+        dispatch({ type: "selection", selection: clearSelection(ui.selection) }),
+
+      archiveSelected: () => bulk({ kind: "archive", threadIds: commandTargetIds }, true),
+      trashSelected: () => bulk({ kind: "trash", threadIds: commandTargetIds }, true),
+      snoozeSelected: () =>
+        bulk({ kind: "snooze", threadIds: commandTargetIds, until: Date.now() + DAY }, true),
+      // Starring a mixed set stars all of it; only an already-all-starred set
+      // unstars. Anything else and the same keystroke does opposite things to
+      // different rows of one selection.
+      starSelected: () => {
+        const byId = new Map(visibleThreads.map((t) => [t.id, t]));
+        const allStarred =
+          commandTargetIds.length > 0 &&
+          commandTargetIds.every((id) => byId.get(id)?.starred === true);
+        bulk({ kind: "star", threadIds: commandTargetIds, starred: !allStarred }, false);
+      },
+
+      setFocus: (focus) => dispatch({ type: "focus", focus }),
+      toggleFocus: () =>
+        dispatch({ type: "focus", focus: ui.focus === "list" ? "rail" : "list" }),
+      // The composer owns the draft, and it lives in the reading pane's own
+      // subtree; the reply button in `ReadingPane` belongs to another unit's
+      // file, so this is the seam between them.
+      replySelected: () =>
+        window.dispatchEvent(new CustomEvent("mach:compose", { detail: { kind: "reply" } })),
+      undo: () => {
+        const undo = ui.status?.undo;
+        if (!undo) return;
+        // Everything that puts a thread back on screen has to clear the
+        // optimistic hide as well as run the command.
+        if (
+          undo.kind === "unarchive" ||
+          undo.kind === "untrash" ||
+          undo.kind === "unsnooze"
+        ) {
+          dispatch({ type: "restore", threadIds: undo.threadIds });
+        }
+        void run(undo);
+      },
+      shiftPeriod: (delta) => {
+        const step =
+          ui.calendarView === "day"
+            ? addDays(ui.anchor, delta)
+            : ui.calendarView === "week"
+              ? addDays(ui.anchor, delta * 7)
+              : addMonths(ui.anchor, delta);
+        dispatch({ type: "anchor", anchor: step.getTime() });
+      },
+      goToday: () => dispatch({ type: "anchor", anchor: Date.now() }),
+      setPalette: (open) => dispatch({ type: "palette", open }),
+      setAddAccount: (open) => dispatch({ type: "addAccount", open }),
+      setStatus: (message, tone = "info") =>
+        dispatch({ type: "status", status: { message, tone } }),
+      toggleFavoriteView: () => pin(viewFavorite),
+      toggleFavoriteThread: () => {
+        if (!threadFavorite) {
+          dispatch({
+            type: "status",
+            status: { message: "Open a conversation first", tone: "info" },
+          });
+          return;
+        }
+        pin(threadFavorite);
+      },
+      // One key for both, because "favorite this" means whatever is in front of
+      // you: the conversation you are reading, or the mailbox you are in.
+      toggleFavoriteFocused: () => pin(threadFavorite ?? viewFavorite),
+      unfavorite: (key) => setFavorites((list) => removeFavorite(list, key)),
+      openFavorite: (favorite) => {
+        if (favorite.kind === "mailbox") {
+          dispatch({ type: "account", accountId: favorite.accountId });
+          dispatch({ type: "label", labelId: favorite.labelId });
+        } else {
+          dispatch({ type: "mode", mode: "mail" });
+          dispatch({ type: "thread", threadId: favorite.threadId });
+        }
+      },
+      cycleTheme: () =>
+        dispatch({
+          type: "theme",
+          theme: ui.theme === "system" ? "light" : ui.theme === "light" ? "dark" : "system",
+        }),
+      loadMore: () => streamRef.current.loadMore(),
+      syncNow: () => {
+        void getDataSource()
+          .syncNow()
+          .catch((caught) =>
+            dispatch({
+              type: "status",
+              status: { message: toMailboxError(caught).message, tone: "error" },
+            }),
+          );
+      },
+      reload: () => {
+        setReloadKey((k) => k + 1);
+        streamRef.current.refresh();
+      },
+    };
+  }, [
+    ui.mode,
+    ui.threadId,
+    ui.status,
+    ui.anchor,
+    ui.calendarView,
+    ui.theme,
+    ui.selection,
+    ui.focus,
+    selectedIndex,
+    visibleThreads,
+    listIds,
+    commandTargetIds,
+    viewFavorite,
+    threadFavorite,
+    isFavorite,
+    run,
+  ]);
+
+  const value: MachValue = {
+    ui,
+    accounts,
+    labels,
+    calendars,
+    allThreads,
+    visibleThreads,
+    visibleEvents,
+    events,
+    detail,
+    detailLoading,
+    favorites,
+    viewFavorite,
+    threadFavorite,
+    isFavorite,
+    selectedIndex,
+    commandTargets: commandTargetIds,
+    isRowSelected,
+    selectedEvent,
+    state,
+    sync,
+    progress,
+    live: getDataSource().kind === "tauri",
+    hasMore: stream.hasMore,
+    loadingMore: stream.loadingMore,
+    accountById,
+    calendarById,
+    isUnread,
+    dispatch,
+    actions,
+  };
+
+  return <MachContext.Provider value={value}>{children}</MachContext.Provider>;
+}
+
+export function useMach(): MachValue {
+  const value = useContext(MachContext);
+  if (!value) throw new Error("useMach must be used inside <MachProvider>");
+  return value;
+}
+
+/** The days a calendar view covers, given the anchor. */
+export function viewRange(view: CalendarView, anchor: number): { start: Date; days: number } {
+  if (view === "day") return { start: new Date(new Date(anchor).setHours(0, 0, 0, 0)), days: 1 };
+  if (view === "week") return { start: startOfWeek(anchor), days: 7 };
+  return { start: startOfWeek(new Date(new Date(anchor).setDate(1))), days: 42 };
+}

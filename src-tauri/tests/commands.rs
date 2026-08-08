@@ -1,0 +1,1898 @@
+//! Behaviour tests for the typed command layer.
+//!
+//! No network: every test drives a scripted `HttpTransport` (the same injection
+//! seam `tests/google.rs` uses) against a real in-memory SQLite database.
+//!
+//! The load-bearing tests are the ones that pin the *design claims* rather than
+//! the mechanics:
+//!
+//!  * `local_change_lands_before_the_remote_call` — the transport reads the
+//!    database at the moment the request goes out and finds the change already
+//!    committed. This is the whole reason the command layer exists.
+//!  * `remote_failure_rolls_the_local_change_back_exactly` — the store never
+//!    keeps a write Google refused.
+//!  * `undoing_an_archive_restores_every_label_not_just_inbox` — undo is
+//!    correct, not approximate.
+//!  * `fifty_threads_issue_one_batched_call` — bulk triage is one round trip.
+
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use mach_lib::commands::{
+    AccountClients, Command, CommandDispatcher, EventDraft, EventPatch, EventScope, FailureKind,
+    ThreadLabelState,
+};
+use mach_lib::db::models::{
+    Event, LabelType, NewAccount, NewEvent, NewLabel, NewMessage, NewThread, Participant,
+    RsvpStatus,
+};
+use mach_lib::db::{queries, Db};
+use mach_lib::google::{
+    BoxFuture, HttpRequest, HttpResponse, HttpTransport, RetryPolicy, StaticTokenProvider,
+    TransportError,
+};
+
+// ============================================================== test doubles
+
+/// Replays a scripted list of responses, records every request, and — crucially
+/// — can snapshot the local database *at the moment the request is made*. That
+/// snapshot is what proves the local write happened first.
+struct FakeTransport {
+    responses: Mutex<VecDeque<Result<HttpResponse, TransportError>>>,
+    default: Mutex<Option<Result<HttpResponse, TransportError>>>,
+    requests: Mutex<Vec<HttpRequest>>,
+    /// Database + thread id to observe on every request.
+    observe: Mutex<Option<(Db, i64)>>,
+    /// Labels seen on that thread, one entry per request.
+    observed: Mutex<Vec<Vec<String>>>,
+    /// Database to count event rows in on every request — the calendar half of
+    /// the same local-first claim `observe` makes for mail.
+    observe_events: Mutex<Option<Db>>,
+    observed_events: Mutex<Vec<usize>>,
+}
+
+impl FakeTransport {
+    fn always_ok() -> Arc<Self> {
+        Arc::new(Self {
+            responses: Mutex::new(VecDeque::new()),
+            default: Mutex::new(Some(Ok(HttpResponse::json(200, "{}")))),
+            requests: Mutex::new(Vec::new()),
+            observe: Mutex::new(None),
+            observed: Mutex::new(Vec::new()),
+            observe_events: Mutex::new(None),
+            observed_events: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn scripted(responses: Vec<Result<HttpResponse, TransportError>>) -> Arc<Self> {
+        Arc::new(Self {
+            responses: Mutex::new(responses.into_iter().collect()),
+            default: Mutex::new(Some(Ok(HttpResponse::json(200, "{}")))),
+            requests: Mutex::new(Vec::new()),
+            observe: Mutex::new(None),
+            observed: Mutex::new(Vec::new()),
+            observe_events: Mutex::new(None),
+            observed_events: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn always_failing(status: u16, body: &str) -> Arc<Self> {
+        Arc::new(Self {
+            responses: Mutex::new(VecDeque::new()),
+            default: Mutex::new(Some(Ok(HttpResponse::json(status, body.to_string())))),
+            requests: Mutex::new(Vec::new()),
+            observe: Mutex::new(None),
+            observed: Mutex::new(Vec::new()),
+            observe_events: Mutex::new(None),
+            observed_events: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn observing(self: &Arc<Self>, db: &Db, thread_id: i64) {
+        *self.observe.lock().unwrap() = Some((db.clone(), thread_id));
+    }
+
+    fn observing_events(self: &Arc<Self>, db: &Db) {
+        *self.observe_events.lock().unwrap() = Some(db.clone());
+    }
+
+    fn observed_events(&self) -> Vec<usize> {
+        self.observed_events.lock().unwrap().clone()
+    }
+
+    fn requests(&self) -> Vec<HttpRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn call_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    fn observed(&self) -> Vec<Vec<String>> {
+        self.observed.lock().unwrap().clone()
+    }
+}
+
+impl HttpTransport for FakeTransport {
+    fn execute<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+        if let Some((db, thread_id)) = self.observe.lock().unwrap().as_ref() {
+            let labels = thread_labels(db, *thread_id);
+            self.observed.lock().unwrap().push(labels);
+        }
+        if let Some(db) = self.observe_events.lock().unwrap().as_ref() {
+            let count = all_events(db).len();
+            self.observed_events.lock().unwrap().push(count);
+        }
+        self.requests.lock().unwrap().push(request);
+        let next = self.responses.lock().unwrap().pop_front();
+        let out = match next {
+            Some(r) => r,
+            None => self
+                .default
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("transport script exhausted"),
+        };
+        Box::pin(async move { out })
+    }
+}
+
+// ================================================================== fixtures
+
+fn dispatcher(db: &Db, transport: Arc<FakeTransport>) -> CommandDispatcher {
+    let clients = AccountClients::new(transport)
+        .with_gmail_base_url("https://gmail.test/gmail/v1")
+        .with_calendar_base_url("https://calendar.test/calendar/v3")
+        .with_retry_policy(RetryPolicy::none())
+        .with_account(1, Arc::new(StaticTokenProvider::new("token-1")))
+        .with_account(2, Arc::new(StaticTokenProvider::new("token-2")));
+    CommandDispatcher::new(db.clone(), Arc::new(clients)).expect("dispatcher")
+}
+
+fn seed_account(db: &Db, email: &str) -> i64 {
+    db.write(|c| {
+        queries::upsert_account(
+            c,
+            &NewAccount {
+                email: email.to_string(),
+                display_name: None,
+                token_ref: String::new(),
+                colour_index: 0,
+            },
+        )
+    })
+    .unwrap()
+}
+
+/// A thread with one message and the given labels.
+fn seed_thread(db: &Db, account_id: i64, gmail_thread_id: &str, labels: &[&str]) -> i64 {
+    seed_thread_with_messages(db, account_id, gmail_thread_id, labels, 1)
+}
+
+fn seed_thread_with_messages(
+    db: &Db,
+    account_id: i64,
+    gmail_thread_id: &str,
+    labels: &[&str],
+    messages: usize,
+) -> i64 {
+    db.write(|c| {
+        let thread_id = queries::upsert_thread(
+            c,
+            &NewThread {
+                account_id,
+                gmail_thread_id: gmail_thread_id.to_string(),
+                participants: vec![Participant::new("someone@example.com")],
+                subject: format!("subject {gmail_thread_id}"),
+                snippet: "snippet".into(),
+                last_message_at: 1_700_000_000_000,
+                is_unread: labels.contains(&"UNREAD"),
+                message_count: messages as i64,
+                has_attachments: false,
+                label_ids: labels.iter().map(|s| s.to_string()).collect(),
+            },
+        )?;
+        for i in 0..messages {
+            queries::upsert_message(
+                c,
+                &NewMessage {
+                    thread_id,
+                    account_id,
+                    gmail_message_id: format!("{gmail_thread_id}-m{i}"),
+                    from: Participant::new("someone@example.com"),
+                    subject: "subject".into(),
+                    snippet: "snippet".into(),
+                    internal_date: 1_700_000_000_000 + i as i64,
+                    is_unread: labels.contains(&"UNREAD"),
+                    ..Default::default()
+                },
+            )?;
+        }
+        Ok(thread_id)
+    })
+    .unwrap()
+}
+
+fn seed_label(db: &Db, account_id: i64, gmail_label_id: &str, name: &str) {
+    db.write(|c| {
+        queries::upsert_label(
+            c,
+            &NewLabel {
+                account_id,
+                gmail_label_id: gmail_label_id.to_string(),
+                name: name.to_string(),
+                label_type: LabelType::User,
+            },
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+}
+
+fn thread_labels(db: &Db, thread_id: i64) -> Vec<String> {
+    let mut labels = db
+        .read(|c| queries::thread_summary(c, thread_id))
+        .unwrap()
+        .expect("thread")
+        .label_ids;
+    labels.sort();
+    labels
+}
+
+/// Every event row, oldest first. `events_in_range` is the only list query the
+/// store exposes, so "everything" is the widest window it will take.
+fn all_events(db: &Db) -> Vec<Event> {
+    db.read(|c| queries::events_in_range(c, i64::MIN, i64::MAX, None))
+        .unwrap()
+}
+
+fn seed_event(db: &Db, account_id: i64, new: NewEvent) -> i64 {
+    db.write(|c| {
+        queries::upsert_event(
+            c,
+            &NewEvent {
+                account_id,
+                ..new
+            },
+        )
+    })
+    .unwrap()
+}
+
+fn thread_is_unread(db: &Db, thread_id: i64) -> bool {
+    db.read(|c| queries::thread_summary(c, thread_id))
+        .unwrap()
+        .expect("thread")
+        .is_unread
+}
+
+fn sorted(items: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+    v.sort();
+    v
+}
+
+fn body_json(request: &HttpRequest) -> serde_json::Value {
+    serde_json::from_slice(request.body.as_deref().unwrap_or(b"null")).expect("json body")
+}
+
+fn ids_of(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value[key]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ========================================================= local-then-remote
+
+#[tokio::test]
+async fn local_change_lands_before_the_remote_call() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "UNREAD"]);
+
+    let transport = FakeTransport::always_ok();
+    transport.observing(&db, thread);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    // One request went out, and at the instant it did the local store had
+    // already dropped INBOX. This is the ordering claim, asserted directly.
+    assert_eq!(transport.call_count(), 1);
+    assert_eq!(transport.observed(), vec![vec!["UNREAD".to_string()]]);
+}
+
+#[tokio::test]
+async fn archive_applies_the_local_change_and_issues_the_right_remote_call() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(thread_labels(&db, thread), sorted(&["Receipts"]));
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    // One message in the thread, so the single-message endpoint is used.
+    assert!(
+        requests[0].url.ends_with("/users/me/messages/t1-m0/modify"),
+        "unexpected url {}",
+        requests[0].url
+    );
+    let body = body_json(&requests[0]);
+    assert_eq!(ids_of(&body, "removeLabelIds"), vec!["INBOX"]);
+    assert!(ids_of(&body, "addLabelIds").is_empty());
+}
+
+#[tokio::test]
+async fn mark_read_clears_the_unread_label_and_the_unread_flag() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "UNREAD"]);
+    assert!(thread_is_unread(&db, thread));
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MarkRead {
+            thread_ids: vec![thread],
+            read: true,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX"]));
+    assert!(!thread_is_unread(&db, thread));
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(ids_of(&body, "removeLabelIds"), vec!["UNREAD"]);
+}
+
+#[tokio::test]
+async fn star_adds_the_starred_label() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    d.execute(Command::Star {
+        thread_ids: vec![thread],
+        starred: true,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX", "STARRED"]));
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(ids_of(&body, "addLabelIds"), vec!["STARRED"]);
+}
+
+#[tokio::test]
+async fn adding_and_removing_a_label_are_inverses_of_each_other() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Label_7"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Label {
+            thread_ids: vec![thread],
+            label_id: "Label_7".into(),
+            add: false,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX"]));
+    assert_eq!(
+        result.undo,
+        Some(Command::Label {
+            thread_ids: vec![thread],
+            label_id: "Label_7".into(),
+            add: true,
+        }),
+        "removing a label must return add-that-label"
+    );
+
+    d.execute(result.undo.unwrap()).await.unwrap();
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX", "Label_7"]));
+}
+
+#[tokio::test]
+async fn trashing_one_message_uses_the_trash_endpoint() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(thread_labels(&db, thread), sorted(&["TRASH"]));
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].url.ends_with("/users/me/messages/t1-m0/trash"),
+        "unexpected url {}",
+        requests[0].url
+    );
+    // Undo restores the labels the thread actually had.
+    assert_eq!(
+        result.undo,
+        Some(Command::Untrash {
+            thread_ids: vec![thread],
+            restore: vec![ThreadLabelState {
+                thread_id: thread,
+                label_ids: vec!["INBOX".to_string()],
+                is_unread: false,
+            }],
+        })
+    );
+}
+
+// =================================================================== rollback
+
+#[tokio::test]
+async fn remote_failure_rolls_the_local_change_back_exactly() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Receipts", "UNREAD"]);
+    let before = thread_labels(&db, thread);
+
+    let transport = FakeTransport::always_failing(403, r#"{"error":{"message":"nope"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert!(result.applied.is_empty());
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(result.failed[0].kind, FailureKind::Forbidden);
+    assert!(result.failed[0].rolled_back);
+    assert!(!result.failed[0].retriable);
+    assert!(result.undo.is_none(), "nothing happened, nothing to undo");
+
+    // The exact prior state, not an approximation of it.
+    assert_eq!(thread_labels(&db, thread), before);
+    assert!(thread_is_unread(&db, thread));
+}
+
+#[tokio::test]
+async fn a_rate_limit_is_reported_as_retriable_but_still_rolled_back() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX"]);
+
+    let transport = FakeTransport::always_failing(429, r#"{"error":{"message":"slow down"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert_eq!(result.failed[0].kind, FailureKind::RateLimited);
+    assert!(result.failed[0].retriable);
+    assert!(result.failed[0].rolled_back);
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX"]));
+}
+
+// ======================================================================= undo
+
+#[tokio::test]
+async fn undoing_an_archive_restores_every_label_not_just_inbox() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Receipts", "Family"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+    assert_eq!(thread_labels(&db, thread), sorted(&["Family", "Receipts"]));
+
+    let undo = result.undo.expect("archive is undoable");
+    d.execute(undo).await.unwrap();
+
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["Family", "INBOX", "Receipts"]),
+        "undo must restore the labels the thread actually had"
+    );
+}
+
+#[tokio::test]
+async fn undo_of_mark_read_only_touches_threads_that_actually_changed() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let unread = seed_thread(&db, account, "t1", &["INBOX", "UNREAD"]);
+    let already_read = seed_thread(&db, account, "t2", &["INBOX"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MarkRead {
+            thread_ids: vec![unread, already_read],
+            read: true,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(
+        result.undo,
+        Some(Command::MarkRead {
+            thread_ids: vec![unread],
+            read: false,
+        }),
+        "undo must not mark an already-read thread unread"
+    );
+
+    d.execute(result.undo.unwrap()).await.unwrap();
+    assert!(thread_is_unread(&db, unread));
+    assert!(!thread_is_unread(&db, already_read));
+}
+
+// ============================================================== idempotence
+
+#[tokio::test]
+async fn archiving_an_already_archived_thread_is_a_no_op_not_an_error() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.applied, vec![thread]);
+    assert_eq!(
+        transport.call_count(),
+        0,
+        "a no-op must not spend a round trip"
+    );
+    assert_eq!(thread_labels(&db, thread), sorted(&["Receipts"]));
+    assert!(
+        result.undo.is_none(),
+        "nothing changed, so the inverse must not claim to restore INBOX"
+    );
+}
+
+#[tokio::test]
+async fn archiving_a_mixed_selection_produces_an_inverse_for_only_the_changed_threads() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let in_inbox = seed_thread(&db, account, "t1", &["INBOX"]);
+    let already_archived = seed_thread(&db, account, "t2", &["Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![in_inbox, already_archived],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(
+        result.undo,
+        Some(Command::Unarchive {
+            thread_ids: vec![in_inbox],
+            restore: Vec::new(),
+        })
+    );
+
+    d.execute(result.undo.unwrap()).await.unwrap();
+    assert_eq!(thread_labels(&db, in_inbox), sorted(&["INBOX"]));
+    assert_eq!(
+        thread_labels(&db, already_archived),
+        sorted(&["Receipts"]),
+        "the untouched thread must not gain INBOX"
+    );
+}
+
+// ====================================================================== batch
+
+#[tokio::test]
+async fn fifty_threads_issue_one_batched_call() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let threads: Vec<i64> = (0..50)
+        .map(|i| seed_thread(&db, account, &format!("t{i}"), &["INBOX"]))
+        .collect();
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: threads.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.applied.len(), 50);
+    assert_eq!(
+        transport.call_count(),
+        1,
+        "50 threads must be one batchModify, not 50 modifies"
+    );
+    let request = &transport.requests()[0];
+    assert!(
+        request.url.ends_with("/users/me/messages/batchModify"),
+        "unexpected url {}",
+        request.url
+    );
+    let body = body_json(request);
+    assert_eq!(ids_of(&body, "ids").len(), 50);
+    assert_eq!(ids_of(&body, "removeLabelIds"), vec!["INBOX"]);
+    for thread in &threads {
+        assert!(thread_labels(&db, *thread).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn threads_from_two_accounts_are_batched_per_account() {
+    let db = Db::open_in_memory().unwrap();
+    let a = seed_account(&db, "a@example.com");
+    let b = seed_account(&db, "b@example.com");
+    let t1 = seed_thread(&db, a, "a1", &["INBOX"]);
+    let t2 = seed_thread(&db, a, "a2", &["INBOX"]);
+    let t3 = seed_thread(&db, b, "b1", &["INBOX"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![t1, t2, t3],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(
+        transport.call_count(),
+        2,
+        "batchModify is per-account, so two accounts means two calls"
+    );
+    let tokens: Vec<String> = transport
+        .requests()
+        .iter()
+        .map(|r| r.header("authorization").unwrap_or_default().to_string())
+        .collect();
+    assert!(tokens.contains(&"Bearer token-1".to_string()));
+    assert!(tokens.contains(&"Bearer token-2".to_string()));
+}
+
+#[tokio::test]
+async fn a_failed_chunk_rolls_back_only_its_own_threads() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    // 50 threads, one message each, chunked 10 ids at a time => 5 chunks.
+    let threads: Vec<i64> = (0..50)
+        .map(|i| seed_thread(&db, account, &format!("t{i}"), &["INBOX"]))
+        .collect();
+
+    // Chunk 3 (0-indexed 2) fails; the rest succeed.
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(204, "")),
+        Ok(HttpResponse::json(204, "")),
+        Ok(HttpResponse::json(500, r#"{"error":{"message":"boom"}}"#)),
+        Ok(HttpResponse::json(204, "")),
+        Ok(HttpResponse::json(204, "")),
+    ]);
+    let d = dispatcher(&db, transport.clone()).with_max_batch_message_ids(10);
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: threads.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok, "a partial failure is not ok");
+    assert_eq!(transport.call_count(), 5);
+    assert_eq!(result.applied.len(), 40);
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(result.failed[0].ids.len(), 10);
+    assert!(result.failed[0].rolled_back);
+    assert_eq!(result.failed[0].kind, FailureKind::Server);
+
+    // The failed chunk's threads are back in the inbox; the rest are archived.
+    let failed: Vec<i64> = result.failed[0].ids.clone();
+    for thread in &threads {
+        if failed.contains(thread) {
+            assert_eq!(
+                thread_labels(&db, *thread),
+                sorted(&["INBOX"]),
+                "thread {thread} was in the failed chunk and must be rolled back"
+            );
+        } else {
+            assert!(thread_labels(&db, *thread).is_empty());
+        }
+    }
+
+    // Undo covers only the threads that really changed.
+    match result.undo.expect("40 threads changed") {
+        Command::Unarchive { thread_ids, .. } => assert_eq!(thread_ids.len(), 40),
+        other => panic!("unexpected inverse {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_multi_message_thread_never_straddles_two_chunks() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let a = seed_thread_with_messages(&db, account, "t1", &["INBOX"], 3);
+    let b = seed_thread_with_messages(&db, account, "t2", &["INBOX"], 3);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone()).with_max_batch_message_ids(4);
+
+    d.execute(Command::Archive {
+        thread_ids: vec![a, b],
+    })
+    .await
+    .unwrap();
+
+    // 6 ids with a cap of 4 would split 4/2 if chunking were id-wise; thread-wise
+    // chunking splits 3/3 so a thread is never half-applied.
+    let sizes: Vec<usize> = transport
+        .requests()
+        .iter()
+        .map(|r| ids_of(&body_json(r), "ids").len())
+        .collect();
+    assert_eq!(sizes, vec![3, 3]);
+}
+
+// ===================================================================== snooze
+
+#[tokio::test]
+async fn snooze_moves_the_thread_out_of_the_inbox_and_records_a_wake_time() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let wake_at = 1_800_000_000_000;
+    let result = d
+        .execute(Command::Snooze {
+            thread_ids: vec![thread],
+            until: wake_at,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["Label_snooze", "Receipts"])
+    );
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(ids_of(&body, "addLabelIds"), vec!["Label_snooze"]);
+    assert_eq!(ids_of(&body, "removeLabelIds"), vec!["INBOX"]);
+
+    let due = db
+        .read(|c| mach_lib::db::command_queries::due_snoozes(c, wake_at))
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].thread_id, thread);
+    assert_eq!(due[0].wake_at, wake_at);
+
+    // Un-snooze restores exactly what was there before, INBOX included.
+    let undo = result.undo.expect("snooze is undoable");
+    assert_eq!(
+        undo,
+        Command::Unsnooze {
+            thread_ids: vec![thread]
+        }
+    );
+    d.execute(undo).await.unwrap();
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX", "Receipts"]));
+    assert!(db
+        .read(|c| mach_lib::db::command_queries::due_snoozes(c, wake_at))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn snoozing_creates_the_label_when_it_does_not_exist_yet() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX"]);
+
+    // Gmail has no snooze primitive, so Mach uses a real user label — the same
+    // approach Superhuman and Boomerang take. On a fresh account that label
+    // does not exist, and refusing to snooze because of it is a dead end the
+    // user cannot resolve from inside the app. Create it instead.
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Snooze {
+            thread_ids: vec![thread],
+            until: 1_800_000_000_000,
+        })
+        .await
+        .expect("a missing snooze label must be created, not refused");
+
+    assert!(result.ok, "snooze should succeed: {}", result.message);
+    assert!(
+        transport.call_count() >= 2,
+        "expected a labels.create followed by the modify, saw {}",
+        transport.call_count()
+    );
+    assert!(
+        !thread_labels(&db, thread).contains(&"INBOX".to_string()),
+        "a snoozed thread leaves the inbox"
+    );
+}
+
+// ======================================================================= rsvp
+
+#[tokio::test]
+async fn rsvp_updates_the_local_event_and_patches_the_right_endpoint() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = db
+        .write(|c| {
+            queries::upsert_event(
+                c,
+                &NewEvent {
+                    account_id: account,
+                    calendar_id: "primary".into(),
+                    google_event_id: "evt-1".into(),
+                    title: "Standup".into(),
+                    start_ts: 1_700_000_000_000,
+                    end_ts: 1_700_003_600_000,
+                    attendees: vec![Participant::new("a@example.com")],
+                    rsvp_status: Some(RsvpStatus::NeedsAction),
+                    status: "confirmed".into(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    // events_rsvp reads the event, then patches it.
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(
+            200,
+            r#"{"id":"evt-1","attendees":[{"email":"a@example.com","self":true,
+                 "responseStatus":"needsAction"}]}"#,
+        )),
+        Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#)),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Rsvp {
+            event_id,
+            response: RsvpStatus::Accepted,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let events = db
+        .read(|c| queries::events_in_range(c, 0, i64::MAX, None))
+        .unwrap();
+    assert_eq!(events[0].rsvp_status, Some(RsvpStatus::Accepted));
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]
+        .url
+        .ends_with("/calendars/primary/events/evt-1"));
+    assert_eq!(requests[1].method, mach_lib::google::HttpMethod::Patch);
+    assert!(requests[1]
+        .url
+        .ends_with("/calendars/primary/events/evt-1"));
+    let patched = body_json(&requests[1]);
+    assert_eq!(patched["attendees"][0]["responseStatus"], "accepted");
+
+    assert_eq!(
+        result.undo,
+        Some(Command::Rsvp {
+            event_id,
+            response: RsvpStatus::NeedsAction,
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_failed_rsvp_restores_the_previous_response() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = db
+        .write(|c| {
+            queries::upsert_event(
+                c,
+                &NewEvent {
+                    account_id: account,
+                    calendar_id: "primary".into(),
+                    google_event_id: "evt-1".into(),
+                    title: "Standup".into(),
+                    rsvp_status: Some(RsvpStatus::Tentative),
+                    status: "confirmed".into(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    let transport = FakeTransport::always_failing(404, r#"{"error":{"message":"gone"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Rsvp {
+            event_id,
+            response: RsvpStatus::Declined,
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert_eq!(result.failed[0].kind, FailureKind::NotFound);
+    let events = db
+        .read(|c| queries::events_in_range(c, i64::MIN, i64::MAX, None))
+        .unwrap();
+    assert_eq!(events[0].rsvp_status, Some(RsvpStatus::Tentative));
+}
+
+// ============================================================ self-describing
+
+#[test]
+fn every_command_variant_appears_in_the_catalogue() {
+    let catalogue = Command::catalogue();
+    let kinds: Vec<&str> = catalogue.iter().map(|spec| spec.kind).collect();
+    for expected in [
+        "archive", "unarchive", "markRead", "star", "label", "trash", "untrash", "snooze",
+        "unsnooze", "rsvp", "createEvent", "updateEvent", "deleteEvent", "moveEvent",
+    ] {
+        assert!(kinds.contains(&expected), "{expected} missing from catalogue");
+    }
+    assert_eq!(kinds.len(), 14);
+    // Every spec is serialisable, which is what makes it an agent tool schema.
+    let json = serde_json::to_value(catalogue).unwrap();
+    assert!(json.is_array());
+    assert_eq!(json[0]["params"][0]["name"], "threadIds");
+}
+
+#[test]
+fn commands_round_trip_through_the_wire_shape_the_ui_uses() {
+    let command = Command::MarkRead {
+        thread_ids: vec![1, 2],
+        read: true,
+    };
+    let json = serde_json::to_value(&command).unwrap();
+    assert_eq!(json["kind"], "markRead");
+    assert_eq!(json["threadIds"], serde_json::json!([1, 2]));
+    assert_eq!(json["read"], true);
+    assert_eq!(
+        serde_json::from_value::<Command>(json).unwrap(),
+        command,
+        "the TypeScript Command union must deserialize back into Rust"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_thread_is_a_typed_error_before_anything_is_written() {
+    let db = Db::open_in_memory().unwrap();
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let err = d
+        .execute(Command::Archive {
+            thread_ids: vec![404],
+        })
+        .await
+        .expect_err("no such thread");
+
+    assert_eq!(err.kind(), "unknownThread");
+    assert_eq!(transport.call_count(), 0);
+}
+
+// ================================================== calendar: the write path
+
+const HOUR_MS: i64 = 3_600_000;
+const NOON: i64 = 1_754_654_400_000; // 2025-08-08T12:00:00Z
+
+fn timed_draft(title: &str, start: i64, hours: i64) -> EventDraft {
+    EventDraft {
+        title: title.to_string(),
+        start_ts: start,
+        end_ts: start + hours * HOUR_MS,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn creating_an_event_writes_the_row_before_the_insert_goes_out() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"evt-new","htmlLink":"https://calendar.google.com/evt-new"}"#,
+    ))]);
+    transport.observing_events(&db);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::CreateEvent {
+            account_id: account,
+            calendar_id: "primary".into(),
+            draft: timed_draft("Standup", NOON, 1),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    // The whole claim: at the instant the insert went out, the block was
+    // already on the grid.
+    assert_eq!(transport.observed_events(), vec![1]);
+
+    let events = all_events(&db);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].title, "Standup");
+    assert_eq!(events[0].start_ts, NOON);
+    // The placeholder id is gone: the row now answers to what Google called it,
+    // so the next sync updates this row rather than adding a twin.
+    assert_eq!(events[0].google_event_id, "evt-new");
+    assert_eq!(
+        events[0].html_link.as_deref(),
+        Some("https://calendar.google.com/evt-new")
+    );
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, mach_lib::google::HttpMethod::Post);
+    assert!(
+        requests[0].url.ends_with("/calendars/primary/events"),
+        "unexpected url {}",
+        requests[0].url
+    );
+    let body = body_json(&requests[0]);
+    assert_eq!(body["summary"], "Standup");
+    assert!(body["start"]["dateTime"].is_string());
+    assert!(body["end"]["dateTime"].is_string());
+
+    assert_eq!(
+        result.undo,
+        Some(Command::DeleteEvent {
+            event_id: events[0].id,
+            scope: EventScope::This,
+        })
+    );
+    assert_eq!(result.applied, vec![events[0].id]);
+}
+
+#[tokio::test]
+async fn a_failed_create_leaves_no_row_behind() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+
+    let transport = FakeTransport::always_failing(403, r#"{"error":{"message":"no"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::CreateEvent {
+            account_id: account,
+            calendar_id: "primary".into(),
+            draft: timed_draft("Standup", NOON, 1),
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert_eq!(result.failed[0].kind, FailureKind::Forbidden);
+    assert!(result.undo.is_none());
+    assert!(all_events(&db).is_empty(), "the optimistic row survived");
+}
+
+#[tokio::test]
+async fn an_all_day_create_sends_dates_not_timestamps() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"e1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    // All-day rows are stored at UTC midnight, and the end date is exclusive.
+    let midnight = 1_754_611_200_000; // 2025-08-08T00:00:00Z
+    d.execute(Command::CreateEvent {
+        account_id: account,
+        calendar_id: "primary".into(),
+        draft: EventDraft {
+            title: "Offsite".into(),
+            start_ts: midnight,
+            end_ts: midnight + 2 * 86_400_000,
+            is_all_day: true,
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap();
+
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(body["start"]["date"], "2025-08-08");
+    assert_eq!(body["end"]["date"], "2025-08-10");
+    assert!(body["start"]["dateTime"].is_null());
+}
+
+#[tokio::test]
+async fn a_recurring_create_adopts_the_id_its_first_occurrence_will_have() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"series"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::CreateEvent {
+            account_id: account,
+            calendar_id: "primary".into(),
+            draft: EventDraft {
+                recurrence: vec!["RRULE:FREQ=WEEKLY".into()],
+                ..timed_draft("Weekly", NOON, 1)
+            },
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let events = all_events(&db);
+    // `{master}_{original start in UTC}` — what events.instances will return,
+    // so sync updates this row instead of adding a second one beside it.
+    assert_eq!(events[0].google_event_id, "series_20250808T120000Z");
+    assert_eq!(events[0].recurring_event_id.as_deref(), Some("series"));
+    assert_eq!(body_json(&transport.requests()[0])["recurrence"][0], "RRULE:FREQ=WEEKLY");
+    // Undoing the creation of a series takes the series, not one occurrence.
+    assert_eq!(
+        result.undo,
+        Some(Command::DeleteEvent {
+            event_id: events[0].id,
+            scope: EventScope::All,
+        })
+    );
+}
+
+#[tokio::test]
+async fn moving_an_event_in_time_patches_google_and_inverts_to_where_it_was() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                start_ts: Some(NOON + HOUR_MS),
+                end_ts: Some(NOON + 2 * HOUR_MS),
+                is_all_day: Some(false),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let events = all_events(&db);
+    assert_eq!(events[0].start_ts, NOON + HOUR_MS);
+    assert_eq!(events[0].end_ts, NOON + 2 * HOUR_MS);
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, mach_lib::google::HttpMethod::Patch);
+    assert!(requests[0].url.ends_with("/calendars/primary/events/evt-1"));
+    // A time change always sends both halves: Google rejects a body whose start
+    // is a `date` and whose end is a `dateTime`.
+    let body = body_json(&requests[0]);
+    assert!(body["start"]["dateTime"].is_string());
+    assert!(body["end"]["dateTime"].is_string());
+    assert!(body["summary"].is_null(), "an untouched field was sent");
+
+    assert_eq!(
+        result.undo,
+        Some(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                start_ts: Some(NOON),
+                end_ts: Some(NOON + HOUR_MS),
+                is_all_day: Some(false),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_failed_update_restores_every_field_exactly() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            location: Some("Room 2".into()),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_failing(500, r#"{"error":{"message":"boom"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                title: Some("Renamed".into()),
+                location: Some(String::new()),
+                start_ts: Some(NOON + HOUR_MS),
+                end_ts: Some(NOON + 2 * HOUR_MS),
+                is_all_day: Some(false),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert_eq!(result.failed[0].kind, FailureKind::Server);
+    let events = all_events(&db);
+    assert_eq!(events[0].title, "Standup");
+    assert_eq!(events[0].location.as_deref(), Some("Room 2"));
+    assert_eq!(events[0].start_ts, NOON);
+    assert_eq!(events[0].end_ts, NOON + HOUR_MS);
+}
+
+#[tokio::test]
+async fn clearing_a_text_field_sends_null_and_inverts_to_the_old_text() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            location: Some("Room 2".into()),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                location: Some(String::new()),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(all_events(&db)[0].location.is_none());
+    assert!(body_json(&transport.requests()[0])["location"].is_null());
+    assert_eq!(
+        result.undo,
+        Some(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                location: Some("Room 2".into()),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+    );
+}
+
+#[tokio::test]
+async fn renaming_a_whole_series_patches_the_master_and_every_local_occurrence() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let mut ids = Vec::new();
+    for week in 0..3i64 {
+        ids.push(seed_event(
+            &db,
+            account,
+            NewEvent {
+                calendar_id: "primary".into(),
+                google_event_id: format!("series_{week}"),
+                title: "Weekly".into(),
+                start_ts: NOON + week * 7 * 24 * HOUR_MS,
+                end_ts: NOON + week * 7 * 24 * HOUR_MS + HOUR_MS,
+                recurring_event_id: Some("series".into()),
+                status: "confirmed".into(),
+                ..Default::default()
+            },
+        ));
+    }
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"series"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id: ids[1],
+            patch: EventPatch {
+                title: Some("Weekly sync".into()),
+                ..Default::default()
+            },
+            scope: EventScope::All,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    // The series master is what Google was asked to change.
+    assert!(
+        transport.requests()[0]
+            .url
+            .ends_with("/calendars/primary/events/series"),
+        "unexpected url {}",
+        transport.requests()[0].url
+    );
+    for event in all_events(&db) {
+        assert_eq!(event.title, "Weekly sync");
+    }
+    assert_eq!(result.applied.len(), 3);
+    assert_eq!(
+        result.undo,
+        Some(Command::UpdateEvent {
+            event_id: ids[1],
+            patch: EventPatch {
+                title: Some("Weekly".into()),
+                ..Default::default()
+            },
+            scope: EventScope::All,
+        })
+    );
+}
+
+#[tokio::test]
+async fn re_timing_a_whole_series_is_refused_rather_than_guessed_at() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "series_0".into(),
+            title: "Weekly".into(),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            recurring_event_id: Some("series".into()),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let err = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                start_ts: Some(NOON + HOUR_MS),
+                end_ts: Some(NOON + 2 * HOUR_MS),
+                is_all_day: Some(false),
+                ..Default::default()
+            },
+            scope: EventScope::All,
+        })
+        .await
+        .expect_err("a series cannot be re-timed from one occurrence");
+
+    assert_eq!(err.kind(), "invalid");
+    assert_eq!(transport.call_count(), 0, "nothing should have been sent");
+    assert_eq!(all_events(&db)[0].start_ts, NOON, "nothing should have moved");
+}
+
+#[tokio::test]
+async fn deleting_an_event_removes_the_row_and_inverts_to_a_create() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            location: Some("Room 2".into()),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            attendees: vec![Participant::new("b@example.com")],
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(204, "{}"))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::DeleteEvent {
+            event_id,
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(all_events(&db).is_empty());
+    let requests = transport.requests();
+    assert_eq!(requests[0].method, mach_lib::google::HttpMethod::Delete);
+    assert!(requests[0].url.ends_with("/calendars/primary/events/evt-1"));
+
+    match result.undo {
+        Some(Command::CreateEvent {
+            account_id,
+            calendar_id,
+            draft,
+        }) => {
+            assert_eq!(account_id, account);
+            assert_eq!(calendar_id, "primary");
+            assert_eq!(draft.title, "Standup");
+            assert_eq!(draft.start_ts, NOON);
+            assert_eq!(draft.location.as_deref(), Some("Room 2"));
+            assert_eq!(draft.attendees.len(), 1);
+        }
+        other => panic!("expected a create as the inverse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_failed_delete_puts_the_event_back_with_its_id_intact() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_failing(500, r#"{"error":{"message":"boom"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::DeleteEvent {
+            event_id,
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    let events = all_events(&db);
+    assert_eq!(events.len(), 1);
+    // The same row id, not a new one — anything holding a reference to it (the
+    // open modal, the selection) still points at the right event.
+    assert_eq!(events[0].id, event_id);
+    assert_eq!(events[0].title, "Standup");
+}
+
+#[tokio::test]
+async fn deleting_a_series_takes_every_occurrence_and_offers_no_undo() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let mut ids = Vec::new();
+    for week in 0..3i64 {
+        ids.push(seed_event(
+            &db,
+            account,
+            NewEvent {
+                calendar_id: "primary".into(),
+                google_event_id: format!("series_{week}"),
+                title: "Weekly".into(),
+                start_ts: NOON + week * 7 * 24 * HOUR_MS,
+                end_ts: NOON + week * 7 * 24 * HOUR_MS + HOUR_MS,
+                recurring_event_id: Some("series".into()),
+                status: "confirmed".into(),
+                ..Default::default()
+            },
+        ));
+    }
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(204, "{}"))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::DeleteEvent {
+            event_id: ids[2],
+            scope: EventScope::All,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(all_events(&db).is_empty());
+    assert_eq!(result.applied.len(), 3);
+    assert!(transport.requests()[0]
+        .url
+        .ends_with("/calendars/primary/events/series"));
+    // Google has no endpoint that puts a cancelled occurrence back into its
+    // series, so claiming an inverse here would be a lie.
+    assert!(result.undo.is_none());
+}
+
+#[tokio::test]
+async fn deleting_one_occurrence_addresses_the_instance_not_the_series() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let keep = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "series_0".into(),
+            title: "Weekly".into(),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            recurring_event_id: Some("series".into()),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+    let drop = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "series_1".into(),
+            title: "Weekly".into(),
+            start_ts: NOON + 7 * 24 * HOUR_MS,
+            end_ts: NOON + 7 * 24 * HOUR_MS + HOUR_MS,
+            recurring_event_id: Some("series".into()),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(204, "{}"))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::DeleteEvent {
+            event_id: drop,
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let events = all_events(&db);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, keep);
+    assert!(transport.requests()[0]
+        .url
+        .ends_with("/calendars/primary/events/series_1"));
+}
+
+#[tokio::test]
+async fn deleting_something_google_already_lost_still_clears_the_grid() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_failing(404, r#"{"error":{"message":"gone"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::DeleteEvent {
+            event_id,
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    // Restoring the row would leave a block on screen that nothing can remove.
+    assert!(result.ok, "{result:?}");
+    assert!(all_events(&db).is_empty());
+}
+
+#[tokio::test]
+async fn moving_an_event_to_another_account_inserts_there_and_deletes_here() {
+    let db = Db::open_in_memory().unwrap();
+    let from = seed_account(&db, "a@example.com");
+    let to = seed_account(&db, "b@example.com");
+    let event_id = seed_event(
+        &db,
+        from,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(200, r#"{"id":"evt-2"}"#)),
+        Ok(HttpResponse::json(204, "{}")),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MoveEvent {
+            event_id,
+            account_id: to,
+            calendar_id: "work".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let events = all_events(&db);
+    assert_eq!(events[0].account_id, to);
+    assert_eq!(events[0].calendar_id, "work");
+    assert_eq!(events[0].google_event_id, "evt-2");
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].url.ends_with("/calendars/work/events"));
+    assert!(requests[1].url.ends_with("/calendars/primary/events/evt-1"));
+    assert_eq!(requests[1].method, mach_lib::google::HttpMethod::Delete);
+
+    assert_eq!(
+        result.undo,
+        Some(Command::MoveEvent {
+            event_id,
+            account_id: from,
+            calendar_id: "primary".into(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_move_whose_copy_lands_but_whose_delete_fails_leaves_one_event_not_two() {
+    let db = Db::open_in_memory().unwrap();
+    let from = seed_account(&db, "a@example.com");
+    let to = seed_account(&db, "b@example.com");
+    let event_id = seed_event(
+        &db,
+        from,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(200, r#"{"id":"evt-2"}"#)),
+        Ok(HttpResponse::json(500, r#"{"error":{"message":"boom"}}"#)),
+        // The undo of the copy.
+        Ok(HttpResponse::json(204, "{}")),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MoveEvent {
+            event_id,
+            account_id: to,
+            calendar_id: "work".into(),
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    let events = all_events(&db);
+    assert_eq!(events[0].account_id, from);
+    assert_eq!(events[0].calendar_id, "primary");
+    assert_eq!(events[0].google_event_id, "evt-1");
+    // Three calls: insert, the delete that failed, and the cleanup of the copy.
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].url.ends_with("/calendars/work/events/evt-2"));
+    assert_eq!(requests[2].method, mach_lib::google::HttpMethod::Delete);
+}
+
+#[tokio::test]
+async fn an_edit_that_changes_nothing_costs_no_round_trip() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch::default(),
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert!(result.undo.is_none());
+    assert_eq!(transport.call_count(), 0);
+}
+
+#[tokio::test]
+async fn an_unknown_event_is_a_typed_error_before_anything_is_written() {
+    let db = Db::open_in_memory().unwrap();
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let err = d
+        .execute(Command::DeleteEvent {
+            event_id: 404,
+            scope: EventScope::This,
+        })
+        .await
+        .expect_err("no such event");
+
+    assert_eq!(err.kind(), "unknownEvent");
+    assert_eq!(transport.call_count(), 0);
+}
+
+#[test]
+fn the_event_commands_round_trip_through_the_wire_shape_the_ui_uses() {
+    let command = Command::UpdateEvent {
+        event_id: 7,
+        patch: EventPatch {
+            title: Some("Renamed".into()),
+            start_ts: Some(NOON),
+            end_ts: Some(NOON + HOUR_MS),
+            is_all_day: Some(false),
+            ..Default::default()
+        },
+        scope: EventScope::All,
+    };
+    let json = serde_json::to_value(&command).unwrap();
+    assert_eq!(json["kind"], "updateEvent");
+    assert_eq!(json["eventId"], 7);
+    assert_eq!(json["patch"]["startTs"], NOON);
+    assert_eq!(json["scope"], "all");
+    assert_eq!(
+        serde_json::from_value::<Command>(json).unwrap(),
+        command,
+        "the TypeScript Command union must deserialize back into Rust"
+    );
+
+    // `scope` is optional on the wire and defaults to this occurrence, so the
+    // common case does not have to say so.
+    let terse: Command =
+        serde_json::from_value(serde_json::json!({ "kind": "deleteEvent", "eventId": 3 })).unwrap();
+    assert_eq!(
+        terse,
+        Command::DeleteEvent {
+            event_id: 3,
+            scope: EventScope::This,
+        }
+    );
+}

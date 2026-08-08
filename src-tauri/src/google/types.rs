@@ -1,0 +1,747 @@
+//! Wire types for the Gmail and Google Calendar REST APIs, plus the MIME
+//! walking that turns Gmail's recursive part tree into a flat body + attachment
+//! list.
+//!
+//! Everything here is pure data. No HTTP, no auth, no clock — so it is all
+//! directly testable against fixture JSON.
+
+use base64::engine::general_purpose::{URL_SAFE_NO_PAD, URL_SAFE_NO_PAD_INDIFFERENT};
+use base64::Engine as _;
+use chrono::{DateTime, FixedOffset, NaiveDate};
+use serde::{Deserialize, Serialize};
+
+// =============================================================== base64url
+
+/// Gmail encodes every body and attachment as base64url. Padding is usually
+/// stripped but not always, and some senders' data round-trips through standard
+/// base64 alphabets, so decoding is deliberately permissive.
+pub fn decode_base64url(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    let cleaned: String = input.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    match URL_SAFE_NO_PAD_INDIFFERENT.decode(&cleaned) {
+        Ok(v) => Ok(v),
+        Err(first) => {
+            // Fall back to the standard alphabet before giving up.
+            let translated: String = cleaned
+                .chars()
+                .map(|c| match c {
+                    '+' => '-',
+                    '/' => '_',
+                    other => other,
+                })
+                .collect();
+            URL_SAFE_NO_PAD_INDIFFERENT
+                .decode(&translated)
+                .map_err(|_| first)
+        }
+    }
+}
+
+/// Encode bytes the way Gmail's `raw` field wants them: base64url, no padding.
+pub fn encode_base64url(input: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(input)
+}
+
+// =================================================================== Gmail
+
+/// A `{ id, threadId }` pair — what the list and history endpoints return.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageRef {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Header {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagePartBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<String>,
+    #[serde(default)]
+    pub size: i64,
+    /// base64url-encoded payload. Absent for parts that must be fetched via
+    /// `users.messages.attachments.get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+/// One node of Gmail's recursive MIME tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagePart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<Header>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<MessagePartBody>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<MessagePart>,
+}
+
+impl MessagePart {
+    /// Case-insensitive header lookup, the only kind that is ever correct.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str())
+    }
+
+    pub fn mime(&self) -> &str {
+        self.mime_type.as_deref().unwrap_or("text/plain")
+    }
+
+    fn is_multipart(&self) -> bool {
+        self.mime().to_ascii_lowercase().starts_with("multipart/")
+    }
+
+    fn disposition(&self) -> Option<String> {
+        self.header("content-disposition")
+            .map(|d| d.trim().to_ascii_lowercase())
+    }
+
+    fn content_id(&self) -> Option<String> {
+        self.header("content-id")
+            .map(|v| v.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+            .filter(|v| !v.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub thread_id: String,
+    #[serde(default)]
+    pub label_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_id: Option<String>,
+    /// Milliseconds since the epoch, as a decimal string. Google's int64 wire
+    /// convention — parse with [`Message::internal_date_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_estimate: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<MessagePart>,
+    /// Only present with `format=raw`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+}
+
+impl Message {
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.payload
+            .as_ref()
+            .and_then(|p| p.header(name))
+            .map(str::to_string)
+    }
+
+    pub fn internal_date_ms(&self) -> Option<i64> {
+        self.internal_date.as_ref()?.parse().ok()
+    }
+
+    /// Walk the MIME tree and pull out the display bodies and attachments.
+    pub fn extract_body(&self) -> ExtractedBody {
+        match &self.payload {
+            Some(p) => extract_body(p),
+            None => ExtractedBody::default(),
+        }
+    }
+}
+
+/// A leaf part that is a file rather than a display body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttachmentMeta {
+    pub part_id: Option<String>,
+    /// The handle for `users.messages.attachments.get`. Absent when the bytes
+    /// came inline in `data`.
+    pub attachment_id: Option<String>,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: i64,
+    /// `Content-ID` with the angle brackets stripped, for resolving `cid:` URLs
+    /// in the HTML body.
+    pub content_id: Option<String>,
+    /// True for `Content-Disposition: inline` or anything carrying a Content-ID
+    /// — these belong in the rendered body, not the attachment chip row.
+    pub inline: bool,
+    /// Decoded bytes, when Gmail inlined them instead of handing out an
+    /// attachment id.
+    pub data: Option<Vec<u8>>,
+}
+
+/// The flattened result of walking a message's MIME tree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractedBody {
+    pub text: Option<String>,
+    pub html: Option<String>,
+    pub attachments: Vec<AttachmentMeta>,
+}
+
+impl ExtractedBody {
+    /// Attachments a user would think of as attachments (excludes inline
+    /// images referenced by the HTML).
+    pub fn files(&self) -> impl Iterator<Item = &AttachmentMeta> {
+        self.attachments.iter().filter(|a| !a.inline)
+    }
+
+    pub fn inline_parts(&self) -> impl Iterator<Item = &AttachmentMeta> {
+        self.attachments.iter().filter(|a| a.inline)
+    }
+}
+
+/// Walk a part tree depth-first.
+///
+/// Rules, in the order they matter:
+/// * `multipart/*` nodes are containers — recurse, never emit.
+/// * A `text/plain` or `text/html` leaf with no filename and no
+///   `Content-Disposition: attachment` is a display body. First one wins, which
+///   is what makes `multipart/alternative` (plain then html) come out right.
+/// * Everything else with bytes behind it is an attachment. `message/rfc822`
+///   is treated as an opaque attachment rather than descended into, so a
+///   forwarded mail's body never masquerades as this message's body.
+pub fn extract_body(root: &MessagePart) -> ExtractedBody {
+    let mut out = ExtractedBody::default();
+    walk(root, &mut out);
+    out
+}
+
+fn walk(part: &MessagePart, out: &mut ExtractedBody) {
+    if part.is_multipart() {
+        for child in &part.parts {
+            walk(child, out);
+        }
+        return;
+    }
+
+    let mime = part.mime().split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let filename = part.filename.clone().unwrap_or_default();
+    let disposition = part.disposition().unwrap_or_default();
+    let is_attached = disposition.starts_with("attachment") || !filename.is_empty();
+
+    if !is_attached && (mime == "text/plain" || mime == "text/html") {
+        let data = part.body.as_ref().and_then(|b| b.data.as_deref());
+        if let Some(encoded) = data {
+            let decoded = decode_base64url(encoded)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            let slot = if mime == "text/html" {
+                &mut out.html
+            } else {
+                &mut out.text
+            };
+            if slot.is_none() && !decoded.is_empty() {
+                *slot = Some(decoded);
+            }
+        }
+        return;
+    }
+
+    let body = part.body.clone().unwrap_or_default();
+    let has_bytes = body.attachment_id.is_some() || body.data.is_some();
+    if !has_bytes && filename.is_empty() {
+        // A container we do not understand and that carries nothing. Recurse
+        // in case Gmail nested something under a non-multipart mime type.
+        for child in &part.parts {
+            walk(child, out);
+        }
+        return;
+    }
+
+    let content_id = part.content_id();
+    out.attachments.push(AttachmentMeta {
+        part_id: part.part_id.clone().filter(|s| !s.is_empty()),
+        attachment_id: body.attachment_id.clone(),
+        filename,
+        mime_type: mime,
+        size: body.size,
+        inline: disposition.starts_with("inline") || content_id.is_some(),
+        content_id,
+        data: body.data.as_deref().and_then(|d| decode_base64url(d).ok()),
+    });
+}
+
+// ---------------------------------------------------------- Gmail responses
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesListResponse {
+    #[serde(default)]
+    pub messages: Vec<MessageRef>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub result_size_estimate: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadsListResponse {
+    #[serde(default)]
+    pub threads: Vec<MessageRef>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub result_size_estimate: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryMessage {
+    #[serde(default)]
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryLabelChange {
+    #[serde(default)]
+    pub message: Message,
+    #[serde(default)]
+    pub label_ids: Vec<String>,
+}
+
+/// One entry in `users.history.list`. Each kind of change is its own list, and
+/// a single record can carry several kinds at once.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRecord {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub messages: Vec<MessageRef>,
+    #[serde(default)]
+    pub messages_added: Vec<HistoryMessage>,
+    #[serde(default)]
+    pub messages_deleted: Vec<HistoryMessage>,
+    #[serde(default)]
+    pub labels_added: Vec<HistoryLabelChange>,
+    #[serde(default)]
+    pub labels_removed: Vec<HistoryLabelChange>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryListResponse {
+    #[serde(default)]
+    pub history: Vec<HistoryRecord>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    /// The watermark to store once this sweep has been applied.
+    #[serde(default)]
+    pub history_id: Option<String>,
+}
+
+/// Every page of a history sweep, plus the watermark to persist afterwards.
+#[derive(Debug, Clone, Default)]
+pub struct HistorySweep {
+    pub records: Vec<HistoryRecord>,
+    pub history_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelColor {
+    #[serde(default)]
+    pub text_color: Option<String>,
+    #[serde(default)]
+    pub background_color: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Label {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// `system` or `user`. Named around the Rust keyword.
+    #[serde(default, rename = "type")]
+    pub label_type: Option<String>,
+    #[serde(default)]
+    pub message_list_visibility: Option<String>,
+    #[serde(default)]
+    pub label_list_visibility: Option<String>,
+    #[serde(default)]
+    pub color: Option<LabelColor>,
+    #[serde(default)]
+    pub messages_total: Option<i64>,
+    #[serde(default)]
+    pub messages_unread: Option<i64>,
+    #[serde(default)]
+    pub threads_total: Option<i64>,
+    #[serde(default)]
+    pub threads_unread: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelsListResponse {
+    #[serde(default)]
+    pub labels: Vec<Label>,
+}
+
+/// `users.getProfile` — the account's own address and its current watermark.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Profile {
+    #[serde(default)]
+    pub email_address: String,
+    #[serde(default)]
+    pub messages_total: Option<i64>,
+    #[serde(default)]
+    pub threads_total: Option<i64>,
+    #[serde(default)]
+    pub history_id: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentBody {
+    #[serde(default)]
+    pub attachment_id: Option<String>,
+    #[serde(default)]
+    pub size: i64,
+    #[serde(default)]
+    pub data: Option<String>,
+}
+
+// ================================================================ Calendar
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarListEntry {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub summary_override: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub time_zone: Option<String>,
+    #[serde(default)]
+    pub color_id: Option<String>,
+    #[serde(default)]
+    pub background_color: Option<String>,
+    #[serde(default)]
+    pub foreground_color: Option<String>,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(default)]
+    pub deleted: bool,
+    #[serde(default)]
+    pub access_role: Option<String>,
+}
+
+impl CalendarListEntry {
+    /// What the sidebar should show.
+    pub fn display_name(&self) -> &str {
+        self.summary_override
+            .as_deref()
+            .or(self.summary.as_deref())
+            .unwrap_or(&self.id)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarListResponse {
+    #[serde(default)]
+    pub items: Vec<CalendarListEntry>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub next_sync_token: Option<String>,
+}
+
+/// Calendar's tagged union of "all-day" (`date`) and "timed" (`dateTime`).
+///
+/// Keeping both fields on one struct mirrors the wire format exactly; the
+/// helpers below are how callers should read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventDateTime {
+    /// `YYYY-MM-DD` — set only for all-day events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    /// RFC3339 with an offset — set only for timed events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date_time: Option<String>,
+    /// IANA zone name. Google sends this alongside `dateTime`; it is *not*
+    /// redundant with the offset (it survives DST changes when patching).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+}
+
+impl EventDateTime {
+    pub fn date_time(value: impl Into<String>, time_zone: Option<&str>) -> Self {
+        Self {
+            date: None,
+            date_time: Some(value.into()),
+            time_zone: time_zone.map(str::to_string),
+        }
+    }
+
+    pub fn all_day(date: impl Into<String>) -> Self {
+        Self {
+            date: Some(date.into()),
+            date_time: None,
+            time_zone: None,
+        }
+    }
+
+    pub fn is_all_day(&self) -> bool {
+        self.date_time.is_none() && self.date.is_some()
+    }
+
+    /// The instant, with the sender's UTC offset preserved rather than
+    /// normalised away.
+    pub fn as_datetime(&self) -> Option<DateTime<FixedOffset>> {
+        DateTime::parse_from_rfc3339(self.date_time.as_deref()?).ok()
+    }
+
+    /// The calendar day, for all-day events.
+    pub fn as_date(&self) -> Option<NaiveDate> {
+        NaiveDate::parse_from_str(self.date.as_deref()?, "%Y-%m-%d").ok()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventPerson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, rename = "self", skip_serializing_if = "is_false")]
+    pub is_self: bool,
+}
+
+/// The four values Google accepts for an attendee's `responseStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseStatus {
+    NeedsAction,
+    Declined,
+    Tentative,
+    Accepted,
+}
+
+impl ResponseStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResponseStatus::NeedsAction => "needsAction",
+            ResponseStatus::Declined => "declined",
+            ResponseStatus::Tentative => "tentative",
+            ResponseStatus::Accepted => "accepted",
+        }
+    }
+}
+
+impl std::fmt::Display for ResponseStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventAttendee {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub organizer: bool,
+    /// Google's `self` flag — this is the signed-in account's own row, which is
+    /// the one an RSVP has to touch.
+    #[serde(default, rename = "self", skip_serializing_if = "is_false")]
+    pub is_self: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resource: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_guests: Option<i64>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventReminderOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minutes: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventReminders {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_default: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<EventReminderOverride>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Event {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_link: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<EventPerson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organizer: Option<EventPerson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<EventDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<EventDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_time_unspecified: Option<bool>,
+    /// RRULE/EXDATE lines. Empty on the concrete instances that
+    /// `singleEvents=true` expands a series into.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recurrence: Vec<String>,
+    /// Set on an expanded instance, pointing at the series it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recurring_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_start_time: Option<EventDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    #[serde(default, rename = "iCalUID", skip_serializing_if = "Option::is_none")]
+    pub ical_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attendees: Vec<EventAttendee>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attendees_omitted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hangout_link: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conference_data: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminders: Option<EventReminders>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guests_can_modify: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guests_can_invite_others: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guests_can_see_other_guests: Option<bool>,
+}
+
+impl Event {
+    /// True for a concrete occurrence expanded out of a recurring series.
+    pub fn is_instance(&self) -> bool {
+        self.recurring_event_id.is_some()
+    }
+
+    /// True for a series master (only ever returned with `singleEvents=false`).
+    pub fn is_recurring_master(&self) -> bool {
+        !self.recurrence.is_empty()
+    }
+
+    /// Deleted, or an instance cancelled out of a series. With
+    /// `showDeleted=true` these arrive as skeletons carrying only ids.
+    pub fn is_cancelled(&self) -> bool {
+        self.status.as_deref() == Some("cancelled")
+    }
+
+    /// The signed-in account's own attendee row, if this account is invited.
+    pub fn self_attendee(&self) -> Option<&EventAttendee> {
+        self.attendees.iter().find(|a| a.is_self)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventsListResponse {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub updated: Option<String>,
+    #[serde(default)]
+    pub time_zone: Option<String>,
+    #[serde(default)]
+    pub access_role: Option<String>,
+    #[serde(default)]
+    pub default_reminders: Vec<EventReminderOverride>,
+    #[serde(default)]
+    pub items: Vec<Event>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    /// Present only on the final page. Store it; pass it back next sync.
+    #[serde(default)]
+    pub next_sync_token: Option<String>,
+}
+
+/// Every page of an `events.list` sweep, plus the token to persist afterwards.
+#[derive(Debug, Clone, Default)]
+pub struct EventsSweep {
+    pub events: Vec<Event>,
+    pub next_sync_token: Option<String>,
+    /// The calendar's default timezone, from the last page seen.
+    pub time_zone: Option<String>,
+}

@@ -1,0 +1,38 @@
+{
+  "id": "18f2c4a9b1d3bbbb",
+  "threadId": "18f2c4a9b1d3bbbb",
+  "labelIds": [
+    "INBOX"
+  ],
+  "snippet": "cron output",
+  "historyId": "884310",
+  "internalDate": "1754570400000",
+  "sizeEstimate": 512,
+  "payload": {
+    "partId": "",
+    "mimeType": "text/plain",
+    "filename": "",
+    "headers": [
+      {
+        "name": "From",
+        "value": "cron daemon <root@bruce.local>"
+      },
+      {
+        "name": "To",
+        "value": "alex@example.com"
+      },
+      {
+        "name": "Subject",
+        "value": "Cron <alex@host> backup.sh"
+      },
+      {
+        "name": "Content-Type",
+        "value": "text/plain; charset=\"US-ASCII\""
+      }
+    ],
+    "body": {
+      "size": 42,
+      "data": "YmFja3VwIGNvbXBsZXRlZDogNDIxMiBmaWxlcywgMCBlcnJvcnMK"
+    }
+  }
+}

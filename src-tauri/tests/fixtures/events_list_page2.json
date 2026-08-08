@@ -1,0 +1,30 @@
+{
+  "kind": "calendar#events",
+  "etag": "\"p33gcpq4qk7reg1g\"",
+  "summary": "alex@example.com",
+  "updated": "2026-08-07T15:00:00.000Z",
+  "timeZone": "America/Chicago",
+  "accessRole": "owner",
+  "nextSyncToken": "CIjJ4-2Ig4oDEAAYASD_",
+  "items": [
+    {
+      "kind": "calendar#event",
+      "etag": "\"3401234567893000\"",
+      "id": "berlin_board_call",
+      "status": "confirmed",
+      "summary": "Board call (Berlin)",
+      "creator": { "email": "chair@example.com" },
+      "organizer": { "email": "chair@example.com", "displayName": "Chair" },
+      "start": { "dateTime": "2026-08-13T15:00:00+02:00", "timeZone": "Europe/Berlin" },
+      "end": { "dateTime": "2026-08-13T16:00:00+02:00", "timeZone": "Europe/Berlin" },
+      "iCalUID": "berlin_board_call@google.com",
+      "sequence": 3,
+      "attendees": [
+        { "email": "chair@example.com", "organizer": true, "responseStatus": "accepted" },
+        { "email": "alex@example.com", "self": true, "responseStatus": "needsAction" }
+      ],
+      "reminders": { "useDefault": false, "overrides": [ { "method": "popup", "minutes": 5 } ] },
+      "eventType": "default"
+    }
+  ]
+}

@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# scripts/qa — look at a running Mach instead of guessing.
+#
+#   qa up            launch YOUR instance (the real mailbox)
+#   qa down          stop it
+#   qa shoot NAME    screenshot the window -> .qa/<instance>/NAME.png
+#   qa state         process, window, accounts, sync watermark, row counts
+#   qa logs [n]      tail the log
+#   qa key KEYS      send keystrokes (focuses the window — see the warning)
+#   qa click X,Y     click at window-relative coordinates (focuses)
+#
+# ---------------------------------------------------------------------------
+# NEVER TOUCH THE OWNER'S FOCUS
+# ---------------------------------------------------------------------------
+#
+# Someone is using this machine. Raising a window to look at it, or sending
+# synthetic keys and clicks, takes the keyboard away from them mid-sentence.
+#
+#   `qa shoot` is safe. It captures the window's own buffer by CGWindowID, so
+#   the window is never raised — occluded, backgrounded, whatever. Use it
+#   freely.
+#
+#   `qa key` and `qa click` are NOT safe and now refuse by default. Synthetic
+#   input goes wherever focus is, so they must raise the window; there is no
+#   polite version. MACH_QA_INPUT=1 overrides, and you should have a reason.
+#
+# To exercise the UI, drive it headlessly instead. Vite serves the same
+# frontend on http://localhost:1420, and outside Tauri it renders the fixture
+# data source (see `src/main.tsx`). A headless browser can click, type, read
+# the DOM and screenshot with no window and no focus at all:
+#
+#   bunx playwright screenshot --wait-for-timeout=1500 http://localhost:1420 out.png
+#
+# or the chrome-devtools MCP tools against the same URL. Real-data checks do
+# not need the UI: `qa state` reads the database directly.
+#
+# ---------------------------------------------------------------------------
+# INSTANCES
+# ---------------------------------------------------------------------------
+#
+# `MACH_QA_INSTANCE=agent qa up` launches a SEPARATE app with its own SQLite
+# store under .qa/agent/data, its own window, and its own log. Nothing it does
+# touches the mailbox the owner is reading.
+#
+#   MACH_QA_INSTANCE=agent scripts/qa seed    # copy the real store once
+#   MACH_QA_INSTANCE=agent scripts/qa up
+#   MACH_QA_INSTANCE=agent scripts/qa shoot before
+#
+# `seed` copies the owner's database so the agent instance has realistic mail
+# and calendars without doing its own backfill or spending API quota. It
+# refuses to overwrite an existing seeded store unless you pass --force.
+#
+# Every command targets one instance's pid, so two instances can run at once
+# and `shoot` never captures the wrong window.
+#
+# ---------------------------------------------------------------------------
+#
+# The binary runs directly rather than under `tauri dev`: the watcher rebuilds
+# on every change, and each new unsigned binary re-prompts macOS for Keychain
+# access. Vite still serves the frontend, so UI changes hot-reload into every
+# running instance; only Rust changes need `down` && `up`.
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTANCE="${MACH_QA_INSTANCE:-main}"
+QA_DIR="$REPO/.qa/$INSTANCE"
+PIDFILE="$QA_DIR/mach.pid"
+LOG="$QA_DIR/mach.log"
+VITE_LOG="$REPO/.qa/vite.log"
+BIN="$REPO/src-tauri/target/debug/mach"
+REAL_DB="$HOME/Library/Application Support/com.mach.mail/mach.sqlite3"
+
+# The owner's instance uses the OS app-data dir; every other instance is
+# self-contained under .qa/<name>/data.
+if [ "$INSTANCE" = "main" ]; then
+  DATA_DIR=""
+  DB="$REAL_DB"
+else
+  DATA_DIR="$QA_DIR/data"
+  DB="$DATA_DIR/mach.sqlite3"
+fi
+
+mkdir -p "$QA_DIR"
+
+die() { echo "qa[$INSTANCE]: $*" >&2; exit 1; }
+
+instance_pid() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid; pid="$(cat "$PIDFILE")"
+  kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+# Window rect for THIS instance's pid. Returns "x y w h".
+window_rect() {
+  local pid; pid="$(instance_pid)" || return 1
+  osascript <<APPLESCRIPT 2>/dev/null
+tell application "System Events"
+  set procs to (every process whose unix id is $pid)
+  if procs is {} then return ""
+  tell item 1 of procs
+    if (count of windows) is 0 then return ""
+    set p to position of window 1
+    set s to size of window 1
+    return ((item 1 of p) as string) & " " & ((item 2 of p) as string) & " " & ((item 1 of s) as string) & " " & ((item 2 of s) as string)
+  end tell
+end tell
+APPLESCRIPT
+}
+
+# The window's CGWindowID, for capturing its own buffer without raising it.
+window_id() {
+  local pid; pid="$(instance_pid)" || return 1
+  "$REPO/scripts/windowid.py" "$pid" 2>/dev/null
+}
+
+focus() {
+  local pid; pid="$(instance_pid)" || return 0
+  osascript -e "tell application \"System Events\" to set frontmost of (item 1 of (every process whose unix id is $pid)) to true" >/dev/null 2>&1 || true
+}
+
+ensure_vite() {
+  curl -sf -o /dev/null http://localhost:1420 && return 0
+  ( cd "$REPO" && nohup bun run dev >"$VITE_LOG" 2>&1 & )
+  for _ in $(seq 1 30); do curl -sf -o /dev/null http://localhost:1420 && return 0; sleep 1; done
+  die "vite did not come up; see $VITE_LOG"
+}
+
+cmd_seed() {
+  [ "$INSTANCE" != "main" ] || die "seed is for agent instances; MACH_QA_INSTANCE=main is the real store"
+  [ -f "$REAL_DB" ] || die "no store to copy from at $REAL_DB"
+  mkdir -p "$DATA_DIR"
+  if [ -f "$DB" ] && [ "${1:-}" != "--force" ]; then
+    die "$DB already exists (pass --force to replace it)"
+  fi
+  # A live WAL means a plain cp can copy a torn database. sqlite3 .backup
+  # takes a consistent snapshot while the owner's app keeps writing.
+  sqlite3 "$REAL_DB" ".backup '$DB'"
+  echo "seeded $DB from the real store"
+  sqlite3 "$DB" "SELECT (SELECT count(*) FROM threads)||' threads, '||(SELECT count(*) FROM messages)||' messages, '||(SELECT count(*) FROM events)||' events';"
+  echo
+  echo "NOTE: tokens live in the Keychain, not the database, so this instance"
+  echo "      will sync as the same accounts. If you do not want it touching"
+  echo "      Google at all, keep it offline or do not add accounts to it."
+}
+
+cmd_up() {
+  if pid="$(instance_pid)"; then echo "already running (pid $pid)"; return 0; fi
+  [ -x "$BIN" ] || die "no binary at $BIN — run: cd src-tauri && cargo build"
+  [ -f "$REPO/.env.local" ] || die "no .env.local — the app would boot 'not configured'"
+  [ "$INSTANCE" = "main" ] || [ -f "$DB" ] || echo "qa[$INSTANCE]: no seeded store; starting empty (try: qa seed)"
+
+  ensure_vite
+  # `exec` matters: without it the subshell stays alive as the parent and $!
+  # is the *wrapper's* pid, not the app's — so every window lookup misses and
+  # `shoot` silently degrades to a whole-screen capture. exec replaces the
+  # subshell with the binary, so the recorded pid is the GUI process.
+  (
+    cd "$REPO" || exit 1
+    set -a; . ./.env.local; set +a
+    [ -n "$DATA_DIR" ] && export MACH_DATA_DIR="$DATA_DIR"
+    exec "$BIN" >"$LOG" 2>&1
+  ) &
+  echo $! >"$PIDFILE"
+  for _ in $(seq 1 30); do instance_pid >/dev/null && break; sleep 1; done
+  pid="$(instance_pid)" || die "the app did not start; see $LOG"
+  echo "up (pid $pid)${DATA_DIR:+  data=$DATA_DIR}"
+}
+
+cmd_down() {
+  if pid="$(instance_pid)"; then kill "$pid" 2>/dev/null || true; rm -f "$PIDFILE"; echo "stopped (pid $pid)";
+  else echo "not running"; fi
+}
+
+cmd_shoot() {
+  local name="${1:-shot}"
+  local pid; pid="$(instance_pid)" || die "not running — try: qa up"
+  local out="$QA_DIR/$name.png"
+
+  # Captured by window id, which reads the window's own buffer: occluded,
+  # behind other apps, on another Space — it does not matter, and nothing is
+  # raised or focused. Raising the window to photograph it steals focus from
+  # whoever is using the machine, and an agent iterating visually would do that
+  # every few seconds.
+  local wid; wid="$(window_id)" || wid=""
+  if [ -n "$wid" ]; then
+    screencapture -x -o -l"$wid" "$out"
+    echo "$out  (window $wid, pid $pid — not raised)"
+    return 0
+  fi
+
+  # No window. Almost always the display is asleep or the app has not finished
+  # launching. A black frame read as "the UI is broken" is worse than no frame.
+  if pmset -g powerstate IODisplayWrangler 2>/dev/null | tail -1 | grep -qE '^ *[0-3] '; then
+    die "the display is asleep or locked — wake it and retry"
+  fi
+  die "no capturable window for pid $pid (still launching?)"
+}
+
+cmd_state() {
+  local pid; pid="$(instance_pid)" || pid=""
+  echo "instance: $INSTANCE"
+  echo "process : ${pid:+running (pid $pid)}${pid:-NOT RUNNING}"
+  echo "vite    : $(curl -sf -o /dev/null http://localhost:1420 && echo up || echo down)"
+  echo "store   : $DB"
+  local rect; rect="$(window_rect 2>/dev/null)" || rect=""
+  echo "window  : ${rect:-<none>}"
+  [ -f "$DB" ] || { echo "db      : <none yet>"; return 0; }
+  sqlite3 "$DB" <<'SQL'
+.mode list
+.headers off
+SELECT 'accounts: ' || COALESCE(group_concat(email || ' [' || COALESCE(history_id,'backfilling') || ']', ', '), '<none>') FROM accounts;
+SELECT 'threads : ' || count(*) FROM threads;
+SELECT 'messages: ' || count(*) FROM messages;
+SELECT 'labels  : ' || count(*) FROM labels;
+SELECT 'events  : ' || count(*) || '  (' || COALESCE(min(date(start_ts/1000,'unixepoch')),'-') || ' .. ' || COALESCE(max(date(start_ts/1000,'unixepoch')),'-') || ')' FROM events;
+SQL
+}
+
+cmd_key() {
+  [ $# -gt 0 ] || die "usage: qa key <cliclick spec>   e.g. kp:return, t:hello"
+  command -v cliclick >/dev/null || die "cliclick is not installed (brew install cliclick)"
+  instance_pid >/dev/null || die "not running"
+  # Synthetic keys go wherever focus is, so this *must* raise the window —
+  # there is no non-stealing way to do it. Prefer driving the UI in a headless
+  # browser against Vite (see the header) and keep this for the rare case that
+  # genuinely needs the real Tauri window.
+  [ "${MACH_QA_INPUT:-}" = "1" ] || \
+    die "qa key raises the window and steals focus. Drive the UI headlessly instead (see 'qa' with no args), or set MACH_QA_INPUT=1 if you accept interrupting whoever is at the machine."
+  focus; sleep 0.6
+  cliclick "$@"
+}
+
+cmd_click() {
+  [ $# -eq 1 ] || die "usage: qa click X,Y   (window-relative)"
+  command -v cliclick >/dev/null || die "cliclick is not installed"
+  [ "${MACH_QA_INPUT:-}" = "1" ] || \
+    die "qa click raises the window and steals focus. Drive the UI headlessly instead (see 'qa' with no args), or set MACH_QA_INPUT=1 if you accept interrupting whoever is at the machine."
+  local rect; rect="$(window_rect)" || die "cannot read the window rect"
+  # shellcheck disable=SC2086
+  set -- $rect "$1"
+  local wx="$1" wy="$2" xy="$5"
+  local rx="${xy%%,*}" ry="${xy##*,}"
+  focus; sleep 0.5
+  cliclick "c:$((wx + rx)),$((wy + ry))"
+  echo "clicked window($rx,$ry)"
+}
+
+cmd_logs() { tail -n "${1:-30}" "$LOG"; }
+
+case "${1:-}" in
+  up)    shift; cmd_up "$@" ;;
+  down)  shift; cmd_down "$@" ;;
+  seed)  shift; cmd_seed "$@" ;;
+  shoot) shift; cmd_shoot "$@" ;;
+  state) shift; cmd_state "$@" ;;
+  key)   shift; cmd_key "$@" ;;
+  click) shift; cmd_click "$@" ;;
+  logs)  shift; cmd_logs "$@" ;;
+  *) sed -n '4,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ; exit 1 ;;
+esac

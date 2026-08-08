@@ -1,0 +1,65 @@
+# The gate this repo did not have.
+#
+# Two jobs, split by what they cost. `frontend` is the one that runs on every
+# push and comes back in about a minute; `rust` compiles the Tauri dependency
+# tree, which is minutes on a cold cache and seconds on a warm one.
+#
+# Deliberately not here yet:
+#   * `cargo fmt --check` and `clippy` — both fail on code already on main, and
+#     a gate that is red on arrival teaches everyone to ignore it. Format the
+#     tree first, then add them in the same commit.
+#   * `tauri build` — signing and a full bundle belong in a release workflow,
+#     not on every pull request.
+#
+# `rust` runs on macOS because that is the only platform Mach targets: the
+# Keychain is where refresh tokens live, and a Linux runner would need a
+# keyring backend and a webkit stack to say anything true about this code.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A second push to the same branch makes the first answer worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: types and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Test
+        run: bunx vitest run
+
+  rust:
+    name: rust
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Keyed on src-tauri/Cargo.lock, so the dependency tree is compiled once
+      # rather than once per pull request.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Test
+        run: cargo test --manifest-path src-tauri/Cargo.toml

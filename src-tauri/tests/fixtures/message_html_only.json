@@ -1,0 +1,39 @@
+{
+  "id": "18f2c4a9b1d3aaaa",
+  "threadId": "18f2c4a9b1d3aaaa",
+  "labelIds": [
+    "INBOX",
+    "CATEGORY_PROMOTIONS"
+  ],
+  "snippet": "Big news from Marketing Co",
+  "historyId": "884300",
+  "internalDate": "1754566800000",
+  "sizeEstimate": 9042,
+  "payload": {
+    "partId": "",
+    "mimeType": "text/html",
+    "filename": "",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Marketing Co <news@marketing.example>"
+      },
+      {
+        "name": "To",
+        "value": "alex@example.com"
+      },
+      {
+        "name": "Subject",
+        "value": "Big news"
+      },
+      {
+        "name": "Content-Type",
+        "value": "text/html; charset=\"UTF-8\""
+      }
+    ],
+    "body": {
+      "size": 64,
+      "data": "PGh0bWw-PGJvZHk-PGgxPkJpZyBuZXdzPC9oMT48cD5TYWxlIGVuZHMgc29vbi48L3A-PC9ib2R5PjwvaHRtbD4"
+    }
+  }
+}

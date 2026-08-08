@@ -1,0 +1,197 @@
+{
+  "id": "18f2c4a9b1d3e5f7",
+  "threadId": "18f2c4a9b1d3e5f0",
+  "labelIds": [
+    "UNREAD",
+    "IMPORTANT",
+    "CATEGORY_PERSONAL",
+    "INBOX"
+  ],
+  "snippet": "Hi Alex, The Q3 numbers are attached.",
+  "historyId": "884213",
+  "internalDate": "1754563200000",
+  "sizeEstimate": 184320,
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Delivered-To",
+        "value": "alex@example.com"
+      },
+      {
+        "name": "From",
+        "value": "Tawny Reeves <tawny@example.com>"
+      },
+      {
+        "name": "To",
+        "value": "Alex Rivera <alex@example.com>"
+      },
+      {
+        "name": "Cc",
+        "value": "Board <board@example.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Q3 numbers"
+      },
+      {
+        "name": "Date",
+        "value": "Thu, 7 Aug 2026 09:20:00 -0500"
+      },
+      {
+        "name": "Message-ID",
+        "value": "<CA+abc123@mail.example.com>"
+      },
+      {
+        "name": "Content-Type",
+        "value": "multipart/mixed; boundary=\"000000000000mixed\""
+      }
+    ],
+    "body": {
+      "size": 0
+    },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "multipart/related",
+        "filename": "",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "multipart/related; boundary=\"000000000000related\""
+          }
+        ],
+        "body": {
+          "size": 0
+        },
+        "parts": [
+          {
+            "partId": "0.0",
+            "mimeType": "multipart/alternative",
+            "filename": "",
+            "headers": [
+              {
+                "name": "Content-Type",
+                "value": "multipart/alternative; boundary=\"000000000000alt\""
+              }
+            ],
+            "body": {
+              "size": 0
+            },
+            "parts": [
+              {
+                "partId": "0.0.0",
+                "mimeType": "text/plain",
+                "filename": "",
+                "headers": [
+                  {
+                    "name": "Content-Type",
+                    "value": "text/plain; charset=\"UTF-8\""
+                  },
+                  {
+                    "name": "Content-Transfer-Encoding",
+                    "value": "base64"
+                  }
+                ],
+                "body": {
+                  "size": 107,
+                  "data": "SGkgQnJ1bm8sDQoNClRoZSBRMyBudW1iZXJzIGFyZSBhdHRhY2hlZC4gU2hvcnQgdmVyc2lvbjogcmV2ZW51ZSB1cCAxOCUsDQpjaHVybiBkb3duIHRvIDIuMSUuDQoNCi0tIFRhd255DQo"
+                }
+              },
+              {
+                "partId": "0.0.1",
+                "mimeType": "text/html",
+                "filename": "",
+                "headers": [
+                  {
+                    "name": "Content-Type",
+                    "value": "text/html; charset=\"UTF-8\""
+                  },
+                  {
+                    "name": "Content-Transfer-Encoding",
+                    "value": "base64"
+                  }
+                ],
+                "body": {
+                  "size": 201,
+                  "data": "PGRpdiBkaXI9Imx0ciI-PHA-SGkgQnJ1bm8sPC9wPjxwPlRoZSBRMyBudW1iZXJzIGFyZSBhdHRhY2hlZC4gU2hvcnQgdmVyc2lvbjogcmV2ZW51ZSB1cCA8Yj4xOCU8L2I-LCBjaHVybiBkb3duIHRvIDxiPjIuMSU8L2I-LjwvcD48aW1nIHNyYz0iY2lkOmNoYXJ0LWlubGluZS0wMDEiIGFsdD0iY2hhcnQiPjxwPiZtZGFzaDsgVGF3bnk8L3A-PC9kaXY-"
+                }
+              }
+            ]
+          },
+          {
+            "partId": "0.1",
+            "mimeType": "image/png",
+            "filename": "chart.png",
+            "headers": [
+              {
+                "name": "Content-Type",
+                "value": "image/png; name=\"chart.png\""
+              },
+              {
+                "name": "Content-Disposition",
+                "value": "inline; filename=\"chart.png\""
+              },
+              {
+                "name": "Content-ID",
+                "value": "<chart-inline-001>"
+              },
+              {
+                "name": "X-Attachment-Id",
+                "value": "chart-inline-001"
+              }
+            ],
+            "body": {
+              "attachmentId": "ANGjdJ_inline_png_001",
+              "size": 20481
+            }
+          }
+        ]
+      },
+      {
+        "partId": "1",
+        "mimeType": "application/pdf",
+        "filename": "Q3-numbers.pdf",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/pdf; name=\"Q3-numbers.pdf\""
+          },
+          {
+            "name": "Content-Disposition",
+            "value": "attachment; filename=\"Q3-numbers.pdf\""
+          },
+          {
+            "name": "Content-Transfer-Encoding",
+            "value": "base64"
+          }
+        ],
+        "body": {
+          "attachmentId": "ANGjdJ_pdf_002",
+          "size": 158204
+        }
+      },
+      {
+        "partId": "2",
+        "mimeType": "text/csv",
+        "filename": "q3.csv",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "text/csv; charset=\"US-ASCII\"; name=\"q3.csv\""
+          },
+          {
+            "name": "Content-Disposition",
+            "value": "attachment; filename=\"q3.csv\""
+          }
+        ],
+        "body": {
+          "attachmentId": "ANGjdJ_csv_003",
+          "size": 412
+        }
+      }
+    ]
+  }
+}

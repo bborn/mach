@@ -1,0 +1,790 @@
+//! The mail commands: archive, unarchive, read/unread, star, label, trash,
+//! untrash, snooze, unsnooze.
+//!
+//! # Everything is a label delta
+//!
+//! Gmail has no "archive" call and no "star" call. It has `messages.modify`,
+//! which adds and removes label ids. So this module computes, for each thread,
+//! the **target label set** the command implies, diffs it against the set the
+//! thread actually has, and turns that diff into one Gmail request.
+//!
+//! Doing it as a target-and-diff rather than a hard-coded add/remove pair buys
+//! three properties that would otherwise each need their own special case:
+//!
+//!  * **Idempotence** is free. Archiving a thread that is already archived
+//!    produces an empty diff, so no request is sent and nothing is written.
+//!  * **Undo is exact.** The prior label set is captured before the write, so
+//!    the inverse restores what was there — `[INBOX, Receipts, Family]` comes
+//!    back as all three, never as a bare `INBOX`.
+//!  * **Restore is a command**, not a code path. `Unarchive { restore }` and
+//!    `Untrash { restore }` name a target set directly, which is what lets undo
+//!    be a value the UI (or the agent) hands back to `execute`.
+//!
+//! # Order of operations
+//!
+//! 1. Read the prior state of every thread. (No writes yet — a bad thread id
+//!    fails here, having changed nothing.)
+//! 2. Write every local change, in **one transaction**, and commit.
+//! 3. Only then talk to Google.
+//! 4. If a call fails, put the affected threads back exactly as they were.
+//!
+//! Step 2 before step 3 is the entire point of the command layer: the UI
+//! re-renders from SQLite the instant the transaction commits, so archiving 50
+//! threads is visually instantaneous regardless of what Gmail is doing.
+//!
+//! # Batching, and what a partial failure means
+//!
+//! Threads are grouped by `(account, add-set, remove-set)` — batchModify is
+//! per-account and applies one delta to every id — and each group is cut into
+//! chunks of at most [`DEFAULT_MAX_BATCH_MESSAGE_IDS`] message ids.
+//!
+//! Chunking is **thread-wise**: a thread's messages never straddle two chunks.
+//! That is what makes the failure unit meaningful. A chunk is all-or-nothing at
+//! Google, so when one chunk of five fails:
+//!
+//!  * the threads in that chunk are rolled back locally, completely — a thread
+//!    is never left half-modified;
+//!  * the threads in the other four chunks keep their change and appear in
+//!    `applied`;
+//!  * `ok` is `false` and `failed` names exactly the ids that were reverted;
+//!  * `undo` covers **only** the applied threads, so undoing after a partial
+//!    failure cannot resurrect a change that never happened.
+//!
+//! # Snooze
+//!
+//! Gmail's API has no snooze. Google's own snooze is implemented with an
+//! internal label the API does not return, so it is invisible to us. Mach's
+//! representation is therefore:
+//!
+//!  * a real Gmail user label, `Mach/Snoozed` by default, applied while INBOX
+//!    is removed — so the thread is out of the way in Gmail's web UI too, and
+//!    visibly *why*;
+//!  * a local `snoozed_threads` row holding the wake time and the label set the
+//!    thread was snoozed *from*.
+//!
+//! The label alone would not be enough (no wake time), and the local row alone
+//! would not be enough (the thread would still sit in the Gmail inbox on the
+//! phone). Both together mean the state is legible from either side.
+//!
+//! Consequences, including the case where the user snoozes in the Gmail web UI:
+//!
+//!  * **Gmail-web snooze looks like an archive to Mach.** Google removes INBOX
+//!    and applies an internal label the API never returns, so sync sees a
+//!    thread leave the inbox and nothing else. Mach shows it as archived, with
+//!    no wake badge. Nothing is corrupted; the information simply is not
+//!    exposed by the API.
+//!  * **Gmail wakes it on its own schedule.** When it does, `history.list`
+//!    reports INBOX being added back and the thread reappears at the top of
+//!    Mach's stream. The round trip self-heals.
+//!  * **A Mach snooze is visible in Gmail** as the `Mach/Snoozed` label, but
+//!    Gmail will not wake it — Mach's clock does, from the stored `wake_at`.
+//!    Because the wake time is a row and not a timer, a snooze that comes due
+//!    while Mach is closed fires at next launch instead of being lost.
+//!  * **If the user strips the label in Gmail web**, sync removes it locally
+//!    and the stale wake row simply un-snoozes a thread that is already
+//!    un-snoozed, which is a no-op. Un-snooze is idempotent by construction.
+//!
+//! Creating the label is `users.labels.create`, which the Gmail client does not
+//! expose yet, so a missing label is a typed
+//! [`CommandError::MissingLabel`](super::CommandError::MissingLabel) rather
+//! than a silently invented label id.
+
+use crate::db::command_queries::{self as cq, SnoozeRow, ThreadSnapshot};
+use crate::db::Db;
+use crate::google::gmail::GmailClient;
+use crate::google::GoogleError;
+
+use super::error::{CommandError, CommandFailure};
+use super::types::{plural, Command, CommandResult, ThreadLabelState};
+use super::CommandDispatcher;
+
+/// Gmail's system labels the command layer names directly.
+pub const INBOX: &str = "INBOX";
+pub const UNREAD: &str = "UNREAD";
+pub const STARRED: &str = "STARRED";
+pub const TRASH: &str = "TRASH";
+
+/// The Gmail user label Mach applies to snoozed threads.
+pub const DEFAULT_SNOOZE_LABEL: &str = "Mach/Snoozed";
+
+/// Gmail caps `messages.batchModify` at 1000 ids per call.
+pub const DEFAULT_MAX_BATCH_MESSAGE_IDS: usize = 1000;
+
+// ---------------------------------------------------------------------------
+// plans
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteOp {
+    Modify,
+    /// Trash has a dedicated endpoint that is worth using when there is exactly
+    /// one message; beyond that it is expressed as a label delta so it can be
+    /// batched like everything else.
+    Trash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SnoozeAction {
+    Leave,
+    Set { wake_at: i64 },
+    Clear,
+}
+
+/// One thread's worth of work: where it was, where it is going, and how.
+struct ThreadPlan {
+    snap: ThreadSnapshot,
+    prior_snooze: Option<SnoozeRow>,
+    target_labels: Vec<String>,
+    target_unread: bool,
+    add: Vec<String>,
+    remove: Vec<String>,
+    op: RemoteOp,
+    snooze: SnoozeAction,
+}
+
+impl ThreadPlan {
+    fn id(&self) -> i64 {
+        self.snap.thread_id
+    }
+
+    fn labels_changed(&self) -> bool {
+        !self.add.is_empty() || !self.remove.is_empty()
+    }
+
+    fn snooze_changed(&self) -> bool {
+        match &self.snooze {
+            SnoozeAction::Leave => false,
+            SnoozeAction::Set { wake_at } => {
+                self.prior_snooze.as_ref().map(|r| r.wake_at) != Some(*wake_at)
+            }
+            SnoozeAction::Clear => self.prior_snooze.is_some(),
+        }
+    }
+
+    /// Whether anything about the local row actually differs.
+    fn changed(&self) -> bool {
+        self.labels_changed() || self.target_unread != self.snap.is_unread || self.snooze_changed()
+    }
+
+    /// Whether Google has to be told. A local-only difference (a snooze row)
+    /// does not earn a round trip.
+    fn remote_needed(&self) -> bool {
+        self.labels_changed()
+    }
+
+    fn prior_state(&self) -> ThreadLabelState {
+        ThreadLabelState {
+            thread_id: self.snap.thread_id,
+            label_ids: self.snap.label_ids.clone(),
+            is_unread: self.snap.is_unread,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tiny sorted-set helpers
+// ---------------------------------------------------------------------------
+
+fn normalise(mut labels: Vec<String>) -> Vec<String> {
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn with(labels: &[String], add: &[&str]) -> Vec<String> {
+    let mut out = labels.to_vec();
+    for label in add {
+        out.push((*label).to_string());
+    }
+    normalise(out)
+}
+
+fn without(labels: &[String], remove: &[&str]) -> Vec<String> {
+    normalise(
+        labels
+            .iter()
+            .filter(|l| !remove.contains(&l.as_str()))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Everything in `a` that is not in `b`.
+fn difference(a: &[String], b: &[String]) -> Vec<String> {
+    a.iter().filter(|x| !b.contains(x)).cloned().collect()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// planning
+// ---------------------------------------------------------------------------
+
+fn restore_state<'a>(
+    restore: &'a [ThreadLabelState],
+    thread_id: i64,
+) -> Option<&'a ThreadLabelState> {
+    restore.iter().find(|s| s.thread_id == thread_id)
+}
+
+/// Read the prior state of every named thread and work out what each one's
+/// target state is. Nothing is written here.
+async fn build_plans(
+    dispatcher: &CommandDispatcher,
+    command: &Command,
+) -> Result<Vec<ThreadPlan>, CommandError> {
+    let thread_ids = command.target_ids();
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Snapshots first, so an unknown id fails before any write.
+    let snapshots = dispatcher.db.read(|conn| {
+        let mut out = Vec::with_capacity(thread_ids.len());
+        for id in &thread_ids {
+            out.push((cq::thread_snapshot(conn, *id)?, cq::snooze_row(conn, *id)?));
+        }
+        Ok(out)
+    })?;
+
+    let mut pairs = Vec::with_capacity(snapshots.len());
+    for (id, (snap, snooze)) in thread_ids.iter().zip(snapshots) {
+        let snap = snap.ok_or(CommandError::UnknownThread { thread_id: *id })?;
+        pairs.push((snap, snooze));
+    }
+
+    // The snooze label is per-account, so resolve it once per distinct account
+    // rather than once per thread.
+    let needs_label = matches!(command, Command::Snooze { .. } | Command::Unsnooze { .. });
+    let mut snooze_labels: Vec<(i64, Option<String>)> = Vec::new();
+    if needs_label {
+        let name = dispatcher.snooze_label_name.clone();
+        for (snap, _) in &pairs {
+            if snooze_labels.iter().any(|(id, _)| *id == snap.account_id) {
+                continue;
+            }
+            let mut label = dispatcher
+                .db
+                .read(|conn| cq::label_id_by_name(conn, snap.account_id, &name))?;
+
+            // Gmail has no snooze primitive, so Mach represents it with a real
+            // user label — the same thing Superhuman and Boomerang do. Refusing
+            // to snooze because that label does not exist yet is a dead end the
+            // user cannot resolve from inside the app, so create it on demand.
+            if label.is_none() {
+                let gmail = dispatcher.clients.gmail(snap.account_id)?;
+                let created = match gmail.labels_create("me", &name).await {
+                    Ok(l) => Some(l),
+                    // Already there — Gmail rejects a duplicate name. Someone
+                    // made it outside Mach, or two accounts raced; re-reading
+                    // is the answer, not an error.
+                    Err(GoogleError::InvalidRequest { .. }) => gmail
+                        .labels_list("me")
+                        .await
+                        .map_err(|e| CommandError::Invalid {
+                            message: format!("could not list labels: {e}"),
+                        })?
+                        .into_iter()
+                        .find(|l| l.name == name),
+                    Err(e) => {
+                        return Err(CommandError::Invalid {
+                            message: format!("could not create the \"{name}\" label: {e}"),
+                        })
+                    }
+                };
+                if let Some(created) = created {
+                    dispatcher.db.write(|conn| {
+                        crate::db::queries::upsert_label(
+                            conn,
+                            &crate::db::models::NewLabel {
+                                account_id: snap.account_id,
+                                gmail_label_id: created.id.clone(),
+                                name: created.name.clone(),
+                                label_type: crate::db::models::LabelType::User,
+                            },
+                        )
+                    })?;
+                    label = Some(created.id);
+                }
+            }
+
+            snooze_labels.push((snap.account_id, label));
+        }
+    }
+    let label_for = |account_id: i64| -> Option<String> {
+        snooze_labels
+            .iter()
+            .find(|(id, _)| *id == account_id)
+            .and_then(|(_, label)| label.clone())
+    };
+
+    let mut plans = Vec::with_capacity(pairs.len());
+    for (snap, prior_snooze) in pairs {
+        let prior = snap.label_ids.clone();
+        let (target_labels, target_unread, op, snooze) = match command {
+            Command::Archive { .. } => (
+                without(&prior, &[INBOX]),
+                snap.is_unread,
+                RemoteOp::Modify,
+                SnoozeAction::Leave,
+            ),
+
+            Command::Unarchive { restore, .. } => {
+                match restore_state(restore, snap.thread_id) {
+                    Some(state) => (
+                        normalise(state.label_ids.clone()),
+                        state.is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Leave,
+                    ),
+                    None => (
+                        with(&prior, &[INBOX]),
+                        snap.is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Leave,
+                    ),
+                }
+            }
+
+            Command::MarkRead { read, .. } => {
+                let target = if *read {
+                    without(&prior, &[UNREAD])
+                } else {
+                    with(&prior, &[UNREAD])
+                };
+                (target, !*read, RemoteOp::Modify, SnoozeAction::Leave)
+            }
+
+            Command::Star { starred, .. } => {
+                let target = if *starred {
+                    with(&prior, &[STARRED])
+                } else {
+                    without(&prior, &[STARRED])
+                };
+                (
+                    target,
+                    snap.is_unread,
+                    RemoteOp::Modify,
+                    SnoozeAction::Leave,
+                )
+            }
+
+            Command::Label { label_id, add, .. } => {
+                let target = if *add {
+                    with(&prior, &[label_id.as_str()])
+                } else {
+                    without(&prior, &[label_id.as_str()])
+                };
+                (
+                    target,
+                    snap.is_unread,
+                    RemoteOp::Modify,
+                    SnoozeAction::Leave,
+                )
+            }
+
+            Command::Trash { .. } => (
+                without(&with(&prior, &[TRASH]), &[INBOX]),
+                snap.is_unread,
+                RemoteOp::Trash,
+                SnoozeAction::Leave,
+            ),
+
+            Command::Untrash { restore, .. } => {
+                match restore_state(restore, snap.thread_id) {
+                    Some(state) => (
+                        normalise(state.label_ids.clone()),
+                        state.is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Leave,
+                    ),
+                    None => (
+                        without(&with(&prior, &[INBOX]), &[TRASH]),
+                        snap.is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Leave,
+                    ),
+                }
+            }
+
+            Command::Snooze { until, .. } => {
+                let label =
+                    label_for(snap.account_id).ok_or_else(|| CommandError::MissingLabel {
+                        account_id: snap.account_id,
+                        label_name: dispatcher.snooze_label_name.clone(),
+                    })?;
+                (
+                    without(&with(&prior, &[label.as_str()]), &[INBOX]),
+                    snap.is_unread,
+                    RemoteOp::Modify,
+                    SnoozeAction::Set { wake_at: *until },
+                )
+            }
+
+            Command::Unsnooze { .. } => {
+                // The stored row is the authority: it knows what the thread was
+                // snoozed *from*. Without one (label stripped in Gmail web, or
+                // a thread Mach never snoozed) fall back to the obvious guess.
+                match &prior_snooze {
+                    Some(row) => (
+                        normalise(row.prior_label_ids.clone()),
+                        row.prior_is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Clear,
+                    ),
+                    None => {
+                        let target = match label_for(snap.account_id) {
+                            Some(label) => without(&with(&prior, &[INBOX]), &[label.as_str()]),
+                            None => with(&prior, &[INBOX]),
+                        };
+                        (
+                            target,
+                            snap.is_unread,
+                            RemoteOp::Modify,
+                            SnoozeAction::Clear,
+                        )
+                    }
+                }
+            }
+
+            // The calendar half of the vocabulary never reaches this
+            // function — `CommandDispatcher::execute` routes it away first —
+            // but the match has to be total, and saying so is cheaper than a
+            // wildcard that would swallow a future mail command.
+            Command::Rsvp { .. }
+            | Command::CreateEvent { .. }
+            | Command::UpdateEvent { .. }
+            | Command::DeleteEvent { .. }
+            | Command::MoveEvent { .. } => {
+                return Err(CommandError::Invalid {
+                    message: format!("{} is not a mail command", command.kind()),
+                })
+            }
+        };
+
+        let add = difference(&target_labels, &prior);
+        let remove = difference(&prior, &target_labels);
+        plans.push(ThreadPlan {
+            snap,
+            prior_snooze,
+            target_labels,
+            target_unread,
+            add,
+            remove,
+            op,
+            snooze,
+        });
+    }
+
+    Ok(plans)
+}
+
+// ---------------------------------------------------------------------------
+// local writes
+// ---------------------------------------------------------------------------
+
+fn apply_local(db: &Db, plans: &[&ThreadPlan]) -> Result<(), CommandError> {
+    db.write(|conn| {
+        for plan in plans {
+            cq::set_thread_state(
+                conn,
+                plan.id(),
+                &plan.target_labels,
+                plan.target_unread,
+            )?;
+            match &plan.snooze {
+                SnoozeAction::Leave => {}
+                SnoozeAction::Set { wake_at } => cq::upsert_snooze(
+                    conn,
+                    &SnoozeRow {
+                        thread_id: plan.id(),
+                        wake_at: *wake_at,
+                        snoozed_at: now_ms(),
+                        prior_label_ids: plan.snap.label_ids.clone(),
+                        prior_is_unread: plan.snap.is_unread,
+                    },
+                )?,
+                SnoozeAction::Clear => cq::delete_snooze(conn, plan.id())?,
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Put these threads back exactly as they were — labels, unread flag, and the
+/// snooze row.
+fn rollback_local(db: &Db, plans: &[&ThreadPlan]) -> Result<(), CommandError> {
+    db.write(|conn| {
+        for plan in plans {
+            cq::set_thread_state(conn, plan.id(), &plan.snap.label_ids, plan.snap.is_unread)?;
+            if !matches!(plan.snooze, SnoozeAction::Leave) {
+                match &plan.prior_snooze {
+                    Some(row) => cq::upsert_snooze(conn, row)?,
+                    None => cq::delete_snooze(conn, plan.id())?,
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// remote calls
+// ---------------------------------------------------------------------------
+
+async fn run_chunk(
+    client: &GmailClient,
+    user_id: &str,
+    op: RemoteOp,
+    add: &[String],
+    remove: &[String],
+    chunk: &[&ThreadPlan],
+) -> Result<(), GoogleError> {
+    let ids: Vec<&str> = chunk
+        .iter()
+        .flat_map(|p| p.snap.message_ids.iter().map(String::as_str))
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    if op == RemoteOp::Trash && ids.len() == 1 {
+        return client.messages_trash(user_id, ids[0]).await.map(|_| ());
+    }
+
+    let add: Vec<&str> = add.iter().map(String::as_str).collect();
+    let remove: Vec<&str> = remove.iter().map(String::as_str).collect();
+
+    if ids.len() == 1 {
+        client
+            .messages_modify(user_id, ids[0], &add, &remove)
+            .await
+            .map(|_| ())
+    } else {
+        client
+            .messages_batch_modify(user_id, &ids, &add, &remove)
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the inverse
+// ---------------------------------------------------------------------------
+
+/// The command that reverses what actually happened.
+///
+/// `changed` holds only the threads whose state really moved *and* whose remote
+/// call succeeded. Narrowing to those is what stops undo from, say, adding
+/// INBOX to a thread that was already archived before the command ran.
+fn inverse(command: &Command, changed: &[&ThreadPlan]) -> Option<Command> {
+    if changed.is_empty() {
+        return None;
+    }
+    let thread_ids: Vec<i64> = changed.iter().map(|p| p.id()).collect();
+    let priors: Vec<ThreadLabelState> = changed.iter().map(|p| p.prior_state()).collect();
+
+    Some(match command {
+        // Archive only ever removes INBOX, so adding it back is faithful — the
+        // other labels were never touched.
+        Command::Archive { .. } => Command::Unarchive {
+            thread_ids,
+            restore: Vec::new(),
+        },
+        // Unarchive can be either form, so its inverse always names the exact
+        // prior state.
+        Command::Unarchive { .. } => Command::Unarchive {
+            thread_ids,
+            restore: priors,
+        },
+        Command::MarkRead { read, .. } => Command::MarkRead {
+            thread_ids,
+            read: !read,
+        },
+        Command::Star { starred, .. } => Command::Star {
+            thread_ids,
+            starred: !starred,
+        },
+        Command::Label { label_id, add, .. } => Command::Label {
+            thread_ids,
+            label_id: label_id.clone(),
+            add: !add,
+        },
+        Command::Trash { .. } | Command::Untrash { .. } => Command::Untrash {
+            thread_ids,
+            restore: priors,
+        },
+        Command::Snooze { .. } => Command::Unsnooze { thread_ids },
+        Command::Unsnooze { .. } => {
+            // Re-snoozing needs one wake time. If the threads were snoozed to
+            // different times there is no single `Snooze` that restores them,
+            // so this is honestly not undoable rather than approximately so.
+            let wakes: Vec<i64> = changed
+                .iter()
+                .filter_map(|p| p.prior_snooze.as_ref().map(|r| r.wake_at))
+                .collect();
+            if wakes.len() != changed.len() || wakes.iter().any(|w| *w != wakes[0]) {
+                return None;
+            }
+            Command::Snooze {
+                thread_ids,
+                until: wakes[0],
+            }
+        }
+        Command::Rsvp { .. }
+        | Command::CreateEvent { .. }
+        | Command::UpdateEvent { .. }
+        | Command::DeleteEvent { .. }
+        | Command::MoveEvent { .. } => return None,
+    })
+}
+
+fn describe(command: &Command, n: usize) -> String {
+    let subject = plural(n, "conversation");
+    match command {
+        Command::Archive { .. } => format!("Archived {subject}"),
+        Command::Unarchive { .. } => format!("Moved {subject} back to the inbox"),
+        Command::MarkRead { read: true, .. } => format!("Marked {subject} read"),
+        Command::MarkRead { read: false, .. } => format!("Marked {subject} unread"),
+        Command::Star { starred: true, .. } => format!("Starred {subject}"),
+        Command::Star { starred: false, .. } => format!("Unstarred {subject}"),
+        Command::Label { add: true, .. } => format!("Labelled {subject}"),
+        Command::Label { add: false, .. } => format!("Removed the label from {subject}"),
+        Command::Trash { .. } => format!("Trashed {subject}"),
+        Command::Untrash { .. } => format!("Restored {subject} from the trash"),
+        Command::Snooze { .. } => format!("Snoozed {subject}"),
+        Command::Unsnooze { .. } => format!("Un-snoozed {subject}"),
+        Command::Rsvp { .. } => "RSVP sent".to_string(),
+        // Not reachable: `commands::calendar` writes its own messages.
+        Command::CreateEvent { .. }
+        | Command::UpdateEvent { .. }
+        | Command::DeleteEvent { .. }
+        | Command::MoveEvent { .. } => command.kind().to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// execution
+// ---------------------------------------------------------------------------
+
+/// Group key: batchModify is per-account and applies one delta to every id, so
+/// threads can only share a call when all three of these match.
+type GroupKey = (i64, Vec<String>, Vec<String>, RemoteOp);
+
+pub(crate) async fn execute(
+    dispatcher: &CommandDispatcher,
+    command: &Command,
+) -> Result<CommandResult, CommandError> {
+    let plans = build_plans(dispatcher, command).await?;
+    if plans.is_empty() {
+        return Ok(CommandResult::noop(describe(command, 0)));
+    }
+
+    // A thread whose messages we have never fetched cannot be named in a Gmail
+    // request. Rather than write locally and let the store drift, it is
+    // reported as a failure and left untouched.
+    let mut failures: Vec<CommandFailure> = Vec::new();
+    let unaddressable: Vec<i64> = plans
+        .iter()
+        .filter(|p| p.remote_needed() && p.snap.message_ids.is_empty())
+        .map(|p| p.id())
+        .collect();
+    if !unaddressable.is_empty() {
+        failures.push(CommandFailure::invalid(
+            unaddressable.clone(),
+            "thread has no locally known Gmail message ids; sync it before acting on it",
+        ));
+    }
+
+    let actionable: Vec<&ThreadPlan> = plans
+        .iter()
+        .filter(|p| !unaddressable.contains(&p.id()))
+        .collect();
+
+    // ---------------------------------------------------------- local first
+    let to_write: Vec<&ThreadPlan> = actionable
+        .iter()
+        .copied()
+        .filter(|p| p.changed())
+        .collect();
+    apply_local(&dispatcher.db, &to_write)?;
+
+    // -------------------------------------------------------- then the wire
+    let mut groups: Vec<(GroupKey, Vec<&ThreadPlan>)> = Vec::new();
+    for plan in actionable.iter().copied().filter(|p| p.remote_needed()) {
+        let key: GroupKey = (
+            plan.snap.account_id,
+            plan.add.clone(),
+            plan.remove.clone(),
+            plan.op,
+        );
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => members.push(plan),
+            None => groups.push((key, vec![plan])),
+        }
+    }
+
+    let mut failed_ids: Vec<i64> = unaddressable;
+    for ((account_id, add, remove, op), members) in groups {
+        let client = dispatcher.clients.gmail(account_id)?;
+        for chunk in chunk_threads(&members, dispatcher.max_batch_message_ids) {
+            if let Err(error) =
+                run_chunk(&client, &dispatcher.user_id, op, &add, &remove, &chunk).await
+            {
+                rollback_local(&dispatcher.db, &chunk)?;
+                let ids: Vec<i64> = chunk.iter().map(|p| p.id()).collect();
+                failed_ids.extend(ids.iter().copied());
+                failures.push(CommandFailure::from_google(ids, &error));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- report
+    let applied: Vec<i64> = actionable
+        .iter()
+        .map(|p| p.id())
+        .filter(|id| !failed_ids.contains(id))
+        .collect();
+    let changed: Vec<&ThreadPlan> = actionable
+        .iter()
+        .copied()
+        .filter(|p| p.changed() && !failed_ids.contains(&p.id()))
+        .collect();
+
+    Ok(CommandResult {
+        ok: failures.is_empty(),
+        message: describe(command, applied.len()),
+        undo: inverse(command, &changed),
+        applied,
+        failed: failures,
+    })
+}
+
+/// Cut a group into chunks of at most `max` message ids, never splitting a
+/// thread. A thread with more messages than `max` still travels alone rather
+/// than being broken up.
+fn chunk_threads<'a>(plans: &[&'a ThreadPlan], max: usize) -> Vec<Vec<&'a ThreadPlan>> {
+    let max = max.max(1);
+    let mut out: Vec<Vec<&ThreadPlan>> = Vec::new();
+    let mut current: Vec<&ThreadPlan> = Vec::new();
+    let mut count = 0usize;
+    for plan in plans {
+        let size = plan.snap.message_ids.len();
+        if !current.is_empty() && count + size > max {
+            out.push(std::mem::take(&mut current));
+            count = 0;
+        }
+        current.push(plan);
+        count += size;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}

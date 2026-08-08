@@ -1,0 +1,16 @@
+{
+  "kind": "calendar#event",
+  "etag": "\"3401234567893000\"",
+  "id": "berlin_board_call",
+  "status": "confirmed",
+  "summary": "Board call (Berlin)",
+  "organizer": { "email": "chair@example.com", "displayName": "Chair" },
+  "start": { "dateTime": "2026-08-13T15:00:00+02:00", "timeZone": "Europe/Berlin" },
+  "end": { "dateTime": "2026-08-13T16:00:00+02:00", "timeZone": "Europe/Berlin" },
+  "iCalUID": "berlin_board_call@google.com",
+  "sequence": 3,
+  "attendees": [
+    { "email": "chair@example.com", "organizer": true, "responseStatus": "accepted" },
+    { "email": "alex@example.com", "self": true, "responseStatus": "needsAction" }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "kind": "calendar#calendarList",
+  "etag": "\"p32ofsc8g9h8vg0g\"",
+  "nextSyncToken": "CJi_ncbF_",
+  "items": [
+    {
+      "kind": "calendar#calendarListEntry",
+      "id": "alex@example.com",
+      "summary": "alex@example.com",
+      "timeZone": "America/Chicago",
+      "colorId": "14",
+      "backgroundColor": "#9fe1e7",
+      "foregroundColor": "#000000",
+      "selected": true,
+      "accessRole": "owner",
+      "primary": true,
+      "defaultReminders": [ { "method": "popup", "minutes": 10 } ]
+    },
+    {
+      "kind": "calendar#calendarListEntry",
+      "id": "en.usa#holiday@group.v.calendar.google.com",
+      "summary": "Holidays in United States",
+      "timeZone": "America/Chicago",
+      "colorId": "8",
+      "backgroundColor": "#16a765",
+      "foregroundColor": "#000000",
+      "selected": false,
+      "accessRole": "reader"
+    }
+  ]
+}

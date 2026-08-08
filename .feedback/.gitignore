@@ -1,0 +1,6 @@
+# Feedback captures are local artifacts of the in-app feedback loop: the PNG a
+# ⌘K → Send feedback session hands to the agent working the resulting task.
+# They are durable on purpose (an agent reads them minutes later) and private
+# by definition — the app's window contains real mail.
+*
+!.gitignore

@@ -1,0 +1,8 @@
+{
+  "labels": [
+    { "id": "INBOX", "name": "INBOX", "type": "system", "messageListVisibility": "hide", "labelListVisibility": "labelShow" },
+    { "id": "UNREAD", "name": "UNREAD", "type": "system" },
+    { "id": "STARRED", "name": "STARRED", "type": "system" },
+    { "id": "Label_18", "name": "Lumen/Invoices", "type": "user", "color": { "textColor": "#ffffff", "backgroundColor": "#16a765" }, "messagesTotal": 412, "messagesUnread": 3, "threadsTotal": 388, "threadsUnread": 3 }
+  ]
+}

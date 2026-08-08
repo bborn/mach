@@ -1,0 +1,910 @@
+//! Tests for the Tauri IPC layer and the app bootstrap (U8).
+//!
+//! A `#[tauri::command]` cannot be invoked without standing up an application,
+//! so the handlers in `ipc::commands` are deliberately empty wrappers and every
+//! decision lives in `ipc::reads`, `ipc::state` and `ipc::types`. That is what
+//! these tests drive, with a real SQLite database and no Tauri runtime at all.
+//!
+//! The load-bearing tests are the ones that pin promises the compiler cannot:
+//!
+//!  * `camel_case_*` — the wire format. A snake_case key here compiles fine and
+//!    silently breaks every screen in the frontend, so the assertions are on
+//!    `serde_json` output rather than on Rust field names.
+//!  * `paginating_the_stream_*` — the keyset cursor neither skips nor repeats a
+//!    row, which is the whole reason it is not `LIMIT/OFFSET`.
+//!  * `booting_without_credentials_*` — a fresh checkout has no `.env.local`,
+//!    and the app has to start anyway and say why it cannot sign in.
+//!  * `an_account_whose_keychain_entry_is_gone_*` — the credential can vanish
+//!    under us; that is a state to report, not a crash.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use mach_lib::auth::tokens::{MemoryTokenStore, Secret, TokenStore};
+use mach_lib::commands::CommandError;
+use mach_lib::config::AppConfig;
+use mach_lib::db::models::*;
+use mach_lib::db::queries as q;
+use mach_lib::db::{command_queries, schema, Db};
+use mach_lib::ipc::state::restore_accounts;
+use mach_lib::ipc::types::{SyncStatusPayload, ThreadPage, ThreadQuery};
+use mach_lib::ipc::{reads, IpcError};
+
+// ---------------------------------------------------------------------------
+// harness
+// ---------------------------------------------------------------------------
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A temp-file database that deletes itself. On-disk rather than in-memory so
+/// migrations are exercised against a real file, which is what boot does.
+struct TempDb {
+    path: PathBuf,
+    db: Db,
+}
+
+impl TempDb {
+    fn new(tag: &str) -> TempDb {
+        let path = temp_path(tag);
+        let db = Db::open(&path).expect("open temp db");
+        TempDb { path, db }
+    }
+
+    fn reopen(&self) -> Db {
+        Db::open(&self.path).expect("reopen temp db")
+    }
+}
+
+fn temp_path(tag: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "mach-ipc-test-{}-{}-{}.sqlite3",
+        tag,
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+impl std::ops::Deref for TempDb {
+    type Target = Db;
+    fn deref(&self) -> &Db {
+        &self.db
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        remove_db_files(&self.path);
+    }
+}
+
+fn remove_db_files(path: &PathBuf) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = path.clone().into_os_string();
+        p.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+}
+
+fn account(db: &Db, email: &str, colour: i64) -> i64 {
+    let conn = db.writer();
+    q::upsert_account(
+        &conn,
+        &NewAccount {
+            email: email.to_string(),
+            display_name: Some(email.to_string()),
+            token_ref: "com.mach.mail.oauth".to_string(),
+            colour_index: colour,
+        },
+    )
+    .expect("upsert account")
+}
+
+fn thread(db: &Db, account_id: i64, gmail_id: &str, subject: &str, at: i64) -> i64 {
+    let conn = db.writer();
+    q::upsert_thread(
+        &conn,
+        &NewThread {
+            account_id,
+            gmail_thread_id: gmail_id.to_string(),
+            participants: vec![Participant {
+                name: Some("Tawny".into()),
+                email: "tawny@example.com".into(),
+            }],
+            subject: subject.to_string(),
+            snippet: format!("snippet of {subject}"),
+            last_message_at: at,
+            is_unread: true,
+            message_count: 1,
+            has_attachments: false,
+            label_ids: vec!["INBOX".to_string()],
+        },
+    )
+    .expect("upsert thread")
+}
+
+fn message(db: &Db, thread_id: i64, account_id: i64, gmail_id: &str, subject: &str, body: &str) {
+    let conn = db.writer();
+    q::upsert_message(
+        &conn,
+        &NewMessage {
+            thread_id,
+            account_id,
+            gmail_message_id: gmail_id.to_string(),
+            rfc822_message_id: Some(format!("<{gmail_id}@example.com>")),
+            from: Participant {
+                name: Some("Tawny".into()),
+                email: "tawny@example.com".into(),
+            },
+            to: vec![Participant::new("alex@example.com")],
+            subject: subject.to_string(),
+            body_text: Some(body.to_string()),
+            snippet: body.chars().take(40).collect(),
+            internal_date: 1_700_000_000_000,
+            is_unread: true,
+            ..Default::default()
+        },
+    )
+    .expect("upsert message");
+}
+
+fn event(db: &Db, account_id: i64, calendar_id: &str, google_id: &str, start: i64, end: i64) {
+    let conn = db.writer();
+    q::upsert_event(
+        &conn,
+        &NewEvent {
+            account_id,
+            calendar_id: calendar_id.to_string(),
+            google_event_id: google_id.to_string(),
+            title: format!("event {google_id}"),
+            start_ts: start,
+            end_ts: end,
+            status: "confirmed".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("upsert event");
+}
+
+fn json(value: &impl serde::Serialize) -> serde_json::Value {
+    serde_json::to_value(value).expect("serialize")
+}
+
+/// Every key name in a JSON tree, so a snake_case leak anywhere is visible.
+fn all_keys(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.clone());
+                all_keys(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                all_keys(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// migrations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn migrations_run_on_a_fresh_database_and_bring_it_to_the_latest_version() {
+    let db = TempDb::new("fresh");
+    let version: i64 = db
+        .reader()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .expect("read user_version");
+    assert_eq!(version, schema::LATEST_VERSION as i64);
+    assert!(
+        schema::LATEST_VERSION >= 2,
+        "snoozed_threads was promoted to migration 2"
+    );
+}
+
+#[test]
+fn the_snooze_table_now_comes_from_a_migration_not_from_the_command_layer() {
+    let db = TempDb::new("snooze-migration");
+    // Nothing has constructed a CommandDispatcher, so if the table is here it
+    // came from MIGRATIONS.
+    let count: i64 = db
+        .reader()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'snoozed_threads'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master");
+    assert_eq!(count, 1);
+
+    let index: i64 = db
+        .reader()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_snoozed_threads_wake'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite_master");
+    assert_eq!(index, 1);
+}
+
+#[test]
+fn ensure_command_schema_is_still_idempotent_after_the_migration() {
+    let db = TempDb::new("ensure-idempotent");
+    // The command layer still calls this on every dispatcher construction; it
+    // must find the migrated table and do nothing.
+    for _ in 0..3 {
+        db.write(command_queries::ensure_command_schema)
+            .expect("ensure_command_schema");
+    }
+
+    let account_id = account(&db, "alex@example.com", 0);
+    let thread_id = thread(&db, account_id, "t1", "Snoozable", 10);
+    db.write(|conn| {
+        command_queries::upsert_snooze(
+            conn,
+            &command_queries::SnoozeRow {
+                thread_id,
+                wake_at: 500,
+                snoozed_at: 100,
+                prior_label_ids: vec!["INBOX".into()],
+                prior_is_unread: true,
+            },
+        )
+    })
+    .expect("upsert snooze");
+
+    let due = db
+        .read(|conn| command_queries::due_snoozes(conn, 1_000))
+        .expect("due snoozes");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].thread_id, thread_id);
+}
+
+#[test]
+fn migrating_is_idempotent_across_reopens() {
+    let db = TempDb::new("idempotent");
+    account(&db, "alex@example.com", 0);
+
+    // Reopening runs `migrate` again; it must apply nothing and lose nothing.
+    for _ in 0..3 {
+        let reopened = db.reopen();
+        let accounts = reads::list_accounts(&reopened).expect("list accounts");
+        assert_eq!(accounts.len(), 1);
+        let version: i64 = reopened
+            .reader()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read user_version");
+        assert_eq!(version, schema::LATEST_VERSION as i64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// reads
+// ---------------------------------------------------------------------------
+
+#[test]
+fn paginating_the_stream_with_the_cursor_neither_skips_nor_repeats_a_thread() {
+    let db = TempDb::new("paginate");
+    let account_id = account(&db, "alex@example.com", 0);
+    for i in 0..7 {
+        thread(&db, account_id, &format!("t{i}"), &format!("Subject {i}"), 100 + i);
+    }
+
+    let mut seen: Vec<i64> = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let page = reads::list_threads(
+            &db,
+            &ThreadQuery {
+                limit: Some(3),
+                cursor,
+                ..Default::default()
+            },
+        )
+        .expect("list threads");
+        pages += 1;
+        seen.extend(page.items.iter().map(|t| t.id));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+        assert!(pages < 10, "pagination did not terminate");
+    }
+
+    assert_eq!(pages, 3, "7 rows at 3 a page is three pages");
+    assert_eq!(seen.len(), 7, "every thread came back exactly once");
+
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 7, "no thread was repeated across pages");
+
+    // The stream is newest first, so the ids must arrive in descending
+    // last_message_at order — the cursor must not reorder anything.
+    let all = reads::list_threads(&db, &ThreadQuery::default()).expect("list all");
+    let expected: Vec<i64> = all.items.iter().map(|t| t.id).collect();
+    assert_eq!(seen, expected);
+}
+
+#[test]
+fn a_full_page_carries_a_cursor_and_a_short_page_does_not() {
+    let db = TempDb::new("cursor-end");
+    let account_id = account(&db, "alex@example.com", 0);
+    for i in 0..4 {
+        thread(&db, account_id, &format!("t{i}"), "Subject", 100 + i);
+    }
+
+    let full = reads::list_threads(
+        &db,
+        &ThreadQuery {
+            limit: Some(4),
+            ..Default::default()
+        },
+    )
+    .expect("full page");
+    assert_eq!(full.items.len(), 4);
+    assert!(
+        full.next_cursor.is_some(),
+        "a page that came back full might have more behind it"
+    );
+
+    let short = reads::list_threads(
+        &db,
+        &ThreadQuery {
+            limit: Some(10),
+            ..Default::default()
+        },
+    )
+    .expect("short page");
+    assert_eq!(short.items.len(), 4);
+    assert!(short.next_cursor.is_none(), "a short page is the end");
+}
+
+#[test]
+fn listing_threads_narrows_to_one_account_and_one_label() {
+    let db = TempDb::new("narrow");
+    let a = account(&db, "a@example.com", 0);
+    let b = account(&db, "b@example.com", 1);
+    thread(&db, a, "t1", "From A", 200);
+    thread(&db, b, "t2", "From B", 300);
+
+    let page = reads::list_threads(
+        &db,
+        &ThreadQuery {
+            account_id: Some(a),
+            ..Default::default()
+        },
+    )
+    .expect("list threads");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].account_email, "a@example.com");
+
+    let labelled = reads::list_threads(
+        &db,
+        &ThreadQuery {
+            label_id: Some("INBOX".into()),
+            ..Default::default()
+        },
+    )
+    .expect("list threads");
+    assert_eq!(labelled.items.len(), 2);
+
+    let missing = reads::list_threads(
+        &db,
+        &ThreadQuery {
+            label_id: Some("Label_nope".into()),
+            ..Default::default()
+        },
+    )
+    .expect("list threads");
+    assert!(missing.items.is_empty());
+}
+
+#[test]
+fn searching_returns_fts_matches_ranked_and_hydrated() {
+    let db = TempDb::new("search");
+    let account_id = account(&db, "alex@example.com", 0);
+
+    let hit = thread(&db, account_id, "t1", "Velocipede maintenance", 300);
+    message(
+        &db,
+        hit,
+        account_id,
+        "m1",
+        "Velocipede maintenance",
+        "the front wheel needs truing before Saturday",
+    );
+
+    let miss = thread(&db, account_id, "t2", "Invoice", 200);
+    message(&db, miss, account_id, "m2", "Invoice", "attached is the invoice");
+
+    let page = reads::search_threads(&db, "velocipede", None).expect("search");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].id, hit);
+    assert_eq!(page.items[0].subject, "Velocipede maintenance");
+    assert!(page.next_cursor.is_none(), "search results are ranked, not keyset");
+
+    // Search-as-you-type: a prefix of a word in the body is a match.
+    let prefix = reads::search_threads(&db, "trui", None).expect("search prefix");
+    assert_eq!(prefix.items.len(), 1);
+    assert_eq!(prefix.items[0].id, hit);
+
+    // A blank box is an empty result, not an error.
+    assert!(reads::search_threads(&db, "   ", None).expect("blank").items.is_empty());
+    // And a query matching nothing is simply empty.
+    assert!(reads::search_threads(&db, "pterodactyl", None)
+        .expect("no match")
+        .items
+        .is_empty());
+}
+
+#[test]
+fn reading_a_thread_returns_its_whole_conversation() {
+    let db = TempDb::new("detail");
+    let account_id = account(&db, "alex@example.com", 0);
+    let thread_id = thread(&db, account_id, "t1", "Subject", 300);
+    message(&db, thread_id, account_id, "m1", "Subject", "first");
+    message(&db, thread_id, account_id, "m2", "Subject", "second");
+
+    let detail = reads::get_thread(&db, thread_id).expect("get thread");
+    assert_eq!(detail.thread.id, thread_id);
+    assert_eq!(detail.messages.len(), 2);
+}
+
+#[test]
+fn calendars_are_derived_from_the_events_actually_held() {
+    let db = TempDb::new("calendars");
+    let a = account(&db, "a@example.com", 0);
+    let b = account(&db, "b@example.com", 1);
+    event(&db, a, "a@example.com", "e1", 100, 200);
+    event(&db, a, "a@example.com", "e2", 300, 400);
+    event(&db, a, "team@group.calendar.google.com", "e3", 100, 200);
+    event(&db, b, "b@example.com", "e4", 100, 200);
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    assert_eq!(calendars.len(), 3);
+
+    let primary = calendars
+        .iter()
+        .find(|c| c.id == "a@example.com")
+        .expect("account a's primary calendar");
+    assert_eq!(primary.account_id, a);
+    assert_eq!(primary.account_email, "a@example.com");
+    assert_eq!(primary.colour_index, 0);
+    assert_eq!(primary.event_count, 2);
+}
+
+#[test]
+fn listing_events_returns_everything_overlapping_the_window() {
+    let db = TempDb::new("events");
+    let account_id = account(&db, "alex@example.com", 0);
+    event(&db, account_id, "primary", "before", 0, 50);
+    event(&db, account_id, "primary", "straddling", 50, 150);
+    event(&db, account_id, "primary", "inside", 110, 120);
+    event(&db, account_id, "primary", "after", 500, 600);
+
+    let events = reads::list_events(&db, 100, 200).expect("list events");
+    let ids: Vec<&str> = events.iter().map(|e| e.google_event_id.as_str()).collect();
+    assert_eq!(ids, vec!["straddling", "inside"]);
+}
+
+// ---------------------------------------------------------------------------
+// typed errors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unknown_account_id_is_a_typed_error_not_an_empty_list() {
+    let db = TempDb::new("unknown-account");
+    account(&db, "alex@example.com", 0);
+
+    let error = reads::list_labels(&db, Some(9_999)).expect_err("unknown account");
+    assert_eq!(error.kind(), "notFound");
+    assert!(
+        error.to_string().contains("9999"),
+        "the message names the id: {error}"
+    );
+
+    let payload = json(&error);
+    assert_eq!(payload["kind"], "notFound");
+    assert!(payload["message"].is_string());
+
+    // A known account with no labels is an empty list, which is why the two
+    // cannot be conflated.
+    let accounts = reads::list_accounts(&db).expect("list accounts");
+    assert!(reads::list_labels(&db, Some(accounts[0].id))
+        .expect("known account")
+        .is_empty());
+}
+
+#[test]
+fn an_unknown_thread_id_is_a_typed_error() {
+    let db = TempDb::new("unknown-thread");
+    let error = reads::get_thread(&db, 42).expect_err("unknown thread");
+    assert_eq!(error.kind(), "notFound");
+    assert!(error.to_string().contains("42"));
+}
+
+#[test]
+fn the_command_layers_own_error_tag_survives_the_boundary() {
+    // A command error is not flattened into "command failed" — the frontend
+    // branches on the specific tag the command layer chose.
+    let error = IpcError::from(CommandError::UnknownAccount { account_id: 7 });
+    assert_eq!(error.kind(), "unknownAccount");
+    assert_eq!(json(&error)["kind"], "unknownAccount");
+
+    let error = IpcError::from(CommandError::UnknownThread { thread_id: 7 });
+    assert_eq!(error.kind(), "unknownThread");
+}
+
+#[test]
+fn every_error_serializes_as_kind_and_message() {
+    let cases: Vec<(IpcError, &str)> = vec![
+        (IpcError::NotConfigured("nope".into()), "notConfigured"),
+        (IpcError::not_found("thread", 1), "notFound"),
+        (IpcError::UnknownPending("abc".into()), "unknownPending"),
+        (IpcError::internal("boom"), "internal"),
+    ];
+    for (error, expected) in cases {
+        let payload = json(&error);
+        assert_eq!(payload["kind"], expected);
+        assert!(
+            payload["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "every error carries a renderable sentence"
+        );
+        assert_eq!(payload.as_object().expect("object").len(), 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the wire format
+// ---------------------------------------------------------------------------
+
+#[test]
+fn camel_case_thread_page() {
+    let db = TempDb::new("wire-threads");
+    let account_id = account(&db, "alex@example.com", 3);
+    let thread_id = thread(&db, account_id, "t1", "Subject", 1_700_000_000_000);
+    message(&db, thread_id, account_id, "m1", "Subject", "body");
+
+    let page = reads::list_threads(
+        &db,
+        &ThreadQuery {
+            limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .expect("list threads");
+    let payload = json(&page);
+
+    assert!(payload["items"].is_array());
+    let row = &payload["items"][0];
+    for key in [
+        "id",
+        "accountId",
+        "accountEmail",
+        "accountColourIndex",
+        "gmailThreadId",
+        "participants",
+        "subject",
+        "snippet",
+        "lastMessageAt",
+        "isUnread",
+        "messageCount",
+        "hasAttachments",
+        "labelIds",
+    ] {
+        assert!(row.get(key).is_some(), "thread row is missing {key}: {row}");
+    }
+    assert!(
+        row["lastMessageAt"].is_i64(),
+        "timestamps are epoch millis as numbers, not strings"
+    );
+
+    let cursor = &payload["nextCursor"];
+    assert!(cursor.get("lastMessageAt").is_some());
+    assert!(cursor.get("id").is_some());
+
+    let mut keys = Vec::new();
+    all_keys(&payload, &mut keys);
+    let snake: Vec<&String> = keys.iter().filter(|k| k.contains('_')).collect();
+    assert!(snake.is_empty(), "snake_case leaked to the wire: {snake:?}");
+}
+
+#[test]
+fn camel_case_thread_detail() {
+    let db = TempDb::new("wire-detail");
+    let account_id = account(&db, "alex@example.com", 0);
+    let thread_id = thread(&db, account_id, "t1", "Subject", 1_700_000_000_000);
+    message(&db, thread_id, account_id, "m1", "Subject", "body");
+
+    let payload = json(&reads::get_thread(&db, thread_id).expect("get thread"));
+    assert!(payload.get("thread").is_some());
+    let message = &payload["messages"][0];
+    for key in [
+        "id",
+        "threadId",
+        "accountId",
+        "gmailMessageId",
+        "rfc822MessageId",
+        "from",
+        "to",
+        "bodyText",
+        "internalDate",
+        "isUnread",
+        "isDraft",
+        "attachments",
+    ] {
+        assert!(message.get(key).is_some(), "message is missing {key}");
+    }
+
+    let mut keys = Vec::new();
+    all_keys(&payload, &mut keys);
+    let snake: Vec<&String> = keys.iter().filter(|k| k.contains('_')).collect();
+    assert!(snake.is_empty(), "snake_case leaked to the wire: {snake:?}");
+}
+
+#[test]
+fn camel_case_calendars_and_events() {
+    let db = TempDb::new("wire-calendar");
+    let account_id = account(&db, "alex@example.com", 2);
+    event(&db, account_id, "primary", "e1", 100, 200);
+
+    let calendars = json(&reads::list_calendars(&db).expect("calendars"));
+    for key in [
+        "id",
+        "accountId",
+        "accountEmail",
+        "name",
+        "colourIndex",
+        "eventCount",
+    ] {
+        assert!(calendars[0].get(key).is_some(), "calendar is missing {key}");
+    }
+
+    let events = json(&reads::list_events(&db, 0, 1_000).expect("events"));
+    for key in [
+        "id",
+        "accountId",
+        "calendarId",
+        "googleEventId",
+        "startTs",
+        "endTs",
+        "isAllDay",
+        "attendees",
+        "updatedAt",
+    ] {
+        assert!(events[0].get(key).is_some(), "event is missing {key}");
+    }
+}
+
+#[test]
+fn camel_case_sync_status() {
+    let payload = json(&SyncStatusPayload::default());
+    for key in [
+        "running",
+        "accounts",
+        "lastPassStartedAt",
+        "lastPassFinishedAt",
+        "configured",
+        "configurationError",
+        "needsReauthorization",
+    ] {
+        assert!(payload.get(key).is_some(), "sync status is missing {key}");
+    }
+}
+
+#[test]
+fn camel_case_pending_authorization_handle() {
+    let payload = json(&mach_lib::ipc::PendingAuthorizationHandle {
+        url: "https://accounts.google.com/o/oauth2/v2/auth?x=1".into(),
+        pending_id: "opaque".into(),
+    });
+    assert_eq!(payload["url"], "https://accounts.google.com/o/oauth2/v2/auth?x=1");
+    assert_eq!(payload["pendingId"], "opaque");
+}
+
+#[test]
+fn thread_query_arrives_from_typescript_in_camel_case() {
+    // Exactly what `invoke("list_threads", { query })` sends.
+    let query: ThreadQuery = serde_json::from_str(
+        r#"{"accountId":3,"labelId":"INBOX","unreadOnly":true,"limit":25,
+            "cursor":{"lastMessageAt":1700000000000,"id":42}}"#,
+    )
+    .expect("deserialize camelCase query");
+
+    assert_eq!(query.account_id, Some(3));
+    assert_eq!(query.label_id.as_deref(), Some("INBOX"));
+    assert!(query.unread_only);
+    assert_eq!(query.effective_limit(), 25);
+    assert_eq!(query.cursor.expect("cursor").id, 42);
+
+    // An omitted field is the default, so `invoke("list_threads", { query: {} })`
+    // is the opening inbox.
+    let empty: ThreadQuery = serde_json::from_str("{}").expect("deserialize empty query");
+    assert_eq!(empty.account_id, None);
+    assert!(!empty.unread_only);
+    assert_eq!(
+        empty.effective_limit(),
+        mach_lib::db::queries::DEFAULT_PAGE_SIZE
+    );
+
+    // `after` is the store's name for the same field; accepting it costs
+    // nothing and removes a whole class of frontend/backend mismatch.
+    let aliased: ThreadQuery =
+        serde_json::from_str(r#"{"after":{"lastMessageAt":1,"id":2}}"#).expect("alias");
+    assert_eq!(aliased.cursor.expect("cursor").id, 2);
+}
+
+#[test]
+fn a_page_size_beyond_the_cap_is_clamped_not_honoured() {
+    let query = ThreadQuery {
+        limit: Some(1_000_000),
+        ..Default::default()
+    };
+    assert_eq!(query.effective_limit(), mach_lib::db::queries::MAX_PAGE_SIZE);
+}
+
+#[test]
+fn an_empty_page_serializes_as_an_array_and_a_null_cursor() {
+    // The frontend maps over `items` unconditionally, so it must never be null.
+    let payload = json(&ThreadPage::default());
+    assert_eq!(payload["items"], serde_json::json!([]));
+    // `.get`, not indexing: indexing a missing key also yields `Null`, which
+    // would let a renamed field pass this assertion.
+    assert_eq!(
+        payload.get("nextCursor"),
+        Some(&serde_json::Value::Null),
+        "the key is present and null, not absent"
+    );
+}
+
+#[test]
+fn the_command_catalogue_crosses_the_boundary_as_data() {
+    let payload = json(&mach_lib::commands::Command::catalogue().to_vec());
+    let specs = payload.as_array().expect("array of specs");
+    assert!(specs.iter().any(|s| s["kind"] == "archive"));
+    let archive = specs
+        .iter()
+        .find(|s| s["kind"] == "archive")
+        .expect("archive spec");
+    assert_eq!(archive["params"][0]["name"], "threadIds");
+    assert!(archive["undoable"].as_bool().expect("undoable"));
+}
+
+// ---------------------------------------------------------------------------
+// configuration and boot
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_client_id_is_a_not_configured_state_with_a_renderable_reason() {
+    let config = AppConfig::from_values("/tmp/mach.sqlite3", None, None);
+    assert!(!config.is_configured());
+    let message = config.configuration_error.expect("a reason");
+    assert!(message.contains("MACH_GOOGLE_CLIENT_ID"), "{message}");
+    assert!(message.contains(".env.local"), "{message}");
+}
+
+#[test]
+fn a_client_id_without_a_secret_is_also_not_configured() {
+    // Google issues a secret with every desktop client and its token endpoint
+    // expects one; discovering that as an unexplained 401 later is worse.
+    let config = AppConfig::from_values("/tmp/mach.sqlite3", Some("id.apps".into()), None);
+    assert!(!config.is_configured());
+    assert!(config
+        .configuration_error
+        .expect("a reason")
+        .contains("MACH_GOOGLE_CLIENT_SECRET"));
+
+    // Whitespace is not a credential.
+    let blank = AppConfig::from_values(
+        "/tmp/mach.sqlite3",
+        Some("id.apps".into()),
+        Some("   ".into()),
+    );
+    assert!(!blank.is_configured());
+}
+
+#[test]
+fn both_variables_present_is_configured() {
+    let config = AppConfig::from_values(
+        "/tmp/mach.sqlite3",
+        Some("id.apps.googleusercontent.com".into()),
+        Some("GOCSPX-secret".into()),
+    );
+    assert!(config.is_configured());
+    assert!(config.configuration_error.is_none());
+}
+
+#[tokio::test]
+async fn booting_without_credentials_starts_the_app_and_reports_not_configured() {
+    let path = temp_path("boot-unconfigured");
+    let config = AppConfig::from_values(&path, None, None);
+
+    // The whole point: this must not panic, and must not return Err.
+    let state = mach_lib::ipc::bootstrap(config).expect("boot without credentials");
+
+    let status = state.status_payload();
+    assert!(!status.configured);
+    assert!(status
+        .configuration_error
+        .expect("a reason")
+        .contains("MACH_GOOGLE_CLIENT_ID"));
+    assert!(!status.running);
+    assert!(status.accounts.is_empty());
+
+    // Local reads still work — the store is the source of truth, not Google.
+    assert!(reads::list_accounts(&state.db).expect("list accounts").is_empty());
+    assert!(!state.should_start_sync(), "nothing to sync, nothing to start");
+
+    // And asking for the OAuth client gives the UI a renderable error rather
+    // than a panic.
+    let error = state.client_config().expect_err("no client");
+    assert_eq!(error.kind(), "notConfigured");
+
+    drop(state);
+    remove_db_files(&path);
+}
+
+#[tokio::test]
+async fn booting_with_credentials_runs_migrations_and_reports_configured() {
+    let path = temp_path("boot-configured");
+    let config = AppConfig::from_values(
+        &path,
+        Some("id.apps.googleusercontent.com".into()),
+        Some("GOCSPX-secret".into()),
+    );
+
+    let state = mach_lib::ipc::bootstrap(config).expect("boot with credentials");
+    let status = state.status_payload();
+    assert!(status.configured);
+    assert!(status.configuration_error.is_none());
+
+    // Boot ran migrations on a brand-new file.
+    let version: i64 = state
+        .db
+        .reader()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .expect("read user_version");
+    assert_eq!(version, schema::LATEST_VERSION as i64);
+
+    // No accounts yet, so the loop has nothing to do.
+    assert!(!state.should_start_sync());
+
+    drop(state);
+    remove_db_files(&path);
+}
+
+// ---------------------------------------------------------------------------
+// restoring accounts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_account_whose_keychain_entry_is_gone_needs_reauthorization_rather_than_crashing() {
+    let db = TempDb::new("restore");
+    account(&db, "kept@example.com", 0);
+    account(&db, "lost@example.com", 1);
+
+    let store = MemoryTokenStore::default();
+    store
+        .save_refresh_token("kept@example.com", &Secret::new("refresh"))
+        .expect("save");
+
+    let needs = restore_accounts(&db, &store).expect("restore accounts");
+    assert_eq!(needs, vec!["lost@example.com".to_string()]);
+}
+
+#[test]
+fn restoring_an_empty_store_asks_for_nothing() {
+    let db = TempDb::new("restore-empty");
+    let needs = restore_accounts(&db, &MemoryTokenStore::default()).expect("restore accounts");
+    assert!(needs.is_empty());
+}

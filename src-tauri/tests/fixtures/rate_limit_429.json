@@ -1,0 +1,14 @@
+{
+  "error": {
+    "code": 429,
+    "message": "User-rate limit exceeded.  Retry after 2026-08-07T12:00:00.000Z",
+    "errors": [
+      {
+        "message": "User-rate limit exceeded.",
+        "domain": "usageLimits",
+        "reason": "rateLimitExceeded"
+      }
+    ],
+    "status": "RESOURCE_EXHAUSTED"
+  }
+}

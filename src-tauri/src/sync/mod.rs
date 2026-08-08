@@ -1,0 +1,575 @@
+//! The background sync loop — the component that makes "the UI never waits on
+//! Google" true.
+//!
+//! Nothing in here is ever on a user's critical path. The engine's only job is
+//! to keep local SQLite an accurate mirror of five Gmail mailboxes and their
+//! calendars, so that every read the UI performs is a local read.
+//!
+//! # Shape
+//!
+//! ```text
+//!   SyncEngine::start()
+//!        │
+//!        └── loop task ──┬── account 1 task ── MailSync ─┐
+//!                        ├── account 2 task ── MailSync ─┤──► db::queries ──► SQLite
+//!                        ├── …                CalendarSync ┘
+//!                        └── (bounded by two semaphores)
+//! ```
+//!
+//! * **Per-account isolation.** Each account is its own task with its own
+//!   watermark. A revoked token or a rate-limited account records an error in
+//!   its own [`status::AccountStatus`] and the other four finish normally.
+//! * **Two bounds, not one.** `account_concurrency` caps how many mailboxes are
+//!   in flight; `request_concurrency` caps how many HTTP requests exist across
+//!   *all* of them. Without the second, five accounts each running a wide
+//!   backfill would put a hundred requests on the wire at once and earn a 429
+//!   for everyone.
+//! * **A pipeline, not a lockstep.** The backfill enumerates ids into a durable
+//!   queue, then keeps `backfill_fetch_concurrency` `messages.get` calls in
+//!   flight continuously while a single writer task commits completed messages
+//!   `message_batch_size` at a time. Fetching does not stop while a transaction
+//!   is open, which is what separates 40 messages a second from 11.
+//! * **Cancellation is structural.** Every task holds a [`CancelToken`]; the
+//!   engine aborts its loop on drop. No detached work outlives shutdown.
+//!
+//! The two hard correctness properties — watermark ordering and backfill
+//! resumability — are documented where they live, in [`mail`].
+
+pub mod cancel;
+pub mod calendar;
+pub mod convert;
+pub mod mail;
+pub mod status;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+
+use crate::db::models::Account;
+use crate::db::{queries, sync_queries, Db, DbError};
+use crate::google::calendar::CalendarClient;
+use crate::google::gmail::GmailClient;
+use crate::google::{GoogleError, HttpTransport, RetryPolicy, Sleeper, TokenProvider};
+
+pub use cancel::{CancelToken, Cancelled};
+pub use status::{AccountReporter, AccountStatus, StatusSink, SyncPhase, SyncStatus};
+
+// ===========================================================================
+// errors
+// ===========================================================================
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error("store: {0}")]
+    Db(#[from] DbError),
+    #[error("google: {0}")]
+    Google(#[from] GoogleError),
+    /// Shutdown was requested mid-pass. Everything committed stays committed.
+    #[error("sync cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    Config(String),
+}
+
+impl From<Cancelled> for SyncError {
+    fn from(_: Cancelled) -> Self {
+        SyncError::Cancelled
+    }
+}
+
+impl SyncError {
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, SyncError::Cancelled)
+    }
+}
+
+// ===========================================================================
+// configuration
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+pub struct SyncConfig {
+    /// How far back the initial backfill reaches. Older mail stays reachable
+    /// through server-side search.
+    pub backfill_window_days: i64,
+    /// Fetched messages written per transaction. This is a *write* batch, not a
+    /// fetch batch: the backfill no longer waits for a batch to be written
+    /// before asking for more.
+    pub message_batch_size: usize,
+    /// `maxResults` for `messages.list` during the backfill.
+    pub list_page_size: u32,
+    /// `maxResults` for `users.history.list`.
+    pub history_page_size: u32,
+    /// Mailboxes synced at once.
+    pub account_concurrency: usize,
+    /// HTTP requests in flight across every account. The stampede guard.
+    pub request_concurrency: usize,
+    /// `messages.get` calls one account's backfill keeps in flight.
+    ///
+    /// This is the throughput knob. Gmail allows 250 quota units per second per
+    /// user and a `messages.get` costs 5, so the per-account ceiling is 50
+    /// fetches a second — and throughput is *concurrency ÷ round-trip*, nothing
+    /// else, because the backfill is pure latency. At the ~0.4 s round trip
+    /// measured against a real mailbox, 16 in flight is ~40 fetches a second:
+    /// close to the ceiling with about a fifth of the quota left for
+    /// `history.list`, attachment fetches and whatever the UI is doing.
+    ///
+    /// Never effectively larger than `request_concurrency`, which bounds every
+    /// account together — going wider than the global bound would only park
+    /// tasks on the shared semaphore.
+    ///
+    /// Deliberately *not* paired with a rate limiter: the client's
+    /// [`RetryPolicy`] already backs off with jitter on a 429, and a second
+    /// governor would only argue with it.
+    pub backfill_fetch_concurrency: usize,
+    pub calendar_past_days: i64,
+    pub calendar_future_days: i64,
+    pub calendar_page_size: u32,
+    /// Empty means "ask Google for the calendar list".
+    pub calendar_ids: Vec<String>,
+    /// Gap between passes of the background loop.
+    pub poll_interval: Duration,
+    pub sync_mail: bool,
+    pub sync_calendar: bool,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            backfill_window_days: 365,
+            message_batch_size: 25,
+            list_page_size: 500,
+            history_page_size: 500,
+            account_concurrency: 5,
+            // Five mailboxes onboarding at once share this; one mailbox on its
+            // own is bounded by `backfill_fetch_concurrency` below.
+            request_concurrency: 32,
+            backfill_fetch_concurrency: 16,
+            calendar_past_days: 90,
+            calendar_future_days: 365,
+            calendar_page_size: 250,
+            calendar_ids: Vec::new(),
+            poll_interval: Duration::from_secs(60),
+            sync_mail: true,
+            sync_calendar: true,
+        }
+    }
+}
+
+// ===========================================================================
+// clients
+// ===========================================================================
+
+/// How the engine gets an API client for an account.
+///
+/// A trait rather than a concrete type because the engine must not know how
+/// tokens are stored: production hands it a Keychain-backed `TokenManager`,
+/// tests hand it a static string and a scripted transport.
+pub trait ClientFactory: Send + Sync + 'static {
+    fn gmail(&self, account: &Account) -> Result<GmailClient, SyncError>;
+    fn calendar(&self, account: &Account) -> Result<CalendarClient, SyncError>;
+}
+
+/// Resolves an account to the token provider that signs its requests.
+pub type TokenProviderFor = dyn Fn(&Account) -> Arc<dyn TokenProvider> + Send + Sync;
+
+/// The ordinary implementation: one shared transport (and therefore one
+/// connection pool) plus a per-account token provider.
+pub struct TransportClients {
+    transport: Arc<dyn HttpTransport>,
+    tokens: Box<TokenProviderFor>,
+    gmail_base: Option<String>,
+    calendar_base: Option<String>,
+    retry: Option<RetryPolicy>,
+    sleeper: Option<Arc<dyn Sleeper>>,
+}
+
+impl TransportClients {
+    pub fn new(
+        transport: Arc<dyn HttpTransport>,
+        tokens: impl Fn(&Account) -> Arc<dyn TokenProvider> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            transport,
+            tokens: Box::new(tokens),
+            gmail_base: None,
+            calendar_base: None,
+            retry: None,
+            sleeper: None,
+        }
+    }
+
+    /// Point both clients somewhere other than Google — the seam the tests use.
+    pub fn with_base_urls(
+        mut self,
+        gmail: impl Into<String>,
+        calendar: impl Into<String>,
+    ) -> Self {
+        self.gmail_base = Some(gmail.into());
+        self.calendar_base = Some(calendar.into());
+        self
+    }
+
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = Some(retry);
+        self
+    }
+
+    pub fn with_sleeper(mut self, sleeper: Arc<dyn Sleeper>) -> Self {
+        self.sleeper = Some(sleeper);
+        self
+    }
+}
+
+impl ClientFactory for TransportClients {
+    fn gmail(&self, account: &Account) -> Result<GmailClient, SyncError> {
+        let mut client = GmailClient::new(Arc::clone(&self.transport), (self.tokens)(account));
+        if let Some(base) = &self.gmail_base {
+            client = client.with_base_url(base.clone());
+        }
+        if let Some(retry) = self.retry {
+            client = client.with_retry_policy(retry);
+        }
+        if let Some(sleeper) = &self.sleeper {
+            client = client.with_sleeper(Arc::clone(sleeper));
+        }
+        Ok(client)
+    }
+
+    fn calendar(&self, account: &Account) -> Result<CalendarClient, SyncError> {
+        let mut client = CalendarClient::new(Arc::clone(&self.transport), (self.tokens)(account));
+        if let Some(base) = &self.calendar_base {
+            client = client.with_base_url(base.clone());
+        }
+        if let Some(retry) = self.retry {
+            client = client.with_retry_policy(retry);
+        }
+        if let Some(sleeper) = &self.sleeper {
+            client = client.with_sleeper(Arc::clone(sleeper));
+        }
+        Ok(client)
+    }
+}
+
+// ===========================================================================
+// pass results
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountOutcome {
+    pub account_id: i64,
+    pub email: String,
+    pub messages_written: u64,
+    pub events_written: u64,
+    /// `None` on success. An account that failed still leaves its siblings'
+    /// outcomes untouched.
+    pub error: Option<String>,
+    pub cancelled: bool,
+}
+
+impl AccountOutcome {
+    pub fn is_ok(&self) -> bool {
+        self.error.is_none() && !self.cancelled
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPass {
+    pub started_at: i64,
+    pub finished_at: i64,
+    pub accounts: Vec<AccountOutcome>,
+}
+
+impl SyncPass {
+    pub fn messages_written(&self) -> u64 {
+        self.accounts.iter().map(|a| a.messages_written).sum()
+    }
+
+    pub fn events_written(&self) -> u64 {
+        self.accounts.iter().map(|a| a.events_written).sum()
+    }
+
+    pub fn account(&self, account_id: i64) -> Option<&AccountOutcome> {
+        self.accounts.iter().find(|a| a.account_id == account_id)
+    }
+
+    pub fn failures(&self) -> impl Iterator<Item = &AccountOutcome> {
+        self.accounts.iter().filter(|a| a.error.is_some())
+    }
+}
+
+// ===========================================================================
+// the engine
+// ===========================================================================
+
+struct Inner {
+    db: Db,
+    clients: Arc<dyn ClientFactory>,
+    config: Arc<SyncConfig>,
+    cancel: CancelToken,
+    status: StatusSink,
+    /// Nudge the loop into an immediate pass.
+    wake: Notify,
+    /// Global in-flight request bound, shared by every account across every
+    /// pass so it actually bounds anything.
+    limiter: Arc<Semaphore>,
+}
+
+/// Start it, read its status, stop it. This is the whole surface the Tauri
+/// layer needs.
+pub struct SyncEngine {
+    inner: Arc<Inner>,
+    loop_handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl SyncEngine {
+    pub fn new(
+        db: Db,
+        clients: Arc<dyn ClientFactory>,
+        config: SyncConfig,
+    ) -> Result<Self, SyncError> {
+        db.write(sync_queries::ensure_schema)?;
+        let request_concurrency = config.request_concurrency.max(1);
+        Ok(Self {
+            inner: Arc::new(Inner {
+                db,
+                clients,
+                config: Arc::new(config),
+                cancel: CancelToken::new(),
+                status: StatusSink::new(),
+                wake: Notify::new(),
+                limiter: Arc::new(Semaphore::new(request_concurrency)),
+            }),
+            loop_handle: Mutex::new(None),
+        })
+    }
+
+    /// Subscribe to progress. `Receiver::borrow()` is a synchronous read of the
+    /// latest value, so a Tauri command can answer without awaiting; `changed()`
+    /// drives a push feed if the UI prefers one.
+    pub fn status(&self) -> tokio::sync::watch::Receiver<SyncStatus> {
+        self.inner.status.subscribe()
+    }
+
+    /// The current picture, copied.
+    pub fn status_snapshot(&self) -> SyncStatus {
+        self.inner.status.snapshot()
+    }
+
+    /// The token every task in this engine watches. Handy for wiring an app
+    /// shutdown hook that must also stop other work.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.inner.cancel.clone()
+    }
+
+    pub fn config(&self) -> &SyncConfig {
+        &self.inner.config
+    }
+
+    /// Spawn the background loop. Idempotent — calling it twice does not start
+    /// a second loop.
+    pub fn start(&self) {
+        let mut slot = self
+            .loop_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        *slot = Some(tokio::spawn(run_loop(inner)));
+    }
+
+    /// Ask the running loop to start a pass now rather than at the next tick.
+    pub fn sync_now(&self) {
+        self.inner.wake.notify_one();
+    }
+
+    /// Run exactly one pass over every account, inline. This is what the tests
+    /// drive, and what a "Sync now" menu item can await.
+    pub async fn sync_once(&self) -> SyncPass {
+        pass(Arc::clone(&self.inner)).await
+    }
+
+    /// Stop promptly and wait for the loop to actually be gone.
+    pub async fn shutdown(&self) {
+        self.inner.cancel.cancel();
+        self.inner.wake.notify_waiters();
+        let handle = self
+            .loop_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+        self.inner.status.set_running(false);
+    }
+}
+
+/// Dropping the engine cancels it and aborts the loop, so a forgotten
+/// `shutdown()` cannot leave work running against a database that is closing.
+impl Drop for SyncEngine {
+    fn drop(&mut self) {
+        self.inner.cancel.cancel();
+        if let Some(handle) = self
+            .loop_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+    }
+}
+
+async fn run_loop(inner: Arc<Inner>) {
+    inner.status.set_running(true);
+    loop {
+        if inner.cancel.is_cancelled() {
+            break;
+        }
+        pass(Arc::clone(&inner)).await;
+        if inner.cancel.is_cancelled() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            () = inner.cancel.cancelled() => break,
+            () = inner.wake.notified() => {}
+            () = tokio::time::sleep(inner.config.poll_interval) => {}
+        }
+    }
+    inner.status.set_running(false);
+}
+
+/// One pass over every account. Accounts run concurrently and independently;
+/// a failure — or a panic — in one is contained to its own outcome.
+async fn pass(inner: Arc<Inner>) -> SyncPass {
+    let started_at = now_ms();
+    inner.status.begin_pass();
+
+    // A store that will not answer is not a reason to spin: report an empty
+    // pass and let the next tick try again.
+    let accounts = inner.db.read(queries::list_accounts).unwrap_or_default();
+
+    let gate = Arc::new(Semaphore::new(inner.config.account_concurrency.max(1)));
+    let mut set: JoinSet<AccountOutcome> = JoinSet::new();
+    for account in accounts {
+        let inner = Arc::clone(&inner);
+        let gate = Arc::clone(&gate);
+        set.spawn(async move {
+            let _permit = gate.acquire_owned().await;
+            sync_account(inner, account).await
+        });
+    }
+
+    let mut outcomes = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        // A panicked account task is a bug, but it must not abort the pass for
+        // the other four mailboxes.
+        if let Ok(outcome) = joined {
+            outcomes.push(outcome);
+        }
+    }
+    outcomes.sort_by_key(|o| o.account_id);
+
+    inner.status.end_pass();
+    SyncPass {
+        started_at,
+        finished_at: now_ms(),
+        accounts: outcomes,
+    }
+}
+
+async fn sync_account(inner: Arc<Inner>, account: Account) -> AccountOutcome {
+    let report = inner.status.account(account.id, &account.email);
+    report.begin_pass();
+
+    let mut outcome = AccountOutcome {
+        account_id: account.id,
+        email: account.email.clone(),
+        messages_written: 0,
+        events_written: 0,
+        error: None,
+        cancelled: false,
+    };
+
+    if inner.cancel.is_cancelled() {
+        report.cancelled();
+        outcome.cancelled = true;
+        return outcome;
+    }
+
+    if inner.config.sync_mail {
+        match inner.clients.gmail(&account) {
+            Ok(gmail) => {
+                let sync = mail::MailSync {
+                    db: inner.db.clone(),
+                    gmail,
+                    account_id: account.id,
+                    config: Arc::clone(&inner.config),
+                    cancel: inner.cancel.clone(),
+                    report: report.clone(),
+                    limiter: Arc::clone(&inner.limiter),
+                };
+                match sync.run().await {
+                    Ok(n) => outcome.messages_written = n,
+                    Err(SyncError::Cancelled) => outcome.cancelled = true,
+                    Err(e) => outcome.error = Some(e.to_string()),
+                }
+            }
+            Err(e) => outcome.error = Some(e.to_string()),
+        }
+    }
+
+    // Calendar runs even when mail failed: a revoked Gmail scope should not
+    // freeze the week grid, and vice versa.
+    if inner.config.sync_calendar && !outcome.cancelled {
+        match inner.clients.calendar(&account) {
+            Ok(calendar) => {
+                let sync = calendar::CalendarSync {
+                    db: inner.db.clone(),
+                    calendar,
+                    account_id: account.id,
+                    config: Arc::clone(&inner.config),
+                    cancel: inner.cancel.clone(),
+                    report: report.clone(),
+                };
+                match sync.run().await {
+                    Ok(n) => outcome.events_written = n,
+                    Err(SyncError::Cancelled) => outcome.cancelled = true,
+                    Err(e) => {
+                        if outcome.error.is_none() {
+                            outcome.error = Some(e.to_string())
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if outcome.error.is_none() {
+                    outcome.error = Some(e.to_string())
+                }
+            }
+        }
+    }
+
+    match (&outcome.error, outcome.cancelled) {
+        (Some(error), _) => report.failed(error.clone()),
+        (None, true) => report.cancelled(),
+        (None, false) => report.succeeded(),
+    }
+    outcome
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
