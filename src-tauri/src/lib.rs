@@ -105,6 +105,18 @@ pub fn run() {
                 }));
             app.manage(state);
 
+            // Credentials are checked *after* launch, on a thread that is not
+            // this one. Reading the Keychain here would deadlock the window into
+            // existence — see `ipc::state::restore_accounts_into` for the stack.
+            let creds = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let state = creds.state::<ipc::state::AppState>();
+                ipc::state::restore_accounts_into(&state);
+                // Tell the UI, so an account needing attention says so without
+                // waiting for the first sync pass to report it.
+                ipc::events::emit_sync_status(&creds, &state.status_payload());
+            });
+
             // The bridge starts the loop and then forwards its progress for the
             // life of the app. It has to run after `manage`, because it reads
             // the state it is reporting on.

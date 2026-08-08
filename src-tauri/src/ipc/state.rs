@@ -345,7 +345,9 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
     }
     let sync = Arc::new(SyncEngine::new(db.clone(), sync_clients, sync_config)?);
 
-    let needs_reauthorization = restore_accounts(&db, &KeychainTokenStore::default())?;
+    // Deliberately *not* the Keychain read that used to be here. See
+    // `restore_accounts_into`: doing it on this thread deadlocks the launch.
+    let needs_reauthorization = Vec::new();
 
     Ok(AppState {
         db,
@@ -357,6 +359,52 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
         needs_reauthorization: Mutex::new(needs_reauthorization),
         pending: Mutex::new(HashMap::new()),
     })
+}
+
+/// Check stored credentials and record the accounts that need attention.
+///
+/// # Why this cannot run during `bootstrap`
+///
+/// It used to, and the app hung on launch with no window at all.
+///
+/// `bootstrap` is called from Tauri's `setup`, which runs on the main thread
+/// inside `applicationDidFinishLaunching`. Reading a Keychain item from there
+/// is a deadlock waiting for a reason to happen, and rebuilding the binary is
+/// reason enough: the code signature changes, the item's ACL no longer matches,
+/// and macOS wants to ask permission. But `SecurityAgent` cannot put its dialog
+/// on screen until the application has finished launching — so the app waits
+/// for the Keychain, the Keychain waits for an answer, and the answer waits for
+/// the app. The process sits there alive, holding no window, forever.
+///
+/// A sampled stack of exactly that:
+///
+/// ```text
+///   applicationDidFinishLaunching
+///     └ mach_lib::run::{{closure}}          <- setup
+///        └ bootstrap → restore_accounts
+///           └ SecKeychainFindGenericPassword
+///              └ CSSM_DecryptDataFinal      <- blocked
+/// ```
+///
+/// So this runs afterwards, off the main thread, once there is a window for the
+/// prompt to appear over. Nothing needs it to have finished: the mailbox renders
+/// from SQLite, and an account whose credential turns out to be missing is
+/// reported through `needs_reauthorization` a moment later — which is the same
+/// path used when a token expires while the app is running.
+///
+/// This is the app's own invariant applied to the login keychain rather than to
+/// Google: the UI never waits on anything it does not already have locally.
+pub fn restore_accounts_into(state: &AppState) {
+    match restore_accounts(&state.db, &KeychainTokenStore::default()) {
+        Ok(emails) => {
+            for email in emails {
+                state.mark_needs_reauthorization(&email);
+            }
+        }
+        // A failed read is not fatal and never was: every account simply looks
+        // as though it needs attention, which is the honest answer.
+        Err(error) => eprintln!("could not check stored credentials: {error}"),
+    }
 }
 
 /// Which stored accounts still have a usable credential.
