@@ -26,15 +26,27 @@ set -euo pipefail
 #   input goes wherever focus is, so they must raise the window; there is no
 #   polite version. MACH_QA_INPUT=1 overrides, and you should have a reason.
 #
-# To exercise the UI, drive it headlessly instead. Vite serves the same
+#   `qa up` on an instance OTHER than `main` is safe. Those processes set an
+#   Accessory activation policy and build their window unfocused (see
+#   `src-tauri/src/shell.rs`), so they never appear in the Dock, never become
+#   the active application, and cannot take a keystroke — while still being a
+#   real window `qa shoot` can capture. That is the way to exercise anything
+#   needing the Rust backend. `qa up` on `main` is the owner's own app and is
+#   still off limits.
+#
+# For frontend-only work, drive it headlessly instead. Vite serves the same
 # frontend on http://localhost:1420, and outside Tauri it renders the fixture
-# data source (see `src/main.tsx`). A headless browser can click, type, read
-# the DOM and screenshot with no window and no focus at all:
+# data source (see `src/main.tsx`). `scripts/webqa.ts` clicks, types, reads the
+# DOM and screenshots with no window and no focus at all:
 #
-#   bunx playwright screenshot --wait-for-timeout=1500 http://localhost:1420 out.png
+#   bun scripts/webqa.ts reload    # …and reports what the page load logged
+#   bun scripts/webqa.ts eval '<javascript>'
 #
-# or the chrome-devtools MCP tools against the same URL. Real-data checks do
-# not need the UI: `qa state` reads the database directly.
+# Use `reload` first when a page looks blank: it holds one CDP session across
+# the navigation and prints the exceptions, which is the only way to see an
+# error thrown before the app finished mounting.
+#
+# Real-data checks do not need the UI at all: `qa state` reads the database.
 #
 # ---------------------------------------------------------------------------
 # INSTANCES
@@ -165,7 +177,27 @@ cmd_up() {
   echo $! >"$PIDFILE"
   for _ in $(seq 1 30); do instance_pid >/dev/null && break; sleep 1; done
   pid="$(instance_pid)" || die "the app did not start; see $LOG"
+
+  # Wait for a window, not just a process.
+  #
+  # A debug build opening a large store takes appreciably longer to put a
+  # window on screen than it takes to fork, and `up` used to return in between.
+  # Anything that then tried to `shoot` got "no capturable window", which reads
+  # as "the app is broken" rather than "ask again in a moment" — an agent
+  # reported exactly that and concluded its own change had broken the build.
+  local waited=0
+  while [ "$waited" -lt 60 ]; do
+    if [ -n "$(window_id)" ]; then
+      echo "up (pid $pid)${DATA_DIR:+  data=$DATA_DIR}"
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || die "the app exited during startup; see $LOG"
+    sleep 1
+    waited=$((waited + 1))
+  done
+
   echo "up (pid $pid)${DATA_DIR:+  data=$DATA_DIR}"
+  echo "qa[$INSTANCE]: running, but no window after ${waited}s — see $LOG" >&2
 }
 
 cmd_down() {
@@ -183,7 +215,18 @@ cmd_shoot() {
   # raised or focused. Raising the window to photograph it steals focus from
   # whoever is using the machine, and an agent iterating visually would do that
   # every few seconds.
-  local wid; wid="$(window_id)" || wid=""
+  # Retry rather than fail on the first miss: a window that is merely still
+  # being built is the common case, and a hard failure here is indistinguishable
+  # from a genuinely broken app.
+  local wid=""
+  local tries=0
+  while [ "$tries" -lt 20 ]; do
+    wid="$(window_id)" || wid=""
+    [ -n "$wid" ] && break
+    sleep 1
+    tries=$((tries + 1))
+  done
+
   if [ -n "$wid" ]; then
     screencapture -x -o -l"$wid" "$out"
     echo "$out  (window $wid, pid $pid — not raised)"
