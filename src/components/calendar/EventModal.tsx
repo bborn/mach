@@ -306,6 +306,7 @@ export function EventModal({
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto p-3">
         <Input
           ref={titleField}
+          id={ids.title}
           value={form.title}
           placeholder="Add a title"
           aria-label="Title"
@@ -668,6 +669,7 @@ function EndRow({
 function useFieldIds() {
   const base = useId();
   return {
+    title: `${base}-title`,
     startDate: `${base}-start-date`,
     endDate: `${base}-end-date`,
     repeat: `${base}-repeat`,
