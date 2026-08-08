@@ -34,6 +34,7 @@ pub mod config;
 pub mod db;
 pub mod google;
 pub mod ipc;
+pub mod notify;
 pub mod plugins;
 pub mod render;
 pub mod shell;
@@ -58,6 +59,11 @@ pub fn run() {
         // first use; nothing `dialog:` is granted to JavaScript, so the only
         // reachable operation is "save *this* attachment" via Rust.
         .plugin(tauri_plugin_dialog::init())
+        // Banners and the Dock badge. Wraps `tauri-plugin-notification` rather
+        // than being it: the wrapper is what holds the `AppHandle` the sync
+        // loop needs, subscribes to `threads-changed` for the badge, and sees
+        // the `Reopen` a notification click produces. See `notify::host`.
+        .plugin(notify::init())
         // One origin per plugin: `plugin://<id>/`. The handler serves two
         // static files and, crucially, the Content-Security-Policy as a
         // *response header* — see `plugins::protocol`.
@@ -124,6 +130,9 @@ pub fn run() {
             ipc::commands::remove_account,
             ipc::prefs::get_preferences,
             ipc::prefs::set_preference,
+            ipc::notify::notification_state,
+            ipc::notify::notification_request_permission,
+            ipc::notify::notification_pending_open,
             ipc::feedback::submit_feedback,
             ipc::feedback::capture_window,
             ipc::render::render_message_body,

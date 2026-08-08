@@ -73,6 +73,7 @@ import {
   type Selection,
 } from "@/lib/selection";
 import { mailboxName } from "@/lib/mailboxes";
+import { connectNotificationOpen } from "@/lib/notification-open";
 import { toMailboxError, useThreadStream } from "@/hooks/useThreadStream";
 import { DAY, addDays, addMonths, startOfWeek } from "@/lib/time";
 import { undoWindowMs, type WeekStart } from "@/lib/prefs";
@@ -560,6 +561,22 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
     void source.onSyncStatus(setSync).then(keep);
     void source.onThreadsChanged(scheduleRefresh).then(keep);
+
+    /*
+     * Coming back from a notification banner. Mail mode first, then the
+     * account, then the conversation — in that order, because selecting a
+     * thread that the current account filter excludes would select nothing.
+     *
+     * `connectNotificationOpen` is synchronous and returns its own disposer,
+     * so it is not a `keep()` candidate like the two above.
+     */
+    disposers.push(
+      connectNotificationOpen((target) => {
+        dispatch({ type: "mode", mode: "mail" });
+        dispatch({ type: "account", accountId: target.accountId });
+        dispatch({ type: "thread", threadId: target.threadId });
+      }),
+    );
 
     return () => {
       live = false;

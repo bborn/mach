@@ -2,18 +2,23 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_PREFERENCES,
   LIST_WIDTH_BOUNDS,
+  NO_NOTIFICATIONS,
   SEND_DELAY_BOUNDS,
   SIGNATURE_DELIMITER,
   SYNC_INTERVAL_BOUNDS,
   UNDO_WINDOW_BOUNDS,
   composeAccountId,
+  loadNotificationStatus,
   loadPreferences,
   loadSession,
+  notifiesAccount,
   parsePreferences,
   parseSession,
+  requestNotificationPermission,
   sendDelayMs,
   signatureFor,
   undoWindowMs,
+  withAccountNotifying,
   withSignature,
   type Preferences,
 } from "./prefs";
@@ -48,6 +53,9 @@ describe("parsePreferences", () => {
         sendDelaySeconds: 30,
         weekStartsOn: 0,
         workingHours: { start: 8, end: 18 },
+        notificationsEnabled: false,
+        notificationAccounts: { "7": false },
+        badgeEnabled: false,
       }),
     ).toEqual({
       defaultAccountId: 7,
@@ -59,6 +67,9 @@ describe("parsePreferences", () => {
       sendDelaySeconds: 30,
       weekStartsOn: 0,
       workingHours: { start: 8, end: 18 },
+      notificationsEnabled: false,
+      notificationAccounts: { "7": false },
+      badgeEnabled: false,
     });
   });
 
@@ -384,5 +395,51 @@ describe("restoring a session through the reducer", () => {
 describe("loadSession", () => {
   it("answers nothing stored when there is no backend and no storage", async () => {
     await expect(loadSession()).resolves.toEqual({});
+  });
+});
+
+describe("notifications", () => {
+  it("default to on, for every account, with a badge", () => {
+    expect(DEFAULT_PREFERENCES.notificationsEnabled).toBe(true);
+    expect(DEFAULT_PREFERENCES.badgeEnabled).toBe(true);
+    expect(notifiesAccount(DEFAULT_PREFERENCES, 4)).toBe(true);
+  });
+
+  it("only stores the accounts that are muted", () => {
+    // `true` is already the default, so writing it would be a second spelling
+    // of the same state — and two spellings is how a mute starts depending on
+    // which one was written last.
+    const parsed = parsePreferences({
+      notificationAccounts: { "4": false, "7": true, "9": "loud" },
+    });
+    expect(parsed.notificationAccounts).toEqual({ "4": false });
+    expect(notifiesAccount(parsed, 4)).toBe(false);
+    expect(notifiesAccount(parsed, 7)).toBe(true);
+    expect(notifiesAccount(parsed, 9)).toBe(true);
+  });
+
+  it("treats a non-boolean switch as the default rather than as off", () => {
+    // Silence is the failure mode that hides itself: a rubbish row must not be
+    // able to turn the feature off without anybody being told.
+    for (const rubbish of [null, 0, "yes", {}]) {
+      expect(parsePreferences({ notificationsEnabled: rubbish }).notificationsEnabled).toBe(true);
+      expect(parsePreferences({ badgeEnabled: rubbish }).badgeEnabled).toBe(true);
+    }
+    expect(parsePreferences({ notificationsEnabled: false }).notificationsEnabled).toBe(false);
+  });
+
+  it("mutes and unmutes one account without touching the others", () => {
+    const muted = prefs({ notificationAccounts: { "4": false } });
+    expect(withAccountNotifying(muted, 7, false)).toEqual({ "4": false, "7": false });
+    expect(withAccountNotifying(muted, 4, true)).toEqual({});
+    // Never mutated in place: this goes straight into React state.
+    expect(muted.notificationAccounts).toEqual({ "4": false });
+  });
+});
+
+describe("loadNotificationStatus", () => {
+  it("answers 'nothing to deliver through' outside Tauri, rather than throwing", async () => {
+    await expect(loadNotificationStatus()).resolves.toEqual(NO_NOTIFICATIONS);
+    await expect(requestNotificationPermission()).resolves.toEqual(NO_NOTIFICATIONS);
   });
 });

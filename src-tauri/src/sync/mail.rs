@@ -44,6 +44,22 @@
 //! Nothing about the correctness properties changed: the writer still deletes a
 //! queue row in the same transaction that stores its message, and the watermark
 //! is still read before enumeration and promoted only once the queue is empty.
+//!
+//! # Which writes count as *mail arriving*
+//!
+//! Storing a message and receiving one are not the same event, and only this
+//! file can tell them apart. A backfill stores a year of mail; every row of it
+//! is new to the store and none of it is news to the person reading it. So
+//! [`Voice`] is threaded through the one path that can report an arrival, and
+//! the backfill — including the catch-up replay that immediately follows one,
+//! which covers however many hours the backfill itself took — passes
+//! [`Voice::Silent`].
+//!
+//! That is a structural gate rather than a filter: [`crate::notify`] is
+//! unreachable from the backfill, so no rule about promotions or read state can
+//! be got wrong in a way that produces thirty thousand banners. The only caller
+//! that speaks is an account that already had a history watermark when the pass
+//! began, which is exactly the definition of "already synced".
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -80,6 +96,20 @@ const WRITE_QUEUE_DEPTH: usize = 2;
 /// keyset read of a few hundred rows costs about as much as one of ten.
 const LEASE_AHEAD: usize = 4;
 
+/// Whether the messages a history replay stores are allowed to say anything.
+///
+/// The distinction is not cosmetic — see the module doc. It is an enum rather
+/// than a `bool` because `self.incremental(&watermark, true)` at a call site is
+/// exactly the kind of argument that gets flipped by accident, and flipping
+/// this one costs the owner tens of thousands of notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Voice {
+    /// An ordinary pass on an account that was already synced. Real arrivals.
+    Announce,
+    /// A backfill, or the catch-up that follows one. Everything here is history.
+    Silent,
+}
+
 /// Everything one account's Gmail sync needs. Cheap to construct per pass.
 pub struct MailSync {
     pub db: Db,
@@ -111,7 +141,10 @@ impl MailSync {
         })?;
 
         match watermark {
-            Some(watermark) => match self.incremental(&watermark).await {
+            // The only branch that speaks: this account was already synced when
+            // the pass began, so anything `history.list` reports as added is
+            // mail that arrived while Mach was watching.
+            Some(watermark) => match self.incremental(&watermark, Voice::Announce).await {
                 Err(SyncError::Google(e)) if e.requires_full_resync() => {
                     // Expected, not exceptional: the watermark aged out of
                     // Gmail's retention window. Throw it away and rebuild.
@@ -189,8 +222,10 @@ impl MailSync {
         self.db
             .write(|conn| sync_queries::finish_backfill(conn, account_id, &start_history_id))?;
 
-        // Everything that arrived *during* the backfill is now replayed.
-        let caught_up = match self.incremental(&start_history_id).await {
+        // Everything that arrived *during* the backfill is now replayed. Silent:
+        // a first sync can run for hours, and the mail that landed while it did
+        // is being seen for the first time, not received for the first time.
+        let caught_up = match self.incremental(&start_history_id, Voice::Silent).await {
             Ok(n) => n,
             Err(SyncError::Google(e)) if e.requires_full_resync() => {
                 // The backfill outlived Gmail's history retention. Drop the
@@ -438,7 +473,10 @@ impl MailSync {
 
     /// Replay `users.history.list` from `start` and persist the new watermark
     /// only once the whole sweep is durably applied.
-    async fn incremental(&self, start: &str) -> Result<u64, SyncError> {
+    ///
+    /// `voice` decides whether the messages this sweep stores are treated as
+    /// mail *arriving* or merely as mail being *found*. See [`Voice`].
+    async fn incremental(&self, start: &str, voice: Voice) -> Result<u64, SyncError> {
         self.report.phase(SyncPhase::Incremental);
         let account_id = self.account_id;
 
@@ -507,15 +545,21 @@ impl MailSync {
 
         let records = sweep.records;
         let watermark = sweep.history_id.clone();
-        let written = self.db.write(|conn| {
+        let (written, arrived) = self.db.write(|conn| {
             let mut touched: HashSet<i64> = HashSet::new();
             let mut stored = 0u64;
+            // The ids this sweep genuinely added, in the order Gmail reported
+            // them. Collected even when the voice is silent — it costs a `Vec`
+            // of strings the caller drops — so that the two paths through this
+            // function stay one path.
+            let mut arrived: Vec<String> = Vec::new();
 
             for record in &records {
                 for added in &record.messages_added {
                     if let Some(message) = fetched.get(&added.message.id) {
                         touched.insert(store_message(conn, account_id, message)?);
                         stored += 1;
+                        arrived.push(added.message.id.clone());
                     }
                 }
                 for change in &record.labels_added {
@@ -563,8 +607,15 @@ impl MailSync {
             if let Some(watermark) = &watermark {
                 queries::set_history_id(conn, account_id, Some(watermark))?;
             }
-            Ok(stored)
+            Ok((stored, arrived))
         })?;
+
+        // After the commit, never inside it: nothing is announced that a crash
+        // could take back, and `announce` opens its own short transaction to
+        // record what it said.
+        if voice == Voice::Announce {
+            crate::notify::announce(&self.db, account_id, &arrived);
+        }
 
         self.report.add_messages(written as i64);
         Ok(written)

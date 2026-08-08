@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import type { Account, Calendar, CalendarId, AccountId } from "@/types";
 import { useUiSession } from "@/components/prefs/PreferencesProvider";
@@ -57,6 +58,36 @@ export function CalendarSidebar({
   const collapsed = session.collapsedCalendarAccounts ?? [];
   const setCollapsed = (next: AccountId[]) =>
     remember({ collapsedCalendarAccounts: next });
+
+  /*
+   * Google's own "is this calendar shown", adopted exactly once per calendar.
+   *
+   * `selected` is a real preference the user set in Google, and ignoring it is
+   * why an account with a dozen subscribed calendars opened as a wall of blocks
+   * the user had already turned off somewhere else. Adopting it happens through
+   * the same `onToggle` every click uses rather than through a second source of
+   * truth, so there is only ever one answer to "is this calendar hidden".
+   *
+   * The ref is what makes it *initial* state rather than a policy: once a
+   * calendar has been seeded it is never seeded again, so turning a
+   * Google-hidden calendar back on here sticks, and nothing fights the user.
+   * A ref rather than persisted session state because `hidden` itself is not
+   * persisted — both should live exactly as long as the window does, and today
+   * they do because `App` keeps both mode layers mounted and merely hides the
+   * inactive one. A refactor that unmounts `CalendarMode` on a mode switch would
+   * quietly turn this into a policy that re-hides a calendar every time you come
+   * back from mail, and this sentence is the only warning it would get.
+   */
+  const seeded = useRef(new Set<CalendarId>());
+  useEffect(() => {
+    for (const calendar of calendars) {
+      if (seeded.current.has(calendar.id)) continue;
+      seeded.current.add(calendar.id);
+      if (calendar.selected === false && !hidden.includes(calendar.id)) {
+        onToggle(calendar.id);
+      }
+    }
+  }, [calendars, hidden, onToggle]);
 
   const groups = accounts.map((account) => ({
     account,
@@ -121,15 +152,17 @@ export function CalendarSidebar({
               owned.map((calendar) => {
                 const off = hidden.includes(calendar.id);
                 const slot = index++;
+                const label = calendarLabel(calendar);
                 return (
                   <button
                     key={calendar.id}
                     type="button"
                     onClick={() => onToggle(calendar.id)}
-                    title={`${off ? "Show" : "Hide"} ${calendarLabel(calendar)}${
-                      slot < 9 ? ` (${formatBinding(`v ${slot + 1}`)})` : ""
-                    }`}
-                    className="flex items-center gap-1.5 rounded-[3px] py-[3px] pl-4 pr-1 text-left hover:bg-row-hover"
+                    // A row is a toggle, so it says so. The swatch is the state
+                    // indicator and a swatch cannot be read aloud.
+                    aria-pressed={!off}
+                    title={calendarTooltip(calendar, off, slot)}
+                    className="flex items-center gap-1.5 rounded-[3px] py-[3px] pl-4 pr-1 text-left hover:bg-row-hover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   >
                     <span
                       className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
@@ -140,13 +173,20 @@ export function CalendarSidebar({
                           : undefined,
                       }}
                     />
+                    {/*
+                     * The name truncates because the rail is 13rem wide and
+                     * "Holidays in United States" is not. The full string lives
+                     * on the button's `title`, so the tooltip is the overflow —
+                     * which is why the tooltip leads with the name rather than
+                     * with the verb.
+                     */}
                     <span
                       className={cn(
                         "min-w-0 flex-1 truncate text-micro",
                         off ? "text-faint-foreground" : "text-foreground",
                       )}
                     >
-                      {calendarLabel(calendar)}
+                      {label}
                     </span>
                   </button>
                 );
@@ -202,17 +242,58 @@ function Toggle({
 }
 
 /**
- * Google hands back calendar ids as names for the ones it has no summary for —
- * a 64-character group address is not a label. Shorten it to something a human
- * can scan without losing which calendar it is.
+ * What to call a calendar.
+ *
+ * This function used to make names up. It had to: nothing in Mach had ever
+ * called `calendarList.list`, so the only string available was the calendar id,
+ * and `c_d814cb1f…@group.calendar.google.com` is not a label. So it produced
+ * `Shared · d814cb` — a string that appears nowhere in Google, tells the user
+ * nothing except that six hex digits exist, and is indistinguishable from the
+ * next four calendars that also start with `Shared · `.
+ *
+ * Since migration 6 the name arrives from Google (`summaryOverride ?? summary`,
+ * with the account holder's name substituted on the primary), so the invention
+ * is gone and this is nearly always a passthrough.
+ *
+ * What remains is the gap: a calendar whose events have synced but whose
+ * metadata sweep has not, in which case `name` is still the id. That case
+ * *shortens the id* instead of inventing a label — `en.usa#holiday` rather than
+ * `Holidays · usa holiday` — because a truncated true thing degrades honestly
+ * and a plausible false thing does not. Ordinary addresses are left whole: a
+ * calendar id that is somebody's actual email is already a name.
  */
 export function calendarLabel(calendar: Calendar): string {
   const name = calendar.name.trim();
-  if (!name.includes("@")) return name;
-  const [local, domain = ""] = name.split("@");
-  if (domain.includes("holiday")) return `Holidays · ${local.replace(/^en\./, "").replace("#", " ")}`;
-  if (domain.includes("group.calendar.google.com") || domain.includes("import.calendar.google.com")) {
-    return `Shared · ${local.slice(0, 6)}`;
-  }
-  return name;
+  if (!name) return calendar.id;
+  const at = name.lastIndexOf("@");
+  if (at <= 0) return name;
+  const local = name.slice(0, at);
+  const domain = name.slice(at + 1);
+  return domain.endsWith("calendar.google.com") ? local : name;
+}
+
+/**
+ * The row's tooltip, and the only place a long name is readable in full.
+ *
+ * Name first, because the tooltip doubles as the overflow for a truncated
+ * label — a tooltip that opens with "Hide" buries the one word the user hovered
+ * to find.
+ */
+function calendarTooltip(calendar: Calendar, off: boolean, slot: number): string {
+  const shortcut = slot < 9 ? ` (${formatBinding(`v ${slot + 1}`)})` : "";
+  const description = calendar.description?.trim();
+  const readOnly =
+    calendar.accessRole === "reader" || calendar.accessRole === "freeBusyReader";
+  return [
+    calendarLabel(calendar),
+    description || null,
+    [
+      readOnly ? "Read-only" : null,
+      `${off ? "Show" : "Hide"}${shortcut}`,
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  ]
+    .filter(Boolean)
+    .join("\n");
 }

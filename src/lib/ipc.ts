@@ -21,6 +21,7 @@ import type {
   AccountSyncStatus,
   Attachment,
   Calendar,
+  CalendarAccessRole,
   CalendarEvent,
   ColorIndex,
   Label,
@@ -118,6 +119,15 @@ interface WireCalendar {
   summary?: Nullable<string>;
   colourIndex?: Nullable<number>;
   colorIndex?: Nullable<number>;
+  /** `ipc::types::Calendar`, migration 6. All optional: see `mapCalendars`. */
+  description?: Nullable<string>;
+  backgroundColor?: Nullable<string>;
+  foregroundColor?: Nullable<string>;
+  accessRole?: Nullable<string>;
+  timeZone?: Nullable<string>;
+  primary?: Nullable<boolean>;
+  selected?: Nullable<boolean>;
+  deleted?: Nullable<boolean>;
 }
 
 interface WireThread {
@@ -332,6 +342,23 @@ export function mapLabels(wire: WireLabel[]): Label[] {
   }));
 }
 
+/**
+ * Calendars, with everything migration 6 now knows about them.
+ *
+ * The same trap as `mapEvent`, one table later: this builds a fresh object
+ * literal, so a field that is stored, synced and tested on the Rust side is
+ * dropped in silence the moment it is not named *here*. There is no type error
+ * to catch it, because `WireCalendar` is our own hand-written description of the
+ * wire rather than something generated from `ipc::types::Calendar`. The
+ * regression tests at the bottom of `ipc.test.ts` exist for exactly that, and a
+ * new column belongs in them before it belongs anywhere else.
+ *
+ * Everything Google might not have told us stays `undefined` rather than
+ * collapsing to a default. `accessRole` is the one that matters: reading absence
+ * as `reader` would make every calendar in a pre-migration store read-only until
+ * its first metadata sweep, which looks precisely like a bug and is precisely
+ * the mistake `organizerSelf` already taught this codebase not to make.
+ */
 export function mapCalendars(wire: WireCalendar[], accounts: Account[]): Calendar[] {
   const colorByAccount = new Map(accounts.map((a) => [a.id, a.colorIndex]));
   return wire.map((calendar, index) => {
@@ -344,8 +371,40 @@ export function mapCalendars(wire: WireCalendar[], accounts: Account[]): Calenda
         typeof explicit === "number" && Number.isFinite(explicit)
           ? clampColor(explicit)
           : (colorByAccount.get(calendar.accountId) ?? clampColor(index + 1)),
+      description: optional(calendar.description),
+      backgroundColor: optional(calendar.backgroundColor),
+      foregroundColor: optional(calendar.foregroundColor),
+      accessRole: accessRole(calendar.accessRole),
+      timeZone: optional(calendar.timeZone),
+      primary: calendar.primary === true,
+      // Absent means "not told", and a calendar nobody has told us about should
+      // be visible rather than invisible — an empty grid is a much worse first
+      // impression than one calendar too many.
+      selected: calendar.selected !== false,
+      deleted: calendar.deleted === true,
     };
   });
+}
+
+const ACCESS_ROLES = new Set<CalendarAccessRole>([
+  "owner",
+  "writer",
+  "reader",
+  "freeBusyReader",
+]);
+
+/**
+ * A role Google actually uses, or `undefined`.
+ *
+ * A role we do not recognise is dropped rather than passed through, and that is
+ * the permissive answer: `canEditEvent` only withholds the editor on a
+ * positively read-only role, so an unknown string becoming `undefined` leaves
+ * editing offered. Google refusing the write is a better outcome than Mach
+ * refusing it on the strength of a word it has never seen.
+ */
+function accessRole(value: Nullable<string>): CalendarAccessRole | undefined {
+  const role = value as CalendarAccessRole | null | undefined;
+  return role && ACCESS_ROLES.has(role) ? role : undefined;
 }
 
 export function mapThread(wire: WireThread): Thread {

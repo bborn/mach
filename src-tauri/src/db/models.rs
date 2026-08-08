@@ -457,6 +457,95 @@ pub struct NewEvent {
     pub updated_at: i64,
 }
 
+/// A row of `calendars` — everything `calendarList.list` says about one
+/// calendar as seen from one account.
+///
+/// Two fields deserve their names read carefully. `summary` is the calendar's
+/// own title, set by whoever owns it; `summary_override` is the title *this*
+/// account gave its subscription, and it is what the user actually recognises.
+/// [`Calendar::title`] resolves the pair; nothing else should.
+///
+/// `access_role` is `Option` for the same reason `Event::organizer_self` is: a
+/// row can exist before a metadata sweep has ever run, and silence there means
+/// "not told", never "denied".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Calendar {
+    pub id: i64,
+    pub account_id: i64,
+    /// Google's calendar id — usually an address, and never a label.
+    pub calendar_id: String,
+    pub summary: Option<String>,
+    pub summary_override: Option<String>,
+    pub description: Option<String>,
+    pub time_zone: Option<String>,
+    pub color_id: Option<String>,
+    /// The colour the user chose, as `#rrggbb`.
+    pub background_color: Option<String>,
+    pub foreground_color: Option<String>,
+    /// `owner`, `writer`, `reader`, `freeBusyReader` — or `None` for "not told".
+    pub access_role: Option<String>,
+    pub is_primary: bool,
+    /// Google's own "is this calendar shown".
+    pub selected: bool,
+    /// Unsubscribed or removed. The row survives so its events keep a name.
+    pub deleted: bool,
+    pub synced_at: i64,
+}
+
+impl Calendar {
+    /// The name to show, or `None` when Google supplied neither title.
+    ///
+    /// The override is checked first because it is the more specific answer:
+    /// "Dad/Ben Schedule" is what this account renamed somebody else's
+    /// "Ben — school" to, and showing the owner's title instead would be showing
+    /// a name the user has explicitly replaced.
+    ///
+    /// The primary calendar is the one case this cannot answer alone: Google
+    /// sends the account's own email address as `summary` there and substitutes
+    /// the account holder's display name in its own UI. `None` here lets the
+    /// caller — which has the `accounts` row and therefore the display name — do
+    /// the same. See `ipc::reads::list_calendars`.
+    pub fn title(&self) -> Option<&str> {
+        self.summary_override
+            .as_deref()
+            .or(self.summary.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether Google would accept a write to events on this calendar.
+    ///
+    /// `reader` and `freeBusyReader` are read-only; `owner` and `writer` are
+    /// not. Anything else — including `None` — is permissive, because an
+    /// unrecognised role is far more likely to be a role we have not heard of
+    /// than a denial, and the cost of guessing wrong in that direction is one
+    /// refused request rather than an app that will not let you edit anything.
+    pub fn writable(&self) -> bool {
+        !matches!(self.access_role.as_deref(), Some("reader") | Some("freeBusyReader"))
+    }
+}
+
+/// The upsert shape: the same row without the identity SQLite assigns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewCalendar {
+    pub account_id: i64,
+    pub calendar_id: String,
+    pub summary: Option<String>,
+    pub summary_override: Option<String>,
+    pub description: Option<String>,
+    pub time_zone: Option<String>,
+    pub color_id: Option<String>,
+    pub background_color: Option<String>,
+    pub foreground_color: Option<String>,
+    pub access_role: Option<String>,
+    pub is_primary: bool,
+    pub selected: bool,
+    pub deleted: bool,
+    pub synced_at: i64,
+}
+
 // ---------------------------------------------------------------------------
 // search
 // ---------------------------------------------------------------------------

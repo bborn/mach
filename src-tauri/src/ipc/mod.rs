@@ -19,6 +19,7 @@
 //! | `complete_add_account` | `pendingId` | `Account` |
 //! | `remove_account` | `accountId` | `void` |
 //! | `plugin_*` | see [`plugins`] | the plugin surface |
+//! | `notification_*` | see [`notify`] | may we interrupt, and what to open |
 //!
 //! Everything is camelCase on the wire; every timestamp is unix milliseconds as
 //! a number. Failures are [`IpcError`] — `{ kind, message }` — never a panic.
@@ -46,6 +47,7 @@ pub mod compose;
 pub mod error;
 pub mod feedback;
 pub mod events;
+pub mod notify;
 pub mod plugins;
 pub mod prefs;
 pub mod reads;

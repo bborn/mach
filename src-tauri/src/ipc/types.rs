@@ -102,12 +102,16 @@ impl ThreadPage {
 // calendars
 // ---------------------------------------------------------------------------
 
-/// A calendar the local store has events from.
+/// A calendar, as the sidebar needs it.
 ///
-/// There is no `calendars` table: the sync engine writes events keyed by
-/// `(account_id, calendar_id)` and never persists the calendar list itself. So
-/// this is derived from the events on hand, which has the useful property that
-/// the UI is only ever offered calendars it can actually draw.
+/// This is the join of two sources, and it is a join rather than a table read
+/// because either side can be missing. `calendars` (migration 6) holds what
+/// `calendarList.list` said; `events` holds what has actually been swept. A
+/// calendar with metadata and no events is real — an empty calendar is still a
+/// calendar — and so is a calendar with events and no metadata, which is every
+/// calendar in every database written before migration 6 and every one whose
+/// first metadata sweep has not landed yet. `ipc::reads::list_calendars` covers
+/// both, so nothing disappears mid-migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Calendar {
@@ -115,12 +119,40 @@ pub struct Calendar {
     pub id: String,
     pub account_id: i64,
     pub account_email: String,
-    /// Display name. Google's own name is not stored, so this is the id.
+    /// What to show. `summaryOverride ?? summary`, except on the primary
+    /// calendar where Google's `summary` is the account's own email address and
+    /// the account's display name is substituted instead — which is what Google
+    /// itself does. Falls back to the id when the store knows nothing.
     pub name: String,
     /// The owning account's palette index, so calendars colour with their
     /// account.
     pub colour_index: i64,
     pub event_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The colour the user chose in Google, `#rrggbb`. `None` when unknown —
+    /// the UI keeps its own palette for those rather than inventing a colour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_id: Option<String>,
+    /// `owner`, `writer`, `reader`, `freeBusyReader`.
+    ///
+    /// Absent means "never fetched", which every reader treats as permissive.
+    /// The alternative — defaulting to `reader` — turns every pre-migration row
+    /// read-only on the first launch after an upgrade and hands editing back a
+    /// minute later, which looks exactly like a bug.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    pub primary: bool,
+    /// Google's own "is this calendar shown", the initial visibility state.
+    pub selected: bool,
+    /// Unsubscribed or removed in Google, but still holding events here.
+    pub deleted: bool,
 }
 
 // ---------------------------------------------------------------------------

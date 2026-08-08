@@ -95,11 +95,42 @@ export interface ThreadDetail {
   messages: Message[];
 }
 
+/**
+ * Google's access role on a calendar, verbatim.
+ *
+ * A union rather than `string` because these four are the whole vocabulary and
+ * the two read-only ones have to be spelled exactly right for `canEditEvent` to
+ * mean anything. `undefined` is the fifth state and the important one: it means
+ * the metadata has never been fetched, not that access was refused.
+ */
+export type CalendarAccessRole = "owner" | "writer" | "reader" | "freeBusyReader";
+
 export interface Calendar {
   id: CalendarId;
   accountId: AccountId;
+  /** `summaryOverride ?? summary`, with the account's name on the primary. */
   name: string;
   colorIndex: ColorIndex;
+  /** Google's description, when it has one. Shown on hover. */
+  description?: string;
+  /**
+   * The colour the user chose in Google, `#rrggbb`.
+   *
+   * `undefined` for a calendar Mach has metadata for but no colour, and for
+   * every calendar in a store written before migration 6. The palette in
+   * `calendar-palette.ts` covers those, so this is an improvement on a working
+   * default rather than something the UI needs.
+   */
+  backgroundColor?: string;
+  foregroundColor?: string;
+  /** `undefined` means "never fetched" — permissive, never a denial. */
+  accessRole?: CalendarAccessRole;
+  timeZone?: string;
+  primary?: boolean;
+  /** Google's own "is this calendar shown". Absent means yes. */
+  selected?: boolean;
+  /** Unsubscribed in Google, but still holding events here. */
+  deleted?: boolean;
 }
 
 export type Rsvp = "accepted" | "declined" | "tentative" | "needsAction";

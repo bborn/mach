@@ -168,6 +168,23 @@ fn event(db: &Db, account_id: i64, calendar_id: &str, google_id: &str, start: i6
     .expect("upsert event");
 }
 
+/// A `calendarList.list` entry as the metadata sweep would have stored it.
+fn calendar_meta(account_id: i64, calendar_id: &str, name: Option<&str>) -> NewCalendar {
+    NewCalendar {
+        account_id,
+        calendar_id: calendar_id.to_string(),
+        summary: name.map(str::to_string),
+        selected: true,
+        synced_at: 1_000,
+        ..Default::default()
+    }
+}
+
+fn store_calendar(db: &Db, row: &NewCalendar) {
+    let conn = db.writer();
+    q::upsert_calendar(&conn, row).expect("upsert calendar");
+}
+
 fn json(value: &impl serde::Serialize) -> serde_json::Value {
     serde_json::to_value(value).expect("serialize")
 }
@@ -484,6 +501,197 @@ fn calendars_are_derived_from_the_events_actually_held() {
 }
 
 #[test]
+fn stored_metadata_names_a_calendar_that_the_id_could_not() {
+    let db = TempDb::new("calendar-names");
+    let a = account(&db, "bruno@example.com", 0);
+    event(&db, a, "en.usa#holiday@group.v.calendar.google.com", "e1", 100, 200);
+    event(&db, a, "c_d814cb@group.calendar.google.com", "e2", 100, 200);
+
+    store_calendar(
+        &db,
+        &calendar_meta(
+            a,
+            "en.usa#holiday@group.v.calendar.google.com",
+            Some("Holidays in United States"),
+        ),
+    );
+    store_calendar(
+        &db,
+        &NewCalendar {
+            summary: Some("Alicia's calendar".into()),
+            // What this account renamed its subscription to. It wins.
+            summary_override: Some("Alicia & Bruno".into()),
+            background_color: Some("#f83a22".into()),
+            access_role: Some("writer".into()),
+            ..calendar_meta(a, "c_d814cb@group.calendar.google.com", None)
+        },
+    );
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    let names: Vec<&str> = calendars.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"Holidays in United States"));
+    assert!(names.contains(&"Alicia & Bruno"));
+
+    let shared = calendars
+        .iter()
+        .find(|c| c.id.starts_with("c_d814cb"))
+        .expect("the shared calendar");
+    assert_eq!(shared.background_color.as_deref(), Some("#f83a22"));
+    assert_eq!(shared.access_role.as_deref(), Some("writer"));
+    assert_eq!(shared.event_count, 1);
+}
+
+#[test]
+fn the_primary_calendar_is_named_after_the_account_holder_not_the_address() {
+    // Google sends the account's own email as the primary calendar's `summary`
+    // and substitutes the display name in its own UI. Anything else here is a
+    // sidebar that lists five email addresses and calls them calendars.
+    let db = TempDb::new("calendar-primary");
+    let a = account(&db, "bruno@example.com", 0);
+    {
+        let conn = db.writer();
+        q::upsert_account(
+            &conn,
+            &NewAccount {
+                email: "bruno@example.com".to_string(),
+                display_name: Some("Bruno Bornsztein".to_string()),
+                token_ref: String::new(),
+                colour_index: 0,
+            },
+        )
+        .expect("name the account");
+    }
+    store_calendar(
+        &db,
+        &NewCalendar {
+            is_primary: true,
+            ..calendar_meta(a, "bruno@example.com", Some("bruno@example.com"))
+        },
+    );
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    assert_eq!(calendars[0].name, "Bruno Bornsztein");
+    assert!(calendars[0].primary);
+}
+
+#[test]
+fn a_primary_calendar_with_no_display_name_falls_back_to_the_address() {
+    let db = TempDb::new("calendar-primary-anon");
+    let a = account(&db, "solo@example.com", 0);
+    {
+        let conn = db.writer();
+        conn.execute("UPDATE accounts SET display_name = NULL WHERE id = ?1", [a])
+            .expect("clear the display name");
+    }
+    store_calendar(
+        &db,
+        &NewCalendar {
+            is_primary: true,
+            ..calendar_meta(a, "solo@example.com", Some("solo@example.com"))
+        },
+    );
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    assert_eq!(calendars[0].name, "solo@example.com");
+}
+
+#[test]
+fn renaming_your_own_primary_calendar_still_wins() {
+    // `summaryOverride` on the primary is a deliberate rename, so the display
+    // name substitution must not overrule it.
+    let db = TempDb::new("calendar-primary-override");
+    let a = account(&db, "bruno@example.com", 0);
+    store_calendar(
+        &db,
+        &NewCalendar {
+            is_primary: true,
+            summary_override: Some("Work".into()),
+            ..calendar_meta(a, "bruno@example.com", Some("bruno@example.com"))
+        },
+    );
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    assert_eq!(calendars[0].name, "Work");
+}
+
+#[test]
+fn a_calendar_with_events_and_no_metadata_still_appears() {
+    // The mid-migration case, and the one that must never regress: a database
+    // written before migration 6 has events and no calendar rows at all.
+    let db = TempDb::new("calendar-fallback");
+    let a = account(&db, "a@example.com", 0);
+    event(&db, a, "team@group.calendar.google.com", "e1", 100, 200);
+    store_calendar(&db, &calendar_meta(a, "a@example.com", Some("Named one")));
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    let ids: Vec<&str> = calendars.iter().map(|c| c.id.as_str()).collect();
+    assert!(ids.contains(&"team@group.calendar.google.com"));
+
+    let derived = calendars
+        .iter()
+        .find(|c| c.id.starts_with("team"))
+        .expect("the calendar with no metadata");
+    assert_eq!(derived.name, "team@group.calendar.google.com");
+    // Silence is permission: nothing was fetched, so nothing is denied.
+    assert_eq!(derived.access_role, None);
+    assert!(derived.selected, "an unknown calendar starts visible");
+}
+
+#[test]
+fn a_metadata_only_calendar_appears_before_it_has_any_events() {
+    let db = TempDb::new("calendar-empty");
+    let a = account(&db, "a@example.com", 0);
+    store_calendar(&db, &calendar_meta(a, "empty@example.com", Some("Empty")));
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    assert_eq!(calendars.len(), 1);
+    assert_eq!(calendars[0].name, "Empty");
+    assert_eq!(calendars[0].event_count, 0);
+}
+
+#[test]
+fn an_unsubscribed_calendar_keeps_naming_its_events_and_then_leaves() {
+    let db = TempDb::new("calendar-unsubscribed");
+    let a = account(&db, "a@example.com", 0);
+    event(&db, a, "gone@group.calendar.google.com", "e1", 100, 200);
+    store_calendar(
+        &db,
+        &NewCalendar {
+            deleted: true,
+            ..calendar_meta(a, "gone@group.calendar.google.com", Some("Book club"))
+        },
+    );
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    assert_eq!(calendars.len(), 1, "its events are still on the grid");
+    assert_eq!(calendars[0].name, "Book club");
+    assert!(calendars[0].deleted);
+
+    // Once the events age out of the store there is nothing left to name.
+    {
+        let conn = db.writer();
+        conn.execute("DELETE FROM events", []).expect("clear events");
+    }
+    assert!(reads::list_calendars(&db).expect("list").is_empty());
+}
+
+#[test]
+fn googles_own_visibility_flag_is_carried_across_the_seam() {
+    let db = TempDb::new("calendar-selected");
+    let a = account(&db, "a@example.com", 0);
+    store_calendar(
+        &db,
+        &NewCalendar {
+            selected: false,
+            ..calendar_meta(a, "muted@group.calendar.google.com", Some("Muted"))
+        },
+    );
+
+    let calendars = reads::list_calendars(&db).expect("list calendars");
+    assert!(!calendars[0].selected);
+}
+
+#[test]
 fn listing_events_returns_everything_overlapping_the_window() {
     let db = TempDb::new("events");
     let account_id = account(&db, "alex@example.com", 0);
@@ -666,6 +874,9 @@ fn camel_case_calendars_and_events() {
         "name",
         "colourIndex",
         "eventCount",
+        "primary",
+        "selected",
+        "deleted",
     ] {
         assert!(calendars[0].get(key).is_some(), "calendar is missing {key}");
     }

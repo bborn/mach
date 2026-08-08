@@ -551,4 +551,32 @@ describe("canEditEvent", () => {
       ),
     ).toBe(true);
   });
+
+  it("refuses a calendar this account may only read, whoever organized it", () => {
+    // A subscribed holiday or team calendar. Every event on it is organized
+    // elsewhere, `guestsCanModify` means nothing, and Google answers 403 — so
+    // the editor should never have been offered.
+    const ours = { ...event, organizerSelf: true };
+    expect(canEditEvent(ours, mine, "reader")).toBe(false);
+    expect(canEditEvent(ours, mine, "freeBusyReader")).toBe(false);
+  });
+
+  it("does not let a writable calendar hand back an event that is not ours", () => {
+    // The calendar can only ever veto. `writer` says "you may write here", not
+    // "you may rewrite a stranger's invitation", and conflating the two would
+    // put Save back on every event in a shared calendar.
+    const theirs = {
+      ...event,
+      organizerSelf: false,
+      organizer: { name: "Chief", email: "chief@elsewhere.com" },
+    };
+    expect(canEditEvent(theirs, mine, "writer")).toBe(false);
+    expect(canEditEvent(theirs, mine, "owner")).toBe(false);
+  });
+
+  it("treats an unfetched access role as silence, not as a refusal", () => {
+    // Every calendar looks like this until its first metadata sweep lands.
+    expect(canEditEvent({ ...event, organizerSelf: true }, mine, undefined)).toBe(true);
+    expect(canEditEvent({ ...event, organizerSelf: true }, mine)).toBe(true);
+  });
 });

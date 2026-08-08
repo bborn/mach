@@ -52,12 +52,45 @@ export const labels: Label[] = [
   { id: "L_FAMILY", accountId: null, name: "Family", kind: "user" },
 ];
 
+/**
+ * Calendars as `calendarList.list` describes them, not as ids.
+ *
+ * The colours and access roles are here rather than left off because they are
+ * what the sidebar and the edit guard now read: without them the fixture app
+ * exercises only the "Google never told us" path, which is the one branch that
+ * was already working.
+ */
 export const calendars: Calendar[] = [
-  { id: "c1", accountId: 1, name: "Northwind", colorIndex: 1 },
-  { id: "c2", accountId: 2, name: "Lumen", colorIndex: 2 },
-  { id: "c3", accountId: 3, name: "Talleres Ríos", colorIndex: 3 },
-  { id: "c4", accountId: 4, name: "Family", colorIndex: 4 },
-  { id: "c5", accountId: 5, name: "Meridian Data", colorIndex: 5 },
+  {
+    id: "c1",
+    accountId: 1,
+    name: "Northwind",
+    colorIndex: 1,
+    backgroundColor: "#3f51b5",
+    accessRole: "owner",
+    primary: true,
+  },
+  { id: "c2", accountId: 2, name: "Lumen", colorIndex: 2, backgroundColor: "#0b8043", accessRole: "owner" },
+  {
+    id: "c3",
+    accountId: 3,
+    name: "Talleres Ríos",
+    colorIndex: 3,
+    backgroundColor: "#f6bf26",
+    accessRole: "writer",
+    description: "Shop floor and deliveries",
+  },
+  { id: "c4", accountId: 4, name: "Family", colorIndex: 4, backgroundColor: "#d50000", accessRole: "owner" },
+  {
+    id: "c5",
+    accountId: 5,
+    name: "Meridian Data",
+    colorIndex: 5,
+    backgroundColor: "#8e24aa",
+    // A calendar somebody shared read-only, so the editor is never offered on
+    // it — the one state that is invisible until you try to drag something.
+    accessRole: "reader",
+  },
 ];
 
 export const people: Participant[] = [

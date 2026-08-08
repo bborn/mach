@@ -12,7 +12,8 @@ import {
   type EventScope,
 } from "@/lib/data";
 import type { KeyBinding } from "@/lib/keymap";
-import { assignHues, type HueIndex } from "@/lib/calendar-palette";
+import { assignHues, CALENDAR_HUES, type HueIndex } from "@/lib/calendar-palette";
+import { assignCalendarHues } from "@/lib/colors";
 import { mergeDuplicates, type MergedEvent } from "@/lib/calendar-merge";
 import {
   arrowCursor,
@@ -189,9 +190,15 @@ export function CalendarMode() {
   const rangeStart = startOfDay(days[0]).getTime();
   const rangeEnd = startOfDay(days[days.length - 1]).getTime() + DAY;
 
-  // Hue by calendar id hash, so a calendar keeps its colour between sessions
-  // however sync happens to order things.
-  const hues = useMemo(() => assignHues(calendars.map((c) => c.id)), [calendars]);
+  // The hue Google's `backgroundColor` maps onto, so a calendar is the colour
+  // its owner actually chose — falling back to the id hash for the ones with no
+  // colour, which keeps them stable between sessions however sync orders things.
+  // See `assignCalendarHues` for why only the hue is taken and the lightness is
+  // left on the palette's contrast-tuned value.
+  const hues = useMemo(
+    () => assignCalendarHues(calendars, CALENDAR_HUES, assignHues),
+    [calendars],
+  );
   const hueFor = useCallback(
     (id: CalendarId): HueIndex => hues.get(id) ?? 0,
     [hues],
@@ -394,8 +401,11 @@ export function CalendarMode() {
   /** Whether Google would accept a write to this event at all. */
   const accountEmails = useMemo(() => accounts.map((a) => a.email), [accounts]);
   const editable = useCallback(
-    (event: CalendarEvent) => canEditEvent(event, accountEmails),
-    [accountEmails],
+    // The calendar's own access role is part of the same decision: a `reader`
+    // subscription refuses every write whoever organized the event.
+    (event: CalendarEvent) =>
+      canEditEvent(event, accountEmails, calendarById(event.calendarId)?.accessRole),
+    [accountEmails, calendarById],
   );
 
   /**

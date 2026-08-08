@@ -6,8 +6,18 @@ import { registerResolver } from "@/lib/palette/resolver";
 import { anyPopupOpen } from "@/lib/popups";
 import { ACCOUNT_BG } from "@/lib/colors";
 import { cn } from "@/lib/utils";
-import type { Preferences, WeekStart } from "@/lib/prefs";
+import {
+  NO_NOTIFICATIONS,
+  loadNotificationStatus,
+  notifiesAccount,
+  requestNotificationPermission,
+  withAccountNotifying,
+  type NotificationStatus,
+  type Preferences,
+  type WeekStart,
+} from "@/lib/prefs";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Overlay } from "@/components/ui/dialog";
 import {
   Field,
@@ -162,6 +172,21 @@ export function PreferencesDialog() {
   const { accounts } = useMach();
   const [open, setOpen] = useState(false);
   const ids = useIds();
+  const [notifications, setNotifications] = useState<NotificationStatus>(NO_NOTIFICATIONS);
+
+  // Read when the dialog opens rather than once at mount: the answer can change
+  // while the app is running — System Settings is a few clicks away — and this
+  // is the only surface that renders it.
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    void loadNotificationStatus().then((status) => {
+      if (live) setNotifications(status);
+    });
+    return () => {
+      live = false;
+    };
+  }, [open]);
 
   useEffect(() => {
     const show = () => setOpen(true);
@@ -385,6 +410,55 @@ export function PreferencesDialog() {
             </FieldDescription>
           </Field>
 
+          <Section title="Notifications" />
+
+          <Field orientation="row">
+            <FieldLabel htmlFor={ids.notifications}>New mail</FieldLabel>
+            <Toggle
+              id={ids.notifications}
+              label="Show a notification when mail arrives"
+              checked={prefs.notificationsEnabled}
+              onChange={(on) => {
+                set("notificationsEnabled", on);
+                // The permission prompt belongs to this moment and no other —
+                // the user has just said they want this, so macOS asking why is
+                // a question with an obvious answer.
+                if (on) void requestNotificationPermission().then(setNotifications);
+              }}
+            />
+            <FieldDescription>
+              Unread mail that reaches the inbox, from somebody other than you. Promotions,
+              Social, Updates and Forums stay quiet unless the message continues a conversation
+              you have written to. Several arriving together are one notification.
+              {prefs.notificationsEnabled && notifications.permission === "denied" && (
+                <span className="mt-1 block text-danger">
+                  macOS is not delivering Mach's notifications. Turn them on for Mach in System
+                  Settings → Notifications.
+                </span>
+              )}
+            </FieldDescription>
+          </Field>
+
+          <NotifyingAccounts
+            accounts={accounts}
+            prefs={prefs}
+            onChange={(next) => set("notificationAccounts", next)}
+          />
+
+          <Field orientation="row">
+            <FieldLabel htmlFor={ids.badge}>Dock</FieldLabel>
+            <Toggle
+              id={ids.badge}
+              label="Show the unread count on the Dock icon"
+              checked={prefs.badgeEnabled}
+              onChange={(on) => set("badgeEnabled", on)}
+            />
+            <FieldDescription>
+              Counts unread conversations still in an inbox, across every account — so archiving
+              everything takes it to nothing, which is the point of the gesture.
+            </FieldDescription>
+          </Field>
+
           <Section title="Sync" />
 
           <Field orientation="row">
@@ -484,6 +558,88 @@ function Choose<T>({
 }
 
 /**
+ * A checkbox with its own label, for the settings that are genuinely binary.
+ *
+ * Everything else on this surface is a `Select`, deliberately — but "on or off"
+ * through a two-item menu is a click and a read where a switch is neither, and
+ * a checkbox is the control every other Mac settings window uses for exactly
+ * this. The label is part of the hit area, which is the half people expect and
+ * a bare `<Checkbox>` beside a `<span>` does not give you.
+ */
+function Toggle({
+  id,
+  label,
+  checked,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label
+      htmlFor={id}
+      className="flex min-w-0 cursor-default items-center gap-2 py-[0.3125rem] text-body text-foreground"
+    >
+      <Checkbox id={id} checked={checked} onCheckedChange={onChange} />
+      <span className="min-w-0 truncate">{label}</span>
+    </label>
+  );
+}
+
+/**
+ * One line per account, each of which can be told to stay quiet.
+ *
+ * The same shape as {@link Signatures} and for the same reason: with at most
+ * five mailboxes, showing them all is shorter to use than a picker and makes
+ * the thing people get wrong — the work account being the muted one — visible
+ * without a click.
+ */
+function NotifyingAccounts({
+  accounts,
+  prefs,
+  onChange,
+}: {
+  accounts: readonly Account[];
+  prefs: Preferences;
+  onChange: (next: Record<string, boolean>) => void;
+}) {
+  const prefix = useId();
+  return (
+    <Field orientation="row">
+      <FieldLabel>Accounts</FieldLabel>
+      <FieldContent>
+        {accounts.length === 0 ? (
+          <FieldDescription>Add an account and it appears here.</FieldDescription>
+        ) : (
+          accounts.map((account) => (
+            <label
+              key={account.id}
+              htmlFor={`${prefix}-${account.id}`}
+              className="flex min-w-0 cursor-default items-center gap-2 text-body text-foreground"
+            >
+              <Checkbox
+                id={`${prefix}-${account.id}`}
+                disabled={!prefs.notificationsEnabled}
+                checked={notifiesAccount(prefs, account.id)}
+                onCheckedChange={(on) =>
+                  onChange(withAccountNotifying(prefs, account.id, on))
+                }
+              />
+              <span
+                className={cn("h-2 w-2 shrink-0 rounded-[2px]", ACCOUNT_BG[account.colorIndex])}
+              />
+              <span className="min-w-0 truncate">{account.email}</span>
+            </label>
+          ))
+        )}
+      </FieldContent>
+    </Field>
+  );
+}
+
+/**
  * One signature per account, each in its own box.
  *
  * A single box with an account picker above it would be half the height and
@@ -556,5 +712,7 @@ function useIds() {
     workStart: `${prefix}-work-start`,
     workEnd: `${prefix}-work-end`,
     sync: `${prefix}-sync`,
+    notifications: `${prefix}-notifications`,
+    badge: `${prefix}-badge`,
   };
 }

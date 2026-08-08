@@ -155,6 +155,7 @@ fn migrations_apply_cleanly_on_a_fresh_db() {
         "labels",
         "attachments",
         "events",
+        "calendars",
         "messages_fts",
     ] {
         let n: i64 = conn
@@ -241,6 +242,166 @@ fn an_older_database_gains_the_new_event_columns_without_losing_its_events() {
     // make every pre-existing event uneditable until the next sync.
     assert_eq!(events[0].organizer_self, None);
     assert_eq!(events[0].guests_can_modify, None);
+}
+
+// ---------------------------------------------------------------------------
+// calendar metadata (migration 6)
+// ---------------------------------------------------------------------------
+
+fn calendar(account_id: i64, calendar_id: &str) -> NewCalendar {
+    NewCalendar {
+        account_id,
+        calendar_id: calendar_id.to_string(),
+        selected: true,
+        synced_at: 1_000,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_calendar_row_round_trips_every_field_google_sends() {
+    let t = TempDb::new("calendar-round-trip");
+    let a = account(&t, "a@example.com", 0);
+    let conn = t.writer();
+
+    q::upsert_calendar(
+        &conn,
+        &NewCalendar {
+            summary: Some("Ben — school".into()),
+            summary_override: Some("Dad/Ben Schedule".into()),
+            description: Some("Pickups".into()),
+            time_zone: Some("America/Chicago".into()),
+            color_id: Some("7".into()),
+            background_color: Some("#9fe1e7".into()),
+            foreground_color: Some("#000000".into()),
+            access_role: Some("reader".into()),
+            is_primary: false,
+            ..calendar(a, "ben@group.calendar.google.com")
+        },
+    )
+    .expect("upsert calendar");
+
+    let rows = q::list_calendars(&conn, Some(a)).expect("list");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.summary.as_deref(), Some("Ben — school"));
+    assert_eq!(row.background_color.as_deref(), Some("#9fe1e7"));
+    assert_eq!(row.time_zone.as_deref(), Some("America/Chicago"));
+    // The override is the name the user recognises, so it is the one `title`
+    // answers with.
+    assert_eq!(row.title(), Some("Dad/Ben Schedule"));
+    assert!(!row.writable(), "a reader may not be offered an editor");
+    assert!(row.selected);
+    assert!(!row.deleted);
+}
+
+#[test]
+fn an_unknown_access_role_stays_permissive() {
+    // Silence, and anything Google invents after this was written, must mean
+    // "not told" rather than "denied" — the same rule `organizer_self` follows.
+    let t = TempDb::new("calendar-access");
+    let a = account(&t, "a@example.com", 0);
+    let conn = t.writer();
+
+    for (role, writable) in [
+        (None, true),
+        (Some("owner"), true),
+        (Some("writer"), true),
+        (Some("reader"), false),
+        (Some("freeBusyReader"), false),
+        (Some("somethingNew"), true),
+    ] {
+        q::upsert_calendar(
+            &conn,
+            &NewCalendar {
+                access_role: role.map(str::to_string),
+                ..calendar(a, "c@example.com")
+            },
+        )
+        .unwrap();
+        let rows = q::list_calendars(&conn, Some(a)).unwrap();
+        assert_eq!(rows[0].writable(), writable, "role {role:?}");
+    }
+}
+
+#[test]
+fn resyncing_replaces_metadata_rather_than_accumulating_rows() {
+    let t = TempDb::new("calendar-upsert");
+    let a = account(&t, "a@example.com", 0);
+    let conn = t.writer();
+
+    q::upsert_calendar(
+        &conn,
+        &NewCalendar {
+            summary: Some("Old name".into()),
+            description: Some("Once had one".into()),
+            ..calendar(a, "team@group.calendar.google.com")
+        },
+    )
+    .unwrap();
+    q::upsert_calendar(
+        &conn,
+        &NewCalendar {
+            summary: Some("New name".into()),
+            synced_at: 2_000,
+            ..calendar(a, "team@group.calendar.google.com")
+        },
+    )
+    .unwrap();
+
+    let rows = q::list_calendars(&conn, Some(a)).unwrap();
+    assert_eq!(rows.len(), 1, "one calendar, one row");
+    assert_eq!(rows[0].title(), Some("New name"));
+    // Unlike an event upsert, a NULL here is a real answer: the description was
+    // cleared in Google and must not be resurrected from the old row.
+    assert_eq!(rows[0].description, None);
+    assert_eq!(q::calendars_synced_at(&conn, a).unwrap(), Some(2_000));
+}
+
+#[test]
+fn an_unsubscribed_calendar_is_tombstoned_rather_than_deleted() {
+    let t = TempDb::new("calendar-tombstone");
+    let a = account(&t, "a@example.com", 0);
+    let conn = t.writer();
+
+    q::upsert_calendar(&conn, &calendar(a, "kept@example.com")).unwrap();
+    q::upsert_calendar(&conn, &calendar(a, "gone@group.calendar.google.com")).unwrap();
+
+    let marked =
+        q::tombstone_missing_calendars(&conn, a, &["kept@example.com".to_string()]).unwrap();
+    assert_eq!(marked, 1);
+
+    let rows = q::list_calendars(&conn, Some(a)).unwrap();
+    assert_eq!(rows.len(), 2, "the row survives so its events keep a name");
+    let gone = rows
+        .iter()
+        .find(|c| c.calendar_id.starts_with("gone"))
+        .unwrap();
+    assert!(gone.deleted);
+
+    // Running it again marks nothing new, so a steady state does not churn.
+    let again =
+        q::tombstone_missing_calendars(&conn, a, &["kept@example.com".to_string()]).unwrap();
+    assert_eq!(again, 0);
+}
+
+#[test]
+fn calendars_belong_to_their_account_and_leave_with_it() {
+    let t = TempDb::new("calendar-cascade");
+    let a = account(&t, "a@example.com", 0);
+    let b = account(&t, "b@example.com", 1);
+    let conn = t.writer();
+
+    q::upsert_calendar(&conn, &calendar(a, "shared@group.calendar.google.com")).unwrap();
+    q::upsert_calendar(&conn, &calendar(b, "shared@group.calendar.google.com")).unwrap();
+    // The same Google calendar subscribed from two accounts is two rows, because
+    // the name and the colour are per-subscription.
+    assert_eq!(q::list_calendars(&conn, None).unwrap().len(), 2);
+
+    conn.execute("DELETE FROM accounts WHERE id = ?1", [b]).unwrap();
+    let rows = q::list_calendars(&conn, None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].account_id, a);
 }
 
 #[test]

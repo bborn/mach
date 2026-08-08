@@ -279,6 +279,124 @@ describe("requests", () => {
     expect(event.iCalUID).toBeUndefined();
   });
 
+  it("carries every field migration 6 added to a calendar", async () => {
+    // The same tripwire as the two above, one table later. `mapCalendars` also
+    // builds a fresh object literal, so a column that is stored, synced and
+    // tested in Rust is dropped in silence here unless it is named — and
+    // `WireCalendar` is our own description of the wire, so nothing type-checks
+    // the omission. Every field this asserts is one the sidebar or the edit
+    // guard actually reads.
+    const { transport } = fakeTransport({
+      list_accounts: [{ id: 1, email: "bruno@example.com", colourIndex: 1 }],
+      list_calendars: [
+        {
+          id: "c_d814cb@group.calendar.google.com",
+          accountId: 1,
+          accountEmail: "bruno@example.com",
+          name: "Alicia & Bruno",
+          colourIndex: 1,
+          eventCount: 12,
+          description: "Ours",
+          backgroundColor: "#f83a22",
+          foregroundColor: "#ffffff",
+          accessRole: "writer",
+          timeZone: "America/Chicago",
+          primary: false,
+          selected: true,
+          deleted: false,
+        },
+      ],
+    });
+
+    const [calendar] = await createIpcSource(transport).listCalendars();
+
+    expect(calendar.name).toBe("Alicia & Bruno");
+    expect(calendar.description).toBe("Ours");
+    expect(calendar.backgroundColor).toBe("#f83a22");
+    expect(calendar.foregroundColor).toBe("#ffffff");
+    expect(calendar.accessRole).toBe("writer");
+    expect(calendar.timeZone).toBe("America/Chicago");
+    expect(calendar.primary).toBe(false);
+    expect(calendar.selected).toBe(true);
+    expect(calendar.deleted).toBe(false);
+  });
+
+  it("reads a calendar the backend knows nothing about as permissive, not denied", async () => {
+    // Every calendar looks like this on the first launch after migration 6:
+    // events synced, metadata not yet fetched. Defaulting `accessRole` to
+    // `reader` here would make the whole calendar read-only until the next
+    // sweep, and defaulting `selected` to false would show an empty grid.
+    const { transport } = fakeTransport({
+      list_accounts: [{ id: 1, email: "bruno@example.com", colourIndex: 1 }],
+      list_calendars: [
+        {
+          id: "team@group.calendar.google.com",
+          accountId: 1,
+          accountEmail: "bruno@example.com",
+          name: "team@group.calendar.google.com",
+          colourIndex: 1,
+          eventCount: 3,
+        },
+      ],
+    });
+
+    const [calendar] = await createIpcSource(transport).listCalendars();
+
+    expect(calendar.accessRole).toBeUndefined();
+    expect(calendar.backgroundColor).toBeUndefined();
+    expect(calendar.description).toBeUndefined();
+    expect(calendar.timeZone).toBeUndefined();
+    expect(calendar.selected).toBe(true);
+    expect(calendar.deleted).toBe(false);
+    expect(calendar.primary).toBe(false);
+  });
+
+  it("keeps a calendar Google says is hidden, and says it is hidden", async () => {
+    const { transport } = fakeTransport({
+      list_accounts: [{ id: 1, email: "bruno@example.com", colourIndex: 1 }],
+      list_calendars: [
+        {
+          id: "muted@group.calendar.google.com",
+          accountId: 1,
+          accountEmail: "bruno@example.com",
+          name: "Muted",
+          colourIndex: 1,
+          eventCount: 0,
+          selected: false,
+          deleted: true,
+        },
+      ],
+    });
+
+    const [calendar] = await createIpcSource(transport).listCalendars();
+
+    expect(calendar.selected).toBe(false);
+    expect(calendar.deleted).toBe(true);
+  });
+
+  it("drops an access role it does not recognise rather than trusting it", async () => {
+    // An unknown role must not become a denial by accident: `canEditEvent` only
+    // withholds the editor on a positively read-only role, so `undefined` is the
+    // permissive answer and a passed-through mystery string would not be.
+    const { transport } = fakeTransport({
+      list_accounts: [{ id: 1, email: "bruno@example.com", colourIndex: 1 }],
+      list_calendars: [
+        {
+          id: "c",
+          accountId: 1,
+          accountEmail: "bruno@example.com",
+          name: "Odd",
+          colourIndex: 1,
+          eventCount: 0,
+          accessRole: "somethingNew",
+        },
+      ],
+    });
+
+    const [calendar] = await createIpcSource(transport).listCalendars();
+    expect(calendar.accessRole).toBeUndefined();
+  });
+
   it("names the thread id argument the way the Tauri command declares it", async () => {
     const { transport, calls } = fakeTransport({
       get_thread: {

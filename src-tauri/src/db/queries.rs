@@ -793,6 +793,173 @@ pub fn delete_event(conn: &Connection, event_id: i64) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// calendar metadata
+// ---------------------------------------------------------------------------
+
+const CALENDAR_COLUMNS: &str = "\
+    id, account_id, calendar_id, summary, summary_override, description, \
+    time_zone, color_id, background_color, foreground_color, access_role, \
+    is_primary, selected, deleted, synced_at";
+
+fn map_calendar(row: &Row<'_>) -> rusqlite::Result<Calendar> {
+    Ok(Calendar {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        calendar_id: row.get(2)?,
+        summary: row.get(3)?,
+        summary_override: row.get(4)?,
+        description: row.get(5)?,
+        time_zone: row.get(6)?,
+        color_id: row.get(7)?,
+        background_color: row.get(8)?,
+        foreground_color: row.get(9)?,
+        access_role: row.get(10)?,
+        is_primary: row.get(11)?,
+        selected: row.get(12)?,
+        deleted: row.get(13)?,
+        synced_at: row.get(14)?,
+    })
+}
+
+/// Every calendar the store has metadata for, newest account first.
+///
+/// Includes tombstoned rows. Filtering them out here would make the caller
+/// unable to name the events of a calendar that was unsubscribed this morning,
+/// which is the one case the tombstone exists for; `ipc::reads::list_calendars`
+/// is where that judgement belongs because it is the one that knows whether any
+/// events are left.
+pub fn list_calendars(conn: &Connection, account_id: Option<i64>) -> Result<Vec<Calendar>> {
+    let mut sql = format!("SELECT {CALENDAR_COLUMNS} FROM calendars");
+    let mut args: Vec<Value> = Vec::new();
+    if let Some(id) = account_id {
+        args.push(Value::Integer(id));
+        sql.push_str(" WHERE account_id = ?1");
+    }
+    sql.push_str(" ORDER BY account_id, is_primary DESC, calendar_id");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(args.iter()), map_calendar)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// When this account's calendar metadata was last refreshed, as the oldest
+/// `synced_at` across its rows — `None` when it has none at all.
+///
+/// The *oldest* rather than the newest, deliberately. A sweep stamps every row
+/// it writes with the same instant, so the two agree in the ordinary case; they
+/// diverge only when a row was written by something other than a full sweep, and
+/// then the honest reading of "how stale is what I know" is the staleness of the
+/// worst row rather than the best.
+pub fn calendars_synced_at(conn: &Connection, account_id: i64) -> Result<Option<i64>> {
+    Ok(conn.query_row(
+        "SELECT min(synced_at) FROM calendars WHERE account_id = ?1",
+        [account_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )?)
+}
+
+/// Write a calendar's metadata, or bring the existing row up to date.
+///
+/// Every column is overwritten, `COALESCE`d nothing. This is the opposite of
+/// [`upsert_event`], and for the opposite reason: the caller here is always a
+/// complete `calendarList.list` entry rather than a lossy expansion, so a `NULL`
+/// genuinely means "this calendar has no description any more" and preserving
+/// the old value would strand a name the user has just cleared.
+pub fn upsert_calendar(conn: &Connection, new: &NewCalendar) -> Result<i64> {
+    let id = conn.query_row(
+        "INSERT INTO calendars (account_id, calendar_id, summary, summary_override,
+                                description, time_zone, color_id, background_color,
+                                foreground_color, access_role, is_primary, selected,
+                                deleted, synced_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(account_id, calendar_id) DO UPDATE SET
+             summary          = excluded.summary,
+             summary_override = excluded.summary_override,
+             description      = excluded.description,
+             time_zone        = excluded.time_zone,
+             color_id         = excluded.color_id,
+             background_color = excluded.background_color,
+             foreground_color = excluded.foreground_color,
+             access_role      = excluded.access_role,
+             is_primary       = excluded.is_primary,
+             selected         = excluded.selected,
+             deleted          = excluded.deleted,
+             synced_at        = excluded.synced_at
+         RETURNING id",
+        params![
+            new.account_id,
+            new.calendar_id,
+            new.summary,
+            new.summary_override,
+            new.description,
+            new.time_zone,
+            new.color_id,
+            new.background_color,
+            new.foreground_color,
+            new.access_role,
+            new.is_primary,
+            new.selected,
+            new.deleted,
+            new.synced_at,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(id)
+}
+
+/// Tombstone every calendar of this account that `present` does not mention.
+///
+/// This is what an unsubscribe looks like from here: the calendar simply stops
+/// appearing in `calendarList.list`, with no event and no farewell. Deleting the
+/// row would be the tidy answer and the wrong one — its events are still in
+/// `events`, still inside the visible window, and still drawn on the grid, so
+/// removing the only thing that knows their name puts the sidebar back to
+/// showing `c_8f3…@group.calendar.google.com`. Marking it keeps the name and
+/// tells sync to stop asking.
+///
+/// Returns how many rows were newly tombstoned.
+pub fn tombstone_missing_calendars(
+    conn: &Connection,
+    account_id: i64,
+    present: &[String],
+) -> Result<usize> {
+    let mut sql = String::from(
+        "UPDATE calendars SET deleted = 1 WHERE account_id = ?1 AND deleted = 0",
+    );
+    let mut args: Vec<Value> = vec![Value::Integer(account_id)];
+    if !present.is_empty() {
+        let placeholders: Vec<String> = present
+            .iter()
+            .map(|id| {
+                args.push(Value::Text(id.clone()));
+                format!("?{}", args.len())
+            })
+            .collect();
+        sql.push_str(&format!(
+            " AND calendar_id NOT IN ({})",
+            placeholders.join(", ")
+        ));
+    }
+    Ok(conn.execute(&sql, params_from_iter(args.iter()))?)
+}
+
+/// How many events the store holds per `(account_id, calendar_id)`.
+///
+/// Separate from [`list_calendars`] rather than a `LEFT JOIN` on it, because the
+/// two answer different questions and only one of them can be empty: a calendar
+/// with metadata and no events is a real answer, and so is a calendar with
+/// events and no metadata. Reading both and merging is what lets
+/// `ipc::reads::list_calendars` cover the second case at all.
+pub fn event_counts_by_calendar(conn: &Connection) -> Result<Vec<(i64, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_id, calendar_id, count(*) FROM events
+         GROUP BY account_id, calendar_id",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+// ---------------------------------------------------------------------------
 // search
 // ---------------------------------------------------------------------------
 

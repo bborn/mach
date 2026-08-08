@@ -45,4 +45,5 @@ dotenvy = "0.15.7"
 # main.js is what makes "same version, different bytes" reportable.
 sha2 = "0.10.9"
 hex = "0.4.3"
+tauri-plugin-notification = "2.3.3"
 

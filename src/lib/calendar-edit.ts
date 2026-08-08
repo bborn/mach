@@ -18,7 +18,12 @@
  *     of both ends and Google rejects a half-converted pair.
  */
 
-import type { CalendarEvent, CalendarId, Participant } from "@/types";
+import type {
+  CalendarAccessRole,
+  CalendarEvent,
+  CalendarId,
+  Participant,
+} from "@/types";
 import type { EventDraft, EventPatch } from "./data";
 import { DEFAULT_EVENT_MINUTES } from "./calendar-geometry";
 import { DAY, MINUTE, startOfDay } from "./time";
@@ -380,11 +385,27 @@ function sameRules(a: readonly string[], b: readonly string[]): boolean {
  * `accountEmails` is the last resort for the same reason: an event whose
  * organizer is one of the owner's own addresses is his, whatever `self` says
  * about the particular copy in front of us.
+ *
+ * **The calendar can veto, and only the calendar can veto.** `accessRole` is
+ * Google's answer to a different question — not "is this event yours" but "may
+ * you write to this calendar at all" — and a `reader` subscription refuses every
+ * write regardless of who organized what. A subscribed holiday calendar is the
+ * clearest case: every event on it is organized by Google, `guestsCanModify` is
+ * meaningless, and offering an editor produces a 403 a round trip later.
+ *
+ * It is checked first and it can only ever say *no*, which is the shape that
+ * keeps this one decision rather than two. `owner` and `writer` do not grant an
+ * edit on a stranger's invitation; they simply decline to remove one. And the
+ * same silence rule applies once more: `undefined` is a calendar whose metadata
+ * has never been fetched — every calendar, on the first launch after migration 6
+ * — so it means "not told", never "denied".
  */
 export function canEditEvent(
   event: CalendarEvent,
   accountEmails: readonly string[] = [],
+  accessRole?: CalendarAccessRole,
 ): boolean {
+  if (accessRole === "reader" || accessRole === "freeBusyReader") return false;
   if (event.organizerSelf === undefined) return true;
   if (event.organizerSelf) return true;
   if (event.guestsCanModify) return true;

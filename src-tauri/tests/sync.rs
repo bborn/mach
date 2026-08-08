@@ -130,8 +130,10 @@ struct Mailbox {
     history: Vec<(u64, Value)>,
     history_id: u64,
     labels: Vec<(String, String, String)>,
-    /// `(calendar id, is primary)`
-    calendars: Vec<(String, bool)>,
+    /// `calendarList.list` entries, verbatim. Whole JSON rather than
+    /// `(id, primary)` because the metadata sweep reads names, colours and
+    /// access roles off them now, and a tuple could only ever grow.
+    calendars: Vec<Value>,
     /// Everything in the window, answered by a full `events.list`.
     events: BTreeMap<String, Vec<Value>>,
     /// What an incremental (`syncToken`) call will report next, then cleared.
@@ -159,7 +161,7 @@ impl Mailbox {
                 ("STARRED".into(), "STARRED".into(), "system".into()),
                 ("Label_7".into(), "Receipts".into(), "user".into()),
             ],
-            calendars: vec![("primary".into(), true)],
+            calendars: vec![calendar_entry("primary", true)],
             events: BTreeMap::new(),
             pending: BTreeMap::new(),
             sync_token_seq: 0,
@@ -528,12 +530,10 @@ impl FakeGoogle {
         let tail: Vec<&str> = segments.iter().skip(2).map(|s| s.as_str()).collect();
         match tail.as_slice() {
             ["users", "me", "calendarList"] => {
-                let items: Vec<Value> = mailbox
-                    .calendars
-                    .iter()
-                    .map(|(id, primary)| json!({ "id": id, "primary": primary }))
-                    .collect();
-                HttpResponse::json(200, json!({ "items": items }).to_string())
+                HttpResponse::json(
+                    200,
+                    json!({ "items": mailbox.calendars.clone() }).to_string(),
+                )
             }
 
             ["calendars", calendar_id, "events"] => {
@@ -1532,6 +1532,11 @@ async fn one_account_failing_does_not_stop_the_others() {
 // calendar
 // ===========================================================================
 
+/// The minimum `calendarList.list` entry: an id and whether it is the primary.
+fn calendar_entry(id: &str, primary: bool) -> Value {
+    json!({ "id": id, "primary": primary, "selected": true, "accessRole": "owner" })
+}
+
 fn event_json(id: &str, summary: &str, start: &str, end: &str) -> Value {
     json!({
         "id": id,
@@ -1768,6 +1773,208 @@ async fn calendar_sync_keeps_the_fields_an_event_can_only_be_read_back_from() {
     // An instance carries no rule of its own, and inventing one would be worse
     // than the empty list that honestly says "no rule is known here".
     assert!(all_hands.recurrence.is_empty());
+}
+
+#[tokio::test]
+async fn calendar_metadata_is_stored_and_then_left_alone_for_hours() {
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+    let token = format!("tok-{account_id}");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    mailbox.calendars = vec![
+        json!({
+            "id": "one@example.com",
+            "summary": "one@example.com",
+            "primary": true,
+            "selected": true,
+            "accessRole": "owner",
+            "backgroundColor": "#9fe1e7",
+            "foregroundColor": "#000000",
+            "colorId": "14",
+            "timeZone": "America/Chicago",
+        }),
+        json!({
+            "id": "c_d814cb@group.calendar.google.com",
+            "summary": "Alicia's calendar",
+            "summaryOverride": "Alicia & Bruno",
+            "description": "Ours",
+            "selected": false,
+            "accessRole": "writer",
+            "backgroundColor": "#f83a22",
+        }),
+    ];
+    google.install(&token, mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+
+    let stored = db
+        .read(move |conn| queries::list_calendars(conn, Some(account_id)))
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+
+    let primary = stored.iter().find(|c| c.is_primary).expect("primary");
+    assert_eq!(primary.background_color.as_deref(), Some("#9fe1e7"));
+    assert_eq!(primary.color_id.as_deref(), Some("14"));
+    assert_eq!(primary.time_zone.as_deref(), Some("America/Chicago"));
+    assert_eq!(primary.access_role.as_deref(), Some("owner"));
+
+    let shared = stored.iter().find(|c| !c.is_primary).expect("shared");
+    assert_eq!(shared.title(), Some("Alicia & Bruno"));
+    assert_eq!(shared.summary.as_deref(), Some("Alicia's calendar"));
+    assert_eq!(shared.description.as_deref(), Some("Ours"));
+    assert!(!shared.selected, "Google's own visibility flag is kept");
+
+    // --- and now the point: a second pass does not ask again ---------------
+    let listed = google.requests_matching("calendarList").len();
+    assert_eq!(listed, 1);
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+    assert_eq!(
+        google.requests_matching("calendarList").len(),
+        listed,
+        "the calendar list must not be refetched every tick"
+    );
+    // The events still synced, so the skip is of the metadata call alone.
+    assert_eq!(google.requests_matching("/events?").len(), 4);
+}
+
+#[tokio::test]
+async fn a_calendar_that_disappears_is_tombstoned_and_its_events_survive() {
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+    let token = format!("tok-{account_id}");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    mailbox.calendars = vec![
+        calendar_entry("one@example.com", true),
+        json!({
+            "id": "book-club@group.calendar.google.com",
+            "summary": "Book club",
+            "selected": true,
+            "accessRole": "reader",
+        }),
+    ];
+    mailbox.events.insert(
+        "book-club@group.calendar.google.com".into(),
+        vec![event_json(
+            "b1",
+            "Chapter 4",
+            "2026-08-10T19:00:00Z",
+            "2026-08-10T20:00:00Z",
+        )],
+    );
+    google.install(&token, mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+    assert_eq!(
+        db.read(|conn| queries::events_in_range(conn, 0, i64::MAX, None))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Unsubscribe, and force the metadata to be refetched by ageing it out.
+    google.with(&token, |mailbox| {
+        mailbox.calendars = vec![calendar_entry("one@example.com", true)];
+    });
+    db.write(|conn| {
+        conn.execute("UPDATE calendars SET synced_at = 0", [])?;
+        Ok(())
+    })
+    .unwrap();
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+
+    let stored = db
+        .read(move |conn| queries::list_calendars(conn, Some(account_id)))
+        .unwrap();
+    let gone = stored
+        .iter()
+        .find(|c| c.calendar_id.starts_with("book-club"))
+        .expect("the row survives the unsubscribe");
+    assert!(gone.deleted);
+    assert_eq!(gone.title(), Some("Book club"));
+
+    // Its events are still here — orphaning them is the failure this guards.
+    let events = db
+        .read(|conn| queries::events_in_range(conn, 0, i64::MAX, None))
+        .unwrap();
+    assert!(events.iter().any(|e| e.title == "Chapter 4"));
+
+    // And nothing asks Google about it any more.
+    let swept = google.requests_matching("book-club");
+    assert_eq!(
+        swept.len(),
+        1,
+        "a tombstoned calendar must not be swept again: {swept:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_calendar_list_falls_back_to_what_is_already_known() {
+    // The metadata is a nicety; the events are the point. A transient failure
+    // on the list must not blank the week.
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+    let token = format!("tok-{account_id}");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    mailbox.events.insert(
+        "primary".into(),
+        vec![event_json(
+            "e1",
+            "Standup",
+            "2026-08-10T09:00:00Z",
+            "2026-08-10T09:15:00Z",
+        )],
+    );
+    google.install(&token, mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+
+    // Age the metadata out so the next pass tries to refetch it, and break the
+    // account so that refetch fails.
+    db.write(|conn| {
+        conn.execute("UPDATE calendars SET synced_at = 0", [])?;
+        Ok(())
+    })
+    .unwrap();
+    google.with(&token, |mailbox| {
+        mailbox.fail_with = Some((500, "calendarList is having a moment".into()));
+    });
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    let outcome = engine.sync_once().await;
+    let account = outcome.account(account_id).unwrap();
+    // The events call fails too in this fixture, so the pass reports an error —
+    // what matters is *which* error, i.e. that the pass got as far as asking
+    // for events at all rather than stopping at the metadata.
+    assert!(
+        google
+            .requests_matching("/events?")
+            .iter()
+            .filter(|r| r.contains("syncToken="))
+            .count()
+            >= 1,
+        "the sweep must still have been attempted: {:?}",
+        account.error
+    );
+
+    // The stored metadata is untouched by the failure.
+    let stored = db
+        .read(move |conn| queries::list_calendars(conn, Some(account_id)))
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].calendar_id, "primary");
 }
 
 // ===========================================================================

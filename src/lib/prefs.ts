@@ -39,6 +39,15 @@
  *   | `weekStartsOn` | `viewRange` in `useMach`, via `CalendarMode` |
  *   | `workingHours` | `TimeGrid` — the shaded band and the opening scroll |
  *   | `syncIntervalSeconds` | Rust: `ipc::prefs`, straight into the sync loop |
+ *   | `notificationsEnabled` | Rust: `notify::plan`, before it decides anything |
+ *   | `notificationAccounts` | Rust: `notify::plan`, per account |
+ *   | `badgeEnabled` | Rust: `notify::badge`, on every recompute |
+ *
+ * The last three are read only in Rust, and that is not an inconsistency. A
+ * notification is a decision about a message that has *just arrived*, which is
+ * knowledge the sync loop has and the window does not — the window may not even
+ * be open. So these three are settings the frontend writes and never reads,
+ * which is exactly the shape `syncIntervalSeconds` already had.
  *
  * # Transport
  *
@@ -96,6 +105,29 @@ export interface Preferences {
   sendDelaySeconds: number;
   weekStartsOn: WeekStart;
   workingHours: WorkingHours;
+  /**
+   * Whether new mail is allowed to interrupt.
+   *
+   * On by default, which is the one place this file breaks its own rule about
+   * defaults matching the old behaviour. The old behaviour was silence, and
+   * silence is the bug: a client you leave open all day that never says
+   * anything is one you have to keep checking, which is the thing it was
+   * supposed to replace. What makes "on" safe is that the rule behind it is
+   * narrow — see `notify::rule` — so this is not a switch that turns 61,000
+   * messages into 61,000 banners.
+   */
+  notificationsEnabled: boolean;
+  /**
+   * Account id (as a string key, like `signatures`) to `false` for the
+   * mailboxes that should stay quiet.
+   *
+   * Absent means "notify", so adding an account does not require a visit to
+   * this dialog before you hear from it — and removing one leaves a key nobody
+   * reads rather than a mute that silently transfers to the next id.
+   */
+  notificationAccounts: Record<string, boolean>;
+  /** The unread count on the Dock icon. */
+  badgeEnabled: boolean;
 }
 
 /**
@@ -112,6 +144,9 @@ export const DEFAULT_PREFERENCES: Preferences = {
   sendDelaySeconds: 10,
   weekStartsOn: 1,
   workingHours: { start: 9, end: 17 },
+  notificationsEnabled: true,
+  notificationAccounts: {},
+  badgeEnabled: true,
 };
 
 export interface Bounds {
@@ -188,6 +223,28 @@ function signatures(value: unknown): Record<string, string> {
 }
 
 /**
+ * Which accounts are muted, with anything that is not a boolean dropped.
+ *
+ * Only the `false` entries are kept. `true` is the default already, so storing
+ * it would be a row that says nothing and a second way to spell the same state
+ * — and two spellings is how a mute ends up depending on which one was written
+ * last.
+ */
+function mutedAccounts(value: unknown): Record<string, boolean> {
+  if (!isRecord(value)) return {};
+  const out: Record<string, boolean> = {};
+  for (const [key, muted] of Object.entries(value)) {
+    if (muted === false) out[key] = false;
+  }
+  return out;
+}
+
+/** A stored boolean, or the default. */
+function flag(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+/**
  * Whatever the store handed back, as a `Preferences` that is definitely a
  * `Preferences`. Unknown keys are ignored; missing and malformed ones default.
  */
@@ -221,6 +278,9 @@ export function parsePreferences(raw: unknown): Preferences {
         ? (source.weekStartsOn as WeekStart)
         : d.weekStartsOn,
     workingHours: workingHours(source.workingHours, d.workingHours),
+    notificationsEnabled: flag(source.notificationsEnabled, d.notificationsEnabled),
+    notificationAccounts: mutedAccounts(source.notificationAccounts),
+    badgeEnabled: flag(source.badgeEnabled, d.badgeEnabled),
   };
 }
 
@@ -234,6 +294,32 @@ export function undoWindowMs(prefs: Preferences): number {
 
 export function sendDelayMs(prefs: Preferences): number {
   return prefs.sendDelaySeconds * 1000;
+}
+
+/**
+ * Whether one account is allowed to interrupt. Absent means yes — see
+ * {@link Preferences.notificationAccounts}.
+ */
+export function notifiesAccount(prefs: Preferences, accountId: number): boolean {
+  return prefs.notificationAccounts[String(accountId)] !== false;
+}
+
+/**
+ * The map with one account switched on or off.
+ *
+ * Returns a new object rather than mutating, because it is written straight
+ * into React state; and it deletes rather than storing `true`, so the stored
+ * map only ever holds the exceptions.
+ */
+export function withAccountNotifying(
+  prefs: Preferences,
+  accountId: number,
+  notifying: boolean,
+): Record<string, boolean> {
+  const next = { ...prefs.notificationAccounts };
+  if (notifying) delete next[String(accountId)];
+  else next[String(accountId)] = false;
+  return next;
 }
 
 /** The signature for an account, or `""` when there is none. */
@@ -350,6 +436,73 @@ export async function writePreference<K extends keyof Preferences>(
     return;
   }
   await invoke("set_preference", { key, value });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Notification permission — not a preference, but the dialog has to show it   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What macOS will let Mach do, which is not the same question as what the user
+ * asked for.
+ *
+ * `permission` is the operating system's answer; `available` is whether there
+ * is anything to deliver through at all — false in a QA instance, and in the
+ * browser that `bun run dev` serves. Both exist so that ⌘, can explain a switch
+ * that is on and silent, rather than leaving the user to wonder.
+ *
+ * It lives beside the preferences rather than in `lib/ipc.ts` for the reason
+ * the top of this file gives for `get_preferences`: this is settings-surface
+ * plumbing, not part of the read model the data seam abstracts, and the fixture
+ * source has no business implementing it.
+ */
+export interface NotificationStatus {
+  permission: "granted" | "denied" | "prompt";
+  available: boolean;
+}
+
+/** What a place with no notifications looks like. Never an error. */
+export const NO_NOTIFICATIONS: NotificationStatus = {
+  permission: "prompt",
+  available: false,
+};
+
+function parseNotificationStatus(raw: unknown): NotificationStatus {
+  if (!isRecord(raw)) return NO_NOTIFICATIONS;
+  const permission = raw.permission;
+  return {
+    permission:
+      permission === "granted" || permission === "denied" ? permission : "prompt",
+    available: raw.available === true,
+  };
+}
+
+/** Ask without asking macOS anything it has not been asked already. */
+export async function loadNotificationStatus(): Promise<NotificationStatus> {
+  if (!isTauri()) return NO_NOTIFICATIONS;
+  try {
+    return parseNotificationStatus(await invoke<unknown>("notification_state"));
+  } catch {
+    return NO_NOTIFICATIONS;
+  }
+}
+
+/**
+ * Ask macOS for permission, now.
+ *
+ * Called when the switch is turned on and at no other time. A prompt that
+ * arrives at launch — before there is any mail, and before the user has any
+ * idea what the app wants — is the one people refuse out of reflex.
+ */
+export async function requestNotificationPermission(): Promise<NotificationStatus> {
+  if (!isTauri()) return NO_NOTIFICATIONS;
+  try {
+    return parseNotificationStatus(
+      await invoke<unknown>("notification_request_permission"),
+    );
+  } catch {
+    return NO_NOTIFICATIONS;
+  }
 }
 
 /* -------------------------------------------------------------------------- */

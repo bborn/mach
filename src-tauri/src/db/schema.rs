@@ -38,7 +38,80 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         sql: M5_EVENT_ROUND_TRIP,
     },
+    Migration {
+        version: 6,
+        sql: M6_CALENDARS,
+    },
 ];
+
+/// Migration 6 — `calendars`, because a calendar has never had a name.
+///
+/// `list_calendars` answered from `SELECT DISTINCT calendar_id FROM events`, and
+/// a calendar id is not a name: `en.usa#holiday@group.v.calendar.google.com`,
+/// `c_8f3…@group.calendar.google.com`, and — for the calendar Google labels with
+/// the account holder's own name — the account's email address. The sidebar then
+/// invented something readable on top of that (`Shared · d814cb`), which is what
+/// you do when there is nothing to show. There was nothing to show because
+/// `calendarList.list` had a client and no caller: none of the real metadata had
+/// ever been fetched.
+///
+/// This is the table that was missing. One row per `(account, calendar)`,
+/// holding what Google actually says:
+///
+///  * `summary` and `summary_override` — the name, in two columns, because they
+///    are two different facts. `summary` is what the calendar's *owner* called
+///    it; `summary_override` is what *this* account renamed its own subscription
+///    to. The override wins, and it is the entire reason a calendar can read
+///    "Dad/Ben Schedule" here and something else in its owner's account.
+///  * `background_color`, `foreground_color`, `color_id` — Google's spelling
+///    rather than the British one on `accounts.colour_index`, because these are
+///    the API's words and not Mach's, and a column that is a verbatim copy of a
+///    wire field should be searchable by that field's name.
+///  * `access_role` — `owner`, `writer`, `reader` or `freeBusyReader`. Nullable,
+///    and read permissively: every row that predates a metadata fetch says
+///    nothing about access, and "we were not told" must never collapse into
+///    "read-only" or the whole calendar goes flat on first launch.
+///  * `selected` — Google's own "is this calendar shown". It defaults to 1 so
+///    that a calendar Mach learns about some other way is visible rather than
+///    silently absent.
+///  * `deleted` — a tombstone, not a `DELETE`. A calendar unsubscribed or
+///    removed between two syncs still has events sitting in `events`, and
+///    dropping its row would leave them nameless, which is precisely the state
+///    this migration exists to end. The row stays, marked; sync stops asking
+///    about it; the sidebar keeps naming it for as long as its events are still
+///    on screen.
+///  * `synced_at` — when this row was last refreshed. The calendar list is a
+///    dozen rows that change a few times a year, so this is what lets the
+///    calendar pass skip the request on almost every tick instead of asking
+///    Google every minute for an answer that has not moved.
+///
+/// `events` is deliberately *not* foreign-keyed to this table. Event rows are
+/// written by a sweep that knows a calendar id and nothing else, and a
+/// constraint would mean the metadata fetch had to succeed before a single event
+/// could land — coupling the cheap, frequent write to the rare, skippable one.
+/// The two are joined by `(account_id, calendar_id)` at read time instead, and
+/// `list_calendars` still falls back to the derived list for a calendar that has
+/// events but no row yet, so nothing disappears mid-migration.
+const M6_CALENDARS: &str = r#"
+CREATE TABLE calendars (
+    id               INTEGER PRIMARY KEY,
+    account_id       INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    calendar_id      TEXT    NOT NULL,
+    summary          TEXT,
+    summary_override TEXT,
+    description      TEXT,
+    time_zone        TEXT,
+    color_id         TEXT,
+    background_color TEXT,
+    foreground_color TEXT,
+    access_role      TEXT,
+    is_primary       INTEGER NOT NULL DEFAULT 0,
+    selected         INTEGER NOT NULL DEFAULT 1,
+    deleted          INTEGER NOT NULL DEFAULT 0,
+    synced_at        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (account_id, calendar_id)
+);
+"#;
 
 /// Migration 5 — the six event fields that were sent but never kept.
 ///
