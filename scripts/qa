@@ -5,6 +5,7 @@ set -euo pipefail
 #
 #   qa up            launch YOUR instance (the real mailbox)
 #   qa down          stop it
+#   qa restart       rebuild and relaunch — what you want after a `git pull`
 #   qa shoot NAME    screenshot the window -> .qa/<instance>/NAME.png
 #   qa state         process, window, accounts, sync watermark, row counts
 #   qa logs [n]      tail the log
@@ -333,9 +334,30 @@ cmd_click() {
 
 cmd_logs() { tail -n "${1:-30}" "$LOG"; }
 
+# Rebuild, then restart onto what was just built.
+#
+# The rebuild is the point. The frontend hot-reloads through Vite, so after a
+# `git pull` the window looks current while the Rust half is whatever was
+# running before — a mismatched pair that fails in ways that look like ordinary
+# bugs. It has cost this project a whole afternoon twice: once chasing a
+# calendar save path that was already fixed, once with preferences silently
+# having nowhere to persist to because the migration was not in the process.
+#
+# `cargo build` is incremental, so this is a second or two when nothing changed.
+cmd_restart() {
+  echo "building…"
+  ( cd "$REPO/src-tauri" && cargo build 2>&1 | grep -E '^(error|warning)' ) && {
+    echo "qa[$INSTANCE]: build reported problems — not restarting" >&2
+    return 1
+  }
+  cmd_down
+  cmd_up
+}
+
 case "${1:-}" in
-  up)    shift; cmd_up "$@" ;;
-  down)  shift; cmd_down "$@" ;;
+  up)      shift; cmd_up "$@" ;;
+  down)    shift; cmd_down "$@" ;;
+  restart) shift; cmd_restart "$@" ;;
   seed)  shift; cmd_seed "$@" ;;
   shoot) shift; cmd_shoot "$@" ;;
   state) shift; cmd_state "$@" ;;
