@@ -357,6 +357,14 @@ export function nearestRampSlot(hex: string, ramp: readonly string[]): number | 
  *
  * `fallback` is `assignHues` from `calendar-palette.ts`, injected for the same
  * reason `ramp` is.
+ *
+ * Room for a local override, if it is ever wanted: this takes `backgroundColor`
+ * per calendar rather than reading the store, so "let me set colours myself"
+ * is a stored `Record<CalendarId, string>` merged over `calendars` at the one
+ * call site, and nothing below this function changes. It is deliberately not
+ * built yet — Google already answers the question, and a second source of truth
+ * for a calendar's colour would have to be reconciled every time the user
+ * changes it in Google.
  */
 export function assignCalendarColors(
   calendars: readonly { id: string; backgroundColor?: string }[],
