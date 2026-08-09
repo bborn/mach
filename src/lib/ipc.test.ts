@@ -279,6 +279,119 @@ describe("requests", () => {
     expect(event.iCalUID).toBeUndefined();
   });
 
+  it("carries the conference, the guests and the creator migration 7 added", async () => {
+    // Third time on this mapper, same trap: a fresh object literal, a wire type
+    // we wrote by hand, and no type error for a field nobody names. Everything
+    // asserted here is stored in SQLite, filled in by sync, covered by a Rust
+    // test, and rendered by the modal — all of which is worth nothing if it is
+    // dropped between Rust and React, which is exactly what happened to
+    // `recurringEventId`, then to all of migration 5, then to migration 6.
+    const { transport } = fakeTransport({
+      list_events: [
+        {
+          id: 1,
+          accountId: 1,
+          calendarId: "c",
+          title: "Team standup",
+          startTs: 100,
+          endTs: 150,
+          creator: { email: "ops@offerlab.com", name: "Ops Bot" },
+          guests: [
+            { email: "dana@offerlab.com", name: "Dana", response: "declined",
+              comment: "Declined because I am out of office" },
+            { email: "sean@offerlab.com", response: "tentative", organizer: true, optional: true },
+            { email: "me@example.com", response: "accepted", isSelf: true },
+          ],
+          conference: {
+            id: "abc-defg-hij",
+            name: "Google Meet",
+            entryPoints: [
+              { kind: "video", uri: "https://meet.google.com/abc-defg-hij",
+                label: "meet.google.com/abc-defg-hij" },
+              { kind: "phone", uri: "tel:+1-513-555-0199", label: "+1 513-555-0199",
+                pin: "396011834", regionCode: "US" },
+            ],
+          },
+          attachments: [{ title: "Sprint notes", url: "https://drive.google.com/open?id=1AbC" }],
+          visibility: "private",
+          transparency: "transparent",
+        },
+      ],
+    });
+
+    const [event] = await createIpcSource(transport).listEvents({ start: 0, end: 999 });
+
+    expect(event.creator).toEqual({ name: "Ops Bot", email: "ops@offerlab.com" });
+    expect(event.guests?.[0]).toMatchObject({
+      email: "dana@offerlab.com",
+      response: "declined",
+      comment: "Declined because I am out of office",
+    });
+    expect(event.guests?.[1]).toMatchObject({ organizer: true, optional: true });
+    expect(event.guests?.[2]?.isSelf).toBe(true);
+    expect(event.conference?.id).toBe("abc-defg-hij");
+    expect(event.conference?.entryPoints).toHaveLength(2);
+    expect(event.conference?.entryPoints[1]).toMatchObject({
+      kind: "phone",
+      uri: "tel:+1-513-555-0199",
+      pin: "396011834",
+      regionCode: "US",
+    });
+    expect(event.attachments?.[0]?.url).toBe("https://drive.google.com/open?id=1AbC");
+    expect(event.visibility).toBe("private");
+    expect(event.transparency).toBe("transparent");
+  });
+
+  it("drops a conference entry point with nowhere to go, and an empty conference with it", async () => {
+    // An entry point with no uri renders as an empty line and dials nothing, and
+    // a conference block with no way in is a heading over a blank.
+    const { transport } = fakeTransport({
+      list_events: [
+        {
+          id: 1,
+          accountId: 1,
+          calendarId: "c",
+          title: "Sync",
+          startTs: 100,
+          endTs: 150,
+          conference: { name: "Google Meet", entryPoints: [{ kind: "sip" }] },
+        },
+      ],
+    });
+
+    const [event] = await createIpcSource(transport).listEvents({ start: 0, end: 999 });
+    expect(event.conference).toBeUndefined();
+  });
+
+  it("keeps “no answer” distinct from “has not answered” on a guest", async () => {
+    // A row written before migration 7 has addresses and no answers. Collapsing
+    // that to `needsAction` would put guests into the "awaiting" count that
+    // nobody has ever been asked about.
+    const { transport } = fakeTransport({
+      list_events: [
+        {
+          id: 1,
+          accountId: 1,
+          calendarId: "c",
+          title: "Old row",
+          startTs: 100,
+          endTs: 150,
+          guests: [{ email: "ada@example.com" }, { email: "b@x.com", response: "somethingNew" }],
+        },
+      ],
+    });
+
+    const [event] = await createIpcSource(transport).listEvents({ start: 0, end: 999 });
+    expect(event.guests?.[0]?.response).toBeUndefined();
+    expect(event.guests?.[0]?.optional).toBe(false);
+    // A response Google has never sent is not passed through as if it were one.
+    expect(event.guests?.[1]?.response).toBeUndefined();
+    expect(event.creator).toBeUndefined();
+    expect(event.conference).toBeUndefined();
+    expect(event.attachments).toBeUndefined();
+    expect(event.visibility).toBeUndefined();
+  });
+
   it("carries every field migration 6 added to a calendar", async () => {
     // The same tripwire as the two above, one table later. `mapCalendars` also
     // builds a fresh object literal, so a column that is stored, synced and

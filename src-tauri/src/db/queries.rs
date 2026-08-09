@@ -607,7 +607,8 @@ pub(crate) const EVENT_COLUMNS: &str = "\
     id, account_id, calendar_id, google_event_id, title, description, location, \
     start_ts, end_ts, is_all_day, attendees, rsvp_status, recurring_event_id, \
     status, html_link, updated_at, recurrence, reminders, ical_uid, organizer, \
-    organizer_self, guests_can_modify";
+    organizer_self, guests_can_modify, conference, guests, creator, attachments, \
+    visibility, transparency";
 
 /// Read an event row selected with [`EVENT_COLUMNS`].
 ///
@@ -622,7 +623,29 @@ pub(crate) fn map_event(row: &Row<'_>) -> rusqlite::Result<Event> {
     let recurrence: Option<String> = row.get(16)?;
     let reminders: Option<String> = row.get(17)?;
     let organizer: Option<String> = row.get(19)?;
+    let conference: Option<String> = row.get(22)?;
+    let guests: Option<String> = row.get(23)?;
+    let creator: Option<String> = row.get(24)?;
+    let attachments: Option<String> = row.get(25)?;
+
+    let attendees = people_from_json(&attendees);
+    // A row written before migration 7, or one a local edit has just changed the
+    // guest list of, knows the addresses and not the answers. Projecting the
+    // addresses into guest rows means every reader gets one list to render
+    // rather than two to reconcile — and a guest with no `response` says
+    // "nobody told us", which is exactly true.
+    let guests: Vec<crate::db::models::EventGuest> = guests
+        .as_deref()
+        .and_then(json_opt)
+        .unwrap_or_else(|| attendees.iter().map(guest_from_participant).collect());
+
     Ok(Event {
+        guests,
+        conference: conference.as_deref().and_then(json_opt),
+        creator: creator.as_deref().and_then(json_opt),
+        attachments: json_or_default(attachments.as_deref()),
+        visibility: row.get(26)?,
+        transparency: row.get(27)?,
         id: row.get(0)?,
         account_id: row.get(1)?,
         calendar_id: row.get(2)?,
@@ -633,7 +656,7 @@ pub(crate) fn map_event(row: &Row<'_>) -> rusqlite::Result<Event> {
         start_ts: row.get(7)?,
         end_ts: row.get(8)?,
         is_all_day: row.get(9)?,
-        attendees: people_from_json(&attendees),
+        attendees,
         rsvp_status: rsvp.as_deref().and_then(RsvpStatus::parse),
         recurring_event_id: row.get(12)?,
         recurrence: json_or_default(recurrence.as_deref()),
@@ -646,6 +669,15 @@ pub(crate) fn map_event(row: &Row<'_>) -> rusqlite::Result<Event> {
         html_link: row.get(14)?,
         updated_at: row.get(15)?,
     })
+}
+
+/// A guest row for someone we know only as an address.
+fn guest_from_participant(p: &crate::db::models::Participant) -> crate::db::models::EventGuest {
+    crate::db::models::EventGuest {
+        email: p.email.clone(),
+        name: p.name.clone(),
+        ..Default::default()
+    }
 }
 
 /// Decode a JSON column, falling back to the type's default.
@@ -730,7 +762,8 @@ pub fn upsert_event(conn: &Connection, new: &NewEvent) -> Result<i64> {
                              location, start_ts, end_ts, is_all_day, attendees, rsvp_status,
                              recurring_event_id, status, html_link, updated_at,
                              recurrence, reminders, ical_uid, organizer, organizer_self,
-                             guests_can_modify)
+                             guests_can_modify, conference, guests, creator, attachments,
+                             visibility, transparency)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                  COALESCE(?16, (SELECT sibling.recurrence FROM events sibling
                                  WHERE sibling.account_id = ?1
@@ -738,7 +771,7 @@ pub fn upsert_event(conn: &Connection, new: &NewEvent) -> Result<i64> {
                                    AND sibling.recurring_event_id = ?12
                                    AND sibling.recurrence IS NOT NULL
                                  LIMIT 1)),
-                 ?17, ?18, ?19, ?20, ?21)
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
          ON CONFLICT(account_id, calendar_id, google_event_id) DO UPDATE SET
              title              = excluded.title,
              description        = excluded.description,
@@ -757,7 +790,20 @@ pub fn upsert_event(conn: &Connection, new: &NewEvent) -> Result<i64> {
              ical_uid           = COALESCE(excluded.ical_uid, events.ical_uid),
              organizer          = COALESCE(excluded.organizer, events.organizer),
              organizer_self     = COALESCE(excluded.organizer_self, events.organizer_self),
-             guests_can_modify  = COALESCE(excluded.guests_can_modify, events.guests_can_modify)
+             guests_can_modify  = COALESCE(excluded.guests_can_modify, events.guests_can_modify),
+             -- Not COALESCEd, unlike the five above. Google puts all of these on
+             -- every expanded occurrence, so a sync that says nothing is a sync
+             -- that means nothing: a conference that has been removed, a guest
+             -- who has been uninvited, an attachment that has been detached.
+             -- Preserving those would be preserving a meeting that no longer
+             -- exists, which is the opposite failure to the one the COALESCEs
+             -- above are there for.
+             conference         = excluded.conference,
+             guests             = excluded.guests,
+             creator            = COALESCE(excluded.creator, events.creator),
+             attachments        = excluded.attachments,
+             visibility         = excluded.visibility,
+             transparency       = excluded.transparency
          RETURNING id",
         params![
             new.account_id,
@@ -781,6 +827,12 @@ pub fn upsert_event(conn: &Connection, new: &NewEvent) -> Result<i64> {
             json_of(new.organizer.as_ref()),
             new.organizer_self,
             new.guests_can_modify,
+            json_of(new.conference.as_ref()),
+            json_if_present(&new.guests),
+            json_of(new.creator.as_ref()),
+            json_if_present(&new.attachments),
+            new.visibility,
+            new.transparency,
         ],
         |row| row.get(0),
     )?;

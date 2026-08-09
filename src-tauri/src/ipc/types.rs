@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::db::models::{ThreadCursor, ThreadSummary, ThreadWithMessages};
 use crate::sync::AccountStatus;
 
-pub use crate::db::models::{Account, Attachment, Event, Label, Message, Participant, RsvpStatus};
+pub use crate::db::models::{
+    Account, Attachment, ConferenceEntry, Event, EventAttachment, EventConference, EventGuest,
+    Label, Message, Participant, RsvpStatus,
+};
 
 /// What `get_thread` returns: the summary row plus its whole conversation.
 pub type ThreadDetail = ThreadWithMessages;

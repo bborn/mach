@@ -13,6 +13,7 @@ import { CommandPalette } from "@/components/palette/CommandPalette";
 import { ShortcutSheet } from "@/components/chrome/ShortcutSheet";
 import { AddAccountDialog } from "@/components/accounts/AddAccountDialog";
 import { FeedbackDialog } from "@/components/feedback/FeedbackDialog";
+import { HandoffDialog } from "@/components/handoff/HandoffDialog";
 import { AgentDock } from "@/components/agent/AgentDock";
 import { PluginProvider } from "@/hooks/usePlugins";
 import { PluginAskDialog } from "@/components/plugins/PluginAskDialog";
@@ -267,6 +268,9 @@ function Shell() {
       />
       <AddAccountDialog />
       <FeedbackDialog />
+      {/* Renders nothing for a handoff to a target that has run before — it
+          registers the ⌘K layer, launches, and gets out of the way. */}
+      <HandoffDialog />
       <PluginAskDialog />
       <PluginsPanel />
       <PreferencesDialog />

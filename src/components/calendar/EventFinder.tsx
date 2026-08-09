@@ -59,7 +59,7 @@ export function EventFinder({
       <BareInput
         ref={field}
         value={query}
-        placeholder="Type part of an event's name"
+        placeholder="Event name"
         aria-label="Find an event"
         className="min-w-0 flex-1 text-list"
         onChange={(event) => onQuery(event.target.value)}

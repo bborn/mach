@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  containWideContent,
   externalUrl,
   frameDocument,
   nextFrameHeight,
@@ -10,7 +11,9 @@ import {
   FRAME_TOKENS,
   MAX_FRAME_HEIGHT,
   MIN_FRAME_HEIGHT,
+  SCROLL_ATTR,
   type FrameTokens,
+  type WideCandidate,
 } from "@/lib/message-body";
 
 export interface MessageFrameProps {
@@ -48,24 +51,51 @@ export function MessageFrame({ html, allowRemoteImages, title }: MessageFramePro
     [html, allowRemoteImages, tokens],
   );
 
-  // Every height we have applied to the document currently in the frame.
-  // `nextFrameHeight` uses it to tell a real content change from a
-  // measure→resize→measure cycle. Cleared when the document is replaced.
-  const applied = useRef<Set<number>>(new Set());
+  // The tallest height applied to the document currently in the frame, and the
+  // width it was laid out at. `nextFrameHeight` refuses anything shorter than
+  // the peak, which is what makes the measure→resize→measure cycle terminate;
+  // a change of width is the one thing that may take it back down, and it can
+  // only come from the reader. Both are reset when the document is replaced.
+  const peak = useRef(MIN_FRAME_HEIGHT);
+  const laidOutAt = useRef(0);
 
   const measure = useCallback(() => {
-    const doc = frameRef.current?.contentDocument;
-    if (!doc) return;
-    // Measured on the body, not on `documentElement`: the root's `scrollHeight`
-    // is clamped to the frame's own viewport, which is the height we just set,
-    // so a frame measured that way can grow and never shrink again.
+    const frame = frameRef.current;
+    const doc = frame?.contentDocument;
+    if (!frame || !doc) return;
+
+    // The frame element's own width, which is 100% of the reading pane and so
+    // never a function of the height we set. When it changes, the frame is in a
+    // new layout and the heights measured in the old one say nothing about it.
+    const width = frame.clientWidth;
+    if (width !== laidOutAt.current) {
+      laidOutAt.current = width;
+      peak.current = MIN_FRAME_HEIGHT;
+    }
+
+    /*
+     * Three readings, because each one misses something the others catch.
+     *
+     * `body.scrollHeight` is the obvious one and is short by the last child's
+     * bottom margin, which collapses through the body and is not counted — 30px
+     * of a real message, clipped, on the first case this was tested against.
+     *
+     * The root's *box* has it, because the root shrink-wraps the body's margin
+     * box. Its `scrollHeight` would not: that one is `max(content, viewport)`,
+     * and the viewport is the height we just set, so it can only ever ratchet
+     * upward. The rect is independent of what we set — checked at 28, 386, 416
+     * and 900px against the same content, which reported 416 every time.
+     */
     const body = doc.body;
-    const measured = body
-      ? Math.max(body.scrollHeight, Math.ceil(body.getBoundingClientRect().height))
-      : (doc.documentElement?.scrollHeight ?? 0);
+    const root = doc.documentElement;
+    const measured = Math.max(
+      body?.scrollHeight ?? 0,
+      Math.ceil(body?.getBoundingClientRect().height ?? 0),
+      Math.ceil(root?.getBoundingClientRect().height ?? 0),
+    );
     setHeight((current) => {
-      const next = nextFrameHeight(current, measured, applied.current);
-      if (next !== current) applied.current.add(next);
+      const next = nextFrameHeight(current, measured, peak.current);
+      if (next !== current) peak.current = Math.max(peak.current, next);
       return next;
     });
   }, []);
@@ -81,7 +111,8 @@ export function MessageFrame({ html, allowRemoteImages, title }: MessageFramePro
     if (!doc) return;
 
     // A new document is new content, so the old heights say nothing about it.
-    applied.current = new Set();
+    peak.current = MIN_FRAME_HEIGHT;
+    laidOutAt.current = 0;
 
     // Belt and braces: the authoritative reveal is the re-render with
     // `allowRemoteImages: true`, which also widens the frame CSP. This catches
@@ -97,38 +128,49 @@ export function MessageFrame({ html, allowRemoteImages, title }: MessageFramePro
     doc.addEventListener("submit", preventDefault, true);
     doc.addEventListener("dragstart", preventDefault, true);
 
-    const observer =
-      typeof ResizeObserver === "function" ? new ResizeObserver(() => measure()) : null;
-    // The body again, for the same reason, and because observing the root would
-    // re-fire on every height we set and risk a resize loop.
-    const observed = doc.body ?? doc.documentElement;
-    if (observer && observed) observer.observe(observed);
-
     /*
      * Let the frame scroll itself once it is clamped.
      *
-     * Below the cap the frame is exactly as tall as its content and must never
-     * grow a scrollbar — that feedback loop is what made the pane jitter. At
-     * the cap the height is fixed, so the loop cannot start, and without a
-     * scrollbar everything past 12000px was unreachable.
+     * Below the cap the frame is exactly as tall as its content and has nothing
+     * to scroll. At the cap the height has stopped tracking the content, so
+     * without a scrollbar everything past it would be unreachable — which is a
+     * bug this code has already had once.
      */
     const syncCapped = () => {
       const root = frameRef.current?.contentDocument?.documentElement;
       if (!root) return;
       root.classList.toggle("mach-capped", root.scrollHeight > MAX_FRAME_HEIGHT);
     };
-    syncCapped();
 
-    // Inline `data:` images and web fonts settle a frame or two after load.
-    const frameId = requestAnimationFrame(() => {
+    // Contain, then measure, then decide about the cap — in that order, because
+    // each answer depends on the one before it.
+    const settle = () => {
+      const frame = frameRef.current;
+      const inner = frame?.contentDocument;
+      const root = inner?.documentElement;
+      // One property read decides whether the pass is worth running at all.
+      // Ordinary mail does not overflow, and the pass costs a forced layout per
+      // table; this runs on every resize, so "nothing to do" has to be cheap.
+      if (frame && inner && root && root.scrollWidth > root.clientWidth) {
+        containWideContent(wideCandidates(inner), frame.clientWidth);
+      }
       measure();
       syncCapped();
-    });
-    const timer = window.setTimeout(() => {
-      measure();
-      syncCapped();
-    }, 250);
-    measure();
+    };
+
+    const observer =
+      typeof ResizeObserver === "function" ? new ResizeObserver(() => settle()) : null;
+    // The body again, for the same reason, and because observing the root would
+    // re-fire on every height we set and risk a resize loop.
+    const observed = doc.body ?? doc.documentElement;
+    if (observer && observed) observer.observe(observed);
+
+    // Inline `data:` images and web fonts settle a frame or two after load, and
+    // an image is exactly the thing that turns a table that fitted into one
+    // that does not.
+    const frameId = requestAnimationFrame(settle);
+    const timer = window.setTimeout(settle, 250);
+    settle();
 
     teardown.current = () => {
       doc.removeEventListener("click", interceptNavigation, true);
@@ -154,6 +196,57 @@ export function MessageFrame({ html, allowRemoteImages, title }: MessageFramePro
       style={{ height }}
     />
   );
+}
+
+/**
+ * The elements [`containWideContent`] is allowed to consider, deepest first.
+ *
+ * Tables are the whole of the problem in practice — mail is tables — and the
+ * body's own children are the backstop for the rest: a `<div style="width:
+ * 900px">` at the top level is rare but does happen, and there is no reason for
+ * it to drag the document sideways either.
+ *
+ * Deliberately *not* a walk of every element. `scrollWidth` forces layout on
+ * each read, and a thousand-paragraph message would pay for a thousand of them
+ * to find nothing.
+ */
+function wideCandidates(doc: Document): WideCandidate[] {
+  const tables = Array.from(doc.querySelectorAll("table")).reverse();
+  const topLevel = doc.body ? Array.from(doc.body.children) : [];
+  return [...tables, ...topLevel].map((element) => candidate(element, doc));
+}
+
+function candidate(element: Element, doc: Document): WideCandidate {
+  return {
+    // Getters, not values: every wrap changes the layout the next answer
+    // depends on.
+    get scrollWidth() {
+      return element.scrollWidth;
+    },
+    get parentTagName() {
+      return element.parentElement?.tagName ?? "";
+    },
+    get handled() {
+      if (element.parentElement?.hasAttribute(SCROLL_ATTR)) return true;
+      // An element that already scrolls sideways on its own — a `<pre>`, or a
+      // sender's div that kept its overflow — reports its *content* width from
+      // `scrollWidth`, so it would look permanently too wide and be wrapped in
+      // a second scroller for nothing.
+      const view = doc.defaultView;
+      if (!view) return false;
+      return view.getComputedStyle(element).overflowX !== "visible";
+    },
+    wrap() {
+      const parent = element.parentElement;
+      if (!parent) return;
+      // Created and moved, never written as markup: no sender string is
+      // re-parsed by this.
+      const box = doc.createElement("div");
+      box.setAttribute(SCROLL_ATTR, "");
+      parent.insertBefore(box, element);
+      box.appendChild(element);
+    },
+  };
 }
 
 /**

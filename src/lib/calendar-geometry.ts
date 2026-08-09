@@ -42,8 +42,17 @@ export const ALL_DAY_MAX_ROWS = 3;
 /** Below this a column is hopeless whatever you put in it (§2). */
 export const MIN_COLUMN_WIDTH = 40;
 
-/** Named layers instead of Google's magic 5 / 507. */
+/**
+ * Named layers instead of Google's magic 5 / 507.
+ *
+ * The selected block sits above its neighbours because its halo is drawn
+ * *outside* it: at `Z_EVENT` the block starting at the next quarter hour paints
+ * over the bottom band of the mark, and the cursor comes out looking chewed.
+ * Below the hover layer, though — an expanded block is deliberately covering
+ * its cluster and should keep doing so.
+ */
 export const Z_EVENT = 5;
+export const Z_EVENT_SELECTED = 8;
 export const Z_EVENT_HOVER = 10;
 export const Z_NOW = 20;
 

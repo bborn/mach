@@ -3,6 +3,7 @@ import type { CalendarEvent } from "@/types";
 import {
   attendeesField,
   canEditEvent,
+  choiceForEvent,
   choiceFromRules,
   describeReminders,
   describeRules,
@@ -458,6 +459,46 @@ describe("recurrence read-back", () => {
     const weekly: CalendarEvent = { ...event, recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=FR"] };
     const form = { ...formFromEvent(weekly), recurrence: "none" as const };
     expect(formPatch(weekly, form)?.recurrence).toEqual([]);
+  });
+
+  it("never says “does not repeat” about an occurrence Google expanded", () => {
+    // The lie this fixes. `singleEvents=true` returns occurrences, an occurrence
+    // carries no RRULE, so a synced weekly standup arrives with a series id and
+    // an empty rule list — and an empty rule list was being read as "no rule",
+    // which the picker rendered as "Does not repeat" over a meeting Google's own
+    // popover described as "Weekly on weekdays".
+    const occurrence: CalendarEvent = { ...event, recurringEventId: "series-abc" };
+    const form = formFromEvent(occurrence);
+    expect(form.recurrence).toBe("series");
+    expect(choiceForEvent(occurrence)).toBe("series");
+    // And it stays silent on save: nothing is known about the rule, so nothing
+    // is claimed about it.
+    expect(formPatch(occurrence, form)).toBeUndefined();
+    expect(formPatch(occurrence, { ...form, title: "Renamed" })?.recurrence).toBeUndefined();
+  });
+
+  it("still says “does not repeat” about an event that genuinely does not", () => {
+    expect(choiceForEvent(event)).toBe("none");
+    expect(choiceForEvent({ ...event, recurringEventId: "" })).toBe("none");
+  });
+
+  it("prefers a rule it does have over the vaguer answer", () => {
+    // A series Mach created, or one a sibling occurrence taught the store: the
+    // rule is known, so it is named rather than described as "it repeats".
+    const known: CalendarEvent = {
+      ...event,
+      recurringEventId: "series-abc",
+      recurrence: ["RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"],
+    };
+    expect(choiceForEvent(known)).toBe("weekdays");
+  });
+
+  it("replaces an unknown rule only when the user picks one", () => {
+    const occurrence: CalendarEvent = { ...event, recurringEventId: "series-abc" };
+    const form = formFromEvent(occurrence);
+    expect(formPatch(occurrence, { ...form, recurrence: "daily" })?.recurrence).toEqual([
+      "RRULE:FREQ=DAILY",
+    ]);
   });
 
   it("says when a save has to take the whole series with it", () => {

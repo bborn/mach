@@ -205,9 +205,7 @@ export function FeedbackDialog() {
           Send feedback
         </span>
         <span className="truncate text-micro text-faint-foreground">
-          {phase === "sent"
-            ? "filed in the mach project"
-            : "goes straight to an agent working in this repo"}
+          {phase === "sent" ? "filed" : "to an agent in this repo"}
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-1">
           <Kbd keys="escape" />
@@ -254,9 +252,12 @@ export function FeedbackDialog() {
                     Clear
                   </Button>
                   <span className="ml-auto text-micro text-faint-foreground">
-                    {hasInk(annotation)
-                      ? "an arrow says “that one” better than a sentence can"
-                      : "drag on the shot to mark what you mean — or skip it"}
+                    {/*
+                      The empty state used to coach ("an arrow says 'that one'
+                      better than a sentence can"). The toolbar is right there;
+                      what it needed was the verb, not the argument for it.
+                    */}
+                    {hasInk(annotation) ? null : "drag to mark, or skip"}
                   </span>
                 </div>
 
@@ -272,8 +273,7 @@ export function FeedbackDialog() {
               </>
             ) : (
               <Notice tone="warn">
-                No screenshot — {captureError ?? "the window could not be captured"}. The note
-                below is still filed on its own.
+                No screenshot — {captureError ?? "the window could not be captured"}.
               </Notice>
             )}
 
@@ -282,14 +282,12 @@ export function FeedbackDialog() {
               rows={3}
               value={text}
               onChange={(event) => setText(event.target.value)}
-              placeholder="What should change? One line is enough — the picture carries the rest."
+              placeholder="What should change?"
               className="py-1.5"
             />
 
             {phase === "failed" && failure && (
-              <Notice tone="error">
-                Nothing was filed. {failure}
-              </Notice>
+              <Notice tone="error">Not filed — {failure}</Notice>
             )}
           </div>
         )}
@@ -298,9 +296,11 @@ export function FeedbackDialog() {
       <footer className="flex h-9 shrink-0 items-center gap-2 border-t border-border px-3">
         {phase === "sent" ? (
           <>
-            <span className="text-micro text-faint-foreground">
-              Frontend fixes hot-reload into this window; Rust changes need a relaunch.
-            </span>
+            {/*
+              "Frontend fixes hot-reload into this window; Rust changes need a
+              relaunch" used to sit here — the build system explaining itself
+              to the only person who already knows how it works.
+            */}
             <Button size="sm" variant="subtle" className="ml-auto" onClick={closeFeedback}>
               Done
             </Button>
@@ -319,7 +319,7 @@ export function FeedbackDialog() {
                 {phase === "sending" ? (
                   <>
                     <LoaderCircle size={12} strokeWidth={2} className="animate-spin" />
-                    Filing…
+                    Filing
                   </>
                 ) : phase === "failed" ? (
                   "Try again"
@@ -343,11 +343,10 @@ function Filed({ receipt }: { receipt: FeedbackReceipt }) {
         <CircleCheck size={15} strokeWidth={1.75} className="mt-px shrink-0 text-accent" />
         <div className="flex flex-col gap-1">
           <span className="text-body text-foreground">
-            {receipt.taskId ? `Task #${receipt.taskId} is queued.` : "Filed and queued."}
+            {receipt.taskId ? `Task #${receipt.taskId}` : "Filed"}
           </span>
           <span className="text-list text-muted-foreground">
-            An agent is picking it up in the <span className="font-mono">mach</span> project,
-            working in its own git worktree.
+            Queued in <span className="font-mono">mach</span>.
           </span>
         </div>
       </div>

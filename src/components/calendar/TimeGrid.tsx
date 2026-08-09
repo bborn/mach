@@ -25,6 +25,7 @@ import {
   TIME_GUTTER_INSET,
   Z_EVENT,
   Z_EVENT_HOVER,
+  Z_EVENT_SELECTED,
   Z_NOW,
   blockHeight,
   nowScrollTop,
@@ -51,7 +52,7 @@ import { paintFor, toneFor, type HueIndex } from "@/lib/calendar-palette";
 import { DAY, MINUTE, isToday, shortTime, startOfDay, weekdayShort } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { usePreferences } from "@/components/prefs/PreferencesProvider";
-import { EventBlock, EventChip } from "./EventBlock";
+import { EventBlock, EventChip, SELECTION_SHADOW } from "./EventBlock";
 
 /** A provisional event, dragged or clicked into being but not yet saved. */
 export interface EventDraft {
@@ -593,7 +594,7 @@ export function TimeGrid({
         {dragging && ghostPaint && (
           <div
             ref={ghost}
-            className="pointer-events-none absolute overflow-hidden px-1.5 py-[2px] shadow-[0_4px_16px_-4px_rgba(0,0,0,0.4)]"
+            className="pointer-events-none absolute overflow-hidden px-1.5 py-[2px]"
             style={{
               left:
                 TIME_GUTTER + dragging.originDayIndex * ghostColumnWidth + 1,
@@ -603,7 +604,20 @@ export function TimeGrid({
               borderRadius: BLOCK_RADIUS,
               background: ghostPaint.background,
               color: ghostPaint.color,
-              boxShadow: ghostPaint.border ? `inset 0 0 0 1px ${ghostPaint.border}` : undefined,
+              // The block you picked up is the block you are still on, so the
+              // ghost carries the cursor while the source block behind it is
+              // washed out. Without this the selection mark vanishes for the
+              // whole length of a drag — which is when it matters most, because
+              // an optimistic move that Google later refuses snaps back and you
+              // need to know which block just moved.
+              boxShadow: [
+                ghostPaint.border ? `inset 0 0 0 1px ${ghostPaint.border}` : undefined,
+                dragging.eventId === selectedId
+                  ? SELECTION_SHADOW
+                  : "0 4px 16px -4px color-mix(in oklab, var(--foreground) 45%, transparent)",
+              ]
+                .filter((layer): layer is string => layer !== undefined)
+                .join(", "),
               zIndex: Z_NOW + 1,
               willChange: "transform",
             }}
@@ -880,7 +894,11 @@ function DayColumn({
                 dark={dark}
                 tone={toneFor(event.rsvp)}
                 past={event.end < now}
-                selected={event.id === selectedId}
+                // While you are dragging it, the cursor lives on the ghost —
+                // the ghost is the event now, and two accent halos on screen
+                // at once (the hole it left, and the thing under the pointer)
+                // read as two cursors rather than one move in progress.
+                selected={event.id === selectedId && event.id !== draggingId}
                 dimmed={event.id === draggingId || (dimIds?.has(event.id) ?? false)}
                 copies={merged.copies.length}
                 height={height}
@@ -900,7 +918,11 @@ function DayColumn({
                   height,
                   left: expanded ? 0 : geometry.left,
                   width: expanded ? "100%" : geometry.width,
-                  zIndex: expanded ? Z_EVENT_HOVER : Z_EVENT,
+                  zIndex: expanded
+                    ? Z_EVENT_HOVER
+                    : event.id === selectedId
+                      ? Z_EVENT_SELECTED
+                      : Z_EVENT,
                 }}
               />
             </div>

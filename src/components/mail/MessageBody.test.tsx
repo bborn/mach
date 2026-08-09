@@ -13,6 +13,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   clampFrameHeight,
+  containWideContent,
   externalUrl,
   frameCsp,
   frameDocument,
@@ -28,6 +29,7 @@ import {
   MIN_FRAME_HEIGHT,
   type BlockedImage,
   type RenderedMessage,
+  type WideCandidate,
 } from "@/lib/message-body";
 import { MessageBodyView } from "./MessageBody";
 import { MessageFrame } from "./MessageFrame";
@@ -219,7 +221,7 @@ describe("the blocked-images bar", () => {
 });
 
 // ---------------------------------------------------------------------------
-// invariant 6: quoted history
+// invariant 7: quoted history
 // ---------------------------------------------------------------------------
 
 describe("quoted history", () => {
@@ -358,14 +360,20 @@ describe("the wire payload", () => {
 // ---------------------------------------------------------------------------
 
 describe("the frame height rule", () => {
-  /** Run a measurement sequence the way `MessageFrame` does. */
+  /**
+   * Run a measurement sequence the way `MessageFrame` does, at one width.
+   *
+   * `MessageFrame` keeps the peak in a ref and resets it when the frame's own
+   * width changes; a sequence with no width change is exactly what a settling
+   * document produces.
+   */
   function settle(measurements: number[], start = MIN_FRAME_HEIGHT) {
-    const applied = new Set<number>();
+    let peak = MIN_FRAME_HEIGHT;
     let height = start;
     const history: number[] = [];
     for (const measured of measurements) {
-      const next = nextFrameHeight(height, measured, applied);
-      if (next !== height) applied.add(next);
+      const next = nextFrameHeight(height, measured, peak);
+      if (next !== height) peak = Math.max(peak, next);
       height = next;
       history.push(height);
     }
@@ -377,8 +385,8 @@ describe("the frame height rule", () => {
     // the body by 33px, so the measurement alternates forever.
     const flapping = Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? 2436 : 2403));
     const { height, history } = settle(flapping);
-    // It moves at most twice and then never again.
-    expect(new Set(history.slice(3))).toEqual(new Set([height]));
+    // It moves once and then never again.
+    expect(new Set(history.slice(1))).toEqual(new Set([height]));
     // And it settles on the taller value: too short clips the message.
     expect(height).toBe(2436);
   });
@@ -389,51 +397,228 @@ describe("the frame height rule", () => {
   });
 
   it("still grows for content that genuinely got taller", () => {
-    // A late-loading image is the normal case and must not be mistaken for a
-    // cycle, even when the frame has already been that tall before.
+    // A late-loading image is the normal case, and growth is the one direction
+    // that never has to be second-guessed.
     expect(settle([400, 300, 900]).height).toBe(900);
   });
 
-  it("still shrinks to a height it has not seen", () => {
-    expect(settle([900, 400]).height).toBe(400);
+  it("refuses every shrink while the width is unchanged", () => {
+    // Too tall leaves a band of empty space at the foot of a message. Too short
+    // clips it, and re-measuring to fix that is the loop.
+    expect(settle([900, 400]).height).toBe(900);
+    expect(nextFrameHeight(900, 400, 900)).toBe(900);
+    expect(nextFrameHeight(900, 899, 900)).toBe(900);
   });
 
-  it("refuses to shrink back to a height it already applied", () => {
-    const applied = new Set([400]);
-    expect(nextFrameHeight(900, 400, applied)).toBe(900);
-    // ...but the same shrink is fine when that height is new.
-    expect(nextFrameHeight(900, 401, applied)).toBe(401);
+  it("comes back down once the frame has been laid out at a new width", () => {
+    // Dragging the splitter wider makes a message genuinely shorter, and the
+    // peak from the old width is not evidence about the new one. `MessageFrame`
+    // resets it; here that is the peak going back to the floor.
+    expect(nextFrameHeight(900, 400, MIN_FRAME_HEIGHT)).toBe(400);
   });
 
   it("ignores sub-pixel churn in both directions", () => {
-    const applied = new Set<number>();
-    expect(nextFrameHeight(500, 500 + FRAME_HEIGHT_EPSILON, applied)).toBe(500);
-    expect(nextFrameHeight(500, 500 - FRAME_HEIGHT_EPSILON, applied)).toBe(500);
-    expect(nextFrameHeight(500, 502, applied)).toBe(502);
+    expect(nextFrameHeight(500, 500 + FRAME_HEIGHT_EPSILON, 500)).toBe(500);
+    expect(nextFrameHeight(500, 500 - FRAME_HEIGHT_EPSILON, 500)).toBe(500);
+    expect(nextFrameHeight(500, 502, 500)).toBe(502);
   });
 
   it("keeps clamping a hostile measurement", () => {
-    expect(nextFrameHeight(500, 10_000_000, new Set())).toBe(MAX_FRAME_HEIGHT);
-    expect(nextFrameHeight(500, -1, new Set())).toBe(MIN_FRAME_HEIGHT);
-    expect(nextFrameHeight(500, Number.NaN, new Set())).toBe(MIN_FRAME_HEIGHT);
+    expect(nextFrameHeight(500, 10_000_000, 500)).toBe(MAX_FRAME_HEIGHT);
+    // Nonsense in the other direction cannot collapse an open message either:
+    // it clamps to the floor, and the floor is never taller than the peak.
+    expect(nextFrameHeight(500, -1, 500)).toBe(500);
+    expect(nextFrameHeight(500, Number.NaN, 500)).toBe(500);
+    // Only from the floor itself is there nothing to protect.
+    expect(nextFrameHeight(MIN_FRAME_HEIGHT, -1, MIN_FRAME_HEIGHT)).toBe(MIN_FRAME_HEIGHT);
   });
 
-  it("cannot loop for any sequence, including an adversarial one", () => {
-    // Whatever a hostile body does to the measurement, the applied heights must
-    // be finite: every value is either new or a growth, never a revisit.
-    const applied = new Set<number>();
+  it("converges for every sequence, including an adversarial one", () => {
+    // The property that matters: whatever a hostile body reports, the height
+    // changes finitely many times, because every change is strictly upward.
+    let peak = MIN_FRAME_HEIGHT;
     let height = MIN_FRAME_HEIGHT;
-    const seen: number[] = [];
-    for (let i = 0; i < 2000; i++) {
-      const measured = [100, 900, 100, 900, 450, 900, 100][i % 7]!;
-      const next = nextFrameHeight(height, measured, applied);
+    const applied: number[] = [];
+    for (let i = 0; i < 5000; i++) {
+      const measured = [100, 900, 100, 900, 450, 2400, 100, 899, 2400][i % 9]!;
+      const next = nextFrameHeight(height, measured, peak);
       if (next !== height) {
-        applied.add(next);
-        seen.push(next);
+        peak = Math.max(peak, next);
+        applied.push(next);
       }
       height = next;
     }
-    expect(seen.length).toBeLessThan(10);
+    expect(applied).toEqual([100, 900, 2400]);
+    // Strictly increasing, which is why it must stop.
+    expect([...applied].sort((a, b) => a - b)).toEqual(applied);
+    expect(new Set(applied).size).toBe(applied.length);
+  });
+
+  it("cannot be driven up and down by alternating widths", () => {
+    // A reader dragging the splitter resets the peak on every step, so this is
+    // the worst case for the one direction that is allowed to shrink. It is
+    // still not a loop: each height follows the width it was measured at, and
+    // the width is never a function of the height.
+    let height = MIN_FRAME_HEIGHT;
+    for (let i = 0; i < 200; i++) {
+      const measured = i % 2 === 0 ? 900 : 400;
+      // The width changed, so `MessageFrame` puts the peak back on the floor.
+      height = nextFrameHeight(height, measured, MIN_FRAME_HEIGHT);
+      expect(height).toBe(measured);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// width
+//
+// A twelve-column table does not fit in a reading pane, and the question is
+// only where the sideways scrolling goes. These are the decisions
+// `containWideContent` makes; `MessageFrame` supplies the live DOM.
+// ---------------------------------------------------------------------------
+
+describe("containing content too wide for the pane", () => {
+  interface Fake extends WideCandidate {
+    wraps: number;
+  }
+
+  function fake(over: Partial<WideCandidate> & { scrollWidth: number }): Fake {
+    const candidate: Fake = {
+      parentTagName: "DIV",
+      handled: false,
+      wraps: 0,
+      wrap() {
+        candidate.wraps += 1;
+      },
+      ...over,
+    } as Fake;
+    return candidate;
+  }
+
+  const PANE = 595;
+
+  it("leaves an ordinary message completely alone", () => {
+    const fits = [fake({ scrollWidth: 400 }), fake({ scrollWidth: PANE })];
+    expect(containWideContent(fits, PANE)).toBe(0);
+    expect(fits.every((c) => c.wraps === 0)).toBe(true);
+  });
+
+  it("forgives a sub-pixel overshoot rather than wrapping for half a pixel", () => {
+    expect(containWideContent([fake({ scrollWidth: PANE + 1 })], PANE)).toBe(0);
+    expect(containWideContent([fake({ scrollWidth: PANE + 2 })], PANE)).toBe(1);
+  });
+
+  it("wraps the table that is genuinely too wide", () => {
+    // The real one: the Metabase alert's results table measures 2943px against
+    // a 595px pane.
+    const table = fake({ scrollWidth: 2943 });
+    expect(containWideContent([table], PANE)).toBe(1);
+    expect(table.wraps).toBe(1);
+  });
+
+  it("wraps the inner table and leaves the layout tables around it", () => {
+    // Mail is nested tables. Wrapping the outer one would scroll the whole
+    // message sideways, which is the thing being fixed — so the candidates
+    // arrive deepest first, and the ancestors are back under the width by the
+    // time they are asked. That only works because the width is read live.
+    let innerWrapped = false;
+    let outerWraps = 0;
+    const inner: WideCandidate = {
+      scrollWidth: 2943,
+      parentTagName: "TD",
+      handled: false,
+      wrap: () => {
+        innerWrapped = true;
+      },
+    };
+    const outer: WideCandidate = {
+      get scrollWidth() {
+        return innerWrapped ? PANE : 2943;
+      },
+      parentTagName: "BODY",
+      handled: false,
+      wrap: () => {
+        outerWraps += 1;
+      },
+    };
+    expect(containWideContent([inner, outer], PANE)).toBe(1);
+    expect(innerWrapped).toBe(true);
+    expect(outerWraps).toBe(0);
+  });
+
+  it("never puts a wrapper where the parser would move it", () => {
+    for (const parentTagName of ["TABLE", "THEAD", "TBODY", "TFOOT", "TR"]) {
+      const stray = fake({ scrollWidth: 4000, parentTagName });
+      expect(containWideContent([stray], PANE)).toBe(0);
+    }
+  });
+
+  it("does not wrap what is already a scroller", () => {
+    // A `<pre>` scrolls itself, and reports its *content* width — so it would
+    // otherwise look permanently too wide and collect a wrapper on every pass.
+    const already = fake({ scrollWidth: 4000, handled: true });
+    expect(containWideContent([already], PANE)).toBe(0);
+    expect(already.wraps).toBe(0);
+  });
+
+  it("is idempotent, because it runs again on every resize", () => {
+    // A wrapped element goes on measuring wide — it is the content of the
+    // scroller now — so without `handled` every resize would nest another one.
+    let wraps = 0;
+    const table: WideCandidate = {
+      scrollWidth: 2943,
+      parentTagName: "DIV",
+      get handled() {
+        return wraps > 0;
+      },
+      wrap: () => {
+        wraps += 1;
+      },
+    };
+    for (let i = 0; i < 20; i++) containWideContent([table], PANE);
+    expect(wraps).toBe(1);
+  });
+
+  it("does nothing at all before the frame has a width", () => {
+    // The first pass can land before layout. Zero would make everything look
+    // too wide and wrap the entire message.
+    const table = fake({ scrollWidth: 2943 });
+    expect(containWideContent([table], 0)).toBe(0);
+    expect(containWideContent([table], Number.NaN)).toBe(0);
+    expect(table.wraps).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the frame stylesheet
+// ---------------------------------------------------------------------------
+
+describe("the frame stylesheet", () => {
+  const css = frameDocument({ html: "", allowRemoteImages: false });
+
+  it("gives the frame nothing to scroll vertically", () => {
+    // The reading pane is the only vertical scroll. A frame that can scroll
+    // itself is the second scrollbar the reader was complaining about, and it
+    // arrives whether or not the content is tall: a horizontal scrollbar eats
+    // enough of the viewport to summon one.
+    expect(css).toContain("html:not(.mach-capped){overflow-x:auto;overflow-y:hidden");
+  });
+
+  it("still lets a clamped frame scroll, so nothing is unreachable", () => {
+    // Past MAX_FRAME_HEIGHT the height no longer tracks the content, and this
+    // is the only way to the rest of the message.
+    expect(css).not.toContain("html{overflow");
+    expect(css).toMatch(/html:not\(\.mach-capped\)/);
+  });
+
+  it("styles the scroller the width pass adds", () => {
+    expect(css).toContain("[data-mach-scroll]{max-width:100%;overflow-x:auto;overflow-y:hidden}");
+    // ...and lets the wide thing inside it actually be wide.
+    expect(css).toContain("[data-mach-scroll]>table{max-width:none}");
+  });
+
+  it("keeps a code block's lines instead of reflowing them", () => {
+    expect(css).toContain("pre{white-space:pre;max-width:100%;overflow-x:auto;overflow-y:hidden}");
   });
 });
 

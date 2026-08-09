@@ -121,7 +121,7 @@ export function Composer({ draft, onChange, onSend, onClose, busy = false }: Com
     {
       keys: COMPOSER_KEYS.close,
       group: "Composer",
-      description: "Close the composer, keeping the draft",
+      description: "Close, keeping the draft",
       allowInInput: true,
       priority: 120,
       handler: () => {
@@ -196,7 +196,7 @@ export function Composer({ draft, onChange, onSend, onClose, busy = false }: Com
           rows={4}
           onChange={(event) => onChange({ ...draft, body: event.target.value })}
           onInput={resize}
-          placeholder="Markdown-ish. **bold**, `code`, - lists."
+          placeholder="**bold**, `code`, - lists"
           className={cn(
             "mt-3 block w-full resize-none overflow-y-auto bg-transparent",
             "text-reading leading-[1.6] text-foreground",
@@ -233,9 +233,14 @@ export function Composer({ draft, onChange, onSend, onClose, busy = false }: Com
           <span className="inline-flex items-center gap-1">
             <Kbd keys={COMPOSER_KEYS.close} /> close
           </span>
-          <span className="ml-auto truncate">
-            {busy ? "sending…" : "draft saved as you type"}
-          </span>
+          {/*
+            This used to read "draft saved as you type" whenever nothing was
+            happening — the software applauding itself for doing the one thing
+            a draft is for. A draft that saves itself should just save itself.
+            What is left is the state you cannot see and might act on: a send
+            already in flight, which is why the fields have gone dead.
+          */}
+          <span className="ml-auto truncate">{busy ? "Sending" : null}</span>
         </div>
       </div>
     </div>

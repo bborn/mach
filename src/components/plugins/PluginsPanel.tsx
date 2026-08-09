@@ -113,20 +113,18 @@ export function PluginsPanel() {
         */}
         {!backend.available ? (
           <p className="rounded border p-3 text-sm text-muted-foreground">
-            Plugins run in the desktop app. This window is on fixture data, so there is no
-            sandbox to load them into.
+            Plugins run in the desktop app.
           </p>
         ) : (
           !verified && (
             <p className="rounded border border-destructive/40 bg-destructive/10 p-3 text-sm">
-              The plugin sandbox could not be verified in this window, so nothing will be
-              loaded.{conformance?.error ? ` ${conformance.error}` : ""}
+              Sandbox not verified — no plugin will load.{conformance?.error ? ` ${conformance.error}` : ""}
             </p>
           )
         )}
 
         {plugins.length === 0 ? (
-          <p className="text-sm text-muted-foreground">Nothing installed.</p>
+          <p className="text-sm text-muted-foreground">Nothing installed</p>
         ) : (
           <ul className="flex flex-col gap-2">
             {plugins.map((plugin) => (
@@ -148,8 +146,7 @@ export function PluginsPanel() {
 
         <div className="flex flex-col gap-2 border-t pt-4">
           <p className="text-xs text-muted-foreground">
-            Install from a directory containing <code>mach-plugin.json</code>. Nothing is
-            executed until you accept the prompt.
+            Install from a directory containing <code>mach-plugin.json</code>.
           </p>
           <div className="flex items-center gap-2">
             <BareInput
@@ -256,15 +253,15 @@ function describeStatus(status: PluginStatus): string | null {
     case "ready":
       return null;
     case "disabled":
-      return "Disabled.";
+      return "Disabled";
     case "safeMode":
-      return "Mach is in safe mode, so no plugin is running.";
+      return "Safe mode";
     case "invalid":
       return status.detail;
     case "changedWithoutVersionBump":
-      return "Its files changed but its version did not. Review it before enabling it again.";
+      return "Files changed, version did not";
     case "needsReapproval":
-      return `It now asks for more than you approved: ${status.detail.join(", ")}.`;
+      return `Asks for more than you approved: ${status.detail.join(", ")}`;
   }
 }
 
@@ -311,7 +308,7 @@ function ConsentPrompt({
         )}
 
         <div>
-          <p className="mb-1 text-sm font-medium">If you install it, it will be able to:</p>
+          <p className="mb-1 text-sm font-medium">It will be able to:</p>
           <ul className="flex flex-col gap-1.5">
             {consent.map((line, index) => (
               <li
@@ -331,8 +328,8 @@ function ConsentPrompt({
 
         {manifest.machApiProposed.length > 0 && (
           <p className="text-xs text-muted-foreground">
-            Uses proposed APIs ({manifest.machApiProposed.join(", ")}), which work only in a
-            development install and can change or vanish without notice.
+            Proposed APIs ({manifest.machApiProposed.join(", ")}) — development installs only,
+            and unstable.
           </p>
         )}
 

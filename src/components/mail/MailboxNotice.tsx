@@ -9,6 +9,15 @@ import { SyncBar } from "@/components/chrome/SyncIndicator";
  * action: set an environment variable, authorize an account, wait for the first
  * pass, or nothing at all because the mailbox is genuinely empty. They are
  * deliberately not one spinner.
+ *
+ * Each of these used to carry a paragraph explaining itself — that Mach talks
+ * straight to Google with your own OAuth client, that nothing has been
+ * authorized so there is nothing to sync, that the first pass pulls twelve
+ * months per account and conversations land as they arrive. All true, all
+ * reasoning, and none of it is what someone staring at an empty list is
+ * reading for. What survives is the state's name, the one thing they could not
+ * work out for themselves (that the first sync is minutes, not seconds), and
+ * the button. The reasoning lives here instead.
  */
 export function MailboxNotice() {
   const { state, actions, labels, ui, progress } = useMach();
@@ -16,7 +25,7 @@ export function MailboxNotice() {
 
   switch (state.kind) {
     case "loading":
-      return <Notice muted>Reading the local store…</Notice>;
+      return <Notice muted>Loading</Notice>;
 
     case "notConfigured":
       return (
@@ -25,10 +34,10 @@ export function MailboxNotice() {
           detail={state.message}
           body={
             <>
-              Mach talks straight to Google with your own OAuth client. Set{" "}
+              Set{" "}
               <code className="font-mono text-micro text-foreground">MACH_GOOGLE_CLIENT_ID</code>{" "}
               (and <code className="font-mono text-micro text-foreground">MACH_GOOGLE_CLIENT_SECRET</code>{" "}
-              for a desktop client) in the environment Mach launches from, then relaunch.
+              for a desktop client), then relaunch.
             </>
           }
         />
@@ -37,8 +46,7 @@ export function MailboxNotice() {
     case "noAccounts":
       return (
         <Notice
-          title="No accounts yet"
-          body="Nothing has been authorized, so there is nothing to sync. Adding an account opens Google's consent screen in your browser."
+          title="No accounts"
           action={
             <Button variant="default" onClick={() => actions.setAddAccount(true)}>
               Add account
@@ -49,7 +57,7 @@ export function MailboxNotice() {
 
     case "syncing":
       return (
-        <Notice title="First sync in progress" body={FIRST_SYNC_COPY}>
+        <Notice title="First sync" body={FIRST_SYNC_COPY}>
           <div className="mt-3 w-full max-w-xs">
             <SyncBar progress={progress} />
             <div className="mt-1.5 font-mono text-micro tabular-nums text-faint-foreground">
@@ -62,9 +70,8 @@ export function MailboxNotice() {
     case "error":
       return (
         <Notice
-          title="Sync trouble"
+          title="Sync failed"
           detail={state.message}
-          body="Mail already in the local store still opens. This is the last error the sync engine reported."
           action={
             <Button variant="subtle" onClick={actions.syncNow}>
               Try again
@@ -81,8 +88,14 @@ export function MailboxNotice() {
   }
 }
 
-const FIRST_SYNC_COPY =
-  "The first pass pulls twelve months of mail per account — around thirteen minutes for a large one. Conversations appear here as they land; nothing has to finish first.";
+/**
+ * The one thing here that is not self-evident, and so the one thing that stays.
+ *
+ * Twelve months per account is roughly thirteen minutes on a large mailbox.
+ * Without a number, an empty inbox for that long reads as broken rather than as
+ * working — which is the only reason this state says anything at all.
+ */
+const FIRST_SYNC_COPY = "Twelve months per account — a few minutes. Mail appears as it lands.";
 
 interface NoticeProps {
   title?: string;

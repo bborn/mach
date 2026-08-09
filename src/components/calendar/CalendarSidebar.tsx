@@ -198,7 +198,7 @@ export function CalendarSidebar({
       <div className="mt-auto flex flex-col gap-1 border-t border-border pt-2">
         <Toggle
           label="Merge duplicates"
-          hint="One block when the same meeting is on several accounts"
+          hint="One block per meeting, across accounts"
           on={settings.mergeDuplicates}
           onChange={(on) => onSettings({ ...settings, mergeDuplicates: on })}
         />

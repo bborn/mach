@@ -8,58 +8,53 @@
 //! pill. Everything after that arrives as events, so the owner keeps reading
 //! mail while it works, and several sessions can be in flight at once.
 //!
-//! # The loop
+//! # The shape, since the brain became swappable
 //!
 //! ```text
-//!   stream a turn ──► text? emit deltas
-//!         │
-//!         ├─ no tool calls ──► idle: wait for the next message (or close)
-//!         │
-//!         └─ tool calls ──► for each:
-//!                              Auto     → run it now
-//!                              Approve  → park, tell the UI, wait for a decision
-//!                           results go back in ONE user message
+//!   start ──► resolve a backend ──► build the gate ──► hand a BrainIo to a brain
+//!               (agent::backend)      (agent::gate)         (anthropic | cli | command)
+//!                                          │
+//!   agent_send ──► input pump ─────────────┘
+//!                    │  Approve/Deny ──► ApprovalDesk (unparks the gate)
+//!                    │  Message ───────► the brain's follow-up channel
+//!                    └  Close ─────────► cancelled, and every wait ends
 //! ```
 //!
-//! Parking on approval is a real state, not a modal: the session sits in
-//! [`SessionStatus::AwaitingApproval`] and the task is blocked on its input
-//! channel. Nothing has been queued, nothing has left. A denial comes back to
-//! the model as a tool error, so it can say what it would have done instead of
-//! dying.
+//! The pump exists because approval stopped being something the loop could do
+//! inline. When the brain lives in another process, its tool calls arrive on the
+//! MCP server's threads while this task is blocked on a child — so a decision
+//! has to be routable to whatever is waiting for it, from anywhere. The desk is
+//! that routing table, and it is the reason "the owner said yes" means the same
+//! thing on all three backends.
 //!
 //! # Why the transcript is rebuilt rather than derived
 //!
-//! `entries` is what the drawer renders; `messages` is what the API sees. They
-//! are different shapes — the drawer wants "Archived 3 conversations", the API
-//! wants a `tool_result` block — and keeping both is cheaper than deriving one
-//! from the other on every render.
+//! `entries` is what the drawer renders; each brain keeps whatever shape its own
+//! wire needs. They are different — the drawer wants "Archived 3 conversations",
+//! the Messages API wants a `tool_result` block — and keeping both is cheaper
+//! than deriving one from the other on every render.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::commands::CommandDispatcher;
 use crate::db::Db;
 use crate::ipc::compose::engine::outbox::Outbox;
 
+use super::backend::{self, Availability, Backend, BackendPrefs};
+use super::brain::{brain_for, BrainIo};
 use super::config::AgentConfig;
 use super::context::{self, ContextItem};
 use super::error::AgentError;
-use super::tools::{self, ToolContext, ToolPolicy};
-use super::wire::{
-    self, AssistantTurn, ModelTransport, SseDecoder, StreamSignal, ToolDefinition, TurnAccumulator,
-    TurnRequest,
-};
-
-/// How many model turns one session may take before it is stopped.
-///
-/// A session that has called forty tools without answering is stuck, and the
-/// owner is paying for it. Generous enough that "search, read three threads,
-/// draft, schedule" never comes close.
-const MAX_TURNS: usize = 24;
+use super::gate::ToolGate;
+use super::tools::ToolContext;
+use super::wire::ModelTransport;
 
 // ===========================================================================
 // State
@@ -110,7 +105,8 @@ pub enum ToolState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingApproval {
-    /// The model's `tool_use` id — what a decision quotes back.
+    /// The id a decision quotes back. The Anthropic backend uses the model's
+    /// `tool_use` id; a backend without one is given a minted id.
     pub tool_use_id: String,
     pub name: String,
     /// One line: "Send \u{201c}Re: data room\u{201d} to tawny@\u{2026} on Tue 12 Aug, 09:00".
@@ -132,6 +128,13 @@ pub struct SessionSnapshot {
     pub pending: Option<PendingApproval>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Which brain is answering — "Claude Code", "Anthropic API (claude-opus-5)".
+    ///
+    /// On the snapshot rather than in a preference read by the UI because it is
+    /// a fact about *this session*: changing the preference mid-conversation
+    /// must not relabel a session that is still being answered by the old one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 /// What the frontend hears. `sessionId` is on every one so a listener can route
@@ -214,6 +217,251 @@ pub enum Input {
 }
 
 // ===========================================================================
+// The drawer, as something a brain can write to
+// ===========================================================================
+
+/// Everything a brain is allowed to put on screen.
+///
+/// One object rather than a handful of channels because every one of these
+/// writes has to do the same two things — update the snapshot a reload would
+/// read, and emit the event a live drawer is listening to — and a brain that
+/// remembered one and forgot the other would produce a session that looked
+/// right until the window was reopened.
+pub struct SessionUi {
+    id: String,
+    snapshot: Arc<Mutex<SessionSnapshot>>,
+    emitter: Arc<dyn SessionEmitter>,
+}
+
+impl SessionUi {
+    /// Build one directly. The engine does this per session; a test does it to
+    /// drive a gate without a whole engine around it.
+    pub fn new(
+        id: impl Into<String>,
+        snapshot: Arc<Mutex<SessionSnapshot>>,
+        emitter: Arc<dyn SessionEmitter>,
+    ) -> SessionUi {
+        SessionUi {
+            id: id.into(),
+            snapshot,
+            emitter,
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Tokens, as they arrive. Not stored: the completed entry supersedes them.
+    pub fn delta(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.emit(SessionEvent::Delta {
+            session_id: self.id.clone(),
+            text: text.to_string(),
+        });
+    }
+
+    pub fn agent_text(&self, text: &str) {
+        self.push_entry(Entry::Agent {
+            text: text.to_string(),
+        });
+    }
+
+    pub fn user_text(&self, text: &str) {
+        self.push_entry(Entry::User {
+            text: text.to_string(),
+        });
+    }
+
+    pub fn tool_running(&self, id: &str, name: &str, summary: &str) {
+        self.push_entry(Entry::Tool {
+            id: id.to_string(),
+            name: name.to_string(),
+            summary: summary.to_string(),
+            state: ToolState::Running,
+        });
+    }
+
+    pub fn tool_finished(&self, id: &str, name: &str, state: ToolState, summary: &str) {
+        self.push_entry(Entry::Tool {
+            id: id.to_string(),
+            name: name.to_string(),
+            summary: summary.to_string(),
+            state,
+        });
+    }
+
+    pub fn threads_changed(&self) {
+        self.emitter.threads_changed();
+    }
+
+    pub fn set_status(&self, status: SessionStatus) {
+        {
+            let mut snapshot = lock(&self.snapshot);
+            if snapshot.status == status {
+                return;
+            }
+            snapshot.status = status;
+        }
+        self.emit(SessionEvent::Status {
+            session_id: self.id.clone(),
+            status,
+        });
+    }
+
+    /// The conversation so far, as plain text. Only what a person said and what
+    /// the agent answered — tool lines are Mach's bookkeeping, not conversation.
+    pub fn transcript(&self) -> String {
+        let snapshot = lock(&self.snapshot);
+        snapshot
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::User { text } => Some(format!("owner: {text}")),
+                Entry::Agent { text } => Some(format!("agent: {text}")),
+                Entry::Tool { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn push_entry(&self, entry: Entry) {
+        {
+            let mut snapshot = lock(&self.snapshot);
+            upsert(&mut snapshot.entries, entry.clone());
+        }
+        self.emit(SessionEvent::Entry {
+            session_id: self.id.clone(),
+            entry,
+        });
+    }
+
+    fn emit(&self, event: SessionEvent) {
+        self.emitter.session_event(&event);
+    }
+
+    fn fail(&self, message: &str) {
+        {
+            let mut snapshot = lock(&self.snapshot);
+            snapshot.status = SessionStatus::Failed;
+            snapshot.pending = None;
+            snapshot.error = Some(message.to_string());
+        }
+        self.emit(SessionEvent::Failed {
+            session_id: self.id.clone(),
+            message: message.to_string(),
+        });
+    }
+}
+
+// ===========================================================================
+// Approval
+// ===========================================================================
+
+/// How a parked action ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Approved,
+    Denied(String),
+    /// The session was closed while it was parked. Nothing ran.
+    Closed,
+}
+
+/// Where a tool call waits for a human, and how the answer finds it.
+///
+/// The desk holds one sender per parked call, keyed by the id the drawer shows.
+/// [`ToolGate`](super::gate::ToolGate) serialises calls, so in practice there is
+/// at most one — but keying by id rather than assuming that is what makes a
+/// decision about a *different* call harmless instead of a mis-delivered yes.
+pub struct ApprovalDesk {
+    ui: Arc<SessionUi>,
+    waiting: Mutex<HashMap<String, oneshot::Sender<ApprovalOutcome>>>,
+    closed: AtomicBool,
+}
+
+impl ApprovalDesk {
+    pub fn new(ui: Arc<SessionUi>) -> ApprovalDesk {
+        ApprovalDesk {
+            ui,
+            waiting: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Park until the owner decides.
+    ///
+    /// Nothing has run when this is entered and nothing runs unless it returns
+    /// [`ApprovalOutcome::Approved`]. This is the only function in the codebase
+    /// that can say yes to sending mail.
+    pub async fn ask(&self, pending: PendingApproval) -> ApprovalOutcome {
+        if self.closed.load(Ordering::SeqCst) {
+            return ApprovalOutcome::Closed;
+        }
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut waiting = lock(&self.waiting);
+            waiting.insert(pending.tool_use_id.clone(), tx);
+        }
+
+        {
+            let mut snapshot = lock(&self.ui.snapshot);
+            snapshot.pending = Some(pending.clone());
+            snapshot.status = SessionStatus::AwaitingApproval;
+        }
+        let id = self.ui.id.clone();
+        self.ui.emit(SessionEvent::Approval {
+            session_id: id.clone(),
+            pending: pending.clone(),
+        });
+        self.ui.emit(SessionEvent::Status {
+            session_id: id.clone(),
+            status: SessionStatus::AwaitingApproval,
+        });
+
+        // A dropped sender means the session was closed: silence is never
+        // consent, so that path is `Closed`, not `Approved`.
+        let outcome = rx.await.unwrap_or(ApprovalOutcome::Closed);
+
+        lock(&self.waiting).remove(&pending.tool_use_id);
+        {
+            let mut snapshot = lock(&self.ui.snapshot);
+            snapshot.pending = None;
+            if snapshot.status == SessionStatus::AwaitingApproval {
+                snapshot.status = SessionStatus::Running;
+            }
+        }
+        if outcome != ApprovalOutcome::Closed {
+            self.ui.emit(SessionEvent::Status {
+                session_id: id,
+                status: SessionStatus::Running,
+            });
+        }
+        outcome
+    }
+
+    /// Deliver a decision. A decision for something that is not parked is
+    /// dropped — a stale click on a prompt that has already been answered.
+    pub fn decide(&self, tool_use_id: &str, outcome: ApprovalOutcome) {
+        let sender = lock(&self.waiting).remove(tool_use_id);
+        if let Some(sender) = sender {
+            let _ = sender.send(outcome);
+        }
+    }
+
+    /// Refuse everything, now and in future. Called when the session closes.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let waiting: Vec<_> = lock(&self.waiting).drain().collect();
+        for (_, sender) in waiting {
+            let _ = sender.send(ApprovalOutcome::Closed);
+        }
+    }
+}
+
+// ===========================================================================
 // The engine
 // ===========================================================================
 
@@ -239,6 +487,10 @@ pub struct AgentEngine {
     /// the tests, and by anything that wants to run a session against a
     /// specific model without exporting a variable.
     config: Option<AgentConfig>,
+    /// Pins the backend instead of detecting one.
+    backend: Option<Backend>,
+    /// Where a child process runs and where its tool-server config is written.
+    workspace: PathBuf,
 }
 
 impl AgentEngine {
@@ -260,6 +512,8 @@ impl AgentEngine {
             sessions: Mutex::new(Vec::new()),
             now: crate::ipc::compose::now_ms,
             config: None,
+            backend: None,
+            workspace: std::env::temp_dir().join(format!("mach-agent-{}", std::process::id())),
         }
     }
 
@@ -268,26 +522,62 @@ impl AgentEngine {
         self
     }
 
+    /// Pin the Anthropic configuration, and with it the backend.
+    ///
+    /// Naming a model, a base URL and a credential is only meaningful for the
+    /// Messages API, so setting one *is* choosing that backend — a test that
+    /// scripts SSE bytes must not find itself talking to whichever CLI happens
+    /// to be installed on the machine running it.
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         self.config = Some(config);
         self
     }
 
+    /// Pin the backend, skipping detection entirely.
+    pub fn with_backend(mut self, backend: Backend) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// Where child-process backends run. The app puts this next to the database;
+    /// it defaults to a temporary directory so a test never has to.
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// Which brain would answer right now, and what else is available.
+    ///
+    /// Used by the preferences dialog, and by [`Self::start`] itself, so what
+    /// the dialog reports and what actually runs cannot drift.
+    pub fn resolve_backend(&self) -> (Result<Backend, AgentError>, Availability) {
+        let available = Availability::probe();
+        if let Some(pinned) = &self.backend {
+            return (Ok(pinned.clone()), available);
+        }
+        if let Some(config) = &self.config {
+            return (
+                Ok(Backend::AnthropicApi(Box::new(config.clone()))),
+                available,
+            );
+        }
+        let prefs = BackendPrefs::load(&self.db);
+        let resolved = backend::resolve(&prefs, &available, None);
+        (resolved, available)
+    }
+
     /// Open a session and start work. Returns as soon as it is registered — the
     /// answer arrives as events.
     ///
-    /// The credential is resolved here rather than at boot, so a missing
-    /// `ANTHROPIC_API_KEY` is a typed error on the one action that needs it and
-    /// never a failed launch.
+    /// The backend is resolved here rather than at boot, so installing Claude
+    /// Code (or setting a key) costs a ⌘K rather than a relaunch, and having
+    /// neither is a typed error on the one action that needs it.
     pub fn start(
         self: &Arc<Self>,
         prompt: String,
         context: Vec<ContextItem>,
     ) -> Result<SessionSnapshot, AgentError> {
-        let config = match &self.config {
-            Some(pinned) => pinned.clone(),
-            None => AgentConfig::load()?,
-        };
+        let backend = self.resolve_backend().0?;
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
             return Err(AgentError::invalid("ask the agent something first"));
@@ -303,6 +593,7 @@ impl AgentEngine {
             entries: vec![Entry::User { text: prompt.clone() }],
             pending: None,
             error: None,
+            backend: Some(backend.label()),
         };
 
         let shared = Arc::new(Mutex::new(snapshot.clone()));
@@ -323,7 +614,7 @@ impl AgentEngine {
 
         let task = SessionTask {
             id: id.clone(),
-            config,
+            backend,
             db: self.db.clone(),
             tools: ToolContext {
                 db: self.db.clone(),
@@ -332,14 +623,17 @@ impl AgentEngine {
                 plugins: Arc::clone(&self.plugins),
             },
             transport: Arc::clone(&self.transport),
-            emitter: Arc::clone(&self.emitter),
-            snapshot: shared,
-            rx,
+            ui: Arc::new(SessionUi {
+                id: id.clone(),
+                snapshot: shared,
+                emitter: Arc::clone(&self.emitter),
+            }),
             cancelled,
             now: self.now,
+            workspace: self.workspace.clone(),
         };
 
-        tokio::spawn(task.run(prompt, context));
+        tokio::spawn(task.run(prompt, context, rx));
         Ok(snapshot)
     }
 
@@ -416,337 +710,109 @@ impl AgentEngine {
 
 struct SessionTask {
     id: String,
-    config: AgentConfig,
+    backend: Backend,
     db: Db,
     tools: ToolContext,
     transport: Arc<dyn ModelTransport>,
-    emitter: Arc<dyn SessionEmitter>,
-    snapshot: Arc<Mutex<SessionSnapshot>>,
-    rx: mpsc::UnboundedReceiver<Input>,
+    ui: Arc<SessionUi>,
     cancelled: Arc<AtomicBool>,
     now: fn() -> i64,
+    workspace: PathBuf,
 }
 
 impl SessionTask {
-    async fn run(mut self, prompt: String, context: Vec<ContextItem>) {
-        if let Err(error) = self.drive(prompt, context).await {
-            self.fail(error);
+    async fn run(
+        self,
+        prompt: String,
+        context: Vec<ContextItem>,
+        rx: mpsc::UnboundedReceiver<Input>,
+    ) {
+        let ui = Arc::clone(&self.ui);
+        if let Err(error) = self.drive(prompt, context, rx).await {
+            ui.fail(&error.to_string());
         }
     }
 
     async fn drive(
-        &mut self,
+        self,
         prompt: String,
         context: Vec<ContextItem>,
+        rx: mpsc::UnboundedReceiver<Input>,
     ) -> Result<(), AgentError> {
-        // Read once per session rather than per turn: the tool list the model
+        // Read once per session rather than per turn: the tool list the brain
         // was given has to be the list its calls are checked against, and a
         // plugin installed mid-session must not change the rules underneath it.
         let plugins = self.tools.plugin_list();
         let system = context::system_prompt(&self.db, (self.now)(), !plugins.is_empty());
-        let tool_defs: Vec<ToolDefinition> = tools::tools_with(&plugins)
-            .into_iter()
-            .map(|t| t.definition)
-            .collect();
-
         let block = context::render(&self.db, &context)?;
-        let mut messages = vec![wire::user_text(format!("{block}{prompt}"))];
 
-        for _ in 0..MAX_TURNS {
-            if self.cancelled.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            self.set_status(SessionStatus::Running);
+        let desk = Arc::new(ApprovalDesk::new(Arc::clone(&self.ui)));
+        let gate = Arc::new(ToolGate::new(
+            self.tools,
+            plugins,
+            Arc::clone(&self.ui),
+            Arc::clone(&desk),
+        ));
 
-            let request = TurnRequest {
-                system: system.clone(),
-                messages: messages.clone(),
-                tools: tool_defs.clone(),
-            };
-            let turn = self.stream_turn(&request, &plugins).await?;
+        let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+        tokio::spawn(pump(
+            rx,
+            Arc::clone(&desk),
+            messages_tx,
+            Arc::clone(&self.cancelled),
+        ));
 
-            if self.cancelled.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-
-            if turn.is_refusal() {
-                return Err(AgentError::Api {
-                    status: 200,
-                    message: "the model declined this request".to_string(),
-                });
-            }
-
-            messages.push(wire::assistant_message(&turn.content));
-
-            let text = turn.text();
-            if !text.trim().is_empty() {
-                self.push_entry(Entry::Agent { text: text.trim().to_string() });
-            }
-
-            if !turn.wants_tools() {
-                // Idle, not finished: the drawer stays open and another message
-                // resumes the same conversation.
-                self.set_status(SessionStatus::Done);
-                match self.rx.recv().await {
-                    Some(Input::Message(next)) => {
-                        self.push_entry(Entry::User { text: next.clone() });
-                        messages.push(wire::user_text(next));
-                        continue;
-                    }
-                    // A decision with nothing pending, or a close: we are done.
-                    _ => return Ok(()),
-                }
-            }
-
-            let results = self.run_tools(&turn, &plugins).await?;
-            if self.cancelled.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            messages.push(wire::tool_results_message(results));
-        }
-
-        Err(AgentError::invalid(
-            "the agent kept working without reaching an answer, so it was stopped",
-        ))
-    }
-
-    /// One model turn, streamed. Emits deltas as they arrive.
-    async fn stream_turn(
-        &mut self,
-        request: &TurnRequest,
-        plugins: &[crate::plugins::InstalledPlugin],
-    ) -> Result<AssistantTurn, AgentError> {
-        let mut rx = match self
-            .transport
-            .send(wire::build_call(&self.config, request, self.config.fallbacks))
-            .await
-        {
-            Ok(rx) => rx,
-            // An account without the fallback beta must still get an agent.
-            Err(error) if self.config.fallbacks && wire::is_fallback_rejection(&error) => {
-                self.transport
-                    .send(wire::build_call(&self.config, request, false))
-                    .await?
-            }
-            Err(error) => return Err(error),
+        let io = BrainIo {
+            session_id: self.id.clone(),
+            system,
+            first_message: format!("{block}{prompt}"),
+            gate,
+            ui: Arc::clone(&self.ui),
+            messages: messages_rx,
+            cancelled: Arc::clone(&self.cancelled),
+            workspace: self.workspace,
         };
 
-        let mut decoder = SseDecoder::new();
-        let mut accumulator = TurnAccumulator::new();
+        let brain = brain_for(self.backend, self.transport);
+        let result = brain.drive(io).await;
 
-        while let Some(chunk) = rx.recv().await {
-            if self.cancelled.load(Ordering::SeqCst) {
-                break;
-            }
-            for payload in decoder.push(&chunk?) {
-                for signal in accumulator.apply(&payload)? {
-                    match signal {
-                        StreamSignal::TextDelta(text) => {
-                            self.emit(SessionEvent::Delta {
-                                session_id: self.id.clone(),
-                                text,
-                            });
-                        }
-                        StreamSignal::ToolStarted { id, name } => {
-                            // Attributed the moment it starts: the owner has to
-                            // be able to see *which third party* is touching
-                            // their mailbox, not just that something is.
-                            let summary = super::plugin_tools::running_summary(&plugins, &name)
-                                .unwrap_or_else(|| running_summary(&name));
-                            self.push_entry(Entry::Tool {
-                                id,
-                                summary,
-                                name,
-                                state: ToolState::Running,
-                            });
-                        }
-                        StreamSignal::Done => {}
-                    }
-                }
-            }
-        }
-
-        Ok(accumulator.finish())
-    }
-
-    /// Execute every tool the turn asked for, gating the outbound ones.
-    async fn run_tools(
-        &mut self,
-        turn: &AssistantTurn,
-        plugins: &[crate::plugins::InstalledPlugin],
-    ) -> Result<Vec<Value>, AgentError> {
-        let mut results = Vec::new();
-
-        for call in turn.tool_uses() {
-            if self.cancelled.load(Ordering::SeqCst) {
-                return Ok(results);
-            }
-
-            if tools::policy_for_with(&call.name, plugins) == ToolPolicy::Approve {
-                match self.await_approval(&call, plugins).await {
-                    Approval::Approved => {}
-                    Approval::Denied(reason) => {
-                        self.update_tool(&call.id, ToolState::Denied, &reason);
-                        results.push(wire::tool_result(
-                            &call.id,
-                            &format!("The owner declined this action. {reason}"),
-                            true,
-                        ));
-                        continue;
-                    }
-                    Approval::Closed => return Ok(results),
-                }
-            }
-
-            match tools::execute(&self.tools, &call.name, &call.input).await {
-                Ok(outcome) => {
-                    self.update_tool(&call.id, ToolState::Ok, &outcome.summary);
-                    if outcome.mutated {
-                        self.emitter.threads_changed();
-                    }
-                    results.push(wire::tool_result(
-                        &call.id,
-                        &outcome.payload.to_string(),
-                        false,
-                    ));
-                }
-                Err(error) if error.is_recoverable_by_model() => {
-                    self.update_tool(&call.id, ToolState::Error, &error.to_string());
-                    results.push(wire::tool_result(&call.id, &error.to_string(), true));
-                }
-                // A missing credential or a dead transport is not something the
-                // model can work around.
-                Err(error) => return Err(error),
-            }
-        }
-
-        Ok(results)
-    }
-
-    /// Park until the owner decides. Nothing has run when this is entered and
-    /// nothing runs if it returns anything but [`Approval::Approved`].
-    async fn await_approval(
-        &mut self,
-        call: &wire::ToolUse,
-        plugins: &[crate::plugins::InstalledPlugin],
-    ) -> Approval {
-        let pending = PendingApproval {
-            tool_use_id: call.id.clone(),
-            name: call.name.clone(),
-            summary: approval_summary(&self.tools, plugins, &call.name, &call.input),
-            input: call.input.clone(),
-        };
-
-        {
-            let mut snapshot = lock(&self.snapshot);
-            snapshot.pending = Some(pending.clone());
-            snapshot.status = SessionStatus::AwaitingApproval;
-        }
-        self.emit(SessionEvent::Approval {
-            session_id: self.id.clone(),
-            pending,
-        });
-        self.emit(SessionEvent::Status {
-            session_id: self.id.clone(),
-            status: SessionStatus::AwaitingApproval,
-        });
-
-        let decision = loop {
-            match self.rx.recv().await {
-                Some(Input::Approve { tool_use_id }) if tool_use_id == call.id => {
-                    break Approval::Approved
-                }
-                Some(Input::Deny { tool_use_id, reason }) if tool_use_id == call.id => {
-                    break Approval::Denied(
-                        reason.unwrap_or_else(|| "No reason given.".to_string()),
-                    )
-                }
-                // A decision about some other tool call, or a message typed
-                // while the drawer was open: keep waiting rather than treating
-                // silence as consent.
-                Some(_) => continue,
-                None => break Approval::Closed,
-            }
-        };
-
-        {
-            let mut snapshot = lock(&self.snapshot);
-            snapshot.pending = None;
-            snapshot.status = SessionStatus::Running;
-        }
-        self.emit(SessionEvent::Status {
-            session_id: self.id.clone(),
-            status: SessionStatus::Running,
-        });
-        decision
-    }
-
-    // ------------------------------------------------------------------ state
-
-    fn emit(&self, event: SessionEvent) {
-        self.emitter.session_event(&event);
-    }
-
-    fn set_status(&self, status: SessionStatus) {
-        {
-            let mut snapshot = lock(&self.snapshot);
-            if snapshot.status == status {
-                return;
-            }
-            snapshot.status = status;
-        }
-        self.emit(SessionEvent::Status {
-            session_id: self.id.clone(),
-            status,
-        });
-    }
-
-    fn push_entry(&self, entry: Entry) {
-        {
-            let mut snapshot = lock(&self.snapshot);
-            upsert(&mut snapshot.entries, entry.clone());
-        }
-        self.emit(SessionEvent::Entry {
-            session_id: self.id.clone(),
-            entry,
-        });
-    }
-
-    fn update_tool(&self, id: &str, state: ToolState, summary: &str) {
-        let existing = {
-            let snapshot = lock(&self.snapshot);
-            snapshot.entries.iter().find_map(|entry| match entry {
-                Entry::Tool { id: eid, name, .. } if eid == id => Some(name.clone()),
-                _ => None,
-            })
-        };
-        self.push_entry(Entry::Tool {
-            id: id.to_string(),
-            name: existing.unwrap_or_else(|| "tool".to_string()),
-            summary: summary.to_string(),
-            state,
-        });
-    }
-
-    fn fail(&self, error: AgentError) {
-        let message = error.to_string();
-        {
-            let mut snapshot = lock(&self.snapshot);
-            snapshot.status = SessionStatus::Failed;
-            snapshot.pending = None;
-            snapshot.error = Some(message.clone());
-        }
-        self.emit(SessionEvent::Failed {
-            session_id: self.id.clone(),
-            message,
-        });
+        // Whatever happened, nothing may stay parked: a session that ended with
+        // a prompt still on screen would be an approval nobody can answer.
+        desk.close();
+        result
     }
 }
 
-enum Approval {
-    Approved,
-    Denied(String),
-    Closed,
+/// Route what the owner sends to whoever is waiting for it.
+///
+/// One task per session, and it is the only reader of the input channel. It ends
+/// when the channel closes or a [`Input::Close`] arrives, and its ending is what
+/// tells a brain waiting on [`BrainIo::idle`] that the session is over.
+async fn pump(
+    mut rx: mpsc::UnboundedReceiver<Input>,
+    desk: Arc<ApprovalDesk>,
+    messages: mpsc::UnboundedSender<String>,
+    cancelled: Arc<AtomicBool>,
+) {
+    while let Some(input) = rx.recv().await {
+        match input {
+            Input::Approve { tool_use_id } => {
+                desk.decide(&tool_use_id, ApprovalOutcome::Approved);
+            }
+            Input::Deny { tool_use_id, reason } => {
+                let reason = reason.unwrap_or_else(|| "No reason given.".to_string());
+                desk.decide(&tool_use_id, ApprovalOutcome::Denied(reason));
+            }
+            Input::Message(text) => {
+                if messages.send(text).is_err() {
+                    return;
+                }
+            }
+            Input::Close => break,
+        }
+    }
+    cancelled.store(true, Ordering::SeqCst);
+    desk.close();
 }
 
 /// Tool entries replace themselves by id; everything else appends.
@@ -765,63 +831,6 @@ fn upsert(entries: &mut Vec<Entry>, entry: Entry) {
 // ===========================================================================
 // Wording
 // ===========================================================================
-
-/// What a tool call says while it is running. The model's own arguments have
-/// not finished streaming at this point, so this is by name only.
-fn running_summary(name: &str) -> String {
-    match name {
-        "search_threads" => "Searching mail…".to_string(),
-        "get_thread" => "Reading the conversation…".to_string(),
-        "list_threads" => "Listing conversations…".to_string(),
-        "list_events" => "Checking the calendar…".to_string(),
-        "list_labels" | "list_accounts" => "Looking things up…".to_string(),
-        tools::DRAFT_TOOL => "Writing a reply…".to_string(),
-        tools::SEND_TOOL => "Ready to send…".to_string(),
-        other => format!("{other}…"),
-    }
-}
-
-/// The sentence the owner approves. It has to name the consequence — "Send" and
-/// "to whom" and "when" — because that is the whole point of asking.
-fn approval_summary(
-    ctx: &ToolContext,
-    plugins: &[crate::plugins::InstalledPlugin],
-    name: &str,
-    input: &Value,
-) -> String {
-    if let Some(summary) = super::plugin_tools::approval_summary(plugins, name) {
-        return summary;
-    }
-    if name != tools::SEND_TOOL {
-        return format!("Run {name}");
-    }
-
-    let draft_id = input.get("draftId").and_then(Value::as_str).unwrap_or_default();
-    let draft = crate::ipc::compose::engine::draft::load_draft(&ctx.db, draft_id)
-        .ok()
-        .flatten();
-
-    let (subject, to) = match &draft {
-        Some(draft) => (
-            draft.subject.clone(),
-            draft
-                .to
-                .iter()
-                .map(|m| m.email.clone())
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-        None => (String::from("(draft not found)"), String::new()),
-    };
-
-    match input.get("sendAt").and_then(Value::as_i64) {
-        Some(at) => format!(
-            "Send \u{201c}{subject}\u{201d} to {to} on {}",
-            context::human_time(at)
-        ),
-        None => format!("Send \u{201c}{subject}\u{201d} to {to} now"),
-    }
-}
 
 /// The pill's label: the ask, trimmed to something that fits.
 pub fn derive_title(prompt: &str) -> String {

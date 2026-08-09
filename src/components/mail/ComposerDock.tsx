@@ -270,7 +270,7 @@ export function ComposerDock() {
     setPending(null);
     const cancelled = await undoSend(id).catch(() => false);
     if (!cancelled) {
-      actions.setStatus("Too late — that message has already left", "error");
+      actions.setStatus("Already sent", "error");
       return;
     }
     const restored = recalled.current;

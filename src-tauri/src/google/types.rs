@@ -600,6 +600,112 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One way into a conference: a video URL, a dial-in number, a SIP address, or
+/// the "more phone numbers" page.
+///
+/// Every field is optional because Google fills in a different subset per
+/// `entryPointType`, and because the shape is versioned by addition — a
+/// `passcode` appeared on Meet entry points years after `pin` did. Deserializing
+/// permissively is what stops a new field on a video entry point from costing us
+/// the whole conference block.
+///
+/// `uri` is the only field that is load-bearing, and it is attacker-controlled:
+/// anyone who can send an invitation can put a string here. Nothing in this file
+/// validates it — this is the wire, verbatim — and the two places that act on it
+/// (the join affordance in the modal, `ipc::render::open_external` behind it)
+/// each check the scheme themselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConferenceEntryPoint {
+    /// `video`, `phone`, `sip` or `more`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_point_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// The human form of `uri` — `meet.google.com/abc-defg-hij`, or a phone
+    /// number written the way its country writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The dial-in PIN. Useless without the number, and the number is useless
+    /// without it, which is why they travel together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passcode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// ISO 3166-1 alpha-2 for a phone entry point — which country's number this
+    /// is, and the only thing that distinguishes six identical-looking rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConferenceSolutionKey {
+    /// `hangoutsMeet`, `addOn`, and the two deprecated Hangouts values.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub solution_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConferenceSolution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<ConferenceSolutionKey>,
+    /// "Google Meet", or whatever a third-party add-on calls itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_uri: Option<String>,
+}
+
+/// The conference attached to an event.
+///
+/// This was an `Option<serde_json::Value>` — parsed off the wire, held as an
+/// opaque blob, and dropped on the floor before it reached the store. Naming it
+/// is what lets the sync layer keep the join link, the dial-in number and its
+/// PIN, which between them are the difference between a calendar entry and a
+/// meeting you can attend.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConferenceData {
+    /// The meeting code — `abc-defg-hij` for Meet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conference_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conference_solution: Option<ConferenceSolution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_points: Vec<ConferenceEntryPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// Google's own round-trip token. Meaningless to us, and preserved for
+    /// exactly that reason: a patch that dropped it would be a patch that
+    /// re-created the conference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// A Drive file attached to an event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventAttachment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_link: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventReminderOverride {
@@ -670,10 +776,16 @@ pub struct Event {
     pub attendees: Vec<EventAttendee>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attendees_omitted: Option<bool>,
+    /// The pre-`conferenceData` Meet URL. Deprecated for a decade and still
+    /// populated on every Meet event Google sends, so it is the fallback when
+    /// `conferenceData` is absent — which it is on events created by clients
+    /// that only ever knew the old field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hangout_link: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conference_data: Option<serde_json::Value>,
+    pub conference_data: Option<ConferenceData>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<EventAttachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminders: Option<EventReminders>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

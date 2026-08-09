@@ -42,7 +42,67 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 6,
         sql: M6_CALENDARS,
     },
+    Migration {
+        version: 7,
+        sql: M7_EVENT_DETAIL,
+    },
 ];
+
+/// Migration 7 — what makes an event a meeting rather than a block of colour.
+///
+/// The comparison that produced this was Google's own popover beside Mach's
+/// modal, on one recurring standup. Google had a Meet link with a join button, a
+/// dial-in number with its PIN, "3 guests · 1 yes, 1 no, 1 maybe" with each
+/// answer under it and a declining guest's reason spelled out, and a creator who
+/// was not the organizer. Mach had a comma-separated list of addresses. Every
+/// one of those facts arrived in the same `events.list` response Mach was
+/// already making — parsed, held for the length of one function, and dropped for
+/// want of somewhere to put it.
+///
+///  * `conference` — the join link, the meeting code, and every entry point:
+///    video, phone with its PIN and region, SIP, and the "more phone numbers"
+///    page. Flattened out of `conferenceData` rather than stored verbatim,
+///    because half of that block exists to round-trip a conference this app
+///    never creates. `hangoutLink` — deprecated since Hangouts and still
+///    populated on every Meet event — is folded in here as the video entry point
+///    when `conferenceData` is missing, which is why it gets no column of its
+///    own: two spellings of one URL is not two facts.
+///  * `guests` — the answer sheet. `attendees` stays exactly as it was, holding
+///    the addresses the editor round-trips, and this holds what Google says
+///    about each of them: `responseStatus`, `optional`, `organizer`, `self`,
+///    `resource`, and the comment a guest attached to their reply. Two columns
+///    rather than a richer `attendees` because the two are written by different
+///    things — a local edit sets the addresses and cannot know the answers, and
+///    a sync knows the answers and must not fight the edit. When a local edit
+///    changes the guest list this column is set back to `NULL`, i.e. "we no
+///    longer know", and the next sync fills it in.
+///  * `creator` — who made the event. Different from the organizer more often
+///    than one would think: an assistant booking on a director's calendar, a
+///    room system, an integration. Google shows both; showing only the organizer
+///    attributes the meeting to the wrong person.
+///  * `attachments` — the Drive files hanging off the event. Title and URL only.
+///    The icon link is a remote image and the file id is a handle for an API
+///    Mach does not speak, so neither is kept.
+///  * `visibility`, `transparency` — private, and free-versus-busy. Two words
+///    each, and both of them change what the event *means* rather than how it
+///    looks.
+///
+/// Every column is nullable and there is no backfill. A row that predates this
+/// migration reads back as "we were never told", which each reader treats as
+/// silence rather than as a negative answer — the same rule migration 5 set for
+/// `organizer_self`, and for the same reason: the first launch after an upgrade
+/// must not look like data loss.
+///
+/// No index. Nothing here is ever a predicate; these columns are read by primary
+/// key, one event at a time, by a modal that is already open.
+const M7_EVENT_DETAIL: &str = r#"
+ALTER TABLE events ADD COLUMN conference   TEXT;
+ALTER TABLE events ADD COLUMN guests       TEXT;
+ALTER TABLE events ADD COLUMN creator      TEXT;
+ALTER TABLE events ADD COLUMN attachments  TEXT;
+ALTER TABLE events ADD COLUMN visibility   TEXT;
+ALTER TABLE events ADD COLUMN transparency TEXT;
+"#;
 
 /// Migration 6 — `calendars`, because a calendar has never had a name.
 ///

@@ -187,8 +187,7 @@ export class PluginSandbox {
     if (this.timeouts >= TIMEOUT_STRIKES && !this.disabled) {
       this.disabled = true;
       this.options.onDisabled?.(
-        `${this.id} stopped responding ${this.timeouts} times and has been switched off. ` +
-          `Re-enable it from the plugin list once its author has fixed it.`,
+        `${this.id} stopped responding ${this.timeouts} times — switched off`,
       );
     }
   }

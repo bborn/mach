@@ -92,7 +92,7 @@ export function StatusBar() {
       {/* Fixture data looks exactly like real mail, so say when it isn't. */}
       {!live && (
         <span
-          title="No Tauri backend — rendering fixture data"
+          title="Fixture data"
           className="shrink-0 whitespace-nowrap font-mono text-micro uppercase tracking-[0.06em] text-warning"
         >
           fixtures

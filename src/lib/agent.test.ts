@@ -12,6 +12,8 @@ import {
   reduceSessions,
   requestAsk,
   subscribeAsk,
+  UNKNOWN_BACKEND,
+  loadBackendStatus,
   type AgentEvent,
   type AgentSession,
   type ShellView,
@@ -329,5 +331,22 @@ describe("the session state machine", () => {
     const frozen = JSON.stringify(before);
     reduceSession(before, { type: "delta", sessionId: before.id, text: "x" });
     expect(JSON.stringify(before)).toBe(frozen);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* which brain                                                                 */
+/* -------------------------------------------------------------------------- */
+
+describe("the backend status", () => {
+  it("is 'nothing detected' outside the desktop app rather than an error", async () => {
+    // The settings surface renders this. A browser tab has no agent, which is a
+    // state to show, not a failure to handle.
+    await expect(loadBackendStatus()).resolves.toEqual(UNKNOWN_BACKEND);
+  });
+
+  it("carries the label a session is tagged with", () => {
+    const s = session({ backend: "Claude Code" });
+    expect(s.backend).toBe("Claude Code");
   });
 });

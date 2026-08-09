@@ -368,6 +368,119 @@ impl EventReminders {
     }
 }
 
+/// One guest, with the answer they gave.
+///
+/// [`Participant`] cannot carry this and should not learn to: it is the shape of
+/// a name on a mail header, used in six places that have no notion of an RSVP.
+/// A guest on an invitation is a different thing — the same address plus the
+/// four facts that make a guest list readable, which is why `attendees` (the
+/// editable list of addresses) and `guests` (Google's answer sheet) are two
+/// columns and not one.
+///
+/// `comment` is worth the column on its own. "Declined because I am out of
+/// office" is frequently the entire content of the notification a decline
+/// generates, and dropping it means the user learns that someone said no but
+/// not why — which is the half that would have changed what they did next.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventGuest {
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `None` where Google sent no `responseStatus` at all — which is not the
+    /// same as `needsAction`, and is what every row written before this column
+    /// existed reads as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<RsvpStatus>,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default)]
+    pub organizer: bool,
+    /// Google's `self` — the signed-in account's own row.
+    #[serde(default)]
+    pub is_self: bool,
+    /// A meeting room or other bookable resource rather than a person.
+    #[serde(default)]
+    pub resource: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+impl EventGuest {
+    /// The plain address-book form of this guest, for the editable list.
+    pub fn participant(&self) -> Participant {
+        Participant {
+            name: self.name.clone().filter(|n| !n.is_empty()),
+            email: self.email.clone(),
+        }
+    }
+}
+
+/// One way into a conference — a video link, a dial-in, a SIP address, or the
+/// page listing the other twenty phone numbers.
+///
+/// `uri` is a string an attacker chose: an invitation is an unauthenticated
+/// write into this store from anyone who knows the user's address. It is stored
+/// verbatim and rendered as text; the only place it is ever *followed* is the
+/// join affordance, which validates the scheme and host shape first, and
+/// `ipc::render::open_external`, which validates the scheme again on the far
+/// side of the IPC boundary because the webview is not a trust boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConferenceEntry {
+    /// `video`, `phone`, `sip` or `more`.
+    pub kind: String,
+    pub uri: String,
+    /// The readable form — `meet.google.com/abc-defg-hij`, or a phone number
+    /// spaced the way its country spaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_code: Option<String>,
+}
+
+/// The conference on an event, flattened out of Google's `conferenceData`.
+///
+/// Deliberately not a verbatim copy of the wire shape. `conferenceData` carries
+/// a create-request block, a signature and a solution key that exist for
+/// round-tripping a conference Mach never creates; what a person needs is the
+/// name of the thing, the code to read out loud, and the ways in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventConference {
+    /// The meeting code — `abc-defg-hij`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// "Google Meet", or what a third-party add-on calls itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_points: Vec<ConferenceEntry>,
+    /// Google's free-text note ("This meeting is being recorded"), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+impl EventConference {
+    /// The video link, which is what a "Join" button means.
+    pub fn video(&self) -> Option<&ConferenceEntry> {
+        self.entry_points.iter().find(|e| e.kind == "video")
+    }
+}
+
+/// A file attached to an event — always a Drive file today, since that is the
+/// only kind Google's API accepts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventAttachment {
+    pub title: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Event {
@@ -406,6 +519,39 @@ pub struct Event {
     /// camelCased `iCalUid` would be a third spelling of the same thing.
     #[serde(default, rename = "iCalUID", skip_serializing_if = "Option::is_none")]
     pub ical_uid: Option<String>,
+    /// Who is coming, and what each of them said.
+    ///
+    /// A superset of `attendees`, and never a replacement for it: `attendees` is
+    /// the list the editor round-trips, and a save writes exactly what is in it.
+    /// Empty on a row the store has never been told about, in which case
+    /// [`crate::db::queries`] projects `attendees` into this shape so a reader
+    /// never has to ask which of the two columns to look at.
+    #[serde(default)]
+    pub guests: Vec<EventGuest>,
+    /// The video call, its code and its dial-ins. `None` for an event with no
+    /// conference — the common case, and the reason this is not a struct of six
+    /// nullable columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conference: Option<EventConference>,
+    /// Who made the event, which is not always who owns it.
+    ///
+    /// An assistant creating a meeting on a director's calendar, a room-booking
+    /// system, a Zapier integration: in all three the creator and the organizer
+    /// are different people, and Google shows both. Stored separately for that
+    /// reason and shown only when the two disagree — repeating one name under
+    /// two labels is noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<Participant>,
+    #[serde(default)]
+    pub attachments: Vec<EventAttachment>,
+    /// `default`, `public`, `private` or `confidential`. `None` means Google
+    /// said nothing, which means `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// `opaque` (busy) or `transparent` (free). The thing that decides whether
+    /// this event defends the time or merely records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparency: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub organizer: Option<Participant>,
     /// Google's `organizer.self`: whether the organizer is the calendar this
@@ -446,6 +592,18 @@ pub struct NewEvent {
     pub reminders: Option<EventReminders>,
     #[serde(default, rename = "iCalUID")]
     pub ical_uid: Option<String>,
+    #[serde(default)]
+    pub guests: Vec<EventGuest>,
+    #[serde(default)]
+    pub conference: Option<EventConference>,
+    #[serde(default)]
+    pub creator: Option<Participant>,
+    #[serde(default)]
+    pub attachments: Vec<EventAttachment>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub transparency: Option<String>,
     #[serde(default)]
     pub organizer: Option<Participant>,
     #[serde(default)]

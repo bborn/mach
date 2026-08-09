@@ -38,6 +38,23 @@ import { DAY, MINUTE, startOfDay } from "./time";
  * and showing "every week" makes it silently retime one. So the rule is carried
  * through untouched, described in words, and only replaced if the user picks
  * something else.
+ *
+ * `series` is the same admission one step further along, and it is the state
+ * this form was lying about. Google is asked for events with `singleEvents=true`
+ * and answers with *occurrences*; the RRULE lives on the series master, which
+ * that expansion never returns. So a weekly standup synced from Google arrives
+ * with `recurringEventId` set and `recurrence` empty — the store knows the event
+ * repeats and does not know how — and an empty rule list was being read as "no
+ * rule", which the picker rendered as **Does not repeat** over a meeting that
+ * Google's own popover described as "Weekly on weekdays".
+ *
+ * Fetching the master would answer it exactly, at one `events.get` per series
+ * against a UI that is not allowed to wait on the network, on a path this unit
+ * does not own. The rule is also worth almost nothing here: it cannot be edited
+ * from this form without addressing the whole series anyway. So the honest,
+ * free answer is to stop claiming the opposite of the truth — `series` says
+ * "this repeats, the rule is Google's" and, exactly like `custom`, carries
+ * nothing into a save.
  */
 export type RecurrenceChoice =
   | "none"
@@ -46,7 +63,8 @@ export type RecurrenceChoice =
   | "weekly"
   | "monthly"
   | "yearly"
-  | "custom";
+  | "custom"
+  | "series";
 
 export const RECURRENCE_CHOICES: { id: RecurrenceChoice; label: string }[] = [
   { id: "none", label: "Does not repeat" },
@@ -271,6 +289,12 @@ export function rulesFor(choice: RecurrenceChoice, start: number): string[] {
     // original lines through instead, and that is the only correct answer here.
     case "custom":
       return [];
+    // And a rule this form has never *seen* has nothing to carry through. An
+    // empty list is right for the same reason it is wrong for `none`: it is
+    // compared against what the event already has, which is also empty, so the
+    // save says nothing about how the event repeats.
+    case "series":
+      return [];
     case "daily":
       return ["RRULE:FREQ=DAILY"];
     case "weekdays":
@@ -291,7 +315,23 @@ const BYDAY = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
  * custom rule.
  */
 export function rulesOf(form: EventForm, start: number): string[] {
-  return form.recurrence === "custom" ? form.recurrenceRules : rulesFor(form.recurrence, start);
+  return form.recurrence === "custom" || form.recurrence === "series"
+    ? form.recurrenceRules
+    : rulesFor(form.recurrence, start);
+}
+
+/**
+ * Which picker row an event stands on, rule or no rule.
+ *
+ * The distinction `choiceFromRules` cannot make on its own: an empty rule list
+ * means "no rule is known here", and whether that is "does not repeat" or "we
+ * were not told" is answered by `recurringEventId`, which Google sets on every
+ * occurrence it expands out of a series.
+ */
+export function choiceForEvent(event: CalendarEvent): RecurrenceChoice {
+  const rules = event.recurrence ?? [];
+  if (rules.length === 0 && (event.recurringEventId ?? "").length > 0) return "series";
+  return choiceFromRules(rules, event.start);
 }
 
 /**
@@ -456,7 +496,10 @@ export function formFromEvent(event: CalendarEvent): EventForm {
     // "does not repeat" and "calendar default" on top of a weekly meeting with
     // a fifteen-minute alert — so an unrelated title edit re-sent both defaults
     // and quietly rewrote the event.
-    recurrence: choiceFromRules(rules, event.start),
+    //
+    // `choiceForEvent`, not `choiceFromRules`: a synced series has no rule here
+    // and "no rule" is not "does not repeat".
+    recurrence: choiceForEvent(event),
     recurrenceRules: [...rules],
     reminderMinutes: reminderMinutesOf(event),
   };
@@ -511,14 +554,14 @@ export function formTimes(form: EventForm): FormTimes | { error: string } {
   if (form.allDay) {
     const start = utcMidnightFrom(form.startDate);
     const last = utcMidnightFrom(form.endDate || form.startDate);
-    if (start === null || last === null) return { error: "That date is not a date" };
-    if (last < start) return { error: "It cannot end before it starts" };
+    if (start === null || last === null) return { error: "Not a date" };
+    if (last < start) return { error: "Ends before it starts" };
     return { start, end: last + DAY, allDay: true };
   }
   const start = timestampFrom(form.startDate, form.startTime);
   const end = timestampFrom(form.endDate || form.startDate, form.endTime);
-  if (start === null || end === null) return { error: "That date or time is not valid" };
-  if (end < start) return { error: "It cannot end before it starts" };
+  if (start === null || end === null) return { error: "Not a valid date or time" };
+  if (end < start) return { error: "Ends before it starts" };
   return { start, end, allDay: false };
 }
 

@@ -216,6 +216,11 @@ pub(crate) async fn execute_create(
         status: "confirmed".into(),
         html_link: None,
         updated_at: now_ms(),
+        // Everything migration 7 keeps is Google's to say: a conference it has
+        // not minted yet, the answers nobody has given yet, the creator block it
+        // stamps on the insert. Defaulted here and filled in by the first sync
+        // that reads the created event back.
+        ..Default::default()
     };
 
     let event_id = dispatcher.db.write(|conn| queries::upsert_event(conn, &row))?;

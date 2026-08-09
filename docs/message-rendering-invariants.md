@@ -43,13 +43,22 @@ five mailboxes. Assume the sender knows exactly how the sanitizer works.
    validates the *shape* of `data-mach-cid`, not its ownership. A resolver that
    accepts a Content-ID from another message or account leaks across accounts.
 
+6. **The parent may restructure the frame's DOM, but never by writing markup.**
+   `allow-same-origin` lets the parent reach into the frame, and it uses that:
+   revealing blocked images, and putting content too wide for the pane inside
+   its own scroller (`containWideContent`). Every such change must be made by
+   creating elements and moving nodes — `createElement`, `insertBefore`,
+   `appendChild`. Never `innerHTML`, `insertAdjacentHTML` or anything else that
+   re-parses a string, because the strings in there are the sender's and the
+   sanitizer has already had its one look at them.
+
 ## Behaviour
 
-6. **Auto-expand when new content is empty.** A body that is entirely quoted is
+7. **Auto-expand when new content is empty.** A body that is entirely quoted is
    legitimate for a bare forward — and is also how a sender hides their whole
    message behind the collapse.
 
-7. **Render off the UI thread.** Input is capped at 8 MiB, but a pathological
+8. **Render off the UI thread.** Input is capped at 8 MiB, but a pathological
    body still costs CPU.
 
 ## Known gaps

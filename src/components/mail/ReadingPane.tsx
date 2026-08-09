@@ -29,13 +29,17 @@ export function ReadingPane() {
   useEffect(() => setToggled({}), [threadId]);
 
   if (!detail && detailLoading && ui.threadId !== null) {
-    // A local read, so this is a frame or two — but "no conversation selected"
-    // would be a lie for those frames.
-    return (
-      <div className="flex min-h-0 flex-1 items-center justify-center text-list text-faint-foreground">
-        Opening…
-      </div>
-    );
+    /*
+     * A local read, so this is a frame or two — but "no conversation selected"
+     * would be a lie for those frames, and a flash of the empty state under
+     * every ⏎ reads as the app losing the selection.
+     *
+     * Nothing is said about it. Naming the wait is the software talking about
+     * itself: the reader pressed a key a moment ago and knows what they asked
+     * for, and by the time the sentence is read it is gone. An empty pane for
+     * two frames is what a fast app looks like.
+     */
+    return <div className="flex min-h-0 flex-1" />;
   }
 
   if (!detail) {
@@ -101,7 +105,14 @@ export function ReadingPane() {
             <Button size="icon" title="Archive (e)" onClick={actions.archiveSelected}>
               <Archive size={14} strokeWidth={1.75} />
             </Button>
-            <Button size="icon" title="Snooze (h)" onClick={actions.snoozeSelected}>
+            {/*
+              `b`, not `h`. Both keys snooze — `h` is the Superhuman habit this
+              app shipped with and still answers to — but `b` is Gmail's, it is
+              the one `MailMode` publishes to the shortcut sheet and the status
+              bar, and it is the one a Gmail hand will reach for. A tooltip that
+              names the undocumented alias teaches the wrong key.
+            */}
+            <Button size="icon" title="Snooze (b)" onClick={actions.snoozeSelected}>
               <Clock size={14} strokeWidth={1.75} />
             </Button>
             <Button size="icon" title="Reply (r)" onClick={actions.replySelected}>

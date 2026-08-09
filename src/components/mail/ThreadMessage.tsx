@@ -170,11 +170,27 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
                   type="button"
                   disabled={!live || working}
                   aria-label={`Open ${label}`}
+                  /*
+                   * Both of the unhappy tooltips are labels, not explanations.
+                   *
+                   * The disabled one is a `bun run dev` state: there is no Rust
+                   * process behind the fixtures, so there are no bytes to fetch.
+                   * Nobody in that browser tab needs to be told what the fixture
+                   * preview is — they are the one running it.
+                   *
+                   * The program one is a warning that has to fit on a chip. What
+                   * it is warning about: Rust refuses to hand an executable to
+                   * LaunchServices (`attachments::names::is_dangerous`), so the
+                   * click will fail. `isExecutable` here is only the hint that
+                   * lets the chip say so first. Saving is the way through, and
+                   * the Save button is already the next control along, so the
+                   * tooltip does not have to spell out the recovery.
+                   */
                   title={
                     !live
-                      ? "Attachments need the app; this is the fixture preview"
+                      ? "Needs the app"
                       : program
-                        ? "Mach will not open a program. Save it instead."
+                        ? "Mach does not open programs"
                         : `Open ${name}`
                   }
                   onClick={() =>

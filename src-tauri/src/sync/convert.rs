@@ -4,8 +4,8 @@
 //! directly testable. The sync engine calls these; nothing else should need to.
 
 use crate::db::models::{
-    EventReminder, EventReminders, NewAttachment, NewEvent, NewLabel, NewMessage, Participant,
-    RsvpStatus,
+    ConferenceEntry, EventAttachment, EventConference, EventGuest, EventReminder, EventReminders,
+    NewAttachment, NewEvent, NewLabel, NewMessage, Participant, RsvpStatus,
 };
 use crate::google::types as g;
 
@@ -242,16 +242,27 @@ pub fn prepare_event(account_id: i64, calendar_id: &str, event: &g::Event) -> Op
 
     let is_all_day = event.start.as_ref().map(|s| s.is_all_day()).unwrap_or(false);
 
-    let attendees = event
+    // Guests first; the address list is a projection of them. Built in that
+    // order so the two columns cannot disagree about who is invited — they are
+    // one list read twice, not two lists kept in step.
+    let guests: Vec<EventGuest> = event
         .attendees
         .iter()
         .filter_map(|a| {
-            a.email.clone().map(|email| Participant {
-                name: a.display_name.clone().filter(|n| !n.is_empty()),
+            let email = a.email.clone().filter(|e| !e.is_empty())?;
+            Some(EventGuest {
                 email,
+                name: a.display_name.clone().filter(|n| !n.is_empty()),
+                response: a.response_status.as_deref().and_then(RsvpStatus::parse),
+                optional: a.optional,
+                organizer: a.organizer,
+                is_self: a.is_self,
+                resource: a.resource,
+                comment: a.comment.clone().filter(|c| !c.trim().is_empty()),
             })
         })
         .collect();
+    let attendees = guests.iter().map(EventGuest::participant).collect();
 
     let rsvp_status = event
         .self_attendee()
@@ -262,12 +273,26 @@ pub fn prepare_event(account_id: i64, calendar_id: &str, event: &g::Event) -> Op
         recurrence: event.recurrence.clone(),
         reminders: event.reminders.as_ref().map(reminders_of),
         ical_uid: event.ical_uid.clone().filter(|s| !s.is_empty()),
-        organizer: event.organizer.as_ref().and_then(|person| {
-            person.email.clone().map(|email| Participant {
-                name: person.display_name.clone().filter(|n| !n.is_empty()),
-                email,
+        guests,
+        conference: conference_of(event),
+        creator: event.creator.as_ref().and_then(person_of),
+        attachments: event
+            .attachments
+            .iter()
+            .filter_map(|a| {
+                let url = a.file_url.clone().filter(|u| !u.is_empty())?;
+                Some(EventAttachment {
+                    // A file with no title still has to be nameable; the URL is
+                    // the only other thing we have, and it is at least unique.
+                    title: a.title.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| url.clone()),
+                    url,
+                    mime_type: a.mime_type.clone().filter(|m| !m.is_empty()),
+                })
             })
-        }),
+            .collect(),
+        visibility: event.visibility.clone().filter(|v| !v.is_empty()),
+        transparency: event.transparency.clone().filter(|t| !t.is_empty()),
+        organizer: event.organizer.as_ref().and_then(person_of),
         // `organizer.self` is Google's own answer to "is this event mine": it is
         // true when the organizer is the calendar this copy appears on. Absent
         // is not false — an event Google described without an organizer block
@@ -292,6 +317,102 @@ pub fn prepare_event(account_id: i64, calendar_id: &str, event: &g::Event) -> Op
             .unwrap_or_else(|| "confirmed".to_string()),
         html_link: event.html_link.clone(),
         updated_at: event.updated.as_deref().and_then(rfc3339_ms).unwrap_or(0),
+    })
+}
+
+/// A Google person block as a [`Participant`], or `None` when it names nobody.
+fn person_of(person: &g::EventPerson) -> Option<Participant> {
+    person
+        .email
+        .clone()
+        .filter(|e| !e.is_empty())
+        .map(|email| Participant {
+            name: person.display_name.clone().filter(|n| !n.is_empty()),
+            email,
+        })
+}
+
+/// The conference on an event, from either of the two places Google keeps one.
+///
+/// `conferenceData` is the modern field and carries everything — the meeting
+/// code, the video link, the dial-ins with their PINs, the "more phone numbers"
+/// page. `hangoutLink` is the field it replaced, it has been deprecated since
+/// Hangouts became Meet, and it is still populated on essentially every Meet
+/// event Google sends. Reading only the first would lose the call on events
+/// created by anything old enough to write only the second, and reading only the
+/// second would lose the dial-in on everything else.
+///
+/// So both are read, `conferenceData` wins, and `hangoutLink` is folded in as
+/// the video entry point when the modern block somehow has none. That is also
+/// why `hangout_link` gets no column of its own: two spellings of one URL are
+/// not two facts, and a UI that had to choose between them would eventually
+/// choose wrong.
+///
+/// An entry point with no `uri` is dropped. There is nothing to show and nothing
+/// to dial, and a row that renders as an empty line is worse than no row.
+fn conference_of(event: &g::Event) -> Option<EventConference> {
+    let data = event.conference_data.as_ref();
+
+    let mut entry_points: Vec<ConferenceEntry> = data
+        .map(|d| d.entry_points.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            let uri = entry.uri.clone().filter(|u| !u.is_empty())?;
+            Some(ConferenceEntry {
+                // Google has always sent `entryPointType`, but an entry point
+                // with a URI and no type is still a way in; `video` is the only
+                // guess that makes it reachable rather than merely visible.
+                kind: entry
+                    .entry_point_type
+                    .clone()
+                    .filter(|k| !k.is_empty())
+                    .unwrap_or_else(|| "video".to_string()),
+                label: entry.label.clone().filter(|l| !l.is_empty()),
+                pin: entry
+                    .pin
+                    .clone()
+                    .or_else(|| entry.access_code.clone())
+                    .or_else(|| entry.passcode.clone())
+                    .filter(|p| !p.is_empty()),
+                region_code: entry.region_code.clone().filter(|r| !r.is_empty()),
+                uri,
+            })
+        })
+        .collect();
+
+    if let Some(link) = event.hangout_link.as_deref().filter(|l| !l.is_empty()) {
+        if !entry_points.iter().any(|e| e.kind == "video") {
+            entry_points.push(ConferenceEntry {
+                kind: "video".to_string(),
+                label: link.strip_prefix("https://").map(str::to_string),
+                uri: link.to_string(),
+                pin: None,
+                region_code: None,
+            });
+        }
+    }
+
+    if entry_points.is_empty() {
+        return None;
+    }
+
+    Some(EventConference {
+        id: data.and_then(|d| d.conference_id.clone()).filter(|i| !i.is_empty()),
+        name: data
+            .and_then(|d| d.conference_solution.as_ref())
+            .and_then(|s| s.name.clone())
+            .filter(|n| !n.is_empty())
+            // Named from the link rather than left blank: "Join" with no noun
+            // after it is a button that does not say where it goes.
+            .or_else(|| {
+                entry_points
+                    .iter()
+                    .any(|e| e.uri.contains("meet.google.com"))
+                    .then(|| "Google Meet".to_string())
+            }),
+        notes: data.and_then(|d| d.notes.clone()).filter(|n| !n.trim().is_empty()),
+        entry_points,
     })
 }
 

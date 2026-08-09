@@ -56,6 +56,9 @@ describe("parsePreferences", () => {
         notificationsEnabled: false,
         notificationAccounts: { "7": false },
         badgeEnabled: false,
+        agentBackend: "claudeCli",
+        agentModel: "opus",
+        agentCommand: "/usr/local/bin/my-agent",
       }),
     ).toEqual({
       defaultAccountId: 7,
@@ -70,6 +73,9 @@ describe("parsePreferences", () => {
       notificationsEnabled: false,
       notificationAccounts: { "7": false },
       badgeEnabled: false,
+      agentBackend: "claudeCli",
+      agentModel: "opus",
+      agentCommand: "/usr/local/bin/my-agent",
     });
   });
 

@@ -156,6 +156,64 @@ export interface EventReminders {
   overrides: EventReminder[];
 }
 
+/**
+ * One guest, with the answer they gave.
+ *
+ * `Participant` is a name and an address and is used on mail headers, where an
+ * RSVP means nothing; this is the invitation's own row. `response` absent means
+ * Google never said, which is not `needsAction` — a guest who has not answered
+ * and a guest we know nothing about look identical only if you conflate them.
+ */
+export interface EventGuest {
+  email: string;
+  name?: string;
+  response?: Rsvp;
+  optional?: boolean;
+  organizer?: boolean;
+  /** The signed-in account's own row. */
+  isSelf?: boolean;
+  /** A room or other bookable resource rather than a person. */
+  resource?: boolean;
+  /** Whatever the guest attached to their reply — often the whole point. */
+  comment?: string;
+}
+
+/**
+ * One way into a conference.
+ *
+ * `uri` is attacker-controlled: an invitation is an unauthenticated write into
+ * this store from anyone who knows the user's address. It is rendered as text
+ * and never as markup, and the only place it is followed is behind
+ * `joinUrl()` in `calendar-links.ts`, which checks the scheme and the host
+ * shape before anything is opened.
+ */
+export interface ConferenceEntry {
+  /** `video`, `phone`, `sip` or `more`. */
+  kind: string;
+  uri: string;
+  /** The readable form — `meet.google.com/abc-defg-hij`, or a phone number. */
+  label?: string;
+  pin?: string;
+  /** ISO 3166-1 alpha-2, the only thing telling six dial-ins apart. */
+  regionCode?: string;
+}
+
+export interface EventConference {
+  /** The meeting code — `abc-defg-hij`. */
+  id?: string;
+  /** "Google Meet", or what a third-party add-on calls itself. */
+  name?: string;
+  entryPoints: ConferenceEntry[];
+  notes?: string;
+}
+
+/** A file attached to the event. Always a Drive file, in practice. */
+export interface EventAttachment {
+  title: string;
+  url: string;
+  mimeType?: string;
+}
+
 export interface CalendarEvent {
   id: EventId;
   calendarId: CalendarId;
@@ -167,7 +225,30 @@ export interface CalendarEvent {
   location?: string;
   description?: string;
   organizer?: Participant;
+  /**
+   * Who made the event, when that is not who owns it.
+   *
+   * An assistant booking on a director's calendar, a room system, an
+   * integration: Google shows both names and so does this. Only rendered when
+   * the two differ — one person under two labels is noise.
+   */
+  creator?: Participant;
   attendees: Participant[];
+  /**
+   * The same people with their answers, `optional`/`organizer` flags and any
+   * comment they left. Empty on a store that has never been told; the backend
+   * projects `attendees` into this shape rather than leaving the UI to decide
+   * which of the two lists to read.
+   */
+  guests?: EventGuest[];
+  /** The video call, its code and its dial-ins. */
+  conference?: EventConference;
+  /** Drive files hanging off the event. */
+  attachments?: EventAttachment[];
+  /** `default`, `public`, `private`, `confidential`. Absent means default. */
+  visibility?: string;
+  /** `opaque` (busy) or `transparent` (free). */
+  transparency?: string;
   rsvp?: Rsvp;
   /**
    * The series this occurrence belongs to, when it belongs to one.

@@ -77,9 +77,15 @@ export function AddAccountDialog() {
           <h2 id="add-account-title" className="text-body font-medium text-foreground">
             Add a Google account
           </h2>
+          {/*
+            This carried a paragraph about Mach never seeing the password and
+            the tokens going into the Keychain. Both true, both reassurance —
+            and reassurance nobody asked for reads as a reason to worry. What
+            is left is the only part that changes what you do next: the window
+            will sit there while a browser tab does the work.
+          */}
           <p className="mt-1 text-list leading-[1.5] text-muted-foreground">
-            Consent happens in your browser, not in this window. Mach never sees the password —
-            only the tokens Google hands back, which go straight into the macOS Keychain.
+            Consent opens in your browser.
           </p>
         </div>
 
@@ -87,7 +93,7 @@ export function AddAccountDialog() {
 
         {phase.step === "waiting" && (
           <p className="text-list text-muted-foreground">
-            Waiting for Google… finish in the browser tab that just opened. If nothing opened,{" "}
+            Finish in your browser, or{" "}
             <button
               type="button"
               onClick={() => void getDataSource().openExternal(phase.url)}
@@ -101,8 +107,8 @@ export function AddAccountDialog() {
 
         {phase.step === "done" && (
           <p className="text-list text-foreground">
-            Added <span className="font-medium">{phase.email}</span>. The first sync has started —
-            twelve months of mail takes a few minutes.
+            Added <span className="font-medium">{phase.email}</span>. First sync takes a few
+            minutes.
           </p>
         )}
 
@@ -119,7 +125,7 @@ export function AddAccountDialog() {
             </Button>
           ) : (
             <Button variant="default" disabled={busy} onClick={() => void start()}>
-              {phase.step === "failed" ? "Try again" : busy ? "Waiting for Google…" : "Continue"}
+              {phase.step === "failed" ? "Try again" : busy ? "Waiting" : "Continue"}
             </Button>
           )}
           <Button variant="ghost" disabled={busy} onClick={() => actions.setAddAccount(false)}>
@@ -147,10 +153,10 @@ export function AddAccountDialog() {
 function Expectation() {
   return (
     <ol className="flex flex-col gap-1 rounded-[var(--radius)] border border-border bg-surface-raised p-3 text-list leading-[1.5] text-muted-foreground">
-      <Step n={1}>Pick the account you want to add.</Step>
+      <Step n={1}>Pick the account.</Step>
       <Step n={2}>
         Google will say <span className="text-foreground">“Google hasn’t verified this app”</span>.
-        That is expected — this is your own OAuth client, used by nobody else.
+        That is expected.
       </Step>
       <Step n={3}>
         Click <span className="text-foreground">Advanced</span>, then{" "}

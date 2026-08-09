@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use mach_lib::db::models::{NewAccount, ThreadQuery};
+use mach_lib::db::models::{NewAccount, RsvpStatus, ThreadQuery};
 use mach_lib::db::{queries, sync_queries, Db};
 use mach_lib::google::types::encode_base64url;
 use mach_lib::google::{
@@ -1773,6 +1773,179 @@ async fn calendar_sync_keeps_the_fields_an_event_can_only_be_read_back_from() {
     // An instance carries no rule of its own, and inventing one would be worse
     // than the empty list that honestly says "no rule is known here".
     assert!(all_hands.recurrence.is_empty());
+}
+
+#[tokio::test]
+async fn calendar_sync_keeps_the_conference_the_guest_answers_and_the_creator() {
+    // The comparison that produced migration 7: Google's popover on one standup
+    // against Mach's modal on the same event. Everything asserted here arrived
+    // in the response Mach was already making and was dropped for want of a
+    // column — the Meet link, the dial-in and its PIN, each guest's answer and
+    // the reason one of them gave, and a creator who is not the organizer.
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+    let token = format!("tok-{account_id}");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    let mut standup = event_json(
+        "e1",
+        "Team standup",
+        "2026-08-10T09:00:00Z",
+        "2026-08-10T09:15:00Z",
+    );
+    standup["recurringEventId"] = json!("series-standup");
+    standup["organizer"] = json!({ "email": "sean@offerlab.com", "displayName": "Sean" });
+    // Different from the organizer, which is the case the modal has to handle:
+    // an assistant, a room system or an integration made the event.
+    standup["creator"] = json!({ "email": "ops@offerlab.com", "displayName": "Ops Bot" });
+    standup["visibility"] = json!("private");
+    standup["transparency"] = json!("transparent");
+    standup["hangoutLink"] = json!("https://meet.google.com/abc-defg-hij");
+    standup["conferenceData"] = json!({
+        "conferenceId": "abc-defg-hij",
+        "conferenceSolution": { "key": { "type": "hangoutsMeet" }, "name": "Google Meet" },
+        "entryPoints": [
+            {
+                "entryPointType": "video",
+                "uri": "https://meet.google.com/abc-defg-hij",
+                "label": "meet.google.com/abc-defg-hij",
+            },
+            {
+                "entryPointType": "phone",
+                "uri": "tel:+1-513-555-0199",
+                "label": "+1 513-555-0199",
+                "pin": "396011834",
+                "regionCode": "US",
+            },
+            { "entryPointType": "more", "uri": "https://tel.meet/abc-defg-hij?pin=396011834" },
+            // No uri: nothing to show and nothing to dial.
+            { "entryPointType": "sip" },
+        ],
+    });
+    standup["attendees"] = json!([
+        { "email": "one@example.com", "self": true, "responseStatus": "accepted" },
+        {
+            "email": "dana@offerlab.com",
+            "displayName": "Dana",
+            "responseStatus": "declined",
+            "comment": "Declined because I am out of office",
+        },
+        { "email": "sean@offerlab.com", "organizer": true, "responseStatus": "tentative",
+          "optional": true },
+    ]);
+    standup["attachments"] = json!([
+        {
+            "fileId": "1AbC",
+            "fileUrl": "https://drive.google.com/open?id=1AbC",
+            "title": "Sprint notes",
+            "mimeType": "application/vnd.google-apps.document",
+        },
+    ]);
+
+    mailbox.events.insert("primary".into(), vec![standup]);
+    google.install(&token, mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+
+    let events = db
+        .read(|conn| queries::events_in_range(conn, 0, i64::MAX, None))
+        .unwrap();
+    let event = &events[0];
+
+    let conference = event.conference.as_ref().expect("the call was kept");
+    assert_eq!(conference.name.as_deref(), Some("Google Meet"));
+    assert_eq!(conference.id.as_deref(), Some("abc-defg-hij"));
+    assert_eq!(
+        conference.video().map(|v| v.uri.as_str()),
+        Some("https://meet.google.com/abc-defg-hij")
+    );
+    // The dial-in is useless without its PIN, which is why they are one row.
+    let phone = conference
+        .entry_points
+        .iter()
+        .find(|e| e.kind == "phone")
+        .expect("dial-in kept");
+    assert_eq!(phone.uri, "tel:+1-513-555-0199");
+    assert_eq!(phone.pin.as_deref(), Some("396011834"));
+    assert_eq!(phone.region_code.as_deref(), Some("US"));
+    assert!(conference.entry_points.iter().any(|e| e.kind == "more"));
+    // The SIP entry had no uri; a row that renders as an empty line is worse
+    // than no row. And `hangoutLink` duplicated the video entry rather than
+    // adding a second one.
+    assert_eq!(conference.entry_points.len(), 3);
+
+    let dana = event
+        .guests
+        .iter()
+        .find(|g| g.email == "dana@offerlab.com")
+        .expect("guest kept");
+    assert_eq!(dana.response, Some(RsvpStatus::Declined));
+    assert_eq!(dana.comment.as_deref(), Some("Declined because I am out of office"));
+    assert_eq!(dana.name.as_deref(), Some("Dana"));
+
+    let sean = event
+        .guests
+        .iter()
+        .find(|g| g.email == "sean@offerlab.com")
+        .expect("organizer is also a guest");
+    assert!(sean.organizer && sean.optional);
+    assert_eq!(sean.response, Some(RsvpStatus::Tentative));
+    assert!(event.guests.iter().any(|g| g.is_self));
+    // The editable address list is a projection of the same rows, so the two
+    // columns cannot disagree about who is invited.
+    assert_eq!(event.attendees.len(), event.guests.len());
+
+    assert_eq!(
+        event.creator.as_ref().map(|c| c.email.as_str()),
+        Some("ops@offerlab.com")
+    );
+    assert_eq!(
+        event.organizer.as_ref().map(|o| o.email.as_str()),
+        Some("sean@offerlab.com")
+    );
+    assert_eq!(event.visibility.as_deref(), Some("private"));
+    assert_eq!(event.transparency.as_deref(), Some("transparent"));
+    assert_eq!(event.attachments.len(), 1);
+    assert_eq!(event.attachments[0].title, "Sprint notes");
+    // The rule still is not here — an expanded occurrence never carries one —
+    // but `recurring_event_id` is, and that is what stops the modal saying
+    // "Does not repeat" over a meeting that plainly does.
+    assert!(event.recurrence.is_empty());
+    assert_eq!(event.recurring_event_id.as_deref(), Some("series-standup"));
+}
+
+#[tokio::test]
+async fn a_meet_link_in_the_legacy_field_alone_is_still_a_conference() {
+    // `hangoutLink` was deprecated when Hangouts became Meet and is still the
+    // only place some clients put the link. Reading `conferenceData` alone would
+    // lose the call on those events entirely.
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+    let token = format!("tok-{account_id}");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    let mut event = event_json("e1", "Sync", "2026-08-10T09:00:00Z", "2026-08-10T09:30:00Z");
+    event["hangoutLink"] = json!("https://meet.google.com/zzz-yyyy-xxx");
+    mailbox.events.insert("primary".into(), vec![event]);
+    google.install(&token, mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+
+    let events = db
+        .read(|conn| queries::events_in_range(conn, 0, i64::MAX, None))
+        .unwrap();
+    let conference = events[0].conference.as_ref().expect("legacy link kept");
+    assert_eq!(
+        conference.video().map(|v| v.uri.as_str()),
+        Some("https://meet.google.com/zzz-yyyy-xxx")
+    );
+    // Named from the URL, because "Join" with no noun after it is a button that
+    // does not say where it goes.
+    assert_eq!(conference.name.as_deref(), Some("Google Meet"));
 }
 
 #[tokio::test]

@@ -363,6 +363,13 @@ pub fn update_event_fields(conn: &Connection, event_id: i64, fields: &EventField
     if let Some(attendees) = &fields.attendees {
         let json = serde_json::to_string(attendees).unwrap_or_else(|_| "[]".into());
         push("attendees", Value::Text(json), &mut sets, &mut args);
+        // The answer sheet belongs to Google and this edit has just invalidated
+        // it: a guest who was removed would otherwise keep their "yes" on the
+        // list, and a guest who was added would be missing from it entirely.
+        // `NULL` is the honest state — "we no longer know" — and the store reads
+        // it back as the new addresses with no answers against them, which is
+        // what is true until the next sync says otherwise.
+        push("guests", Value::Null, &mut sets, &mut args);
     }
     if let Some(recurrence) = &fields.recurrence {
         let value = match queries::json_if_present(recurrence) {
@@ -480,9 +487,10 @@ pub fn restore_event(conn: &Connection, event: &Event) -> Result<()> {
             (id, account_id, calendar_id, google_event_id, title, description, location,
              start_ts, end_ts, is_all_day, attendees, rsvp_status, recurring_event_id,
              status, html_link, updated_at, recurrence, reminders, ical_uid, organizer,
-             organizer_self, guests_can_modify)
+             organizer_self, guests_can_modify, conference, guests, creator, attachments,
+             visibility, transparency)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18, ?19, ?20, ?21, ?22)",
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             event.id,
             event.account_id,
@@ -506,6 +514,12 @@ pub fn restore_event(conn: &Connection, event: &Event) -> Result<()> {
             queries::json_of(event.organizer.as_ref()),
             event.organizer_self,
             event.guests_can_modify,
+            queries::json_of(event.conference.as_ref()),
+            queries::json_if_present(&event.guests),
+            queries::json_of(event.creator.as_ref()),
+            queries::json_if_present(&event.attachments),
+            event.visibility.as_deref(),
+            event.transparency.as_deref(),
         ],
     )?;
     Ok(())

@@ -47,6 +47,7 @@ pub mod compose;
 pub mod error;
 pub mod feedback;
 pub mod events;
+pub mod handoff;
 pub mod notify;
 pub mod plugins;
 pub mod prefs;

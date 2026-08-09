@@ -310,7 +310,7 @@ export function CommandPalette() {
         // The agent unit registers its own ⇥ resolver at a higher priority and
         // takes this over. This remains only for the empty-query case, which
         // that resolver declines to claim.
-        actions.setStatus("Type a question first, then ⇥ hands it to the agent");
+        actions.setStatus("Type a question first");
       },
     },
   ]);
@@ -336,7 +336,12 @@ export function CommandPalette() {
       <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto py-1">
         {flat.length === 0 ? (
           <div className="px-3 py-6 text-center text-list text-faint-foreground">
-            {query.trim() ? "No local matches." : "Type to search. Everything here is local."}
+            {/*
+              The empty prompt used to add "Everything here is local" — true,
+              and an architecture note, which is a thing a person reaches for
+              ⌘K to *avoid* reading. The footer already says what ⇥ does.
+            */}
+            {query.trim() ? "No matches" : "Type to search"}
           </div>
         ) : (
           grouped.map((group) => (

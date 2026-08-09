@@ -6,9 +6,104 @@ import {
   blockPlan,
   type BlockPlan,
 } from "@/lib/calendar-geometry";
-import { paintFor, type EventTone, type HueIndex } from "@/lib/calendar-palette";
+import {
+  paintFor,
+  type BlockPaint,
+  type EventTone,
+  type HueIndex,
+} from "@/lib/calendar-palette";
 import { shortTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
+
+/* -------------------------------------------------------------------------- */
+/* The selection cursor                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What "this is the block you are on" looks like.
+ *
+ * The old mark was `ring-2 ring-accent ring-offset-1`, and it failed for three
+ * separate reasons at once:
+ *
+ *   1. **It was a hue against hues.** The accent is a blue at L≈0.55; the
+ *      calendar ramp puts a fill at L=0.54 on every hue including 250°, which
+ *      is the accent's own neighbourhood. A blue ring on a blue calendar is not
+ *      a ring. Colour cannot be the signal when the thing behind it is
+ *      user-chosen colour.
+ *   2. **On half the blocks it was not drawn at all.** Tailwind's `ring-*`
+ *      utilities compile to `box-shadow`, and every outlined block — an
+ *      unanswered invitation, a tentative one, a declined one — sets
+ *      `style.boxShadow` inline for its 1px border. An inline property beats a
+ *      class rule outright, so selecting an unanswered invite silently painted
+ *      no cursor whatsoever.
+ *   3. **It faded with the block.** Dragging sets `opacity: 0.35` on the
+ *      button, and `opacity` takes the ring with it — the cursor dimmed out at
+ *      exactly the moment you were moving something and most needed it.
+ *
+ * The replacement is a *luminance sandwich*, not a colour: outward from the
+ * block edge, 2px of page background, then 3px of accent. The inner band is
+ * the load-bearing one — it is the page's own background, so it is near-white
+ * in light mode and near-black in dark, and the calendar ramp holds every fill
+ * at one middling lightness (L 0.54 light, L 0.50 dark) precisely so that no
+ * hue can ever approach it. There is therefore a hard lightness step between
+ * the fill and the gap on every hue in both themes, and a second one between
+ * the accent and the page. Desaturate the whole thing and the mark survives,
+ * which is the test that matters for a colour-blind reader.
+ *
+ * The structural half is the drop shadow plus a raised z-index: the selected
+ * block lifts off the grid and casts over its neighbours instead of being
+ * overlapped by them. That is a cue with no hue in it at all.
+ *
+ * Drawn entirely in `box-shadow` — never `outline`, never `border`, never a
+ * changed width — so it costs the block no geometry and arrow-stepping through
+ * a day cannot make the grid twitch.
+ */
+export const SELECTION_SHADOW = [
+  "0 0 0 2px var(--background)",
+  "0 0 0 5px var(--accent)",
+  "0 3px 10px -2px color-mix(in oklab, var(--foreground) 45%, transparent)",
+].join(", ");
+
+/**
+ * The same mark, one pixel tighter, for chips.
+ *
+ * All-day bars and month cells sit inside padded containers that clip; 6px of
+ * halo on a 22px chip in a 4px-padded month cell loses its outer band to
+ * `overflow-hidden`. Five reads identically and stays inside the box.
+ */
+const SELECTION_SHADOW_CHIP = [
+  "0 0 0 2px var(--background)",
+  "0 0 0 4px var(--accent)",
+  "0 2px 8px -2px color-mix(in oklab, var(--foreground) 45%, transparent)",
+].join(", ");
+
+/** Layer the block's own border (if it has one) under the selection mark. */
+function shadowFor(border: string | undefined, selected: boolean, chip: boolean): string | undefined {
+  const layers = [border, selected ? (chip ? SELECTION_SHADOW_CHIP : SELECTION_SHADOW) : undefined];
+  const drawn = layers.filter((layer): layer is string => layer !== undefined);
+  return drawn.length > 0 ? drawn.join(", ") : undefined;
+}
+
+/**
+ * Dimming that leaves the cursor alone.
+ *
+ * `opacity` on the whole button was the obvious way to fade a block that is
+ * being dragged or that a type-to-select filter has ruled out, and it faded the
+ * selection ring with it. Wash the *paint* towards the page instead: the fill
+ * and the text recede exactly as before, and the mark — drawn from tokens this
+ * never touches — stays at full strength.
+ */
+function faded(paint: BlockPaint): BlockPaint {
+  const wash = (color: string, keep: number) =>
+    `color-mix(in oklab, ${color} ${keep}%, var(--background))`;
+  return {
+    ...paint,
+    background: wash(paint.background, 30),
+    color: wash(paint.color, 45),
+    border: paint.border === undefined ? undefined : wash(paint.border, 35),
+    timeColor: wash(paint.timeColor, 45),
+  };
+}
 
 export interface EventBlockProps {
   event: CalendarEvent;
@@ -90,7 +185,8 @@ export function EventBlock({
   onPointerLeave,
 }: EventBlockProps) {
   const plan = blockPlan(height, { hasLocation: Boolean(event.location) });
-  const paint = paintFor(hue, tone, { dark, past });
+  const painted = paintFor(hue, tone, { dark, past });
+  const paint = dimmed ? faded(painted) : painted;
   // A half-width block cannot hold "1:30p – 2:15p" without ellipsising the one
   // part that must never ellipsise. Below ~120px, show the start only.
   const time =
@@ -126,6 +222,10 @@ export function EventBlock({
     <button
       type="button"
       ref={blockRef}
+      // The keyboard cursor, said out loud. A screen reader stepping the week
+      // with the arrow keys otherwise has no way to know which block it is on,
+      // because nothing here ever takes DOM focus.
+      aria-current={selected ? "true" : undefined}
       // `tabIndex={-1}` keeps blocks out of the browser's own tab order: Tab
       // steps event-to-event through the keymap, in start order, which is the
       // order the week reads in — not the order the DOM happens to be in.
@@ -143,12 +243,8 @@ export function EventBlock({
         event.location ? ` · ${event.location}` : ""
       }`}
       className={cn(
-        "absolute text-left transition-[left,width,box-shadow,opacity] duration-[120ms] ease-out",
+        "absolute text-left transition-[left,width,box-shadow,background-color] duration-[120ms] ease-out motion-reduce:transition-none",
         plan.overflow ? "overflow-visible" : "overflow-hidden",
-        // Selection is a ring on the outside; `:focus-visible` in globals.css
-        // draws its outline on the inside. Two different marks, so "the cursor
-        // is here" and "the browser focus is here" never read as one thing.
-        selected && "ring-2 ring-accent ring-offset-1 ring-offset-background",
         onGrab && "cursor-grab active:cursor-grabbing",
       )}
       style={{
@@ -157,8 +253,13 @@ export function EventBlock({
         color: paint.color,
         // The dragged block stays put and fades: the ghost is the thing under
         // the pointer, and the hole it left is useful context for where it was.
-        opacity: dimmed ? 0.35 : paint.opacity,
-        boxShadow: ring,
+        // The fade lives in `faded()` now, in the paint rather than in
+        // `opacity`, so it cannot take the selection mark down with it.
+        opacity: paint.opacity,
+        // Selection is a halo on the outside; `:focus-visible` in globals.css
+        // draws its outline on the inside. Two different marks, so "the cursor
+        // is here" and "the browser focus is here" never read as one thing.
+        boxShadow: shadowFor(ring, selected, false),
         // A dashed border cannot be faked with an inset shadow; tentative
         // events get a real one, inset so it does not change the geometry.
         // A sliver has no room for one either — see `sliverOutline` above.
@@ -391,7 +492,8 @@ export function EventChip({
   onSelect: () => void;
   blockRef?: (node: HTMLButtonElement | null) => void;
 }) {
-  const paint = paintFor(hue, tone, { dark, past });
+  const painted = paintFor(hue, tone, { dark, past });
+  const paint = dimmed ? faded(painted) : painted;
 
   return (
     <button
@@ -399,18 +501,26 @@ export function EventChip({
       ref={blockRef}
       tabIndex={-1}
       data-selected={selected || undefined}
+      aria-current={selected ? "true" : undefined}
       onClick={onSelect}
       title={event.title}
       className={cn(
         "relative flex items-center gap-1 overflow-hidden text-left",
-        selected && "ring-2 ring-accent ring-offset-1 ring-offset-background",
+        "transition-[box-shadow,background-color] duration-[120ms] ease-out motion-reduce:transition-none",
       )}
       style={{
         borderRadius: BLOCK_RADIUS,
         background: paint.background,
         color: paint.color,
-        opacity: dimmed ? 0.3 : paint.opacity,
-        boxShadow: paint.border ? `inset 0 0 0 1px ${paint.border}` : undefined,
+        opacity: paint.opacity,
+        boxShadow: shadowFor(
+          paint.border ? `inset 0 0 0 1px ${paint.border}` : undefined,
+          selected,
+          true,
+        ),
+        // A chip stacked against its neighbours has to cast the halo over them
+        // rather than under, or the row above eats the top band of the mark.
+        zIndex: selected ? 1 : undefined,
         padding: "0 8px",
         fontSize: 12,
         lineHeight: "20px",

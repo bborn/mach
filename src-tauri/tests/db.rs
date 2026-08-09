@@ -242,6 +242,68 @@ fn an_older_database_gains_the_new_event_columns_without_losing_its_events() {
     // make every pre-existing event uneditable until the next sync.
     assert_eq!(events[0].organizer_self, None);
     assert_eq!(events[0].guests_can_modify, None);
+    // Migration 7's columns, read on a row that predates them. A conference
+    // nobody mentioned is `None` rather than an empty conference block, and an
+    // unknown visibility is `None` rather than "default" — the store does not
+    // get to invent Google's answers.
+    assert!(events[0].conference.is_none());
+    assert!(events[0].creator.is_none());
+    assert!(events[0].attachments.is_empty());
+    assert!(events[0].visibility.is_none());
+    assert!(events[0].transparency.is_none());
+    // No guest list was stored, so the addresses are projected into one. Both
+    // are empty here; the projection is asserted against real attendees in
+    // `a_guest_list_without_answers_is_projected_from_the_addresses`.
+    assert!(events[0].guests.is_empty());
+}
+
+#[test]
+fn a_guest_list_without_answers_is_projected_from_the_addresses() {
+    // Every row written before migration 7 has addresses and no answers, and so
+    // does every row a local guest-list edit has just touched. A reader must not
+    // have to know which of the two columns holds the truth, so `guests` is
+    // filled from `attendees` when it is `NULL` — with no `response`, which is
+    // the honest way to say that nobody has told us.
+    let db = Db::open_in_memory().unwrap();
+    let account_id = q::upsert_account(
+        &db.writer(),
+        &NewAccount {
+            email: "alex@example.com".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let conn = db.writer();
+    q::upsert_event(
+        &conn,
+        &NewEvent {
+            account_id,
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            start_ts: 10,
+            end_ts: 20,
+            attendees: vec![
+                Participant {
+                    name: Some("Tawny".into()),
+                    email: "tawny@example.com".into(),
+                },
+                Participant::new("sean@offerlab.com"),
+            ],
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let events = q::events_in_range(&conn, 0, 100, None).unwrap();
+    let guests = &events[0].guests;
+    assert_eq!(guests.len(), 2);
+    assert_eq!(guests[0].email, "tawny@example.com");
+    assert_eq!(guests[0].name.as_deref(), Some("Tawny"));
+    assert_eq!(guests[0].response, None, "no answer is not needsAction");
+    assert!(!guests[1].organizer);
 }
 
 // ---------------------------------------------------------------------------

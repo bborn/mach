@@ -194,7 +194,7 @@ export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastL
           "×3" on its own could be read as "one undo takes back all three". */}
       {repeat > 1 && (
         <span
-          title={`${repeat} in a row · ⌘Z takes them back one at a time`}
+          title={`${repeat} in a row · ⌘Z undoes one at a time`}
           className="shrink-0 font-mono text-micro tabular-nums text-faint-foreground"
         >
           ×{repeat}

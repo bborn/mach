@@ -222,8 +222,8 @@ export function between(
  */
 export function selectAllMessage(count: number, hasMore: boolean): string {
   return hasMore
-    ? `${count} selected — every conversation loaded so far, not the whole mailbox`
-    : `${count} selected — every conversation in this mailbox`;
+    ? `${count} selected — loaded so far, not the whole mailbox`
+    : `${count} selected — the whole mailbox`;
 }
 
 /** Ids sorted into list order, deduplicated, with anything unknown dropped. */

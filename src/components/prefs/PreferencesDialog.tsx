@@ -16,6 +16,11 @@ import {
   type Preferences,
   type WeekStart,
 } from "@/lib/prefs";
+import {
+  UNKNOWN_BACKEND,
+  loadBackendStatus,
+  type AgentBackendStatus,
+} from "@/lib/agent";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Overlay } from "@/components/ui/dialog";
@@ -26,6 +31,7 @@ import {
   FieldGroup,
   FieldLabel,
 } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
 import {
   Select,
@@ -124,6 +130,13 @@ const SEND_DELAYS: Choice<number>[] = [
   { value: 10, label: "10 seconds" },
   { value: 20, label: "20 seconds" },
   { value: 30, label: "30 seconds" },
+];
+
+const AGENT_BACKENDS: Choice<Preferences["agentBackend"]>[] = [
+  { value: "auto", label: "Automatic" },
+  { value: "claudeCli", label: "Claude Code" },
+  { value: "anthropicApi", label: "Anthropic API" },
+  { value: "command", label: "Custom command" },
 ];
 
 const SYNC_INTERVALS: Choice<number>[] = [
@@ -475,6 +488,8 @@ export function PreferencesDialog() {
               effect on the next pass.
             </FieldDescription>
           </Field>
+
+          <AgentSettings prefs={prefs} set={set} ids={ids} />
         </FieldGroup>
       </div>
 
@@ -699,6 +714,92 @@ function Signatures({
   );
 }
 
+/**
+ * Which brain answers ⌘K, and how to reach it.
+ *
+ * Self-contained on purpose: one block in the field group, one component here,
+ * nothing threaded through the rest of the dialog.
+ *
+ * The status line under the picker is the load-bearing part. "Not configured"
+ * without an instruction was the original complaint, so on `Automatic` this
+ * says what was *detected* — and when nothing was, it renders the sentence Rust
+ * produced, which names both remedies. It is read from the same resolution
+ * `agent_start` performs, so the dialog cannot claim something the next ⌘K
+ * would contradict.
+ */
+function AgentSettings({
+  prefs,
+  set,
+  ids,
+}: {
+  prefs: Preferences;
+  set: <K extends keyof Preferences>(key: K, value: Preferences[K]) => void;
+  ids: ReturnType<typeof useIds>;
+}) {
+  const [status, setStatus] = useState<AgentBackendStatus>(UNKNOWN_BACKEND);
+
+  // Re-read whenever the choice changes: switching to Claude Code on a machine
+  // without one has to say so immediately, not at the next ⌘K.
+  useEffect(() => {
+    let live = true;
+    void loadBackendStatus().then((next) => {
+      if (live) setStatus(next);
+    });
+    return () => {
+      live = false;
+    };
+  }, [prefs.agentBackend, prefs.agentCommand]);
+
+  return (
+    <>
+      <Section title="Agent" />
+
+      <Field orientation="row">
+        <FieldLabel htmlFor={ids.agentBackend}>Runs on</FieldLabel>
+        <Choose
+          id={ids.agentBackend}
+          label="Agent backend"
+          choices={AGENT_BACKENDS}
+          value={prefs.agentBackend}
+          onChange={(value) => set("agentBackend", value)}
+        />
+        <FieldDescription>
+          {status.message ? (
+            <span className="text-danger">{status.message}</span>
+          ) : (
+            [status.label, status.claudePath].filter(Boolean).join(" · ")
+          )}
+        </FieldDescription>
+      </Field>
+
+      <Field orientation="row">
+        <FieldLabel htmlFor={ids.agentModel}>Model</FieldLabel>
+        <Input
+          id={ids.agentModel}
+          spellCheck={false}
+          placeholder="Default"
+          value={prefs.agentModel}
+          onChange={(event) => set("agentModel", event.target.value)}
+        />
+      </Field>
+
+      {prefs.agentBackend === "command" && (
+        <Field orientation="row">
+          <FieldLabel htmlFor={ids.agentCommand}>Command</FieldLabel>
+          <Input
+            id={ids.agentCommand}
+            spellCheck={false}
+            placeholder="/usr/local/bin/my-agent --flag"
+            value={prefs.agentCommand}
+            onChange={(event) => set("agentCommand", event.target.value)}
+          />
+          <FieldDescription>Contract: docs/agent-backends.md</FieldDescription>
+        </Field>
+      )}
+    </>
+  );
+}
+
 /** Stable ids so every label points at its own control. */
 function useIds() {
   const prefix = useId();
@@ -714,5 +815,8 @@ function useIds() {
     sync: `${prefix}-sync`,
     notifications: `${prefix}-notifications`,
     badge: `${prefix}-badge`,
+    agentBackend: `${prefix}-agent-backend`,
+    agentModel: `${prefix}-agent-model`,
+    agentCommand: `${prefix}-agent-command`,
   };
 }

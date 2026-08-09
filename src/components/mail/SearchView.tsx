@@ -369,7 +369,10 @@ export function SearchView({ children }: { children: ReactNode }) {
           {parsed.unknown.map((raw) => (
             <span
               key={raw}
-              title="Not an operator Mach knows — it was ignored"
+              // The chip is already struck through, which is what "ignored"
+              // looks like; saying it again in words is the tooltip explaining
+              // the picture next to it.
+              title="Not an operator"
               className="rounded-[3px] border border-border px-1 py-px text-micro text-faint-foreground line-through"
             >
               {raw}

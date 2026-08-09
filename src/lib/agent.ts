@@ -65,6 +65,8 @@ export interface AgentSession {
   entries: Entry[];
   pending?: PendingApproval;
   error?: string;
+  /** Which brain answered — "Claude Code", "Anthropic API (claude-opus-5)". */
+  backend?: string;
   /** Tokens arriving right now, not yet part of an entry. Client-side only. */
   streaming?: string;
 }
@@ -450,6 +452,65 @@ export function closeSession(sessionId: string): Promise<void> {
 
 export function removeContext(sessionId: string, itemId: string): Promise<void> {
   return send({ sessionId, action: "removeContext", itemId });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Which brain                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What a ⌘K would use right now, and what else this machine offers.
+ *
+ * Read by the preferences dialog so that what it reports and what actually runs
+ * cannot drift: both answers come from the same resolution in Rust. `message`
+ * is non-null exactly when nothing can run, and it is a sentence naming the
+ * remedy — the whole point being that "not configured" should tell you what to
+ * install, not just what is missing.
+ */
+export interface AgentBackendStatus {
+  backend: "claudeCli" | "anthropicApi" | "command" | null;
+  label: string | null;
+  claudePath: string | null;
+  apiKey: boolean;
+  message: string | null;
+}
+
+export const UNKNOWN_BACKEND: AgentBackendStatus = {
+  backend: null,
+  label: null,
+  claudePath: null,
+  apiKey: false,
+  message: null,
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseBackendStatus(raw: unknown): AgentBackendStatus {
+  if (!isRecord(raw)) return UNKNOWN_BACKEND;
+  const backend = raw.backend;
+  return {
+    backend:
+      backend === "claudeCli" || backend === "anthropicApi" || backend === "command"
+        ? backend
+        : null,
+    label: typeof raw.label === "string" ? raw.label : null,
+    claudePath: typeof raw.claudePath === "string" ? raw.claudePath : null,
+    apiKey: raw.apiKey === true,
+    message: typeof raw.message === "string" ? raw.message : null,
+  };
+}
+
+/** Never rejects: a browser tab, or a command this build does not register, is
+ * "nothing detected" rather than an error in a settings surface. */
+export async function loadBackendStatus(): Promise<AgentBackendStatus> {
+  if (!isTauri()) return UNKNOWN_BACKEND;
+  try {
+    return parseBackendStatus(await tauriTransport.invoke<unknown>("agent_backend_status", {}));
+  } catch {
+    return UNKNOWN_BACKEND;
+  }
 }
 
 /** Subscribe to the one push channel every session speaks on. */

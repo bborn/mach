@@ -6,13 +6,24 @@ import {
   Layers,
   Lock,
   MapPin,
+  Paperclip,
+  Phone,
   Repeat,
   Trash2,
+  UserPen,
   Users,
   Video,
 } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { Account, Calendar, CalendarEvent, CalendarId, Rsvp } from "@/types";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import type {
+  Account,
+  Calendar,
+  CalendarEvent,
+  CalendarId,
+  EventConference,
+  EventGuest,
+  Rsvp,
+} from "@/types";
 import { Overlay } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -40,7 +51,13 @@ import { useKeyBindings } from "@/hooks/useKeymap";
 import { anyPopupOpen } from "@/lib/popups";
 import type { EventScope } from "@/lib/data";
 import { calendarFill, toneFor, type HueIndex } from "@/lib/calendar-palette";
-import { conferenceLink, googleCalendarUrl } from "@/lib/calendar-links";
+import {
+  conferenceLink,
+  dialUrl,
+  entryLabel,
+  googleCalendarUrl,
+  joinUrl,
+} from "@/lib/calendar-links";
 import type { MergedEvent } from "@/lib/calendar-merge";
 import {
   REMINDER_CHOICES,
@@ -338,10 +355,15 @@ export function EventModal({
     value: choice.id,
     label: choice.label,
   }));
+  // `series` is the occurrence of a synced series whose rule lives on the master
+  // Google never returns. It led the list saying "Does not repeat", which is the
+  // opposite of the truth for the most common recurring event there is.
   const repeatItems =
     form.recurrence === "custom"
       ? [{ value: "custom", label: describeRules(form.recurrenceRules) }, ...repeatChoices]
-      : repeatChoices;
+      : form.recurrence === "series"
+        ? [{ value: "series", label: "Repeats (rule kept in Google)" }, ...repeatChoices]
+        : repeatChoices;
 
   const alertChoices = REMINDER_CHOICES.map((choice) => ({
     value: choice.id,
@@ -371,6 +393,15 @@ export function EventModal({
             repeats
           </span>
         )}
+        {/* Two words that change what the event means rather than how it looks:
+            whether it defends the time, and whether anyone sharing this calendar
+            can read it. Shown only when they are not the default. */}
+        {event?.transparency === "transparent" && (
+          <span className="text-micro text-faint-foreground">free</span>
+        )}
+        {(event?.visibility === "private" || event?.visibility === "confidential") && (
+          <span className="text-micro text-faint-foreground">private</span>
+        )}
         <span className="text-micro text-faint-foreground">
           <Kbd keys="mod+enter" /> save · <Kbd keys="escape" /> close
         </span>
@@ -390,17 +421,20 @@ export function EventModal({
         )}
 
         {/* Google refuses a write from anyone but the organizer, so the modal
-            says why the fields are inert rather than letting the user type into
-            them and discover it from a red line at the bottom of the window. */}
+            says the fields are inert rather than letting the user type into
+            them and discover it from a red line at the bottom of the window.
+            A label, not a paragraph: the two things it used to explain — that
+            you can still RSVP, and that Google Calendar can edit it — are both
+            visible controls a few rows down. */}
         {!canEdit && (
-          <p className="flex items-start gap-1.5 rounded-sm border border-border bg-surface-raised px-2 py-1.5 text-micro text-muted-foreground">
-            <Lock size={12} strokeWidth={1.75} className="mt-[1px] shrink-0" />
-            <span className="min-w-0">
+          <p className="flex items-center gap-1.5 rounded-sm border border-border bg-surface-raised px-2 py-1.5 text-micro text-muted-foreground">
+            <Lock size={12} strokeWidth={1.75} className="shrink-0" />
+            <span className="min-w-0 truncate">
               {event?.organizer?.email
-                ? `${event.organizer.email} organizes this — only they can change it.`
-                : "You are a guest on this event, so only its organizer can change it."}{" "}
-              You can still reply below, or open it in Google Calendar.
+                ? `Organized by ${event.organizer.email}`
+                : "Organized by someone else"}
             </span>
+            <span className="shrink-0 text-faint-foreground">Read-only</span>
           </p>
         )}
 
@@ -490,15 +524,11 @@ export function EventModal({
                 ))}
               </SelectContent>
             </Select>
-            {/* The rule is read back now, so this no longer has to apologise for
-                showing "does not repeat" over a weekly meeting. What it does say
-                is the thing the picker cannot: that changing the rule is a
-                series-wide act, whichever occurrence you opened. */}
+            {/* The one thing the picker cannot say for itself: the rule belongs
+                to the series, so changing it here is never local to the day you
+                opened. A fragment, not the paragraph that used to be here. */}
             {recurring && form.recurrence !== "none" && (
-              <FieldDescription>
-                Changing how this repeats applies to every occurrence — Google keeps the rule on
-                the series, not on the day you opened.
-              </FieldDescription>
+              <FieldDescription>Applies to every occurrence</FieldDescription>
             )}
           </Field>
 
@@ -528,38 +558,39 @@ export function EventModal({
               </SelectContent>
             </Select>
             {form.reminderMinutes === null && event !== null && reminderMinutesOf(event) !== null && (
-              <FieldDescription>
-                Going back to the calendar's default has to be done in Google Calendar — the API
-                Mach speaks can set an alert or remove it, but cannot say “use the default”.
-              </FieldDescription>
+              <FieldDescription>“Calendar default” can only be restored in Google Calendar</FieldDescription>
             )}
           </Field>
+
+          {/* The call comes before the room. A meeting you cannot join from is
+              a calendar entry, and this is the row that stops it being one. */}
+          {(event?.conference || conference) && (
+            <Field orientation="row">
+              <RowCaption>
+                <Video size={11} strokeWidth={1.75} />
+                Call
+              </RowCaption>
+              <ConferenceBlock
+                conference={event?.conference}
+                fallback={conference}
+                onOpenExternal={onOpenExternal}
+              />
+            </Field>
+          )}
 
           <Field orientation="row">
             <FieldLabel htmlFor={ids.location}>
               <MapPin size={11} strokeWidth={1.75} />
               Where
             </FieldLabel>
-            <div className="min-w-0">
-              <Input
-                id={ids.location}
-                value={form.location}
-                placeholder="Add a place, or a call link"
-                aria-label="Location"
-                readOnly={!canEdit}
-                onChange={(e) => set({ location: e.target.value })}
-              />
-              {conference && (
-                <button
-                  type="button"
-                  onClick={() => onOpenExternal(conference.url)}
-                  className="mt-1 inline-flex items-center gap-1 text-micro text-accent hover:underline"
-                >
-                  <Video size={11} strokeWidth={1.75} />
-                  Join {conference.provider}
-                </button>
-              )}
-            </div>
+            <Input
+              id={ids.location}
+              value={form.location}
+              placeholder="Add a place, or a call link"
+              aria-label="Location"
+              readOnly={!canEdit}
+              onChange={(e) => set({ location: e.target.value })}
+            />
           </Field>
 
           <Field orientation="row">
@@ -567,18 +598,66 @@ export function EventModal({
               <Users size={11} strokeWidth={1.75} />
               Who
             </FieldLabel>
-            <Textarea
-              id={ids.attendees}
-              autoSize
-              rows={2}
-              maxRows={5}
-              value={form.attendees}
-              aria-label="Guests"
-              placeholder="ada@example.com, bob@example.com"
-              readOnly={!canEdit}
-              onChange={(e) => set({ attendees: e.target.value })}
-            />
+            <div className="flex min-w-0 flex-col gap-1.5">
+              <Textarea
+                id={ids.attendees}
+                autoSize
+                rows={2}
+                maxRows={5}
+                value={form.attendees}
+                aria-label="Guests"
+                placeholder="ada@example.com, bob@example.com"
+                readOnly={!canEdit}
+                onChange={(e) => set({ attendees: e.target.value })}
+              />
+              {event && <GuestList guests={event.guests ?? []} />}
+            </div>
           </Field>
+
+          {/* Only when they differ. The same name under two labels is noise,
+              and they agree on most events. */}
+          {event?.creator &&
+            event.creator.email.toLowerCase() !== (event.organizer?.email ?? "").toLowerCase() && (
+              <Field orientation="row">
+                <RowCaption>
+                  <UserPen size={11} strokeWidth={1.75} />
+                  Created by
+                </RowCaption>
+                <span className="min-w-0 truncate text-micro text-muted-foreground">
+                  {event.creator.name
+                    ? `${event.creator.name} · ${event.creator.email}`
+                    : event.creator.email}
+                </span>
+              </Field>
+            )}
+
+          {event && (event.attachments?.length ?? 0) > 0 && (
+            <Field orientation="row">
+              <RowCaption>
+                <Paperclip size={11} strokeWidth={1.75} />
+                Files
+              </RowCaption>
+              <div className="flex min-w-0 flex-col gap-0.5">
+                {event.attachments?.map((file) => {
+                  const url = joinUrl(file.url);
+                  return url ? (
+                    <button
+                      key={file.url}
+                      type="button"
+                      onClick={() => onOpenExternal(url)}
+                      className="truncate text-left text-micro text-accent hover:underline"
+                    >
+                      {file.title}
+                    </button>
+                  ) : (
+                    <span key={file.url} className="truncate text-micro text-muted-foreground">
+                      {file.title}
+                    </span>
+                  );
+                })}
+              </div>
+            </Field>
+          )}
 
           <Field orientation="row">
             <FieldLabel htmlFor={ids.calendar}>
@@ -623,10 +702,7 @@ export function EventModal({
               </SelectContent>
             </Select>
             {event && form.calendarId !== event.calendarId && (
-              <FieldDescription>
-                Moving a meeting to another calendar re-creates it there, which re-invites its
-                guests.
-              </FieldDescription>
+              <FieldDescription>Re-creates the event, which re-invites its guests</FieldDescription>
             )}
           </Field>
 
@@ -656,7 +732,7 @@ export function EventModal({
                     return calendar ? calendarLabel(calendar) : copy.calendarId;
                   })
                   .join(", ")}
-                . Edits here apply to this copy only.
+                {" "}· edits apply to this copy
               </span>
             </p>
           )}
@@ -755,6 +831,206 @@ export function EventModal({
       )}
     </Overlay>
   );
+}
+
+/**
+ * A label-shaped caption for a row that labels nothing.
+ *
+ * `FieldLabel` renders a `<label>`, which wants a control to point at. The call,
+ * the creator and the attachments are read-only rows, and a `<label>` with no
+ * target is a promise to a screen reader that nothing keeps. The `data-slot` is
+ * what `Field`'s row grid aligns on, so the gutter stays the same width.
+ */
+function RowCaption({ children }: { children: ReactNode }) {
+  return (
+    <span
+      data-slot="field-label"
+      className="flex items-center gap-1 text-micro leading-none text-faint-foreground select-none"
+    >
+      {children}
+    </span>
+  );
+}
+
+/**
+ * The call: how to join it, what to read out, and how to dial in.
+ *
+ * Everything here is a string an attacker chose — an invitation is an
+ * unauthenticated write into the store from anyone who knows the address — so
+ * two rules hold throughout. Every value is rendered as *text*, never as
+ * markup, so a label of `<img onerror=…>` is a strange-looking meeting and
+ * nothing else. And nothing is ever *followed* without passing `joinUrl` or
+ * `dialUrl` first, which is why a URI that fails those is shown as plain text
+ * rather than as a button that would refuse: the information is still true, it
+ * is only the action that is withheld.
+ *
+ * `fallback` is the link scraped out of the description or the location — the
+ * only way Zoom, Teams and Webex ever appear, since Google mints
+ * `conferenceData` for Meet alone.
+ */
+function ConferenceBlock({
+  conference,
+  fallback,
+  onOpenExternal,
+}: {
+  conference: EventConference | undefined;
+  fallback: { provider: string; url: string } | null;
+  onOpenExternal: (url: string) => void;
+}) {
+  const [copied, setCopied] = useState<"done" | "failed" | null>(null);
+
+  const video = conference?.entryPoints.find((entry) => entry.kind === "video");
+  const join = joinUrl(video?.uri) ?? fallback?.url ?? null;
+  const provider = conference?.name ?? fallback?.provider ?? "call";
+  const shown = video ? entryLabel(video) : (fallback?.url.replace(/^https:\/\//i, "") ?? null);
+
+  const phones = (conference?.entryPoints ?? []).filter((entry) => entry.kind === "phone");
+  const more = conference?.entryPoints.find((entry) => entry.kind === "more");
+  const moreUrl = joinUrl(more?.uri);
+
+  const copy = () => {
+    if (!join) return;
+    // The clipboard can refuse — no permission, no secure context — and a copy
+    // button that silently does nothing is the failure this app has paid for
+    // most often. So the result is said either way.
+    navigator.clipboard
+      ?.writeText(join)
+      .then(() => setCopied("done"))
+      .catch(() => setCopied("failed")) ?? setCopied("failed");
+  };
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="flex min-w-0 items-center gap-1.5">
+        {join && (
+          <Button size="sm" variant="default" onClick={() => onOpenExternal(join)}>
+            <Video size={12} strokeWidth={1.75} />
+            Join {provider}
+          </Button>
+        )}
+        {shown && <span className="min-w-0 truncate text-micro text-muted-foreground">{shown}</span>}
+        {join && (
+          <Button size="sm" variant="ghost" onClick={copy} title="Copy link" aria-label="Copy link">
+            <Copy size={12} strokeWidth={1.75} />
+            {copied === "done" ? "Copied" : copied === "failed" ? "Copy failed" : ""}
+          </Button>
+        )}
+      </div>
+
+      {conference?.id && (
+        <span className="text-micro text-faint-foreground">Code {conference.id}</span>
+      )}
+
+      {phones.map((phone) => {
+        const dial = dialUrl(phone.uri);
+        const label = entryLabel(phone);
+        return (
+          <span key={phone.uri} className="flex min-w-0 items-center gap-1 text-micro">
+            <Phone size={11} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
+            {dial ? (
+              <button
+                type="button"
+                onClick={() => onOpenExternal(dial)}
+                className="truncate text-accent hover:underline"
+              >
+                {label}
+              </button>
+            ) : (
+              <span className="truncate text-muted-foreground">{label}</span>
+            )}
+            {phone.pin && <span className="shrink-0 text-faint-foreground">PIN {phone.pin}</span>}
+            {phone.regionCode && (
+              <span className="shrink-0 text-faint-foreground">{phone.regionCode}</span>
+            )}
+          </span>
+        );
+      })}
+
+      {moreUrl && (
+        <button
+          type="button"
+          onClick={() => onOpenExternal(moreUrl)}
+          className="self-start text-micro text-accent hover:underline"
+        >
+          More phone numbers
+        </button>
+      )}
+
+      {conference?.notes && (
+        <span className="text-micro text-faint-foreground">{conference.notes}</span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Who is coming, and what they said.
+ *
+ * The counts are Google's, in Google's order, because the owner reads them there
+ * every day and a second vocabulary for the same four states would be a second
+ * thing to learn. "Awaiting" covers both guests who have not answered and guests
+ * Google told us nothing about: from the room they look the same, and the two
+ * are only distinguishable further down the stack.
+ *
+ * A declining guest's comment gets its own line rather than a tooltip. It is
+ * usually the entire content of the notification the decline generated, and a
+ * reason you have to hover to find is a reason nobody reads.
+ */
+function GuestList({ guests }: { guests: readonly EventGuest[] }) {
+  if (guests.length === 0) return null;
+
+  const count = (response: Rsvp) => guests.filter((g) => g.response === response).length;
+  const awaiting = guests.filter(
+    (g) => g.response === undefined || g.response === "needsAction",
+  ).length;
+  const parts = [
+    [count("accepted"), "yes"] as const,
+    [count("declined"), "no"] as const,
+    [count("tentative"), "maybe"] as const,
+    [awaiting, "awaiting"] as const,
+  ]
+    .filter(([n]) => n > 0)
+    .map(([n, word]) => `${n} ${word}`);
+
+  return (
+    <div className="flex min-w-0 flex-col gap-0.5">
+      <span className="text-micro text-faint-foreground">
+        {guests.length} {guests.length === 1 ? "guest" : "guests"}
+        {parts.length > 0 ? ` · ${parts.join(", ")}` : ""}
+      </span>
+      <ul className="flex min-w-0 flex-col gap-0.5">
+        {guests.map((guest) => (
+          <li key={guest.email} className="min-w-0 text-micro">
+            <span className="flex min-w-0 items-center gap-1.5">
+              <span className="min-w-0 truncate text-muted-foreground">
+                {guest.name || guest.email}
+              </span>
+              {guest.organizer && <span className="shrink-0 text-faint-foreground">organizer</span>}
+              {guest.optional && <span className="shrink-0 text-faint-foreground">optional</span>}
+              <span className="ml-auto shrink-0 text-faint-foreground">{answer(guest)}</span>
+            </span>
+            {guest.comment && (
+              <span className="block truncate text-faint-foreground">{guest.comment}</span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** One word for a guest's answer, or none where there is no answer to give. */
+function answer(guest: EventGuest): string {
+  switch (guest.response) {
+    case "accepted":
+      return "yes";
+    case "declined":
+      return "no";
+    case "tentative":
+      return "maybe";
+    default:
+      return guest.resource ? "room" : "awaiting";
+  }
 }
 
 /** One end of the range: a caption, a date, and a time unless it is all day. */
@@ -872,9 +1148,10 @@ function ScopePrompt({
           Cancel
         </Button>
       </div>
+      {/* Why there is no third button is in this component's doc comment. The
+          interface only has to say where that choice lives. */}
       <p className="text-micro text-faint-foreground">
-        “This and following” is not offered: Google's API has no such call, and faking it can leave
-        a series split in half. Use Google Calendar for that one.
+        “This and following” — in Google Calendar
       </p>
     </div>
   );

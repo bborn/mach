@@ -206,11 +206,22 @@ export function MessageBodyView({
           <span className="min-w-0 flex-1 truncate text-micro text-muted-foreground">
             {blocked} remote image{blocked === 1 ? "" : "s"} blocked
           </span>
+          {/*
+            The tooltip used to carry the reasoning: that this is a per-message
+            choice, and that a remote image is how a sender learns the message
+            was opened. Both are true and neither belongs on a button. Someone
+            reaching for "Load images" has already decided; two sentences of
+            privacy briefing between them and the pictures is a tax on the
+            decision they came to make, paid on every message.
+
+            What survives is the scope, which is the one thing that is not
+            obvious from the button: this does not remember the sender.
+          */}
           <Button
             size="sm"
             variant="subtle"
             onClick={onLoadRemoteImages}
-            title="Loads them for this message only. Remote images tell the sender you opened it."
+            title="For this message only"
           >
             Load images
           </Button>

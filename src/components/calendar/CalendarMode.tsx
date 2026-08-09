@@ -295,7 +295,7 @@ export function CalendarMode() {
   const applyCursor = useCallback(
     (move: CursorMove) => {
       if (move.kind === "none") {
-        actions.setStatus("Nothing on screen to select — press C to make something", "info");
+        actions.setStatus("Nothing to select", "info");
         return;
       }
       if (move.kind === "page") {
@@ -387,7 +387,7 @@ export function CalendarMode() {
         actions.reloadEvents();
         return result;
       } catch (error) {
-        const message = error instanceof Error ? error.message : "That did not save";
+        const message = error instanceof Error ? error.message : "Not saved";
         dispatch({ type: "status", status: { message, tone: "error" } });
         setFailure({ message, command });
         return null;
@@ -421,7 +421,7 @@ export function CalendarMode() {
       const who = event.organizer?.email;
       actions.setStatus(
         who
-          ? `Only ${who} can change “${event.title}” — you are a guest on it`
+          ? `Only ${who} can change “${event.title}”`
           : `Only the organizer can change “${event.title}”`,
         "error",
       );
@@ -446,7 +446,7 @@ export function CalendarMode() {
       const target = calendarId ?? defaultCalendarId;
       const accountId = target === null ? null : accountForCalendar(target);
       if (target === null || accountId === null) {
-        actions.setStatus("There is no calendar to create on yet", "error");
+        actions.setStatus("No calendar to create on", "error");
         return null;
       }
       return run({ kind: "createEvent", accountId, calendarId: target, draft });
@@ -523,12 +523,12 @@ export function CalendarMode() {
       // the time the first press had already moved it to.
       const event = settledEvents.find((e) => e.id === ui.eventId) ?? selectedEvent;
       if (!event) {
-        actions.setStatus("Pick an event first — Tab steps through them", "info");
+        actions.setStatus("Pick an event first", "info");
         return;
       }
       if (event.allDay) {
         if (action.kind !== "move" || action.axis !== "day") {
-          actions.setStatus("An all-day event has no time to move", "info");
+          actions.setStatus("All-day event — no time to move", "info");
           return;
         }
         const shift = action.days * DAY;
@@ -845,7 +845,7 @@ export function CalendarMode() {
   const withEvent = useCallback(
     (what: (event: CalendarEvent) => void) => () => {
       if (!selectedEvent) {
-        actions.setStatus("Pick an event first — Tab steps through them", "info");
+        actions.setStatus("Pick an event first", "info");
         return;
       }
       what(selectedEvent);
@@ -1078,7 +1078,7 @@ export function CalendarMode() {
         when: () => active,
         handler: withEvent((event) => {
           setClipboard(event);
-          actions.setStatus(`Copied “${event.title}” — ⌘V drops it on the day in view`, "info");
+          actions.setStatus(`Copied “${event.title}”`, "info");
         }),
       },
       {
@@ -1088,7 +1088,7 @@ export function CalendarMode() {
         when: () => active,
         handler: () => {
           if (!clipboard) {
-            actions.setStatus("Nothing copied yet — ⌘C copies the selected event", "info");
+            actions.setStatus("Nothing copied", "info");
             return;
           }
           create(pasteDraft(clipboard, ui.anchor), clipboard.calendarId);
@@ -1321,7 +1321,7 @@ export function CalendarMode() {
           onEnter={() => {
             if (!finderMatch) {
               actions.setStatus(
-                finder.query.trim() ? "Nothing matches that" : "Type part of an event's name",
+                finder.query.trim() ? "Nothing matches" : "Type part of a name",
                 "info",
               );
               return;

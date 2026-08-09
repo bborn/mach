@@ -5,6 +5,7 @@
 //! | `agent_start` | `prompt`, `context?` | [`SessionSnapshot`] |
 //! | `agent_sessions` | `sessionId?` | `SessionSnapshot[]` |
 //! | `agent_send` | `sessionId`, `action?`, `message?`, `toolUseId?`, `reason?`, `itemId?` | `{ ok }` or a snapshot |
+//! | `agent_backend_status` | — | which brain would answer, and what else is available |
 //!
 //! Push, never poll: everything that happens inside a session arrives on the
 //! `agent-session` Tauri event as a [`SessionEvent`]. `agent_sessions` exists
@@ -36,9 +37,19 @@
 //!
 //! It needs the `AppHandle` to emit and the `AppState` to act, and neither is
 //! available at `bootstrap` time. So the first call constructs it and every
-//! later call reuses it. The credential is *not* captured here — it is read per
-//! session, so adding `ANTHROPIC_API_KEY` to the environment takes effect on
-//! the next ⌘K rather than the next launch.
+//! later call reuses it. The backend is *not* captured here — it is resolved per
+//! session, so installing Claude Code (or setting `ANTHROPIC_API_KEY`, or
+//! changing the preference) takes effect on the next ⌘K rather than the next
+//! launch.
+//!
+//! # The workspace
+//!
+//! A backend that spawns a process needs a working directory, and the two
+//! obvious candidates are both wrong: the user's home directory is where his
+//! files are, and the current directory of a bundled app is `/`. So Mach gives
+//! it one of its own, `agent/` beside the database, which contains nothing but
+//! the short-lived tool-server configuration. A CLI told to run there and given
+//! no file tools has nothing to read even if it wanted to.
 
 #[path = "../agent/mod.rs"]
 pub mod engine;
@@ -104,14 +115,24 @@ fn engine(app: &AppHandle, state: &AppState) -> Result<Arc<AgentEngine>, IpcErro
         .map_err(IpcError::from)?,
     );
 
-    let built = Arc::new(AgentEngine::new(
-        state.db.clone(),
-        Arc::clone(&state.dispatcher),
-        outbox,
-        Arc::clone(&state.plugins),
-        Arc::new(engine::wire::ReqwestModelTransport::new()),
-        Arc::new(TauriEmitter { app: app.clone() }),
-    ));
+    let workspace = state
+        .config
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("agent");
+
+    let built = Arc::new(
+        AgentEngine::new(
+            state.db.clone(),
+            Arc::clone(&state.dispatcher),
+            outbox,
+            Arc::clone(&state.plugins),
+            Arc::new(engine::wire::ReqwestModelTransport::new()),
+            Arc::new(TauriEmitter { app: app.clone() }),
+        )
+        .with_workspace(workspace),
+    );
 
     Ok(Arc::clone(ENGINE.get_or_init(|| built)))
 }
@@ -142,6 +163,40 @@ pub async fn agent_sessions(
         Some(id) => engine.session(&id).into_iter().collect(),
         None => engine.sessions(),
     })
+}
+
+/// Which brain would answer a ⌘K right now, and what else this machine offers.
+///
+/// The preferences dialog renders this rather than guessing: "Claude Code
+/// (detected)" is only worth saying if it is the same check `agent_start`
+/// makes, and it is — both go through [`AgentEngine::resolve_backend`].
+///
+/// ```json
+/// { "backend": "claudeCli", "label": "Claude Code",
+///   "claudePath": "/Users/…/.local/bin/claude", "apiKey": false, "message": null }
+/// ```
+#[tauri::command]
+pub async fn agent_backend_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Value, IpcError> {
+    let engine = engine(&app, &state)?;
+    let (resolved, available) = engine.resolve_backend();
+    let (backend, label, message) = match resolved {
+        Ok(backend) => (
+            Some(backend.kind().to_string()),
+            Some(backend.label()),
+            None,
+        ),
+        Err(error) => (None, None, Some(error.to_string())),
+    };
+    Ok(json!({
+        "backend": backend,
+        "label": label,
+        "claudePath": available.claude.map(|p| p.to_string_lossy().to_string()),
+        "apiKey": available.api_key,
+        "message": message,
+    }))
 }
 
 #[tauri::command]

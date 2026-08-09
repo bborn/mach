@@ -70,7 +70,7 @@ describe("the attachment row", () => {
   it("disables the controls when there is no backend to fetch from", () => {
     const html = row([attachment()], false);
     expect(html.split('disabled=""').length - 1).toBe(2);
-    expect(html).toContain("fixture preview");
+    expect(html).toContain("Needs the app");
     expect(row([attachment()], true)).not.toContain('disabled=""');
   });
 

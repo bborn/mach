@@ -42,6 +42,9 @@
  *   | `notificationsEnabled` | Rust: `notify::plan`, before it decides anything |
  *   | `notificationAccounts` | Rust: `notify::plan`, per account |
  *   | `badgeEnabled` | Rust: `notify::badge`, on every recompute |
+ *   | `agentBackend` | Rust: `agent::backend`, when a session starts |
+ *   | `agentModel` | Rust: `agent::backend`, likewise |
+ *   | `agentCommand` | Rust: `agent::backend`, likewise |
  *
  * The last three are read only in Rust, and that is not an inconsistency. A
  * notification is a decision about a message that has *just arrived*, which is
@@ -68,6 +71,20 @@ import { isTauri } from "./ipc";
 
 export type Density = "comfortable" | "compact";
 export type Theme = "system" | "light" | "dark";
+
+/**
+ * Which brain answers ⌘K.
+ *
+ * `auto` is the default and must stay the default: it prefers the Claude Code
+ * CLI when one is installed — which costs nothing extra, because the user is
+ * already paying for it — and falls back to the Anthropic API when a key is
+ * set. The three explicit values exist for the person who wants to override
+ * that, and an explicit value is never quietly substituted: asking for a
+ * backend that cannot run is an error with a sentence, not a silent fallback.
+ *
+ * The strings are the wire values `agent::backend::BackendChoice` parses.
+ */
+export type AgentBackend = "auto" | "claudeCli" | "anthropicApi" | "command";
 
 /** Sunday, Monday or Saturday — the three starts anybody actually uses. */
 export type WeekStart = 0 | 1 | 6;
@@ -128,6 +145,18 @@ export interface Preferences {
   notificationAccounts: Record<string, boolean>;
   /** The unread count on the Dock icon. */
   badgeEnabled: boolean;
+  agentBackend: AgentBackend;
+  /**
+   * A model id or alias, or `""` for the backend's own default.
+   *
+   * Free text rather than a list, because the two backends do not agree on what
+   * a model is called — `opus` is a fine answer for the CLI and a meaningless
+   * one for the Messages API — and a list would go stale the week after it was
+   * written.
+   */
+  agentModel: string;
+  /** The command line for `agentBackend: "command"`. See `docs/agent-backends.md`. */
+  agentCommand: string;
 }
 
 /**
@@ -147,6 +176,9 @@ export const DEFAULT_PREFERENCES: Preferences = {
   notificationsEnabled: true,
   notificationAccounts: {},
   badgeEnabled: true,
+  agentBackend: "auto",
+  agentModel: "",
+  agentCommand: "",
 };
 
 export interface Bounds {
@@ -169,6 +201,7 @@ export const SEND_DELAY_BOUNDS: Bounds = { min: 0, max: 300 };
 /* Parsing                                                                     */
 /* -------------------------------------------------------------------------- */
 
+const AGENT_BACKENDS = new Set<string>(["auto", "claudeCli", "anthropicApi", "command"]);
 const DENSITIES = new Set<string>(["comfortable", "compact"]);
 const THEMES = new Set<string>(["system", "light", "dark"]);
 const WEEK_STARTS = new Set<number>([0, 1, 6]);
@@ -281,7 +314,20 @@ export function parsePreferences(raw: unknown): Preferences {
     notificationsEnabled: flag(source.notificationsEnabled, d.notificationsEnabled),
     notificationAccounts: mutedAccounts(source.notificationAccounts),
     badgeEnabled: flag(source.badgeEnabled, d.badgeEnabled),
+    agentBackend:
+      typeof source.agentBackend === "string" && AGENT_BACKENDS.has(source.agentBackend)
+        ? (source.agentBackend as AgentBackend)
+        : d.agentBackend,
+    // Trimmed, because these are typed by hand and a trailing space in a model
+    // id is a failure two layers away from where it was made.
+    agentModel: text(source.agentModel),
+    agentCommand: text(source.agentCommand),
   };
+}
+
+/** A trimmed string, or `""`. */
+function text(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 /* -------------------------------------------------------------------------- */

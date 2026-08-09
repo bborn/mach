@@ -24,6 +24,8 @@ import type {
   CalendarAccessRole,
   CalendarEvent,
   ColorIndex,
+  EventConference,
+  EventGuest,
   Label,
   Message,
   Participant,
@@ -210,6 +212,42 @@ interface WireEvent {
   iCalUID?: Nullable<string>;
   organizerSelf?: Nullable<boolean>;
   guestsCanModify?: Nullable<boolean>;
+  /** `db::models::Event.creator` — not always the organizer; see migration 7. */
+  creator?: Nullable<WireParticipant>;
+  /** The same people as `attendees`, with what each of them answered. */
+  guests?: Nullable<WireEventGuest[]>;
+  conference?: Nullable<WireConference>;
+  attachments?: Nullable<
+    { title?: Nullable<string>; url?: Nullable<string>; mimeType?: Nullable<string> }[]
+  >;
+  visibility?: Nullable<string>;
+  transparency?: Nullable<string>;
+}
+
+interface WireEventGuest {
+  email?: Nullable<string>;
+  name?: Nullable<string>;
+  response?: Nullable<string>;
+  optional?: Nullable<boolean>;
+  organizer?: Nullable<boolean>;
+  isSelf?: Nullable<boolean>;
+  resource?: Nullable<boolean>;
+  comment?: Nullable<string>;
+}
+
+interface WireConference {
+  id?: Nullable<string>;
+  name?: Nullable<string>;
+  notes?: Nullable<string>;
+  entryPoints?: Nullable<
+    {
+      kind?: Nullable<string>;
+      uri?: Nullable<string>;
+      label?: Nullable<string>;
+      pin?: Nullable<string>;
+      regionCode?: Nullable<string>;
+    }[]
+  >;
 }
 
 interface WireAccountSyncStatus {
@@ -512,6 +550,68 @@ export function mapEvent(wire: WireEvent): CalendarEvent {
     organizerSelf: typeof wire.organizerSelf === "boolean" ? wire.organizerSelf : undefined,
     guestsCanModify:
       typeof wire.guestsCanModify === "boolean" ? wire.guestsCanModify : undefined,
+    // And migration 7's, named here for the third time in this function's
+    // history. The tripwire tests at the bottom of the `requests` block are the
+    // only thing that catches an omission; there is still no type error.
+    creator: wire.creator ? mapParticipant(wire.creator) : undefined,
+    guests: wire.guests ? wire.guests.map(mapGuest) : undefined,
+    conference: mapConference(wire.conference),
+    attachments: wire.attachments
+      ? wire.attachments
+          .filter((a) => typeof a?.url === "string" && a.url.length > 0)
+          .map((a) => ({
+            title: text(a.title) || text(a.url),
+            url: text(a.url),
+            mimeType: optional(a.mimeType),
+          }))
+      : undefined,
+    visibility: optional(wire.visibility),
+    transparency: optional(wire.transparency),
+  };
+}
+
+function mapGuest(wire: WireEventGuest): EventGuest {
+  const response = wire.response as Rsvp | null | undefined;
+  return {
+    email: text(wire.email),
+    name: optional(wire.name),
+    // A guest who has not answered and a guest Google said nothing about are
+    // two states, and only one of them belongs in the "awaiting" count.
+    response: response && RSVP_VALUES.has(response) ? response : undefined,
+    optional: wire.optional === true,
+    organizer: wire.organizer === true,
+    isSelf: wire.isSelf === true,
+    resource: wire.resource === true,
+    comment: optional(wire.comment),
+  };
+}
+
+/**
+ * The conference, with every entry point that has somewhere to go.
+ *
+ * Nothing is validated here beyond shape — `uri` is carried through verbatim,
+ * because this seam's job is to move the wire onto the UI's types and not to
+ * decide what is safe to open. That decision belongs to `joinUrl()` at the point
+ * of use, and to `open_external` in Rust behind it, so a string that reaches the
+ * screen as text is never the same act as a string that gets followed.
+ */
+function mapConference(wire: Nullable<WireConference>): EventConference | undefined {
+  if (!wire) return undefined;
+  const entryPoints = (wire.entryPoints ?? [])
+    .filter((entry) => typeof entry?.uri === "string" && entry.uri.length > 0)
+    .map((entry) => ({
+      kind: text(entry.kind, "video"),
+      uri: text(entry.uri),
+      label: optional(entry.label),
+      pin: optional(entry.pin),
+      regionCode: optional(entry.regionCode),
+    }));
+  if (entryPoints.length === 0) return undefined;
+  return {
+    id: optional(wire.id),
+    name: optional(wire.name),
+    notes: optional(wire.notes),
+    entryPoints,
   };
 }
 
@@ -559,7 +659,7 @@ export function errorMessage(error: unknown): string {
     if (typeof record.message === "string") return record.message;
     if (typeof record.kind === "string") return record.kind;
   }
-  return "Something went wrong talking to the backend.";
+  return "The backend did not answer";
 }
 
 /**

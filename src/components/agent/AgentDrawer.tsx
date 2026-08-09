@@ -75,6 +75,17 @@ export function AgentDrawer({
       <header className="flex h-8 shrink-0 items-center gap-2 border-b border-border px-3">
         <span className="truncate text-list text-foreground">{session.title}</span>
         <StatusLabel session={session} />
+        {/*
+          Which brain answered. Worth a few characters of chrome because the
+          answer can differ between two sessions open at once — the preference
+          is read when a session starts, not when it is read back — and because
+          "why is this one slower / better" is otherwise unanswerable.
+        */}
+        {session.backend && (
+          <span className="hidden truncate text-micro text-faint-foreground sm:inline">
+            {session.backend}
+          </span>
+        )}
         <div className="ml-auto flex items-center gap-0.5">
           <Button size="icon" variant="ghost" onClick={onMinimise} aria-label="Minimise">
             <ChevronDown size={13} strokeWidth={1.75} />

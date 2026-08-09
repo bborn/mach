@@ -252,14 +252,29 @@ function tokenBlock(tokens: FrameTokens): string {
 function frameStyles(tokens: FrameTokens): string {
   return `:root{${tokenBlock(tokens)};color-scheme:light dark}
 html,body{margin:0;padding:0;background:transparent}
-/* The frame must not grow a scrollbar while it is sized to its content: a
-   frame a pixel too short grows one, the scrollbar narrows the body, a
-   narrower body wraps taller, and the height measured to fix it is the height
-   that caused it. That loop is what made the reading pane jitter.
-   At MAX_FRAME_HEIGHT the height stops changing, so the loop cannot start —
-   and hiding the bar there made everything past the cap unreachable. The
-   mach-capped class is set by MessageFrame when it clamps. */
-html:not(.mach-capped){scrollbar-width:none}
+/* Nothing nests. A message grows to its natural height and the reading pane is
+   the only thing that scrolls, so the frame's own viewport must never have
+   anything to scroll:
+
+   - Vertically it cannot, because the frame is sized to the content. Saying so
+     with overflow-y:hidden matters anyway: a horizontal scrollbar takes a
+     centimetre off the bottom of the viewport, which pushes the content past
+     the height we just set, which grows a *vertical* scrollbar as well. That
+     pair is what the reader was looking at, from a single over-wide table.
+   - Horizontally it should not, because content too wide for the pane is given
+     its own scroller by [containWideContent]. overflow-x stays scrollable as a
+     last resort so anything that escapes that pass is reachable rather than
+     silently cut off.
+
+   Hiding the bars is belt and braces on top of that, and is what keeps the
+   frame from re-entering the old feedback loop: a frame a pixel too short grows
+   a scrollbar, the scrollbar narrows the body, a narrower body wraps taller,
+   and the height measured to fix it is the height that caused it.
+
+   Past MAX_FRAME_HEIGHT none of this applies: the height stops tracking the
+   content, so the frame has to scroll itself or the rest of the message would
+   be unreachable. MessageFrame sets mach-capped when it clamps. */
+html:not(.mach-capped){overflow-x:auto;overflow-y:hidden;scrollbar-width:none}
 html:not(.mach-capped)::-webkit-scrollbar{width:0;height:0;display:none}
 body{color:var(--foreground,currentColor);font:0.9375rem/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;overflow-wrap:break-word;word-break:break-word;-webkit-font-smoothing:antialiased;-webkit-user-select:text;user-select:text}
 img{max-width:100%;height:auto;border:0}
@@ -269,7 +284,20 @@ img[data-mach-tracker]{display:none!important}
 table{max-width:100%}
 a{color:var(--accent,currentColor)}
 blockquote{margin:0.5rem 0;padding-left:0.75rem;border-left:2px solid var(--border,currentColor)}
-pre{white-space:pre-wrap;overflow-x:auto}
+/* A log or a code block keeps its lines: reflowing a stack trace to the width
+   of the pane is not preserving it. It scrolls inside itself instead, which is
+   the same bargain the wrapper below makes for a wide table — the paragraphs
+   on either side stay where they are.
+   overflow-y is pinned shut because leaving it at the initial value would make
+   it compute to auto the moment overflow-x does not, and then the horizontal
+   scrollbar could grow a vertical one inside a block that has nothing to
+   scroll vertically. */
+pre{white-space:pre;max-width:100%;overflow-x:auto;overflow-y:hidden}
+/* The scroller [containWideContent] puts around content too wide for the pane.
+   The element inside is released from the 100% cap that made it overflow the
+   document in the first place — inside the scroller, being wide is the point. */
+[data-mach-scroll]{max-width:100%;overflow-x:auto;overflow-y:hidden}
+[data-mach-scroll]>table{max-width:none}
 hr{border:0;border-top:1px solid var(--border,currentColor)}`;
 }
 
@@ -327,11 +355,19 @@ export const MIN_FRAME_HEIGHT = 28;
 /**
  * Invariant: the frame must not be able to lie about its height.
  *
- * A body of a million empty divs would otherwise hand us a height that pushes
- * every other message off the page and makes the pane unscrollable. Past the
- * cap the frame keeps its own scrollbar; real mail never reaches it.
+ * A body of a million empty divs would otherwise hand us a height no layout can
+ * survive. Past the cap the frame keeps its own scrollbar, because a height that
+ * has stopped tracking the content would otherwise put the rest of the message
+ * out of reach — that was a real bug, and the cap caused it.
+ *
+ * It used to be 12 000px, which is about eight screens: long newsletters and
+ * forwarded chains reach that, and every one of them grew a scrollbar inside
+ * itself for no better reason than the number being small. 120 000px is far
+ * past anything a person sends and still nowhere near what a browser will lay
+ * out, so in practice the cap is now only ever hit by something pathological —
+ * which is the only thing it was ever for.
  */
-export const MAX_FRAME_HEIGHT = 12000;
+export const MAX_FRAME_HEIGHT = 120_000;
 
 export function clampFrameHeight(measured: number): number {
   if (!Number.isFinite(measured) || measured <= 0) return MIN_FRAME_HEIGHT;
@@ -345,8 +381,8 @@ export function clampFrameHeight(measured: number): number {
 export const FRAME_HEIGHT_EPSILON = 1;
 
 /**
- * The height to apply next, given what we just measured and every height we
- * have already applied to *this* document.
+ * The height to apply next, given what we just measured and the tallest height
+ * already applied since the frame was last laid out at this width.
  *
  * # Why this is not just `clampFrameHeight(measured)`
  *
@@ -357,24 +393,118 @@ export const FRAME_HEIGHT_EPSILON = 1;
  * the scrollbar narrows the body, and a narrower body wraps taller. So the
  * frame oscillates between "tall enough" and "tall enough, plus a scrollbar's
  * worth of rewrapping", forever — measured on a real newsletter as 2403 ⇄ 2436.
- * `frameStyles` takes the scrollbar out of the layout, which removes that
- * particular loop; this makes *any* such loop terminate.
  *
- * The rule: never shrink back to a height we have already applied. Content that
- * genuinely changed — a late image, a web font — grows the frame, or shrinks it
- * to a height we have not seen before. Only a feedback cycle returns to one we
- * have. So a cycle is broken at its first repeat, and the frame settles on the
- * taller of the two, which is the safe direction: the alternative clips mail.
+ * # Why it cannot oscillate
+ *
+ * At a fixed width the height only ever goes up: a measurement that is not
+ * taller than the tallest we have applied is ignored. So the heights applied to
+ * one document form a strictly increasing sequence bounded by
+ * [`MAX_FRAME_HEIGHT`], which must stop, and in practice stops in two or three
+ * steps — first paint, then the images.
+ *
+ * The one thing that may take it back down is a change of *width*, which resets
+ * the peak (see `MessageFrame`). That cannot start a loop either, because the
+ * frame's width is `100%` of the reading pane and is therefore never a function
+ * of the height we set: a width change comes from the reader dragging the
+ * splitter or resizing the window, never from us. Growth is driven by the
+ * content; shrinking is driven by the reader; neither is driven by the
+ * measurement, which is what a loop would require.
+ *
+ * Refusing to shrink is also the safe direction on its own terms: too tall
+ * leaves a band of empty space, too short clips mail.
  */
-export function nextFrameHeight(
-  current: number,
-  measured: number,
-  applied: ReadonlySet<number>,
-): number {
+export function nextFrameHeight(current: number, measured: number, peak: number): number {
   const next = clampFrameHeight(measured);
   if (Math.abs(next - current) <= FRAME_HEIGHT_EPSILON) return current;
-  if (next < current && applied.has(next)) return current;
-  return next;
+  return next > peak ? next : current;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Width                                                                       */
+/* -------------------------------------------------------------------------- */
+
+/** Marks a scroller this pass added, so the CSS can style it and we can skip it. */
+export const SCROLL_ATTR = "data-mach-scroll";
+
+/**
+ * One element the pass may put in its own sideways scroller.
+ *
+ * Structural rather than a DOM type, for the same reason [`BlockedImage`] is:
+ * the decision is worth testing without a WebView. `scrollWidth` and `handled`
+ * are read *fresh* on every access — wrapping one element re-lays-out every
+ * ancestor of it, and that is the entire point of doing the deepest first.
+ */
+export interface WideCandidate {
+  /** Live: what this element measures now, not when the list was built. */
+  readonly scrollWidth: number;
+  /** The tag it hangs off, so a wrapper is never put somewhere illegal. */
+  readonly parentTagName: string;
+  /** Already wrapped, or already a scroller in its own right. */
+  readonly handled: boolean;
+  /** Put this element inside its own horizontal scroller. */
+  wrap(): void;
+}
+
+/**
+ * Where a `<div>` is not a legal child. The parser would move a wrapper out of
+ * one of these and take the element with it, rearranging the message.
+ */
+const TABLE_INTERNAL = new Set(["TABLE", "THEAD", "TBODY", "TFOOT", "TR"]);
+
+/** Sub-pixel slack, so a table that measures 595.4 against a 595 pane is "fits". */
+const WIDTH_SLACK = 1;
+
+/**
+ * Give content too wide for the frame its own sideways scroller.
+ *
+ * # Why the scrolling has to live here rather than on the document
+ *
+ * A twelve-column table genuinely does not fit in a reading pane, and something
+ * has to give. Letting the *document* scroll sideways — which is what happens
+ * with no intervention — is the worst of the options: the paragraphs above and
+ * below the table are only as wide as the pane, so scrolling right to read the
+ * last column slides the entire message off the screen and leaves a field of
+ * white beside it. It also costs a horizontal scrollbar across the whole
+ * message, and a horizontal scrollbar eats enough of the frame's viewport to
+ * summon a vertical one beside it. That is the pair the reader was looking at.
+ *
+ * A scroller around the wide element alone is what Gmail does and what the
+ * reader asked for: the table scrolls, everything else stays put.
+ *
+ * The senders who care already do this — the message that prompted the work
+ * ships its table inside `<div style="overflow-x:auto">` — but `overflow-x` is
+ * not in the sanitizer's CSS allowlist, so their container arrives as a plain
+ * div. We are not going to widen that allowlist for a layout problem; we
+ * re-establish the container ourselves.
+ *
+ * # Why a DOM pass and not CSS
+ *
+ * "Too wide" is a measurement, and CSS has no selector for it. The obvious
+ * hack — `table{display:block;overflow:auto}` — would apply to every table,
+ * and in mail most tables are the *layout*, not the data.
+ *
+ * Nothing here writes markup: elements are created and moved, never
+ * interpolated, so no sender string is re-parsed. The frame gains no
+ * permission, and `docs/message-rendering-invariants.md` is untouched by it.
+ *
+ * Candidates must arrive **deepest first**. Wrapping the inner table usually
+ * takes its ancestors back under the width, so they are never wrapped at all —
+ * which is what keeps the surrounding layout in place.
+ */
+export function containWideContent(
+  candidates: Iterable<WideCandidate>,
+  frameWidth: number,
+): number {
+  if (!Number.isFinite(frameWidth) || frameWidth <= 0) return 0;
+  let wrapped = 0;
+  for (const candidate of candidates) {
+    if (candidate.handled) continue;
+    if (TABLE_INTERNAL.has(candidate.parentTagName)) continue;
+    if (candidate.scrollWidth <= frameWidth + WIDTH_SLACK) continue;
+    candidate.wrap();
+    wrapped += 1;
+  }
+  return wrapped;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -396,7 +526,7 @@ export function isEffectivelyEmpty(html: string): boolean {
 }
 
 /**
- * Invariant 6. A body that is *entirely* quoted is a legitimate bare forward —
+ * Invariant 7. A body that is *entirely* quoted is a legitimate bare forward —
  * and is also how a sender hides their whole message behind the collapse. So
  * when there is nothing above the quote, the quote is the message: show it.
  */

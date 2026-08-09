@@ -1377,9 +1377,11 @@ fn the_snapshot_is_camel_case_on_the_wire() {
         ],
         pending: None,
         error: None,
+        backend: Some("Claude Code".into()),
     };
 
     let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["backend"], "Claude Code");
     assert_eq!(json["createdAt"], 1);
     assert_eq!(json["status"], "awaitingApproval");
     assert_eq!(json["context"][0]["threadId"], 9);

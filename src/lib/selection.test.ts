@@ -194,12 +194,8 @@ describe("select all", () => {
   });
 
   it("says how much of the mailbox 'all' actually was", () => {
-    expect(selectAllMessage(247, true)).toBe(
-      "247 selected — every conversation loaded so far, not the whole mailbox",
-    );
-    expect(selectAllMessage(12, false)).toBe(
-      "12 selected — every conversation in this mailbox",
-    );
+    expect(selectAllMessage(247, true)).toBe("247 selected — loaded so far, not the whole mailbox");
+    expect(selectAllMessage(12, false)).toBe("12 selected — the whole mailbox");
   });
 });
 
