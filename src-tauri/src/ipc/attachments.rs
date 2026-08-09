@@ -33,6 +33,7 @@
 pub mod store;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -55,6 +56,59 @@ use super::state::AppState;
 /// Gmail addresses the authorised account as `me`, the same way the command
 /// layer does.
 const USER_ID: &str = "me";
+
+/// How long a click on an attachment may go unanswered before it becomes an
+/// error the reader can read.
+///
+/// # What it covers, and what it provably does not
+///
+/// It covers the network. Nothing in this app sets a timeout on a `reqwest`
+/// client, so a connection that stalls after the headers stalls a click on an
+/// attachment for as long as the socket stays open — with a spinner on the chip
+/// and no way for the reader to learn that nothing is happening.
+///
+/// It does **not** cover the failure that was actually caught here. Opening a
+/// PDF from the owner's own mailbox hung indefinitely, and the sample says why:
+///
+/// ```text
+/// attachment_open → materialise → attachment_get_capped → RestClient::send
+///   → ManagedToken::access_token → KeychainTokenStore::load_refresh_token
+///   → SecKeychainFindGenericPassword → __psynch_mutexwait
+/// ```
+///
+/// The token read is a **blocking** Keychain call sitting inside an `async`
+/// poll. When macOS decides the build needs the user's approval it parks in
+/// `securityd` until a dialog is answered, and a dialog cannot be answered
+/// while the app is not able to show one. A `timeout` cannot help there: the
+/// task is stuck *inside* a poll, so it is never polled again and the timer
+/// never gets to fire. Worse, every other token read then queues on the same
+/// lock, which is how one unanswered prompt takes the whole app's network side
+/// — sync included — with it.
+///
+/// So this is a bound on the half that can be bounded, and the other half is a
+/// note to whoever owns `auth::tokens`: the Keychain must not be read from a
+/// runtime worker on the request path. It is the same lesson as "never read the
+/// Keychain on the launch thread", one layer further in.
+///
+/// Two minutes is longer than any legitimate attachment fetch (Gmail will not
+/// deliver over 50 MB, and this cache refuses over 64 MiB) and far shorter than
+/// "never".
+const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Run a fetch under [`FETCH_TIMEOUT`], turning a stall into a sentence.
+async fn within_deadline<T>(
+    what: &str,
+    future: impl std::future::Future<Output = Result<T, IpcError>>,
+) -> Result<T, IpcError> {
+    match tokio::time::timeout(FETCH_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => Err(refused(format!(
+            "{what} did not arrive within {} seconds, so Mach stopped waiting. \
+             Nothing was downloaded — try again.",
+            FETCH_TIMEOUT.as_secs()
+        ))),
+    }
+}
 
 // ===========================================================================
 // Payloads
@@ -201,23 +255,30 @@ pub async fn attachment_inline_image(
     }
 
     let gmail = gmail_for(&state, identity.account_id)?;
-    let message = gmail
-        .messages_get(USER_ID, &identity.gmail_message_id, MessageFormat::Full)
-        .await
-        .map_err(google)?;
-    let body = message.extract_body();
+    // Under the same deadline as a file, and for the same reason: the reading
+    // pane asks for these images the moment a message is expanded, so a stalled
+    // token read here would leave one hung request per inline image for as long
+    // as the app is open.
+    let bytes = within_deadline(&format!("the image {content_id}"), async {
+        let message = gmail
+            .messages_get(USER_ID, &identity.gmail_message_id, MessageFormat::Full)
+            .await
+            .map_err(google)?;
+        let body = message.extract_body();
 
-    let part = body
-        .attachments
-        .iter()
-        .find(|part| matches_content_id(part, &content_id))
-        .ok_or_else(|| {
-            refused(format!(
-                "this message has no part with Content-ID {content_id}"
-            ))
-        })?;
+        let part = body
+            .attachments
+            .iter()
+            .find(|part| matches_content_id(part, &content_id))
+            .ok_or_else(|| {
+                refused(format!(
+                    "this message has no part with Content-ID {content_id}"
+                ))
+            })?;
 
-    let bytes = part_bytes(&gmail, &identity.gmail_message_id, part, MAX_INLINE_IMAGE_BYTES).await?;
+        part_bytes(&gmail, &identity.gmail_message_id, part, MAX_INLINE_IMAGE_BYTES).await
+    })
+    .await?;
 
     // The sender's Content-Type is not consulted. An inline part becomes a
     // `data:` URL inside the message frame, and `render::sanitize` refuses SVG
@@ -311,13 +372,16 @@ async fn materialise(state: &AppState, attachment_id: i64) -> Result<AttachmentF
     }
 
     let gmail = gmail_for(state, row.account_id)?;
-    let bytes = match &row.gmail_attachment_id {
-        Some(id) => gmail
-            .attachment_get_capped(USER_ID, &row.gmail_message_id, id, MAX_ATTACHMENT_BYTES)
-            .await
-            .map_err(google)?,
-        None => inline_part_bytes(&gmail, &row).await?,
-    };
+    let bytes = within_deadline(&filename, async {
+        match &row.gmail_attachment_id {
+            Some(id) => gmail
+                .attachment_get_capped(USER_ID, &row.gmail_message_id, id, MAX_ATTACHMENT_BYTES)
+                .await
+                .map_err(google),
+            None => inline_part_bytes(&gmail, &row).await,
+        }
+    })
+    .await?;
 
     let stored = cache.store(&key, &filename, &bytes).map_err(|e| {
         IpcError::internal(format!("could not cache {filename}: {e}"))

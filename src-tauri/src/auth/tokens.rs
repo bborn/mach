@@ -292,6 +292,40 @@ where
     H: TokenHttp + Send + Sync,
     S: TokenStore,
 {
+    /// Read the persisted refresh token without stalling the async runtime.
+    ///
+    /// [`TokenStore::load_refresh_token`] is synchronous, and on macOS it is a
+    /// Keychain call that can block for an unbounded time: if the item's ACL no
+    /// longer matches the running binary, `securityd` puts up a password prompt
+    /// and does not return until somebody answers it. Called straight from an
+    /// `async fn`, that parks a Tokio worker for the whole of that wait, and
+    /// everything else scheduled on it stops — which is exactly what happened:
+    /// opening an attachment hung on its spinner and took the sync loop with it.
+    ///
+    /// `block_in_place` tells the multi-thread scheduler to move this worker's
+    /// other tasks elsewhere first, so the runtime keeps running while this one
+    /// thread waits. It panics on a current-thread runtime, which is what most
+    /// `#[tokio::test]`s are, so the flavour is checked rather than assumed.
+    ///
+    /// What this does *not* do is bound the wait. The task is still blocked, so
+    /// a timeout wrapped around the caller cannot fire — a task blocked inside
+    /// its own poll is never polled again. Bounding it means moving the read to
+    /// `spawn_blocking`, which needs `S: Clone + 'static` and a wider change
+    /// than this. The remaining symptom is one stuck request rather than a
+    /// stuck application.
+    fn load_refresh_token_unblocking(
+        &self,
+        account_email: &str,
+    ) -> Result<Option<Secret>, AuthError> {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        match Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(RuntimeFlavor::MultiThread) => {
+                tokio::task::block_in_place(|| self.store.load_refresh_token(account_email))
+            }
+            _ => self.store.load_refresh_token(account_email),
+        }
+    }
+
     pub fn new(config: ClientConfig, http: H, store: S) -> Self {
         Self {
             config,
@@ -358,8 +392,7 @@ where
         let refresh_token = match cached.as_ref().and_then(|t| t.refresh_token.clone()) {
             Some(rt) => rt,
             None => self
-                .store
-                .load_refresh_token(account_email)?
+                .load_refresh_token_unblocking(account_email)?
                 .ok_or_else(|| AuthError::NotAuthorized(account_email.to_string()))?,
         };
 
@@ -400,8 +433,7 @@ where
             match cached.and_then(|t| t.refresh_token) {
                 Some(rt) => rt,
                 None => self
-                    .store
-                    .load_refresh_token(account_email)?
+                    .load_refresh_token_unblocking(account_email)?
                     .ok_or_else(|| AuthError::NotAuthorized(account_email.to_string()))?,
             }
         };

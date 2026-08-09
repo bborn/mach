@@ -17,6 +17,8 @@ import {
   attachmentKind,
   attachmentLabel,
   contentIdsIn,
+  disambiguateNames,
+  displayFilename,
   extensionOf,
   fetchInlineImages,
   formatBytes,
@@ -117,9 +119,58 @@ describe("isExecutable", () => {
   });
 });
 
+describe("displayFilename", () => {
+  it("leaves a real name alone", () => {
+    expect(displayFilename("Q3.pdf")).toBe("Q3.pdf");
+    expect(displayFilename("契約書.pdf")).toBe("契約書.pdf");
+  });
+
+  // Every one of these is a shape that turns up in a real mailbox: the
+  // `text/rfc822-headers` part of a bounce, Gmail's AMP alternative body, the
+  // JSON behind an emoji reaction. Before this they rendered as a chip with a
+  // size and no name at all.
+  it("names the parts that arrived without one", () => {
+    expect(displayFilename("")).toBe("attachment");
+    expect(displayFilename("   ")).toBe("attachment");
+  });
+});
+
+describe("disambiguateNames", () => {
+  // Straight out of the owner's mailbox: one message with three copies of
+  // `Plowing 2025.pdf`, and a pile of invitations carrying two `invite.ics`.
+  it("tells identical names apart without touching the first one", () => {
+    expect(
+      disambiguateNames(["Plowing 2025.pdf", "Plowing 2025.pdf", "Plowing 2025.pdf"]),
+    ).toEqual(["Plowing 2025.pdf", "Plowing 2025 (2).pdf", "Plowing 2025 (3).pdf"]);
+  });
+
+  it("matches case-insensitively, the way a filesystem would", () => {
+    expect(disambiguateNames(["Invite.ics", "invite.ics"])).toEqual([
+      "Invite.ics",
+      "invite (2).ics",
+    ]);
+  });
+
+  it("appends to a name with no extension rather than inventing one", () => {
+    expect(disambiguateNames(["attachment", "attachment"])).toEqual([
+      "attachment",
+      "attachment (2)",
+    ]);
+  });
+
+  it("leaves distinct names exactly as they are", () => {
+    const names = ["a.pdf", "b.pdf", "c.png"];
+    expect(disambiguateNames(names)).toEqual(names);
+  });
+});
+
 describe("attachmentLabel", () => {
   it("puts everything the eye gets into words", () => {
     expect(attachmentLabel("Q3.pdf", "application/pdf", 158204)).toBe("Q3.pdf, 154 KB");
+  });
+
+  it("reads out the fallback name for a part that has none", () => {
+    expect(attachmentLabel("", "text/rfc822-headers", 3349)).toBe("attachment, 3 KB");
   });
 
   it("says so when the thing cannot be opened", () => {

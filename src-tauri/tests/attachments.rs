@@ -452,12 +452,6 @@ fn programs_are_recognised_however_they_are_spelled() {
         // The classic: a real extension hiding behind a fake one.
         "report.pdf.exe",
         "photo.jpg.scr",
-        // Documents that execute. Opened with the system handler these become
-        // a page in the default browser running the sender's script.
-        "invoice.html",
-        "invoice.htm",
-        "logo.svg",
-        "page.mhtml",
     ] {
         assert!(
             is_dangerous(name, "application/octet-stream"),
@@ -482,6 +476,78 @@ fn documents_are_not_treated_as_programs() {
         assert!(
             !is_dangerous(name, "application/pdf"),
             "{name:?} should be openable"
+        );
+    }
+}
+
+/// The inverted case, and the reason it is inverted.
+///
+/// These four were refused until the owner pointed out what that costs: an
+/// HTML report and an SVG diagram are things people are *sent*, and a client
+/// that will not open the invoice it has just rendered is broken rather than
+/// careful. Opening one hands the browser a page, which is where a page goes;
+/// it is not the same act as running a program, and this list is about
+/// programs. `render::sanitize` still refuses both inside the reading pane —
+/// see `tests/render.rs`, which is where that decision is tested.
+#[test]
+fn documents_that_open_in_a_browser_are_ordinary_attachments() {
+    for (name, mime) in [
+        ("invoice.html", "text/html"),
+        ("invoice.htm", "text/html"),
+        ("report.xhtml", "application/xhtml+xml"),
+        ("page.mhtml", "message/rfc822"),
+        ("page.mht", "message/rfc822"),
+        ("diagram.svg", "image/svg+xml"),
+        ("diagram.svgz", "image/svg+xml"),
+        ("statement.shtml", "text/html"),
+        ("figure.xht", "application/xhtml+xml"),
+    ] {
+        assert!(
+            !is_dangerous(name, mime),
+            "{name:?} is a document — Mach refusing to open it is the bug that started this"
+        );
+    }
+}
+
+/// The floor under [`is_dangerous`]: whatever else is relaxed, these still
+/// start a process when they are double-clicked, so they are still refused.
+#[test]
+fn things_that_execute_on_a_double_click_are_still_refused() {
+    for name in [
+        "Installer.app",
+        "install.pkg",
+        "disk.dmg",
+        "run.command",
+        "deploy.sh",
+        "deploy.zsh",
+        "macro.scpt",
+        "tool.jar",
+        "setup.exe",
+        "go.bat",
+        "go.cmd",
+        "hook.ps1",
+        "setup.msi",
+        "saver.scr",
+        "macro.vbs",
+    ] {
+        assert!(
+            is_dangerous(name, "application/octet-stream"),
+            "{name:?} runs on a double click and must not be openable"
+        );
+    }
+
+    for mime in [
+        "application/x-mach-binary",
+        "application/x-executable",
+        "application/x-msdownload",
+        "application/x-sh",
+        "application/x-apple-diskimage",
+        "application/vnd.apple.installer+xml",
+        "application/x-msi",
+    ] {
+        assert!(
+            is_dangerous("attachment", mime),
+            "{mime:?} describes a program and must not be openable"
         );
     }
 }

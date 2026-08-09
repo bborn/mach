@@ -298,6 +298,23 @@ pub fn extension_of(name: &str) -> Option<String> {
 /// clicking them usually opens an editor rather than an interpreter, because
 /// "usually" depends on what the user has installed and on a LaunchServices
 /// database we do not control.
+///
+/// # What is deliberately *not* here
+///
+/// `html`, `htm`, `xhtml`, `mhtml` and `svg` used to be. They are gone, and the
+/// distinction they cost is worth stating: this list is about files the system
+/// will **run**, not files the system will **display**. An HTML report and an
+/// SVG diagram are ordinary things to be sent, and opening one puts a page in
+/// the browser — the same browser, with the same protections, that every link
+/// in every message already goes to. Refusing them made the app wrong about the
+/// common case in order to be right about a rare one, and a mail client that
+/// will not open the invoice it just showed you is not a security posture, it
+/// is a bug.
+///
+/// That is not the same decision as `render::sanitize`'s, which still refuses
+/// to put sender HTML or an SVG into the reading pane. Inside the message frame
+/// the sender's markup would run *beside Mach's own document*; in the browser
+/// it is a page in a tab, which is where web pages go.
 const DANGEROUS_EXTENSIONS: &[&str] = &[
     // macOS
     "app", "command", "workflow", "action", "scpt", "scptd", "applescript", "osascript",
@@ -310,15 +327,10 @@ const DANGEROUS_EXTENSIONS: &[&str] = &[
     // Unix-ish
     "sh", "bash", "zsh", "csh", "ksh", "fish", "run", "out", "elf", "bin", "deb", "rpm",
     "appimage", "desktop", "service", "py", "pyc", "pl", "rb", "php", "lua",
-    // Archives that some unarchivers auto-execute, and the classic double-click
-    // trap: an "extension" that is really a second one.
+    // Disk images. Not executable themselves, but mounting one is how an
+    // installer or a `.lnk` chain arrives, and nobody sends a raw `.iso` to
+    // someone who wanted to read it.
     "iso", "img", "vhd", "vhdx",
-    // Documents that execute. An HTML or SVG attachment opened with the system
-    // handler becomes a page in the default browser, with a `file:` origin,
-    // running the sender's script — which is the whole reason
-    // `render::sanitize` will not let either of them near the reading pane
-    // either. A message that wants to show you a web page has a link for that.
-    "html", "htm", "xhtml", "shtml", "mhtml", "mht", "svg", "svgz", "xht",
 ];
 
 /// MIME types that describe a program, whatever the filename says.

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   Download,
   File,
@@ -20,6 +20,8 @@ import { cn } from "@/lib/utils";
 import {
   attachmentKind,
   attachmentLabel,
+  disambiguateNames,
+  displayFilename,
   formatBytes,
   isExecutable,
   openAttachment,
@@ -129,6 +131,14 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
   const [busy, setBusy] = useState<AttachmentId | null>(null);
   const [status, setStatus] = useState<{ error: boolean; message: string } | null>(null);
 
+  // The names as the row will show them: never blank, and never two the same.
+  // Both cases are ordinary in real mail — a part with no filename at all, and
+  // three copies of one name in a single message.
+  const names = useMemo(
+    () => disambiguateNames(attachments.map((a) => displayFilename(a.filename))),
+    [attachments],
+  );
+
   async function run(id: AttachmentId, action: () => Promise<string | null>) {
     setBusy(id);
     setStatus(null);
@@ -145,14 +155,11 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
   return (
     <div className="mt-3">
       <ul aria-label="Attachments" className="flex list-none flex-wrap gap-2 p-0">
-        {attachments.map((attachment) => {
+        {attachments.map((attachment, index) => {
           const kind = attachmentKind(attachment.mimeType, attachment.filename);
           const Icon = ICONS[kind];
-          const label = attachmentLabel(
-            attachment.filename,
-            attachment.mimeType,
-            attachment.sizeBytes,
-          );
+          const name = names[index] ?? displayFilename(attachment.filename);
+          const label = attachmentLabel(name, attachment.mimeType, attachment.sizeBytes);
           const working = busy === attachment.id;
           const program = isExecutable(attachment.filename, attachment.mimeType);
 
@@ -168,7 +175,7 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
                       ? "Attachments need the app; this is the fixture preview"
                       : program
                         ? "Mach will not open a program. Save it instead."
-                        : `Open ${attachment.filename}`
+                        : `Open ${name}`
                   }
                   onClick={() =>
                     run(attachment.id, async () => {
@@ -197,9 +204,7 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
                       )}
                     />
                   )}
-                  <span className="truncate text-micro text-muted-foreground">
-                    {attachment.filename}
-                  </span>
+                  <span className="truncate text-micro text-muted-foreground">{name}</span>
                   <span className="shrink-0 font-mono text-micro text-faint-foreground">
                     {formatBytes(attachment.sizeBytes)}
                   </span>
@@ -208,8 +213,8 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
                 <button
                   type="button"
                   disabled={!live || working}
-                  aria-label={`Save ${attachment.filename}`}
-                  title={`Save ${attachment.filename}…`}
+                  aria-label={`Save ${name}`}
+                  title={`Save ${name}…`}
                   onClick={() =>
                     run(attachment.id, async () => {
                       const saved = await saveAttachment(attachment.id);

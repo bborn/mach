@@ -83,6 +83,29 @@ describe("the attachment row", () => {
     expect(html).toContain("évidence");
   });
 
+  // A bounce report's `text/rfc822-headers`, Gmail's AMP alternative body and
+  // the JSON behind an emoji reaction all arrive as parts with no filename —
+  // thirteen of them in the mailbox this was tested against. The chip used to
+  // render as an icon and a size with nothing in between.
+  it("gives a nameless part the name it will actually be saved under", () => {
+    const html = row([
+      attachment({ filename: "", mimeType: "text/rfc822-headers", sizeBytes: 3349 }),
+    ]);
+    expect(html).toContain("attachment");
+    expect(html).toContain('aria-label="Save attachment"');
+    expect(html).toContain('aria-label="Open attachment, 3 KB"');
+  });
+
+  it("tells three copies of one filename apart", () => {
+    const html = row([
+      attachment({ id: 1, filename: "Plowing 2025.pdf" }),
+      attachment({ id: 2, filename: "Plowing 2025.pdf" }),
+      attachment({ id: 3, filename: "Plowing 2025.pdf" }),
+    ]);
+    expect(html).toContain("Plowing 2025 (2).pdf");
+    expect(html).toContain("Plowing 2025 (3).pdf");
+  });
+
   it("renders nothing but the list when there is no status to report", () => {
     const html = row([attachment()]);
     expect(html).not.toContain('role="status"');

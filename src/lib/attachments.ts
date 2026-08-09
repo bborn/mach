@@ -156,6 +156,64 @@ export function attachmentKind(mimeType: string, filename: string): AttachmentKi
   return "file";
 }
 
+/**
+ * The name Rust falls back to when a part has nothing usable to be called.
+ * Kept in step with `attachments::names::FALLBACK_NAME` — see [`displayFilename`]
+ * for why the two have to agree.
+ */
+export const FALLBACK_FILENAME = "attachment";
+
+/**
+ * What to call an attachment in the chip row.
+ *
+ * Real mail is full of parts with no filename at all: the `text/rfc822-headers`
+ * inside a bounce report, Gmail's own `text/x-amp-html` alternative body, the
+ * JSON blob behind an emoji reaction. Gmail hands every one of them over as a
+ * part with bytes, so they become attachment rows, so they get a chip — and
+ * before this the chip rendered as a size and an icon with *nothing in front of
+ * them*, which reads as a broken component rather than as a nameless part.
+ *
+ * The fallback is deliberately the same word Rust writes to disk. The reader is
+ * one click away from opening or saving this thing, and a chip that invents a
+ * prettier name than the file will actually have would be lying at exactly the
+ * moment it matters.
+ */
+export function displayFilename(filename: string): string {
+  const trimmed = filename.trim();
+  return trimmed.length > 0 ? trimmed : FALLBACK_FILENAME;
+}
+
+/**
+ * Make one row of chips tell itself apart.
+ *
+ * Messages really do carry the same filename more than once — three copies of
+ * `Plowing 2025.pdf`, two `invite.ics`, an Outlook thread where every embedded
+ * picture is `image001.png`. Rendered as they arrive, those are two or three
+ * identical chips, and the reader has no way to say which one they meant.
+ *
+ * The suffix is a **display** distinction and nothing else: the chips are keyed
+ * by attachment id, the fetch is keyed by the Gmail part, and the file that
+ * lands on disk keeps the name the sender gave it. Same rule, and the same
+ * algorithm, as `attachments::names::disambiguate` in Rust — which exists for
+ * this and had nothing calling it. Held on both sides because the names are
+ * decided on this one, from rows the store already has.
+ */
+export function disambiguateNames(names: readonly string[]): string[] {
+  const seen = new Set<string>();
+  return names.map((name) => {
+    let candidate = name;
+    let n = 2;
+    while (seen.has(candidate.toLowerCase())) {
+      const dot = name.lastIndexOf(".");
+      candidate =
+        dot > 0 ? `${name.slice(0, dot)} (${n}).${name.slice(dot + 1)}` : `${name} (${n})`;
+      n += 1;
+    }
+    seen.add(candidate.toLowerCase());
+    return candidate;
+  });
+}
+
 /** The final extension, lowercased. `null` when there isn't one. */
 export function extensionOf(filename: string): string | null {
   const dot = filename.lastIndexOf(".");
@@ -189,7 +247,7 @@ export function isExecutable(filename: string, mimeType: string): boolean {
 export function attachmentLabel(filename: string, mimeType: string, sizeBytes: number): string {
   const kind = attachmentKind(mimeType, filename);
   const suffix = kind === "executable" ? ", a program Mach will not open" : "";
-  return `${filename}, ${formatBytes(sizeBytes)}${suffix}`;
+  return `${displayFilename(filename)}, ${formatBytes(sizeBytes)}${suffix}`;
 }
 
 /* -------------------------------------------------------------------------- */

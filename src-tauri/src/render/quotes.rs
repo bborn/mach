@@ -158,6 +158,21 @@ fn find_underscore_rule(lower: &str, html: &str) -> Option<usize> {
     None
 }
 
+/// The largest char boundary at or below `index`.
+///
+/// `str::floor_char_boundary` is still unstable, and every arithmetic offset in
+/// this module is a byte count that can land inside a multi-byte character.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// The "On <date>, <person> wrote:" attribution line.
 ///
 /// `wrote:` on its own is far too common in prose ("our founder wrote:"), so a
@@ -170,7 +185,14 @@ fn find_attribution(lower: &str, html: &str) -> Option<usize> {
     while let Some(rel) = lower[at..].find("wrote:") {
         let wrote = at + rel;
         at = wrote + 1;
-        let window_start = wrote.saturating_sub(WINDOW);
+        // Backing up a fixed number of *bytes* lands wherever it lands, and
+        // slicing there panics if that is the middle of a character. Real mail
+        // hits this constantly: any confidentiality footer with a curly
+        // apostrophe 320 bytes before a "wrote:" was enough to take the whole
+        // process down, and it did — eight times, on one thread of payroll
+        // PDFs. Nothing about the window needs to be exactly 320 bytes, so it
+        // moves to the boundary at or below it.
+        let window_start = floor_char_boundary(lower, wrote.saturating_sub(WINDOW));
         let window = &lower[window_start..wrote];
         if !window.contains(|c: char| c.is_ascii_digit()) && !window.contains('@') {
             continue;
@@ -313,4 +335,45 @@ fn back_up_over_attribution(lines: &[&str], start: usize) -> usize {
         break;
     }
     i
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    /// The exact shape that killed the process: a multi-byte character sitting
+    /// where the fixed-size lookback lands.
+    #[test]
+    fn an_attribution_search_survives_a_multibyte_char_at_the_window_edge() {
+        // A curly apostrophe placed so that `wrote - 320` falls inside it.
+        let mut html = String::from("<p>");
+        html.push_str(&"a".repeat(317));
+        html.push('\u{2019}'); // three bytes, straddling the 320-byte mark
+        html.push_str(" on 2026-01-01 someone@example.com wrote: hello</p>");
+
+        let lower = html.to_lowercase();
+        // The assertion is that this returns rather than panicking.
+        let _ = find_attribution(&lower, &html);
+    }
+
+    #[test]
+    fn a_footer_full_of_typography_does_not_panic() {
+        let mut html = String::new();
+        for _ in 0..40 {
+            html.push_str("Confidential — do not forward. It’s privileged. ");
+        }
+        html.push_str("On 1 Jan 2026, a@b.com wrote: quoted");
+        let lower = html.to_lowercase();
+        let _ = find_attribution(&lower, &html);
+    }
+
+    #[test]
+    fn floor_char_boundary_never_lands_inside_a_character() {
+        let s = "aé→𝄞";
+        for i in 0..=s.len() {
+            let floored = floor_char_boundary(s, i);
+            assert!(s.is_char_boundary(floored), "{i} floored to {floored}");
+            assert!(floored <= i);
+        }
+    }
 }
