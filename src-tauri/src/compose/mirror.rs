@@ -178,18 +178,39 @@ pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
 /// deleted once it is empty — otherwise discarding a message you never wrote
 /// would leave a subject line in the Drafts list for ever.
 pub fn unmirror(db: &Db, draft: &Draft) -> Result<()> {
+    unmirror_ids(db, &draft.id, Some(&current_id(draft)))
+}
+
+/// The same removal, addressed by ids rather than by a draft object.
+///
+/// [`unmirror`] is the ordinary door; this one exists because the send path
+/// reaches here from the outbox, where the draft row is already gone and only
+/// its ids survive — on the outbox row, put there at queue time. One
+/// implementation rather than two, because "take the draft out of the
+/// conversation" is exactly the operation that has been got wrong four times in
+/// this file's history.
+///
+/// **Only a row that is still a draft is ever deleted.** That single condition
+/// is what makes this safe to call after a send: `drafts.send` can hand back the
+/// same message id the draft had, and the row under that id is by then the sent
+/// message. Deleting it would remove the reply the owner just watched leave.
+pub fn unmirror_ids(db: &Db, draft_id: &str, gmail_message_id: Option<&str>) -> Result<()> {
     db.write(ensure_compose_schema)?;
     // Both ids, because a draft that has been pushed is filed under Gmail's,
     // and one that has not is filed under the placeholder — and after a failed
     // push there can be one of each.
-    let placeholder = mirror_message_id(&draft.id);
-    let gmail_message_id = current_id(draft);
+    let placeholder = mirror_message_id(draft_id);
+    let gmail_message_id = gmail_message_id
+        .filter(|id| !id.is_empty())
+        .unwrap_or(&placeholder)
+        .to_string();
     db.write(|conn| {
         let row: Option<(i64, String)> = conn
             .query_row(
                 "SELECT m.thread_id, t.gmail_thread_id
                    FROM messages m JOIN threads t ON t.id = m.thread_id
-                  WHERE m.gmail_message_id = ?1 OR m.gmail_message_id = ?2",
+                  WHERE m.is_draft = 1
+                    AND (m.gmail_message_id = ?1 OR m.gmail_message_id = ?2)",
                 params![&gmail_message_id, &placeholder],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -199,7 +220,8 @@ pub fn unmirror(db: &Db, draft: &Draft) -> Result<()> {
         };
 
         conn.execute(
-            "DELETE FROM messages WHERE gmail_message_id = ?1 OR gmail_message_id = ?2",
+            "DELETE FROM messages
+              WHERE is_draft = 1 AND (gmail_message_id = ?1 OR gmail_message_id = ?2)",
             params![&gmail_message_id, &placeholder],
         )?;
         conn.execute(
@@ -231,6 +253,99 @@ pub fn unmirror(db: &Db, draft: &Draft) -> Result<()> {
         Ok(())
     })?;
     Ok(())
+}
+
+/// Take out mirror rows that no longer stand for anything.
+///
+/// # What this is cleaning up
+///
+/// A mirror is supposed to have exactly one thing behind it: a row in
+/// `compose_drafts`, and through it a draft on Gmail. Four separate bugs in this
+/// path have left rows that have neither — the owner's mailbox currently holds
+/// two mirrors of one reply on the same conversation, filed under two message
+/// ids, with no draft row for either. `drafts.update` mints a new message id on
+/// every save, so a mirror that missed one adoption is stranded under an id
+/// nothing will ever address again, and it renders in the conversation as a
+/// `Draft` that cannot be opened, edited or discarded.
+///
+/// [`forget_drafts_missing_from`](super::draft::forget_drafts_missing_from)
+/// cannot reach these: it walks `compose_drafts`, and their whole problem is
+/// that they are not in it. So this walks the other way — from the messages —
+/// and it is called from the same sweep with the same listing.
+///
+/// # The one direction to be careful in
+///
+/// **A draft sent from another client also leaves `drafts.list`**, and the
+/// message it became must survive. Three things keep it:
+///
+///  * the row must still be a draft *locally*. `sync::mail` now clears
+///    `is_draft` when Gmail reports the `DRAFT` label removed, so a draft that
+///    was sent on the phone stops matching in the same pass that learns about
+///    the send — before this runs, because messages are synced first.
+///  * the message must not be the message of any draft Gmail just listed.
+///  * the row must predate the listing, so a draft written here a moment ago —
+///    which Gmail has not been asked about yet — is not swept as litter.
+///
+/// Everything removed is a local row. Nothing here touches Gmail.
+pub fn forget_orphan_mirrors(
+    db: &Db,
+    account_id: i64,
+    live_message_ids: &[String],
+    listed_at: i64,
+) -> Result<Vec<String>> {
+    db.write(ensure_compose_schema)?;
+    let candidates: Vec<String> = db.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT gmail_message_id FROM messages
+              WHERE account_id = ?1 AND is_draft = 1 AND internal_date < ?2",
+        )?;
+        let rows = stmt.query_map(params![account_id, listed_at], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })?;
+
+    let mut removed = Vec::new();
+    for gmail_message_id in candidates {
+        if live_message_ids.contains(&gmail_message_id) {
+            continue;
+        }
+        // Which draft row would own this mirror, if one did: the id Gmail filed
+        // it under for a pushed draft, and the placeholder for one that never
+        // got that far.
+        let placeholder_owner = gmail_message_id
+            .strip_prefix(MIRROR_PREFIX)
+            .map(str::to_string);
+        let claimed: bool = db.read(|conn| {
+            let by_message: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM compose_drafts WHERE gmail_message_id = ?1",
+                    [&gmail_message_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if by_message.is_some() {
+                return Ok(true);
+            }
+            let Some(owner) = placeholder_owner.as_deref() else {
+                return Ok(false);
+            };
+            Ok(conn
+                .query_row("SELECT 1 FROM compose_drafts WHERE id = ?1", [owner], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?
+                .is_some())
+        })?;
+        if claimed {
+            continue;
+        }
+        unmirror_ids(
+            db,
+            placeholder_owner.as_deref().unwrap_or_default(),
+            Some(&gmail_message_id),
+        )?;
+        removed.push(gmail_message_id);
+    }
+    Ok(removed)
 }
 
 /// Swap the ids the mirror is standing in for with Gmail's own, once a push has

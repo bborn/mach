@@ -118,6 +118,16 @@ pub struct OutboxEntry {
     pub last_error: Option<String>,
     #[serde(default)]
     pub sent_message_id: Option<String>,
+    /// The `compose_drafts` row this message was written as, and what it was on
+    /// Gmail. Carried because the draft row is deleted the moment the message
+    /// is queued: by the time this leaves, these three strings are all that is
+    /// left of it. See [`Outbox::send_one`].
+    #[serde(default)]
+    pub draft_id: Option<String>,
+    #[serde(default)]
+    pub gmail_draft_id: Option<String>,
+    #[serde(default)]
+    pub gmail_draft_message_id: Option<String>,
 }
 
 impl OutboxEntry {
@@ -199,6 +209,9 @@ impl Outbox {
             attempts: 0,
             last_error: None,
             sent_message_id: None,
+            draft_id: Some(built.draft_id.clone()),
+            gmail_draft_id: built.gmail_draft_id.clone(),
+            gmail_draft_message_id: built.gmail_draft_message_id.clone(),
         };
 
         // The bytes go in first, on their own. If the process dies between this
@@ -210,8 +223,9 @@ impl Outbox {
             conn.execute(
                 "INSERT INTO compose_outbox
                      (id, account_id, thread_id, gmail_thread_id, subject, rfc822, state,
-                      send_after, created_at, attempts, last_error, sent_message_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, NULL)",
+                      send_after, created_at, attempts, last_error, sent_message_id,
+                      draft_id, gmail_draft_id, gmail_draft_message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, NULL, ?10, ?11, ?12)",
                 rusqlite::params![
                     entry.id,
                     entry.account_id,
@@ -222,6 +236,9 @@ impl Outbox {
                     entry.state.as_str(),
                     entry.send_after,
                     entry.created_at,
+                    entry.draft_id,
+                    entry.gmail_draft_id,
+                    entry.gmail_draft_message_id,
                 ],
             )?;
             Ok(())
@@ -294,6 +311,9 @@ impl Outbox {
     /// only ever reads rows, so a row that is not there cannot be sent, and
     /// there is no in-flight timer holding a copy of the bytes.
     pub fn cancel(&self, id: &str) -> Result<bool> {
+        // Read before the delete, because the draft this was written as is only
+        // named on the row that is about to go.
+        let draft_id = self.get(id)?.and_then(|entry| entry.draft_id);
         let removed = self.db.write(|conn| {
             let changed = conn.execute(
                 "DELETE FROM compose_outbox WHERE id = ?1 AND state = 'holding'",
@@ -322,6 +342,15 @@ impl Outbox {
             }
             Ok(changed > 0)
         })?;
+        // The draft is a draft again. Nothing was sent, so the Gmail draft this
+        // was going to be sent *as* is still there — and the row has to point
+        // at it again, or the composer's next save creates a second one beside
+        // it. See `draft::revive`.
+        if removed {
+            if let Some(draft_id) = draft_id {
+                super::draft::revive(&self.db, &draft_id)?;
+            }
+        }
         Ok(removed)
     }
 
@@ -426,19 +455,42 @@ impl Outbox {
         })?;
 
         let client = self.clients.gmail(entry.account_id)?;
-        // Which road the bytes take is decided here and nowhere else. Below the
+        let thread = entry.gmail_thread_id.as_deref();
+        // Two decisions, and they are independent.
+        //
+        // **Which operation** depends on whether this message already exists as
+        // a Gmail draft. If it does, `drafts.send` sends *that draft* and
+        // removes it in one request; anything else leaves the draft behind, and
+        // a draft of a message you have just sent is the duplicate this whole
+        // path exists to stop. If it does not — a reply sent before the push
+        // landed, or one written with the network down — `messages.send` is
+        // still the only thing that can send it.
+        //
+        // **Which host** depends on size, exactly as it did before. Below the
         // threshold the JSON endpoint is one request with one encoding; above
         // it, base64 inside a JSON string is both slower and — past a few
         // megabytes — refused outright, so the upload host takes the message as
-        // bytes. Nothing else changes: the response is the same `Message`.
-        let result = if rfc822.len() > UPLOAD_ABOVE_BYTES {
-            client
-                .messages_send_upload(&self.user_id, &rfc822, entry.gmail_thread_id.as_deref())
-                .await
-        } else {
-            client
-                .messages_send(&self.user_id, &rfc822, entry.gmail_thread_id.as_deref())
-                .await
+        // bytes. The draft-backed send needed its own upload form for this
+        // reason: routing by draft id must not quietly cost a reply its
+        // attachment. Every arm answers with the same `Message`.
+        let big = rfc822.len() > UPLOAD_ABOVE_BYTES;
+        let result = match entry.gmail_draft_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(draft_id) if big => {
+                client
+                    .drafts_send_upload(&self.user_id, draft_id, &rfc822, thread)
+                    .await
+            }
+            Some(draft_id) => {
+                client
+                    .drafts_send(&self.user_id, draft_id, &rfc822, thread)
+                    .await
+            }
+            None if big => {
+                client
+                    .messages_send_upload(&self.user_id, &rfc822, thread)
+                    .await
+            }
+            None => client.messages_send(&self.user_id, &rfc822, thread).await,
         };
 
         match result {
@@ -466,7 +518,36 @@ impl Outbox {
         }
     }
 
+    /// The message has left. Take the draft's local remains with it, then let
+    /// the optimistic copy adopt the id Gmail gave the message.
+    ///
+    /// # Why the mirror is removed here as well as at queue time
+    ///
+    /// The draft's mirror goes when the message is queued — that is what makes
+    /// the conversation repaint with the reply instead of the draft. But the
+    /// Gmail draft is still there for the length of the undo window, so a sync
+    /// pass inside those ten seconds can pull it back down as an ordinary
+    /// `DRAFT` message. `drafts.send` then consumes the draft and the row it
+    /// left behind is a mirror of something that no longer exists.
+    ///
+    /// This runs before the rename for one specific reason: `drafts.send` can
+    /// hand back the same message id the draft was filed under, and two rows
+    /// cannot hold one `(account_id, gmail_message_id)`. Clearing the draft
+    /// first is what leaves the sent message somewhere to land — and
+    /// [`mirror::unmirror_ids`](super::mirror::unmirror_ids) will only ever
+    /// delete a row that is still a draft, so the sent message itself is not
+    /// something this can reach.
     fn mark_sent(&self, entry: &OutboxEntry, gmail_message_id: &str) -> Result<()> {
+        if let Some(draft_id) = entry.draft_id.as_deref().filter(|id| !id.is_empty()) {
+            // Its own transaction, and it must be its own: `Db::write` takes the
+            // writer mutex, so this cannot be folded into the one below.
+            super::mirror::unmirror_ids(
+                &self.db,
+                draft_id,
+                entry.gmail_draft_message_id.as_deref(),
+            )?;
+        }
+        let placeholder = format!("mach-outbox:{}", entry.id);
         self.db.write(|conn| {
             conn.execute(
                 "UPDATE compose_outbox
@@ -476,11 +557,37 @@ impl Outbox {
             )?;
             // Adopt the real id, so the sync engine's upsert lands on this row
             // instead of inserting the same message a second time.
+            //
+            // `OR IGNORE`, as in `mirror::adopt`, because a sync pass can have
+            // imported the sent message already — between `drafts.send`
+            // returning and this write. The rename is then refused rather than
+            // taking the whole flush down with a constraint error, and the copy
+            // that has to go is the optimistic one.
             if !gmail_message_id.is_empty() {
                 conn.execute(
-                    "UPDATE messages SET gmail_message_id = ?2 WHERE gmail_message_id = ?1",
-                    rusqlite::params![format!("mach-outbox:{}", entry.id), gmail_message_id],
+                    "UPDATE OR IGNORE messages SET gmail_message_id = ?2
+                      WHERE gmail_message_id = ?1",
+                    rusqlite::params![placeholder, gmail_message_id],
                 )?;
+                let thread_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT thread_id FROM messages WHERE gmail_message_id = ?1",
+                        [&placeholder],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(thread_id) = thread_id {
+                    conn.execute(
+                        "DELETE FROM messages WHERE gmail_message_id = ?1",
+                        [&placeholder],
+                    )?;
+                    conn.execute(
+                        "UPDATE threads
+                            SET message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?1)
+                          WHERE id = ?1",
+                        [thread_id],
+                    )?;
+                }
             }
             Ok(())
         })?;
@@ -564,7 +671,8 @@ impl Outbox {
 // ---------------------------------------------------------------------------
 
 const ENTRY_COLUMNS: &str = "id, account_id, thread_id, gmail_thread_id, subject, state, \
-                             send_after, created_at, attempts, last_error, sent_message_id";
+                             send_after, created_at, attempts, last_error, sent_message_id, \
+                             draft_id, gmail_draft_id, gmail_draft_message_id";
 
 fn map_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxEntry> {
     let state: String = row.get(5)?;
@@ -580,6 +688,9 @@ fn map_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxEntry> {
         attempts: row.get(8)?,
         last_error: row.get(9)?,
         sent_message_id: row.get(10)?,
+        draft_id: row.get(11)?,
+        gmail_draft_id: row.get(12)?,
+        gmail_draft_message_id: row.get(13)?,
     })
 }
 

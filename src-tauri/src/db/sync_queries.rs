@@ -619,6 +619,33 @@ pub fn set_message_unread_from_labels(
     Ok(())
 }
 
+/// The same, for `DRAFT`.
+///
+/// # Why a label change has to move this column
+///
+/// `is_draft` used to be written only when a message was fetched, so a draft
+/// **sent** from another client stayed a draft here until something re-fetched
+/// it. Two things read that column and both were wrong for as long as it was
+/// stale: the reading pane, which renders the row as a draft and offers to edit
+/// it, and the drafts sweep, which uses "is it still a draft" as its guard
+/// against deleting a message that has just been sent.
+///
+/// Sending a draft is exactly a `DRAFT` removed and a `SENT` added, and the
+/// history sweep already reports it. This is the one line that spends it.
+pub fn set_message_draft_from_labels(
+    conn: &Connection,
+    account_id: i64,
+    gmail_message_id: &str,
+    labels: &[String],
+) -> Result<()> {
+    let draft = labels.iter().any(|l| l == "DRAFT");
+    conn.execute(
+        "UPDATE messages SET is_draft = ?3 WHERE account_id = ?1 AND gmail_message_id = ?2",
+        params![account_id, gmail_message_id, draft],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // calendar
 // ---------------------------------------------------------------------------

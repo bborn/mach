@@ -588,7 +588,13 @@ export function ComposerDock() {
         return;
       }
       const id = draft.id;
+      // Cancelled *and* forgotten. `close` flushes whatever the debounce is
+      // holding, so leaving the entry in the map means one more `saveDraft`
+      // after the message has been queued — a draft of a reply that has just
+      // been sent. Rust refuses that write now as well; both ends, because it
+      // is the specific accident that put a duplicate in his mailbox.
       autosaves.current.get(id)?.cancel();
+      autosaves.current.delete(id);
       setBusy(true);
       void (async () => {
         try {

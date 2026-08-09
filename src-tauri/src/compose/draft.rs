@@ -16,6 +16,7 @@
 //! scrolling past a screen of somebody else's mail, and the quote has to be
 //! built the same way whether a human or the agent produced the body.
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::db::models::{Message, Participant};
@@ -393,6 +394,15 @@ pub struct Built {
     /// a fresh message, because neither is part of the conversation it may have
     /// been started from.
     pub thread_id: Option<i64>,
+    /// The `compose_drafts` row this was built from.
+    pub draft_id: String,
+    /// The Gmail draft behind it, when there is one. Carried this far because
+    /// the send is decided by whether it exists: a message that is already a
+    /// draft on Google is *sent as that draft*, and one that is not is sent as
+    /// a new message. See [`outbox::Outbox::queue`](super::outbox::Outbox::queue).
+    pub gmail_draft_id: Option<String>,
+    /// The message id Gmail filed that draft under.
+    pub gmail_draft_message_id: Option<String>,
 }
 
 /// Turn a draft into the exact bytes' worth of structure that will be sent.
@@ -492,6 +502,9 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
         account_id: draft.account_id,
         gmail_thread_id,
         thread_id,
+        draft_id: draft.id.clone(),
+        gmail_draft_id: draft.remote.draft_id.clone().filter(|id| !id.is_empty()),
+        gmail_draft_message_id: draft.remote.message_id.clone().filter(|id| !id.is_empty()),
     })
 }
 
@@ -684,6 +697,13 @@ fn attribution_date(message: &Message) -> String {
 /// than whatever Gmail holds.
 pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
     db.write(ensure_compose_schema)?;
+    // A draft that has been sent or thrown away stays that way. The composer's
+    // last autosave can land after either, and writing this row back would put
+    // a draft of an already-sent reply into the conversation and — through the
+    // push behind it — onto Gmail. See [`retire`].
+    if is_retired(db, &draft.id)? {
+        return Ok(draft.clone());
+    }
     let saved = Draft {
         updated_at: now_ms,
         ..draft.clone()
@@ -1214,7 +1234,7 @@ pub fn forget_drafts_missing_from(
         if still_a_draft_row(db, account_id, draft.remote.message_id.as_deref())? {
             super::mirror::unmirror(db, &draft)?;
         }
-        delete_draft(db, &draft.id)?;
+        delete_draft(db, &draft.id, listed_at)?;
         removed.push(remote_id);
     }
     Ok(removed)
@@ -1245,14 +1265,182 @@ fn mailboxes(people: &[Participant]) -> Vec<Mailbox> {
 /// The files go with it in the same call rather than being swept later: a
 /// `compose_attachments` row whose draft is gone is 25 MB of database nothing
 /// can reach, and there is no other owner to inherit it.
-pub fn delete_draft(db: &Db, id: &str) -> Result<()> {
+///
+/// A tombstone goes in as the row comes out — see [`retire`] — so that an
+/// autosave still in flight cannot write the draft back a moment later.
+pub fn delete_draft(db: &Db, id: &str, now_ms: i64) -> Result<()> {
     db.write(ensure_compose_schema)?;
+    retire(db, id, now_ms)?;
     super::attach::delete_for_draft(db, id)?;
     db.write(|conn| {
         conn.execute("DELETE FROM compose_drafts WHERE id = ?1", [id])?;
         Ok(())
     })?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// tombstones
+// ---------------------------------------------------------------------------
+
+/// What a retired draft still knows about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetiredDraft {
+    pub id: String,
+    pub account_id: i64,
+    pub thread_id: Option<i64>,
+    pub gmail_draft_id: Option<String>,
+    pub gmail_message_id: Option<String>,
+    pub gmail_thread_id: Option<String>,
+    pub retired_at: i64,
+}
+
+/// Record that a draft has stopped existing.
+///
+/// # The race this closes
+///
+/// The composer autosaves on a debounce, so the last save of a reply can be
+/// on the wire at the instant `⌘⏎` is pressed. It arrives after the send has
+/// already taken the row out, writes it back — `save_draft` is an upsert, and
+/// an upsert has no opinion about whether the row *should* exist — and the push
+/// behind it finds no `gmail_draft_id` and calls `drafts.create`. The result is
+/// a Gmail draft holding the text of a message that has just been sent, which
+/// syncs down and sits in the conversation next to the reply. That is the bug,
+/// and this is the only place it can be stopped: nothing in a save's own
+/// arguments says the draft is over.
+///
+/// The identity is kept rather than just the id, so [`revive`] can hand it back
+/// to a recalled send.
+pub fn retire(db: &Db, id: &str, now_ms: i64) -> Result<()> {
+    db.write(ensure_compose_schema)?;
+    let Some(draft) = load_draft(db, id)? else {
+        // Nothing to describe. A tombstone with no identity would still be
+        // worth writing, but every caller reaches here through a row it just
+        // read, so an absent row means the draft was already retired.
+        return Ok(());
+    };
+    let now = now_ms;
+    db.write(|conn| {
+        conn.execute(
+            "INSERT INTO compose_retired_drafts
+                 (id, account_id, thread_id, gmail_draft_id, gmail_message_id,
+                  gmail_thread_id, retired_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+                 gmail_draft_id   = COALESCE(excluded.gmail_draft_id, gmail_draft_id),
+                 gmail_message_id = COALESCE(excluded.gmail_message_id, gmail_message_id),
+                 gmail_thread_id  = COALESCE(excluded.gmail_thread_id, gmail_thread_id),
+                 retired_at       = excluded.retired_at",
+            rusqlite::params![
+                draft.id,
+                draft.account_id,
+                draft.thread_id,
+                draft.remote.draft_id,
+                draft.remote.message_id,
+                draft.remote.thread_id,
+                now,
+            ],
+        )?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Has this draft been sent or thrown away?
+pub fn is_retired(db: &Db, id: &str) -> Result<bool> {
+    Ok(db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM compose_retired_drafts WHERE id = ?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    })?)
+}
+
+/// Undo a retirement, and say what the draft used to be.
+///
+/// Called when a send is recalled inside the undo window. The row itself is not
+/// rebuilt from here — the composer still holds the text and saves it — but the
+/// Gmail identity is, when there is one, because the draft on Google was never
+/// deleted (`drafts.send` would have consumed it, and the send did not happen).
+/// Without this the recalled draft would save as a stranger and `drafts.create`
+/// a second copy beside the one already there.
+pub fn revive(db: &Db, id: &str) -> Result<Option<RetiredDraft>> {
+    db.write(ensure_compose_schema)?;
+    let found: Option<RetiredDraft> = db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT id, account_id, thread_id, gmail_draft_id, gmail_message_id,
+                        gmail_thread_id, retired_at
+                   FROM compose_retired_drafts WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(RetiredDraft {
+                        id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        thread_id: row.get(2)?,
+                        gmail_draft_id: row.get(3)?,
+                        gmail_message_id: row.get(4)?,
+                        gmail_thread_id: row.get(5)?,
+                        retired_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    })?;
+    db.write(|conn| {
+        conn.execute("DELETE FROM compose_retired_drafts WHERE id = ?1", [id])?;
+        Ok(())
+    })?;
+
+    let Some(retired) = found else {
+        return Ok(None);
+    };
+    // Only a draft Gmail actually holds gets its row put back. Anything else
+    // has nothing to point at, and an empty row would offer an empty composer
+    // on that conversation for ever.
+    if retired.gmail_draft_id.is_some() {
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO compose_drafts
+                     (id, account_id, thread_id, kind, gmail_draft_id, gmail_message_id,
+                      gmail_thread_id, remote_state, remote_synced_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'reply', ?4, ?5, ?6, 'synced', ?7, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     gmail_draft_id   = excluded.gmail_draft_id,
+                     gmail_message_id = excluded.gmail_message_id,
+                     gmail_thread_id  = excluded.gmail_thread_id",
+                rusqlite::params![
+                    retired.id,
+                    retired.account_id,
+                    retired.thread_id,
+                    retired.gmail_draft_id,
+                    retired.gmail_message_id,
+                    retired.gmail_thread_id,
+                    retired.retired_at,
+                ],
+            )?;
+            Ok(())
+        })?;
+    }
+    Ok(Some(retired))
+}
+
+/// Drop tombstones older than an instant. Housekeeping, run beside
+/// [`Outbox::forget_sent`](super::outbox::Outbox::forget_sent): an autosave
+/// racing a send is a matter of milliseconds, and a day is long past the point
+/// where a save with that id could be anything but a new draft.
+pub fn forget_retired_before(db: &Db, before_ms: i64) -> Result<usize> {
+    db.write(ensure_compose_schema)?;
+    Ok(db.write(|conn| {
+        Ok(conn.execute(
+            "DELETE FROM compose_retired_drafts WHERE retired_at < ?1",
+            [before_ms],
+        )?)
+    })?)
 }
 
 const DRAFT_COLUMNS: &str = "id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, \

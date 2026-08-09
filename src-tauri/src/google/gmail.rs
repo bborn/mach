@@ -568,6 +568,74 @@ impl GmailClient {
             .await
     }
 
+    /// `users.drafts.send` — send the draft that already exists, and remove it.
+    ///
+    /// # Why this is not `messages.send`
+    ///
+    /// A reply Mach has pushed exists twice by the time `⌘⏎` is pressed: as the
+    /// bytes in the outbox, and as a real Gmail draft with an id. `messages.send`
+    /// knows nothing about the second one, so it creates a *third* thing — a new
+    /// sent message — and leaves the draft where it was. It then syncs back down
+    /// and sits in the conversation beside the reply that was just sent, which
+    /// is the duplicate the owner saw.
+    ///
+    /// `drafts.send` is the operation that matches what actually happened: the
+    /// draft becomes the sent message, in one request, with no window in which
+    /// both exist and nothing to clean up afterwards. Two calls — a send and a
+    /// delete — can always fail between the two, and the failure leaves exactly
+    /// the state being fixed here.
+    ///
+    /// # Why the bytes go with it
+    ///
+    /// The request body is a Draft, so `message.raw` replaces the draft's
+    /// content before it leaves. That is deliberate rather than incidental: the
+    /// outbox committed its RFC822 at queue time and **those** bytes are what
+    /// the user was told would be sent. Sending whatever Gmail happens to hold
+    /// would send an older autosave whenever the last push had not landed.
+    pub async fn drafts_send(
+        &self,
+        user_id: &str,
+        draft_id: &str,
+        rfc822: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<Message, GoogleError> {
+        let url = self.rest.endpoint(&["users", user_id, "drafts", "send"])?;
+        let body = json!({ "id": draft_id, "message": draft_message(rfc822, thread_id) });
+        self.rest
+            .send_json(HttpMethod::Post, url, Some(body.to_string().into_bytes()))
+            .await
+    }
+
+    /// `users.drafts.send` on the **upload** host, for a draft with a file on it.
+    ///
+    /// The size rule that picks between this and
+    /// [`drafts_send`](Self::drafts_send) is the same rule, applied to the same
+    /// bytes, as the one between [`messages_send`](Self::messages_send) and
+    /// [`messages_send_upload`](Self::messages_send_upload) — a draft-backed
+    /// send must not lose the upload path just because it is addressed by draft
+    /// id. The metadata part is a Draft rather than a Message, which is the only
+    /// difference on the wire: the id has to travel with the bytes, and JSON is
+    /// the only part of a `multipart/related` that can carry it.
+    pub async fn drafts_send_upload(
+        &self,
+        user_id: &str,
+        draft_id: &str,
+        rfc822: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<Message, GoogleError> {
+        let url = self.upload_endpoint(&["users", user_id, "drafts", "send"])?;
+        let mut message = json!({});
+        if let Some(thread_id) = thread_id {
+            message["threadId"] = json!(thread_id);
+        }
+        let metadata = json!({ "id": draft_id, "message": message }).to_string();
+        let (content_type, body) = multipart_related(&metadata, rfc822);
+        self.rest
+            .send_as(HttpMethod::Post, url, Some(body), Some(&content_type))
+            .await
+            .and_then(json_body)
+    }
+
     /// `users.drafts.delete`. Returns nothing on success.
     pub async fn drafts_delete(&self, user_id: &str, draft_id: &str) -> Result<(), GoogleError> {
         let url = self.rest.endpoint(&["users", user_id, "drafts", draft_id])?;

@@ -124,6 +124,31 @@ CREATE TABLE IF NOT EXISTS compose_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_compose_outbox_due ON compose_outbox (state, send_after);
 
+-- Drafts that have stopped existing, and roughly when.
+--
+-- A tombstone rather than nothing, because the composer's autosave can be in
+-- flight at the moment the draft is sent or thrown away, and a save that lands
+-- half a second later would otherwise write the row straight back — and the
+-- push behind it would `drafts.create` a Gmail draft holding the text of a
+-- message the owner has already sent. That is the shape of the duplicate he
+-- found in his mailbox: an outbox row, a sent message, and a draft of the same
+-- words created thirteen milliseconds after `⌘⏎`.
+--
+-- The Gmail identity travels with the tombstone so that undoing a send can put
+-- it back: the recalled draft has to keep pointing at the Gmail draft it came
+-- from, or the next save creates a second one.
+--
+-- Rows are swept with the delivered outbox rows, a day later.
+CREATE TABLE IF NOT EXISTS compose_retired_drafts (
+    id               TEXT    PRIMARY KEY,
+    account_id       INTEGER NOT NULL DEFAULT 0,
+    thread_id        INTEGER,
+    gmail_draft_id   TEXT,
+    gmail_message_id TEXT,
+    gmail_thread_id  TEXT,
+    retired_at       INTEGER NOT NULL DEFAULT 0
+);
+
 -- Files waiting to go out with a draft.
 --
 -- The bytes are a BLOB rather than a path for the same reason
@@ -178,11 +203,33 @@ const DRAFT_REMOTE_COLUMNS: &[(&str, &str)] = &[
     ("body_format", "TEXT NOT NULL DEFAULT 'markdown'"),
 ];
 
+/// The columns that tie a queued message back to the draft it was written as.
+///
+/// Added the same way, and for the same reason, as [`DRAFT_REMOTE_COLUMNS`]:
+/// this module owns the table, and a store written by yesterday's build has to
+/// end up identical to a fresh one.
+///
+///  * `draft_id` — the local `compose_drafts` row. What undo revives, and what
+///    the mirror was filed under before Gmail had heard of it.
+///  * `gmail_draft_id` — present exactly when a real Gmail draft is behind this
+///    message. **This is what decides `drafts.send` against `messages.send`**,
+///    and it is read at flush rather than at queue because the draft row is
+///    gone by then: the identity has to be carried, not looked up.
+///  * `gmail_draft_message_id` — the message Gmail filed that draft under. Only
+///    used to recognise a mirror a sync pass re-imported during the undo
+///    window, which must not survive the send.
+const OUTBOX_DRAFT_COLUMNS: &[(&str, &str)] = &[
+    ("draft_id", "TEXT"),
+    ("gmail_draft_id", "TEXT"),
+    ("gmail_draft_message_id", "TEXT"),
+];
+
 /// Idempotent. Called by every entry point into this module, so no caller has
 /// to remember it.
 pub fn ensure_compose_schema(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(COMPOSE_SCHEMA)?;
     add_missing_columns(conn, "compose_drafts", DRAFT_REMOTE_COLUMNS)?;
+    add_missing_columns(conn, "compose_outbox", OUTBOX_DRAFT_COLUMNS)?;
     Ok(())
 }
 

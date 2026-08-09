@@ -527,6 +527,13 @@ export function MachProvider({ children }: { children: ReactNode }) {
   const [reloadKey, setReloadKey] = useState(0);
   /** Bumped by anything that writes an event — see `reloadEvents`. */
   const [eventsKey, setEventsKey] = useState(0);
+  /**
+   * Bumped when a background write may have changed the open conversation.
+   *
+   * Separate from `reloadKey` because it costs one local `get_thread` rather
+   * than refetching accounts, labels, calendars and the whole thread list.
+   */
+  const [detailKey, setDetailKey] = useState(0);
   // Favorites are the one piece of state here the user owns, so they outlive
   // the window. Read once at mount, written back whenever they change.
   const [favorites, setFavorites] = useState<Favorite[]>(() => loadFavorites());
@@ -582,14 +589,24 @@ export function MachProvider({ children }: { children: ReactNode }) {
   const streamRef = useRef(stream);
   streamRef.current = stream;
 
-  // A backfill can emit `threads-changed` hundreds of times a minute. Coalesce:
-  // one refetch per window, however many events arrived in it.
+  /*
+   * A backfill can emit `threads-changed` hundreds of times a minute. Coalesce:
+   * one refetch per window, however many events arrived in it.
+   *
+   * **The open conversation is refetched too.** It was not, and the gap is what
+   * "I clicked discard but the draft still shows" looked like: this event was
+   * wired to the list only, so anything that changed the thread on screen —
+   * a sync pass removing a draft, another window, the agent — repainted the
+   * list beside a reading pane still showing the old messages. The list has
+   * always refetched here; the pane was the half nobody told.
+   */
   const refreshTimer = useRef<number | null>(null);
   const scheduleRefresh = useCallback(() => {
     if (refreshTimer.current !== null) return;
     refreshTimer.current = window.setTimeout(() => {
       refreshTimer.current = null;
       streamRef.current.refresh();
+      setDetailKey((k) => k + 1);
     }, 600);
   }, []);
   useEffect(
@@ -685,14 +702,22 @@ export function MachProvider({ children }: { children: ReactNode }) {
     };
   }, [reloadKey, scheduleRefresh]);
 
+  // Which conversation the pane is currently showing, so a refetch of the same
+  // one can be silent. A ref rather than state: nothing renders from it.
+  const shownThread = useRef<ThreadId | null>(null);
   useEffect(() => {
     if (ui.threadId === null) {
+      shownThread.current = null;
       setDetail(null);
       setDetailLoading(false);
       return;
     }
     let live = true;
-    setDetailLoading(true);
+    // Only a *different* conversation is worth a loading state. A background
+    // refetch of the one already on screen must not blank it and put it back
+    // — the pane would flash on every sync pass.
+    if (shownThread.current !== ui.threadId) setDetailLoading(true);
+    shownThread.current = ui.threadId;
     void getDataSource()
       .getThread(ui.threadId)
       .then((d) => {
@@ -710,8 +735,10 @@ export function MachProvider({ children }: { children: ReactNode }) {
     };
     // `reloadKey` is a dependency because sending writes an optimistic copy of
     // the reply straight into SQLite: the open conversation is exactly the
-    // thing a reload has to refetch.
-  }, [ui.threadId, reloadKey]);
+    // thing a reload has to refetch. `detailKey` is the same claim made by a
+    // background write — a sync pass, another window — through
+    // `threads-changed`.
+  }, [ui.threadId, reloadKey, detailKey]);
 
   /*
    * The theme is a preference; `ui.theme` mirrors it.

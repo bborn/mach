@@ -212,6 +212,15 @@ pub async fn dispatch(
         // else. See `compose::mirror` and `compose::remote`.
         "saveDraft" => {
             let parsed = parse_draft(&payload)?;
+            // A draft that has been sent or discarded is not saved again, and
+            // the mirror below is the reason this is checked *here* rather than
+            // left to `save_draft`: writing the row back is only half of a
+            // resurrection, and the other half — a `DRAFT` message in the
+            // conversation with nothing behind it — is the half the owner sees.
+            // The composer's last autosave routinely lands after `⌘⏎`.
+            if draft::is_retired(db, &parsed.id)? {
+                return Ok(json!({ "draft": parsed }));
+            }
             let saved = draft::save_draft(db, &parsed, now)?;
             let thread_id = engine::mirror::mirror(db, &saved, now)?;
             // A draft started from nothing now has a conversation to live in,
@@ -245,7 +254,7 @@ pub async fn dispatch(
         "discardDraft" => {
             let id = required_str(&payload, "draftId")?;
             let existing = draft::load_draft(db, &id)?;
-            forget_draft_locally(db, &id)?;
+            forget_draft_locally(db, &id, now)?;
             let Some(remote_id) = existing.as_ref().and_then(|d| d.remote.draft_id.clone()) else {
                 return Ok(json!({ "ok": true, "remote": "none" }));
             };
@@ -316,6 +325,20 @@ pub async fn dispatch(
 
         "send" => {
             let parsed = parse_draft(&payload)?;
+            // The text comes from the editor; **the Gmail identity comes from
+            // the row**. The composer holds a draft object it rebuilt from its
+            // own state, and the push that gave the draft an id may have landed
+            // after the last copy it was handed — so trusting the payload here
+            // would send a draft-backed message down the `messages.send` road
+            // and leave the draft behind, which is the bug. `save_draft` has
+            // never let the editor write these columns for the same reason.
+            let parsed = match draft::load_draft(db, &parsed.id)? {
+                Some(stored) => Draft {
+                    remote: stored.remote,
+                    ..parsed
+                },
+                None => parsed,
+            };
             if parsed.to.is_empty() && parsed.cc.is_empty() && parsed.bcc.is_empty() {
                 return Err(ComposeError::invalid("this message has no recipients"));
             }
@@ -328,9 +351,23 @@ pub async fn dispatch(
                 .unwrap_or(now + UNDO_WINDOW_MS);
             let entry = outbox.queue(&built, now, send_after)?;
             // The draft has become a message; keeping it would re-open an empty
-            // composer on the thread that now contains the reply — and leave a
-            // copy of the unsent text in his Drafts on every device.
-            forget_draft(db, outbox, &parsed.id)?;
+            // composer on the thread that now contains the reply.
+            //
+            // **Local only, and that is the change.** The Gmail draft is not
+            // deleted here, because it is not litter — it is the thing that
+            // will be sent. `outbox` carries its id and calls `drafts.send`,
+            // which sends and removes it in one request. Deleting it now would
+            // leave nothing to send in ten seconds; deleting it *after* the
+            // send, as this used to, is the two-call arrangement whose failure
+            // mode is the duplicate draft in the owner's mailbox.
+            //
+            // The order matters against the drafts sweep in `sync::mail`. The
+            // local row goes first, so the sweep — which only ever reaps drafts
+            // it can see in `compose_drafts` — cannot act on this draft at all
+            // while it is in flight. Gmail still lists it, so nothing on that
+            // side looks deleted either; the two ends agree until `drafts.send`
+            // changes both at once.
+            forget_draft_locally(db, &parsed.id, now)?;
             Ok(json!({
                 "entry": entry,
                 "undoUntil": send_after,
@@ -354,8 +391,12 @@ pub async fn dispatch(
                 .unwrap_or(0);
             let outcomes = outbox.flush_due(now).await?;
             // A day is long enough for "sent" to have been seen and short
-            // enough that the table does not become a mail archive.
+            // enough that the table does not become a mail archive. The
+            // tombstones go with them: they exist to beat an autosave by a few
+            // hundred milliseconds, and a day later a save with that id could
+            // only be a new draft.
             let _ = outbox.forget_sent(now - 86_400_000);
+            let _ = draft::forget_retired_before(db, now - 86_400_000);
             Ok(json!({
                 "outcomes": outcomes,
                 "pending": outbox.pending()?,
@@ -388,44 +429,25 @@ pub async fn dispatch(
     }
 }
 
-/// Forget a draft everywhere it exists: the row, the mirror in the mailbox, and
-/// Gmail.
-///
-/// The three have to go together. Leaving the mirror leaves a phantom in the
-/// Drafts list with nothing behind it; leaving the Gmail draft leaves the copy
-/// on his phone, which is the same bug as the original one seen from the other
-/// end — the app and the mailbox disagreeing about what exists.
-fn forget_draft(
-    db: &crate::db::Db,
-    outbox: &Outbox,
-    draft_id: &str,
-) -> Result<(), ComposeError> {
-    let existing = draft::load_draft(db, draft_id)?;
-    forget_draft_locally(db, draft_id)?;
-    if let Some(draft) = existing {
-        if let Some(remote_id) = draft.remote.draft_id {
-            engine::remote::spawn_delete(
-                db.clone(),
-                outbox.clients(),
-                remote_id,
-                draft.account_id,
-            );
-        }
-    }
-    Ok(())
-}
-
 /// The two local halves of forgetting a draft: the mirror in the conversation,
 /// then the row and the files it was carrying.
 ///
 /// In that order. Taking the row out first would leave [`mirror::unmirror`]
 /// nothing to look the message up by, and the phantom draft in the middle of
 /// the thread is exactly the thing being removed.
-fn forget_draft_locally(db: &crate::db::Db, draft_id: &str) -> Result<(), ComposeError> {
+///
+/// Deleting the row also writes a tombstone (`draft::retire`), which is what
+/// stops an autosave that was already on the wire from writing the draft back
+/// half a second later.
+fn forget_draft_locally(
+    db: &crate::db::Db,
+    draft_id: &str,
+    now: i64,
+) -> Result<(), ComposeError> {
     if let Some(draft) = draft::load_draft(db, draft_id)? {
         engine::mirror::unmirror(db, &draft)?;
     }
-    draft::delete_draft(db, draft_id)
+    draft::delete_draft(db, draft_id, now)
 }
 
 // ---------------------------------------------------------------------------

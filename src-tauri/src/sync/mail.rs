@@ -268,6 +268,21 @@ impl MailSync {
         )
         .map_err(|e| SyncError::Db(DbError::Other(format!("draft sweep: {e}"))))?;
 
+        // And the rows that reached the conversation without a draft row behind
+        // them. Those cannot be reaped by the sweep above — it walks
+        // `compose_drafts`, and being absent from it is their whole problem —
+        // so they are found from the messages instead, against the same
+        // listing. See `mirror::forget_orphan_mirrors` for why a draft *sent*
+        // somewhere else is not one of them.
+        let live_messages: Vec<String> = pairs.into_iter().map(|(message, _)| message).collect();
+        crate::ipc::compose::engine::mirror::forget_orphan_mirrors(
+            &self.db,
+            account_id,
+            &live_messages,
+            listed_at,
+        )
+        .map_err(|e| SyncError::Db(DbError::Other(format!("mirror sweep: {e}"))))?;
+
         Ok(())
     }
 
@@ -927,6 +942,7 @@ fn apply_label_change(
         return Ok(None);
     };
     sync_queries::set_message_unread_from_labels(conn, account_id, gmail_message_id, &resulting)?;
+    sync_queries::set_message_draft_from_labels(conn, account_id, gmail_message_id, &resulting)?;
 
     let thread_id: Option<i64> = {
         use rusqlite::OptionalExtension;

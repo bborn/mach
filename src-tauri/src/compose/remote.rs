@@ -109,6 +109,17 @@ impl DraftRemoteSync {
 
         match result {
             Ok(remote) => {
+                // The draft can have stopped existing while this was in flight:
+                // `⌘⏎` and discard both take the row out, and neither waits for
+                // a push it did not start. Whatever came back is then a Gmail
+                // draft nobody will ever address again — the row that would
+                // have held its id is gone — so it syncs down as a draft of a
+                // message that was already sent, which is the duplicate the
+                // owner found. It goes back now, while its id is still in hand.
+                if draft::is_retired(&self.db, &draft.id)? {
+                    let _ = self.delete(&remote.id, draft.account_id).await;
+                    return Ok(RemoteState::Pending);
+                }
                 let state = DraftRemote {
                     state: RemoteState::Synced,
                     draft_id: Some(remote.id.clone()),
@@ -183,21 +194,15 @@ pub fn spawn_push(db: Db, clients: Arc<dyn GoogleClients>, draft_id: String, now
     });
 }
 
-/// Delete a Gmail draft in the background. Nothing waits on it: the local rows
-/// are already gone, and the worst case is a stale draft on the phone that the
-/// next launch's sweep does not resurrect.
-pub fn spawn_delete(
-    db: Db,
-    clients: Arc<dyn GoogleClients>,
-    remote_draft_id: String,
-    account_id: i64,
-) {
-    let _ = db;
-    tokio::spawn(async move {
-        let sync = DraftRemoteSync::new(db, clients);
-        let _ = sync.delete(&remote_draft_id, account_id).await;
-    });
-}
+// There was a `spawn_delete` here: a fire-and-forget `drafts.delete` for the
+// draft behind a message that had just been sent. It is gone because the send
+// path no longer wants it. A send that has to be chased by a second request is
+// a send that leaves a draft behind whenever the second request does not
+// happen — the app quits, the network drops, the task is cancelled — and that
+// leftover is the duplicate this module has now been fixed for four times.
+// `drafts.send` does both halves at once, and the discard path deletes the
+// draft with the call awaited, because there the answer is worth saying out
+// loud. Nothing is left that wants the unawaited version.
 
 /// A claim on one draft's push slot, released when it is dropped.
 ///
