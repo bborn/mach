@@ -3,6 +3,7 @@
   "productName": "Mach",
   "version": "0.1.0",
   "identifier": "com.mach.mail",
+  "mainBinaryName": "mach",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",

@@ -5,6 +5,17 @@ description = "A fast Google-only mail and calendar client"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/bborn/mach"
+# `src/bin/` holds two development probes — `calendar_live` and `plugin_probe` —
+# so this crate has three binaries and `cargo run` is ambiguous without this.
+#
+# The bundler has to be told the same thing separately, as `mainBinaryName` in
+# `tauri.conf.json`, and that one is not cosmetic: left to choose, it took
+# `plugin_probe` and built a `Mach.app` around it. The bundle was otherwise
+# correct — right Info.plist, right identifier, right icon, signed without
+# complaint — so nothing failed until the app was opened and a dev probe came
+# up instead of the mail client. That config file is JSON and cannot hold this
+# comment, which is why it is here.
+default-run = "mach"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
