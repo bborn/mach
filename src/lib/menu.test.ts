@@ -143,6 +143,33 @@ describe("connectMenu", () => {
     expect(prefs).toHaveBeenCalledTimes(1);
   });
 
+  /*
+   * Every token in `shell.rs` is written the way bindings are written, with
+   * "mod" — never "meta". The tests above all fired canonical tokens, which is
+   * why an unnormalised replay went unnoticed: it only fails on the vocabulary
+   * the menu actually speaks.
+   */
+  it.each(["mod+,", "mod+k", "mod+1", "mod+2"])(
+    "replays %s, the vocabulary shell.rs emits",
+    async (token) => {
+      const keymap = createKeymap("meta");
+      const handler = vi.fn();
+      keymap.register({ keys: token, handler });
+
+      const ch = channel();
+      connectMenu(keymap, {
+        subscribe: ch.subscribe,
+        now: () => now,
+        keys: null,
+        mod: "meta",
+      });
+      await Promise.resolve();
+
+      ch.fire(token);
+      expect(handler).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("unsubscribes and stops listening when torn down", async () => {
     const keymap = createKeymap("meta");
     const handler = vi.fn();

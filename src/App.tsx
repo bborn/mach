@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { KeymapProvider, useKeyBindings, useKeymap } from "@/hooks/useKeymap";
 import type { KeyBinding } from "@/lib/keymap";
+import { connectQaBridge } from "@/lib/qa-bridge";
 import type { LabelId } from "@/types";
 import { MachProvider, useMach } from "@/hooks/useMach";
 import { cn } from "@/lib/utils";
@@ -87,6 +88,30 @@ function Shell() {
    * themselves off, so asking the registry then answers "almost nothing".
    */
   const [shortcuts, setShortcuts] = useState<readonly KeyBinding[] | null>(null);
+
+  /*
+   * The QA control port's window end.
+   *
+   * Here rather than in `KeymapProvider` because two of the three verbs need
+   * `ui` and this is the innermost place both it and the keymap are in scope.
+   * Read through a ref so a state change does not re-subscribe: the bridge
+   * wants the *current* state at the moment a verb arrives, not the state that
+   * was current when it was wired.
+   *
+   * Inert everywhere except a development build of a QA instance — see
+   * `lib/qa-bridge.ts` and `src-tauri/src/qa/`.
+   */
+  const uiRef = useRef(ui);
+  uiRef.current = ui;
+  useEffect(() => {
+    // Checked here as well as inside the bridge so a production build drops
+    // the import: `import.meta.env.DEV` is the literal `false` after Vite
+    // substitutes it, the branch below is dead, and the module tree-shakes
+    // out. The shipped bundle contains no QA bridge at all, which is the same
+    // claim `#[cfg(debug_assertions)]` makes on the Rust half.
+    if (!import.meta.env.DEV) return;
+    return connectQaBridge({ keymap, ui: () => uiRef.current });
+  }, [keymap]);
 
   useKeyBindings([
     {

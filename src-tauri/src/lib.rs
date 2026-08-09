@@ -36,6 +36,13 @@ pub mod google;
 pub mod ipc;
 pub mod notify;
 pub mod plugins;
+/// The QA control port — three verbs, and only in a development build.
+///
+/// `#[cfg(debug_assertions)]` on the declaration rather than a runtime check
+/// inside it, so a release binary does not contain the module at all. See
+/// `qa` for what reaching the port would get you and what stops you.
+#[cfg(debug_assertions)]
+pub mod qa;
 pub mod render;
 pub mod shell;
 pub mod staleness;
@@ -90,6 +97,15 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)
                 .map_err(|e| format!("could not create {}: {e}", data_dir.display()))?;
             let app_config = config::AppConfig::load(config::database_path(&data_dir));
+
+            // A QA instance can be driven without touching the keyboard: a
+            // loopback port that speaks three verbs — key, click, ui — and
+            // hands each to the window as an event. Returns immediately and
+            // silently for the owner's instance, which has no MACH_DATA_DIR
+            // and therefore never opens a port. Not compiled into a release
+            // build at all.
+            #[cfg(debug_assertions)]
+            qa::install(app.handle(), &data_dir);
 
             // Inside `block_on` so the HTTP transport is constructed with a
             // Tokio context available, exactly as it will be used.

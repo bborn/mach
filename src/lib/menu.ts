@@ -26,7 +26,14 @@
  */
 
 import { isTauri } from "./ipc";
-import { tokenFromEvent, type KeyEventLike, type Keymap } from "./keymap";
+import {
+  detectModKey,
+  normalizeToken,
+  tokenFromEvent,
+  type KeyEventLike,
+  type Keymap,
+  type ModKey,
+} from "./keymap";
 
 /** Must match `shell::MENU_EVENT`. */
 export const MENU_EVENT = "mach://menu";
@@ -100,6 +107,8 @@ export interface MenuBridgeOptions {
   now?: () => number;
   /** Where real keystrokes are observed for de-duplication. Defaults to `window`. */
   keys?: KeySource | null;
+  /** What "mod" resolves to. Defaults to the platform's. */
+  mod?: ModKey;
 }
 
 /**
@@ -113,6 +122,7 @@ export function connectMenu(
   options: MenuBridgeOptions = {},
 ): () => void {
   const now = options.now ?? (() => Date.now());
+  const mod = options.mod ?? detectModKey();
   const subscribe = options.subscribe ?? defaultSubscribe;
   if (!options.subscribe && !isTauri()) return () => {};
 
@@ -139,8 +149,16 @@ export function connectMenu(
 
     // A sequence such as "g i" replays a token at a time; the keymap's own
     // sequence timer stitches them back together.
+    //
+    // Normalised first. `shell.rs` writes ids in the same vocabulary the
+    // bindings are written in — "mod+," — and `keyEventFromToken` reads only
+    // canonical modifier names, so an unnormalised "mod+," is a bare comma
+    // with nothing held and matches no binding. Masked until now because
+    // every `mod+` item also carries an accelerator the webview handles
+    // first, and the guard above then drops the menu's duplicate; Settings…
+    // worked because ⌘, never actually reached this line.
     for (const step of token.trim().split(/\s+/)) {
-      keymap.handle(keyEventFromToken(step), now());
+      keymap.handle(keyEventFromToken(normalizeToken(step, mod)), now());
     }
   }).then((off) => {
     if (cancelled) off();

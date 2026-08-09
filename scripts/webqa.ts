@@ -1,23 +1,38 @@
 #!/usr/bin/env bun
 /**
- * Headless QA for the Mach frontend. No window, no focus, ever.
+ * Headless QA for the Mach frontend in Chrome. No window, no focus, ever.
  *
- * Launching the real app to look at it takes the keyboard away from whoever is
- * using the machine: a new Tauri window activates on macOS whether you wanted
- * it to or not. So agents do not launch the app. They drive the same frontend
- * here instead — Vite serves it on :1420, and outside Tauri `src/main.tsx`
- * swaps in the fixture data source, so it renders fully with no backend.
- *
- * Chrome is already installed and speaks CDP over a websocket, and Bun has a
- * websocket client built in, so this needs nothing installed.
+ * Vite serves the frontend on :1420, and outside Tauri `src/main.tsx` swaps in
+ * the fixture data source, so it renders fully with no backend. Chrome is
+ * already installed and speaks CDP over a websocket, and Bun has a websocket
+ * client built in, so this needs nothing installed.
  *
  *   bun scripts/webqa.ts shoot out.png
  *   bun scripts/webqa.ts eval 'document.querySelectorAll("[data-thread-id]").length'
  *   bun scripts/webqa.ts click '[data-thread-id]'
  *   bun scripts/webqa.ts key 'j'
  *
- * What it cannot do: anything that needs real mail or the Rust backend. Use
- * `scripts/qa state` for that — it reads the database and needs no UI.
+ * # This is not the app
+ *
+ * It is Blink, in a tab, against fixtures. That makes it right for component
+ * and logic work and wrong for anything the OS also draws or WebKit decides.
+ * Four defects shipped verified here: preferences with its title under the
+ * traffic lights, which a browser does not have; trackpad period navigation,
+ * which could not be exercised in WebKit at all; discard-draft and send-draft,
+ * because opening a composer needs a keystroke the real window could not be
+ * given; and a dead link, because WebKit will not fire a listener in a
+ * scripting-disabled document and Blink will.
+ *
+ * The real window can now be driven without touching anybody's focus, so it is
+ * the answer for all of those:
+ *
+ *   MACH_QA_INSTANCE=agent scripts/qa up
+ *   MACH_QA_INSTANCE=agent scripts/qa key 'mod+,'
+ *   MACH_QA_INSTANCE=agent scripts/qa shoot prefs
+ *   MACH_QA_INSTANCE=agent scripts/qa ui
+ *
+ * What this cannot do at all: anything that needs real mail or the Rust
+ * backend. `scripts/qa state` reads the database and needs no UI.
  */
 
 const CHROME =

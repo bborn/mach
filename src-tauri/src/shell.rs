@@ -290,6 +290,16 @@ pub fn reopen<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Serialises the tests that mutate `MACH_DATA_DIR`.
+///
+/// The variable is process-wide and `cargo test` runs tests on threads in one
+/// process, so two tests reading it at once see each other's writes. Two
+/// modules now assert on it — this one and `crate::qa`, which refuses to open a
+/// control port unless it is set — so the lock has to live somewhere both can
+/// reach.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,7 +308,8 @@ mod tests {
     /// instances silently start stealing focus again.
     #[test]
     fn qa_instances_are_detected_by_their_data_dir() {
-        // Serialised by running in one test fn: these mutate process state.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         std::env::remove_var("MACH_DATA_DIR");
         assert!(!is_qa_instance(), "the owner's instance must stay a normal app");
 

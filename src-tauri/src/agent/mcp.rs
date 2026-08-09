@@ -426,7 +426,11 @@ fn mcp_call_id() -> String {
 }
 
 /// `None` when the request may proceed; otherwise the refusal to send.
-fn check_headers(
+///
+/// `pub(crate)` because the debug-only QA control port (`crate::qa`) makes the
+/// same four checks and must not make them a second time in its own words. A
+/// copied constant-time compare is exactly the kind of thing that drifts.
+pub(crate) fn check_headers(
     request: &tiny_http::Request,
     expected: &str,
 ) -> Option<tiny_http::Response<std::io::Empty>> {
@@ -526,7 +530,10 @@ fn write_config(dir: &Path, session_id: &str, endpoint: &Endpoint) -> Result<Pat
 /// `auth::oauth` does for the PKCE verifier — one fewer dependency in the
 /// authentication path, and the kernel's CSPRNG is the thing those crates
 /// ultimately ask anyway.
-fn random_token() -> Result<String, AgentError> {
+///
+/// `pub(crate)` for the same reason as [`check_headers`]: one way to mint a
+/// loopback bearer token, not two.
+pub(crate) fn random_token() -> Result<String, AgentError> {
     let mut bytes = [0u8; 32];
     let mut file = std::fs::File::open("/dev/urandom")
         .map_err(|e| AgentError::transport(format!("open /dev/urandom: {e}")))?;

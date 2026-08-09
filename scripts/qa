@@ -9,43 +9,60 @@ set -euo pipefail
 #   qa shoot NAME    screenshot the window -> .qa/<instance>/NAME.png
 #   qa state         process, window, accounts, sync watermark, row counts
 #   qa logs [n]      tail the log
-#   qa key KEYS      send keystrokes (focuses the window — see the warning)
-#   qa click X,Y     click at window-relative coordinates (focuses)
+#   qa key BINDING   press a key in the window: 'mod+2', 'g i', 'c', '?'
+#   qa click CSS     click the first match: '[data-thread-id="41774"]'
+#   qa ui            what is on screen: mode, cursor, selection, overlay, rows
 #
 # ---------------------------------------------------------------------------
-# NEVER TOUCH THE OWNER'S FOCUS
+# DRIVE THE REAL APP. NEVER TOUCH THE OWNER'S FOCUS.
 # ---------------------------------------------------------------------------
 #
-# Someone is using this machine. Raising a window to look at it, or sending
-# synthetic keys and clicks, takes the keyboard away from them mid-sentence.
-#
-#   `qa shoot` is safe. It captures the window's own buffer by CGWindowID, so
-#   the window is never raised — occluded, backgrounded, whatever. Use it
-#   freely.
-#
-#   `qa key` and `qa click` are NOT safe and now refuse by default. Synthetic
-#   input goes wherever focus is, so they must raise the window; there is no
-#   polite version. MACH_QA_INPUT=1 overrides, and you should have a reason.
+# Someone is using this machine, and the whole design here follows from that.
 #
 #   `qa up` on an instance OTHER than `main` is safe. Those processes set an
 #   Accessory activation policy and build their window unfocused (see
 #   `src-tauri/src/shell.rs`), so they never appear in the Dock, never become
 #   the active application, and cannot take a keystroke — while still being a
-#   real window `qa shoot` can capture. That is the way to exercise anything
-#   needing the Rust backend. `qa up` on `main` is the owner's own app and is
-#   still off limits.
+#   real window. `qa up` on `main` is the owner's own app and is off limits.
 #
-# For frontend-only work, drive it headlessly instead. Vite serves the same
-# frontend on http://localhost:1420, and outside Tauri it renders the fixture
-# data source (see `src/main.tsx`). `scripts/webqa.ts` clicks, types, reads the
-# DOM and screenshots with no window and no focus at all:
+#   `qa shoot` is safe. It captures the window's own buffer by CGWindowID, so
+#   the window is never raised — occluded, backgrounded, whatever.
+#
+#   `qa key`, `qa click` and `qa ui` are safe on a QA instance. They do not
+#   send OS input. They POST one of three verbs to a loopback port the app
+#   opens for QA instances in development builds; the frontend synthesises the
+#   keystroke and hands it to the keymap, or dispatches the click in the page.
+#   Focus never moves, because nothing about this involves the window server.
+#   See `src-tauri/src/qa/` and `src/lib/qa-bridge.ts`.
+#
+#   MACH_QA_INPUT=1 switches `key` and `click` back to real OS input, which
+#   raises the window and takes the keyboard. It takes a cliclick spec
+#   (`kp:return`, `t:hello`) and window-relative `X,Y` instead of a binding and
+#   a selector. It exists for the rare thing the page cannot see — a native
+#   menu, a system dialog — and you should have a reason.
+#
+# So: the real app is the answer for anything native. A window edge, the
+# traffic lights, a WebKit-only behaviour, a composer, a full-screen surface —
+# launch a QA instance and drive it.
+#
+#   MACH_QA_INSTANCE=agent scripts/qa up
+#   MACH_QA_INSTANCE=agent scripts/qa key 'mod+,'
+#   MACH_QA_INSTANCE=agent scripts/qa shoot prefs
+#   MACH_QA_INSTANCE=agent scripts/qa ui
+#
+# Headless Chrome against Vite is still there and is still right for pure
+# component and logic work, where a second engine costs nothing. `webqa.ts`
+# clicks, types, reads the DOM and screenshots with no window at all:
 #
 #   bun scripts/webqa.ts reload    # …and reports what the page load logged
 #   bun scripts/webqa.ts eval '<javascript>'
 #
 # Use `reload` first when a page looks blank: it holds one CDP session across
 # the navigation and prints the exceptions, which is the only way to see an
-# error thrown before the app finished mounting.
+# error thrown before the app finished mounting. What it cannot tell you is
+# anything about the app as a Mac application: it is Blink, in a tab, with no
+# traffic lights, no overlay title bar and a different scrollbar engine. Four
+# defects shipped verified that way.
 #
 # Real-data checks do not need the UI at all: `qa state` reads the database.
 #
@@ -89,9 +106,14 @@ REAL_DB="$HOME/Library/Application Support/com.mach.mail/mach.sqlite3"
 if [ "$INSTANCE" = "main" ]; then
   DATA_DIR=""
   DB="$REAL_DB"
+  CONTROL=""
 else
   DATA_DIR="$QA_DIR/data"
   DB="$DATA_DIR/mach.sqlite3"
+  # Written 0600 by `qa::write_endpoint` when the app starts. The `main`
+  # instance has no MACH_DATA_DIR, so it never opens a port and there is
+  # nothing here to read.
+  CONTROL="$DATA_DIR/qa-control.json"
 fi
 
 mkdir -p "$QA_DIR"
@@ -227,6 +249,11 @@ keychain_notice() {
 }
 
 cmd_down() {
+  # The app removes its own token file when it shuts down cleanly, and a
+  # SIGTERM is not a clean shutdown. A bearer token for a port that no longer
+  # exists is only untidy rather than dangerous, and it should still not be
+  # left lying in the tree.
+  [ -n "$CONTROL" ] && rm -f "$CONTROL"
   if pid="$(instance_pid)"; then kill "$pid" 2>/dev/null || true; rm -f "$PIDFILE"; echo "stopped (pid $pid)";
   else echo "not running"; fi
 }
@@ -303,34 +330,88 @@ SELECT 'events  : ' || count(*) || '  (' || COALESCE(min(date(start_ts/1000,'uni
 SQL
 }
 
+# ---------------------------------------------------------------------------
+# The control port
+# ---------------------------------------------------------------------------
+#
+# One POST per verb, to a loopback port bound to 127.0.0.1 on an ephemeral
+# port, carrying the bearer token the app wrote alongside it. Three verbs and
+# no more; there is deliberately no way to ask the window to run code. See
+# `src-tauri/src/qa/` for what a reader of that port could do and what stops
+# them.
+#
+# python3 rather than curl and jq: it is what `windowid.py` already needs, and
+# it reads the endpoint file, sends the request and pretty-prints the answer
+# without a second tool having to be installed.
+control() {
+  local verb="$1" argument="${2:-}"
+  [ -n "$CONTROL" ] || die "the control port only exists on a QA instance — try MACH_QA_INSTANCE=agent"
+  instance_pid >/dev/null || die "not running — try: qa up"
+  [ -f "$CONTROL" ] || die "no control port at $CONTROL (still starting? release build? see $LOG)"
+  MACH_QA_VERB="$verb" MACH_QA_ARG="$argument" python3 - "$CONTROL" <<'PY'
+import json, os, sys, urllib.error, urllib.request
+
+endpoint = json.load(open(sys.argv[1]))
+body = json.dumps({
+    "verb": os.environ["MACH_QA_VERB"],
+    "argument": os.environ["MACH_QA_ARG"],
+}).encode()
+request = urllib.request.Request(
+    "http://127.0.0.1:%d/qa" % endpoint["port"],
+    data=body,
+    headers={
+        "Authorization": "Bearer " + endpoint["token"],
+        "Content-Type": "application/json",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=20) as response:
+        answer = json.load(response)
+except urllib.error.HTTPError as e:
+    answer = {"ok": False, "error": "%d %s" % (e.code, e.read().decode("utf-8", "replace").strip())}
+except OSError as e:
+    answer = {"ok": False, "error": str(e)}
+
+print(json.dumps(answer, indent=2, sort_keys=True))
+sys.exit(0 if answer.get("ok") else 1)
+PY
+}
+
+# A keymap token, delivered in-page. No OS input, no focus change.
+#
+# MACH_QA_INPUT=1 is the old path: real synthetic input, which raises the
+# window and takes the keyboard from whoever is at the machine. It speaks
+# cliclick rather than keymap tokens.
 cmd_key() {
-  [ $# -gt 0 ] || die "usage: qa key <cliclick spec>   e.g. kp:return, t:hello"
-  command -v cliclick >/dev/null || die "cliclick is not installed (brew install cliclick)"
-  instance_pid >/dev/null || die "not running"
-  # Synthetic keys go wherever focus is, so this *must* raise the window —
-  # there is no non-stealing way to do it. Prefer driving the UI in a headless
-  # browser against Vite (see the header) and keep this for the rare case that
-  # genuinely needs the real Tauri window.
-  [ "${MACH_QA_INPUT:-}" = "1" ] || \
-    die "qa key raises the window and steals focus. Drive the UI headlessly instead (see 'qa' with no args), or set MACH_QA_INPUT=1 if you accept interrupting whoever is at the machine."
-  focus; sleep 0.6
-  cliclick "$@"
+  [ $# -gt 0 ] || die "usage: qa key <binding>   e.g. 'mod+2', 'g i', c, '?'"
+  if [ "${MACH_QA_INPUT:-}" = "1" ]; then
+    command -v cliclick >/dev/null || die "cliclick is not installed (brew install cliclick)"
+    instance_pid >/dev/null || die "not running"
+    focus; sleep 0.6
+    cliclick "$@"
+    return
+  fi
+  control key "$1"
 }
 
 cmd_click() {
-  [ $# -eq 1 ] || die "usage: qa click X,Y   (window-relative)"
-  command -v cliclick >/dev/null || die "cliclick is not installed"
-  [ "${MACH_QA_INPUT:-}" = "1" ] || \
-    die "qa click raises the window and steals focus. Drive the UI headlessly instead (see 'qa' with no args), or set MACH_QA_INPUT=1 if you accept interrupting whoever is at the machine."
-  local rect; rect="$(window_rect)" || die "cannot read the window rect"
-  # shellcheck disable=SC2086
-  set -- $rect "$1"
-  local wx="$1" wy="$2" xy="$5"
-  local rx="${xy%%,*}" ry="${xy##*,}"
-  focus; sleep 0.5
-  cliclick "c:$((wx + rx)),$((wy + ry))"
-  echo "clicked window($rx,$ry)"
+  [ $# -eq 1 ] || die "usage: qa click <css selector>   e.g. '[data-thread-id=\"41774\"]'"
+  if [ "${MACH_QA_INPUT:-}" = "1" ]; then
+    command -v cliclick >/dev/null || die "cliclick is not installed"
+    local rect; rect="$(window_rect)" || die "cannot read the window rect"
+    # shellcheck disable=SC2086
+    set -- $rect "$1"
+    local wx="$1" wy="$2" xy="$5"
+    local rx="${xy%%,*}" ry="${xy##*,}"
+    focus; sleep 0.5
+    cliclick "c:$((wx + rx)),$((wy + ry))"
+    echo "clicked window($rx,$ry)"
+    return
+  fi
+  control click "$1"
 }
+
+cmd_ui() { control ui; }
 
 cmd_logs() { tail -n "${1:-30}" "$LOG"; }
 
@@ -363,6 +444,7 @@ case "${1:-}" in
   state) shift; cmd_state "$@" ;;
   key)   shift; cmd_key "$@" ;;
   click) shift; cmd_click "$@" ;;
+  ui)    shift; cmd_ui "$@" ;;
   logs)  shift; cmd_logs "$@" ;;
-  *) sed -n '4,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ; exit 1 ;;
+  *) sed -n '4,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ; exit 1 ;;
 esac

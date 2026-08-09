@@ -85,13 +85,26 @@ The preferences surface shipped with its title underneath the macOS
 close/minimise/zoom buttons. It had been screenshotted — in the browser, where
 those buttons do not exist.
 
-So: **if a change touches full-window layout, a window edge, or anything the OS
-also draws, verify it in the real app**:
+So: **if a change touches full-window layout, a window edge, anything the OS
+also draws, or anything WebKit decides, verify it in the real app.** You can
+drive it now — it no longer only launches and sits there:
 
 ```sh
-MACH_QA_INSTANCE=agent scripts/qa up        # Accessory policy: never takes focus
+MACH_QA_INSTANCE=agent scripts/qa up          # Accessory policy: never takes focus
+MACH_QA_INSTANCE=agent scripts/qa key 'mod+,' # press ⌘, in the window
+MACH_QA_INSTANCE=agent scripts/qa ui          # mode, cursor, selection, overlay, rows
 MACH_QA_INSTANCE=agent scripts/qa shoot after
 ```
+
+`key`, `click` and `ui` are the whole vocabulary, and they are not OS input:
+they POST to a loopback port the app opens for QA instances in development
+builds, and the frontend turns the verb into a keystroke through the keymap or
+a click in the page. Focus never moves. There is deliberately no way to make
+the window run code — see `src-tauri/src/qa/`.
+
+Headless Chrome against Vite (`scripts/webqa.ts`) is still right for component
+and logic work, where a second engine costs nothing. It is not evidence about
+the app as a Mac application.
 
 The window is `titleBarStyle: "Overlay"` with `hiddenTitle`, so macOS paints the
 traffic lights over the top-left of *our* content. Anything filling the window
