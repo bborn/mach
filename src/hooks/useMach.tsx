@@ -1126,12 +1126,18 @@ export function MachProvider({ children }: { children: ReactNode }) {
           if (visibleThreads.length > 0) selectAt(0);
           return;
         }
+        // Selects, and leaves the cursor where it is.
+        //
+        // It used to advance, on the theory that ticking a run of rows is one
+        // gesture. It reads as the app moving under you: `x` is the only key
+        // that both changed the selection *and* moved, so a mis-tick left you
+        // somewhere you did not choose and undoing it meant arrowing back. The
+        // owner: "X shortcut should select but not move. that's a confusing UX.
+        // I can move using arrows."
+        //
+        // Gmail's `x` does the same nothing, and a run of rows already has a
+        // gesture that is *about* moving — ⇧J drags the range with the cursor.
         dispatch({ type: "selection", selection: toggleSelection(ui.selection, ui.threadId) });
-        const next = visibleThreads[selectedIndex + 1];
-        if (next) {
-          if (selectedIndex + 1 >= visibleThreads.length - 5) streamRef.current.loadMore();
-          dispatch({ type: "thread", threadId: next.id });
-        }
       },
 
       // ⇧J / ⇧K — the cursor moves and the range follows it. `keepAnchor` is

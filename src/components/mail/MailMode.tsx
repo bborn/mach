@@ -187,7 +187,7 @@ export function MailMode() {
     {
       keys: "x",
       group: "Selection",
-      description: "Select, and move on",
+      description: "Select",
       when: () => active,
       handler: () => actions.toggleAtCursor(),
     },
