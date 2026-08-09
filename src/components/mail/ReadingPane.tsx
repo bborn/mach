@@ -1,11 +1,13 @@
-import { useEffect, useState } from "react";
-import { Archive, Bookmark, Clock, CornerUpLeft } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Archive, Bookmark, Clock, CornerUpLeft, PencilLine } from "lucide-react";
 import { useMach } from "@/hooks/useMach";
 import { ACCOUNT_BG } from "@/lib/colors";
+import { loadDraftForMessage } from "@/lib/compose";
 import { fullDate } from "@/lib/time";
 import { cn } from "@/lib/utils";
+import type { MessageId, ThreadId } from "@/types";
 import { Button } from "@/components/ui/button";
-import { Hint, Kbd } from "@/components/ui/kbd";
+import { Hint } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ThreadMessage } from "./ThreadMessage";
 import { PluginViews } from "@/components/plugins/PluginView";
@@ -27,6 +29,47 @@ export function ReadingPane() {
   // falls back to "the latest one is open".
   const [toggled, setToggled] = useState<Record<number, boolean>>({});
   useEffect(() => setToggled({}), [threadId]);
+
+  /**
+   * Put a draft row back in the composer.
+   *
+   * The row holds a message id; the editable copy is keyed by draft id, and
+   * Rust owns the mapping between them because the mirror row is renamed the
+   * moment Gmail accepts the push. From there this is `openArtifact` — the same
+   * route the agent's "Open draft" takes, navigating to the conversation and
+   * asking the composer to resume by id. One way in, not two.
+   */
+  const openDraft = useCallback(
+    (messageId: MessageId, fallbackThreadId: ThreadId) => {
+      void (async () => {
+        const draft = await loadDraftForMessage(messageId).catch(() => null);
+        if (!draft) {
+          /*
+           * Almost always a draft that came *down* from Gmail: the sync pass
+           * sets `is_draft` from the `DRAFT` label, so the row is real and
+           * correctly marked, but there is no `compose_drafts` copy and no
+           * `drafts.update` id to write back to. Opening it as a new draft
+           * would leave two on Google — the duplicate this unit has already
+           * been burned by twice.
+           *
+           * So: say so. A row that is plainly a draft and silently does
+           * nothing when activated is the same complaint as the one that
+           * started this, one step further in.
+           */
+          actions.setStatus("Draft from another client — not editable here", "error");
+          return;
+        }
+        actions.openArtifact({
+          kind: "draft",
+          draftId: draft.id,
+          threadId: draft.threadId ?? fallbackThreadId,
+          accountId: draft.accountId,
+          label: draft.subject || "Draft",
+        });
+      })();
+    },
+    [actions],
+  );
 
   if (!detail && detailLoading && ui.threadId !== null) {
     /*
@@ -60,6 +103,10 @@ export function ReadingPane() {
   const account = accountById(thread.accountId);
   const latestId = messages.length > 0 ? messages[messages.length - 1]!.id : null;
   const favorited = isFavorite(threadFavorite);
+  // What `r` will actually do. Every composer route resumes an existing draft
+  // on this thread rather than preparing a fresh one (`ComposerDock.open`), so
+  // while one exists "Reply" is the wrong word for the button that answers.
+  const pendingDraft = messages.find((message) => message.isDraft) ?? null;
 
   return (
     <>
@@ -115,8 +162,20 @@ export function ReadingPane() {
             <Button size="icon" title="Snooze (b)" onClick={actions.snoozeSelected}>
               <Clock size={14} strokeWidth={1.75} />
             </Button>
-            <Button size="icon" title="Reply (r)" onClick={actions.replySelected}>
-              <CornerUpLeft size={14} strokeWidth={1.75} />
+            <Button
+              size="icon"
+              title={pendingDraft ? "Edit draft (r)" : "Reply (r)"}
+              onClick={
+                pendingDraft
+                  ? () => openDraft(pendingDraft.id, thread.id)
+                  : actions.replySelected
+              }
+            >
+              {pendingDraft ? (
+                <PencilLine size={14} strokeWidth={1.75} />
+              ) : (
+                <CornerUpLeft size={14} strokeWidth={1.75} />
+              )}
             </Button>
           </div>
         </div>
@@ -144,12 +203,22 @@ export function ReadingPane() {
                   [message.id]: !(current[message.id] ?? message.id === latestId),
                 }))
               }
+              onOpenDraft={() => openDraft(message.id, thread.id)}
             />
           ))}
 
-          <div className="mt-2 flex items-center gap-2 border-t border-border pt-4 text-micro text-faint-foreground">
-            <Kbd keys="r" /> reply · <Kbd keys="a" /> reply all · <Kbd keys="f" /> forward
-          </div>
+          {/*
+            There is no hint strip here.
+
+            One used to sit under the last message — `r reply · a reply all ·
+            f forward` — a few pixels above the composer dock's own strip,
+            which says the same four things and is made of buttons that do
+            them. Two rows of one control, drawn twice. The dock's survives:
+            it is persistent rather than at the end of a scroll, it is
+            operable by mouse as well as by key, and it is the unit that owns
+            the composer, so it is the one that can say "edit draft" when
+            that is what the key will do.
+          */}
         </div>
       </ScrollArea>
     </>

@@ -244,15 +244,25 @@ function Shell() {
       </main>
 
       {/*
-        Above the status bar and below the modes: agent sessions are part of
-        the window's furniture, not an overlay. Asking is never modal — the
-        list keeps its focus and its scroll while a session works, which is why
-        this is a strip of pills rather than a dialog. Renders nothing until
-        there is a session.
-      */}
-      <AgentDock />
+        The bottom of the window, as one thing.
 
-      <StatusBar />
+        Agent sessions are part of the furniture, not an overlay: asking is
+        never modal, the list keeps its focus and its scroll while a session
+        works, which is why the dock is a strip of pills rather than a dialog.
+        It renders nothing until there is a session.
+
+        The border lives here rather than on each of them because there is one
+        boundary to draw — where the app stops and the furniture starts — and
+        it used to be drawn three times over: above the drawer, above the
+        pills, above the status bar, two of them separating one shade of
+        surface from the same shade. Whichever of the three is topmost now
+        inherits the single edge, and when the drawer is open that edge is also
+        what you drag.
+      */}
+      <div className="flex shrink-0 flex-col border-t border-border">
+        <AgentDock />
+        <StatusBar />
+      </div>
       {/*
         A fixed layer rather than a row in this column: a toast that took part
         in the layout would reflow the panes every time something was archived.

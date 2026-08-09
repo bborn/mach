@@ -164,4 +164,25 @@ describe("the thread row", () => {
   it("is one fixed-height row, so the list scrolls in a rhythm", () => {
     expect(row()).toContain("h-row");
   });
+
+  it("says the preview is your own unsent text, and still shows the text", () => {
+    const html = row({ labelIds: ["INBOX", "DRAFT"] });
+    // The word, not just a colour: this row is read in greyscale, by a
+    // colour-blind reader, and by a screen reader that gets no CSS at all.
+    expect(html).toContain(">Draft<");
+    // And the draft's own words stay — they are the last thing on the
+    // conversation, and replacing them would put stale text on the row.
+    expect(html).toContain("Project: InfluenceKit Environment: production Code Version:");
+    // On the preview line, ahead of the snippet, not up beside the sender.
+    expect(html.indexOf(">Draft<")).toBeGreaterThan(html.indexOf(LONG_SUBJECT));
+  });
+
+  it("leaves an ordinary conversation unmarked", () => {
+    expect(row()).not.toContain(">Draft<");
+  });
+
+  it("lets the Drafts mailbox turn the mark off, where every row would carry it", () => {
+    const html = row({ labelIds: ["DRAFT"] }, { draft: false });
+    expect(html).not.toContain(">Draft<");
+  });
 });

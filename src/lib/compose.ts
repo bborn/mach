@@ -25,6 +25,7 @@
  *    cannot iterate on in a browser.
  */
 
+import * as fixtures from "./fixtures";
 import { isTauri } from "./ipc";
 
 /* -------------------------------------------------------------------------- */
@@ -159,7 +160,7 @@ export function newDraft(accountId: number): Draft {
 }
 
 export async function loadDraftForThread(threadId: number): Promise<Draft | null> {
-  if (!isTauri()) return localDrafts.get(`thread:${threadId}`) ?? null;
+  if (!isTauri()) return localLookup(`thread:${threadId}`);
   const result = await call<{ draft: Draft | null }>({ op: "loadDraft", threadId });
   return result.draft;
 }
@@ -173,8 +174,24 @@ export async function loadDraftForThread(threadId: number): Promise<Draft | null
  * the one whose button was pressed.
  */
 export async function loadDraft(draftId: string): Promise<Draft | null> {
-  if (!isTauri()) return localDrafts.get(draftId) ?? null;
+  if (!isTauri()) return localLookup(draftId);
   const result = await call<{ draft: Draft | null }>({ op: "loadDraft", draftId });
+  return result.draft;
+}
+
+/**
+ * The draft behind a message row in a conversation.
+ *
+ * A draft is mirrored into the thread it answers, so the reading pane holds a
+ * *message* id and needs the editable copy. Not `loadDraftForThread`: a thread
+ * can carry two drafts, and that one returns whichever was typed in last rather
+ * than the one whose row was activated. Rust resolves the id, because the
+ * mirror is renamed the moment Gmail accepts the push and only the store knows
+ * which name it is under now.
+ */
+export async function loadDraftForMessage(messageId: number): Promise<Draft | null> {
+  if (!isTauri()) return localLookup(`message:${messageId}`);
+  const result = await call<{ draft: Draft | null }>({ op: "loadDraft", messageId });
   return result.draft;
 }
 
@@ -553,8 +570,50 @@ export function escapeHtml(text: string): string {
 /* Browser fallback                                                            */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Drafts, keyed three ways: by their own id, by `thread:<id>`, and by
+ * `message:<id>` — the same three questions `compose::draft` answers out of
+ * SQLite.
+ *
+ * The seed is the fixture draft `fixtures.ts` mirrors into a conversation.
+ * Without it, activating that row in `bun run dev` would report "not editable",
+ * and the browser is the only place this flow can be walked without a mailbox.
+ */
 const localDrafts = new Map<string, Draft>();
 let localOutbox: OutboxEntry[] = [];
+
+/**
+ * Seeded on first use rather than at module load: this file and `fixtures` sit
+ * in the same import cycle through `ipc` and `data`, and reading the namespace
+ * while that cycle is still unwinding is a `ReferenceError` at start-up.
+ */
+let seeded = false;
+function localSeed(): void {
+  if (seeded) return;
+  seeded = true;
+  const seed: Draft = {
+    id: fixtures.DRAFT_ID,
+    accountId: 2,
+    threadId: fixtures.DRAFT_THREAD_ID,
+    replyToId: null,
+    kind: "reply",
+    to: [{ name: "Marcus Oyelaran", email: "marcus@lumen.example" }],
+    cc: [],
+    bcc: [],
+    subject: "Re: Checkout conversion dropped 6% overnight",
+    body: fixtures.DRAFT_BODY,
+    updatedAt: 0,
+  };
+  localDrafts.set(seed.id, seed);
+  localDrafts.set(`thread:${fixtures.DRAFT_THREAD_ID}`, seed);
+  localDrafts.set(`message:${fixtures.DRAFT_MESSAGE_ID}`, seed);
+}
+
+/** Every fixture-mode read goes through this, so the seed is always there. */
+function localLookup(key: string): Draft | null {
+  localSeed();
+  return localDrafts.get(key) ?? null;
+}
 
 function localPrepare(threadId: number, kind: DraftKind): Draft {
   return {

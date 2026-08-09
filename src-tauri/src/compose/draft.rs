@@ -38,6 +38,21 @@ pub enum DraftKind {
     Reply,
     ReplyAll,
     Forward,
+    /// Written in some other client and finished here.
+    ///
+    /// Its own kind rather than `Reply` because of what a rebuild would
+    /// otherwise do to the text. The body of a draft written on the phone is
+    /// already the *whole* message — the typed part and whatever the other
+    /// client quoted underneath it — so treating it as a reply and quoting the
+    /// parent again would append a second copy of the original on every save.
+    /// An adopted draft is reproduced exactly as Gmail holds it, and Mach adds
+    /// nothing to the body it did not write.
+    ///
+    /// It still threads: [`build`] takes the `In-Reply-To` and `References`
+    /// chain from the parent, and the conversation from the draft's own Gmail
+    /// thread, so finishing a phone draft here and sending it lands in the same
+    /// conversation everywhere.
+    Adopted,
 }
 
 impl DraftKind {
@@ -47,6 +62,7 @@ impl DraftKind {
             DraftKind::Reply => "reply",
             DraftKind::ReplyAll => "replyAll",
             DraftKind::Forward => "forward",
+            DraftKind::Adopted => "adopted",
         }
     }
 
@@ -55,8 +71,20 @@ impl DraftKind {
             "reply" => DraftKind::Reply,
             "replyAll" => DraftKind::ReplyAll,
             "forward" => DraftKind::Forward,
+            "adopted" => DraftKind::Adopted,
             _ => DraftKind::New,
         }
+    }
+
+    /// Whether this draft belongs to a conversation that already exists.
+    ///
+    /// A forward deliberately does not: threading it onto the original is what
+    /// makes a forwarded message reappear inside the thread it was taken out of.
+    pub fn continues_a_thread(self) -> bool {
+        matches!(
+            self,
+            DraftKind::Reply | DraftKind::ReplyAll | DraftKind::Adopted
+        )
     }
 }
 
@@ -297,13 +325,23 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
         // A forward starts a new conversation. Threading it onto the original
         // is what makes a forwarded message reappear inside the thread it was
         // taken out of, in the recipient's client and in yours.
-        (Some(p), DraftKind::Reply | DraftKind::ReplyAll) => references_for_reply(p),
+        //
+        // An adopted draft gets the chain for the same reason a reply does: it
+        // *is* a reply, written elsewhere, and the headers are what make it
+        // thread in clients that have never heard of Gmail's thread ids.
+        (Some(p), DraftKind::Reply | DraftKind::ReplyAll | DraftKind::Adopted) => {
+            references_for_reply(p)
+        }
         _ => (None, Vec::new()),
     };
 
     let body_text = markdown::to_text(&draft.body);
     let body_html = markdown::to_html(&draft.body);
 
+    // `Adopted` is absent from both arms on purpose: its body already contains
+    // whatever the client that wrote it quoted, and quoting the parent a second
+    // time here is how one save would turn his phone's text into two copies of
+    // the original.
     let (text, html) = match (&parent, draft.kind) {
         (Some(p), DraftKind::Reply | DraftKind::ReplyAll) => (
             format!("{}\n\n{}", body_text.trim_end(), quote_text(p)),
@@ -316,8 +354,11 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
         _ => (body_text, body_html),
     };
 
-    let is_reply = matches!(draft.kind, DraftKind::Reply | DraftKind::ReplyAll);
-    let thread_id = if is_reply { draft.thread_id } else { None };
+    let thread_id = if draft.kind.continues_a_thread() {
+        draft.thread_id
+    } else {
+        None
+    };
     let gmail_thread_id = match thread_id {
         Some(id) => db
             .read(|conn| queries::thread_summary(conn, id))?
@@ -647,6 +688,273 @@ pub fn load_draft_for_thread(db: &Db, thread_id: i64) -> Result<Option<Draft>> {
             )
             .ok())
     })?)
+}
+
+/// The draft that a message row in a conversation *is*.
+///
+/// The reading pane renders a draft as a message — that is what
+/// [`super::mirror`] puts there — so activating that row has to reach the
+/// editable copy in `compose_drafts`. Two ids answer, because the mirror is
+/// renamed the instant Gmail accepts the push (see [`super::mirror::adopt`]):
+/// before that it is filed under `mach-draft:<draft id>`, and after it under
+/// Gmail's own message id, which `compose_drafts.gmail_message_id` also holds.
+/// Reading only the placeholder would work for about half a second and then
+/// quietly stop finding anything.
+///
+/// A draft with no editable copy here is **adopted** rather than refused. See
+/// [`adopt_remote_draft`].
+///
+/// `None` now means one thing only: this row is a draft whose Gmail draft id
+/// Mach has not learned yet, because `users.drafts.list` has not run since the
+/// draft appeared. It resolves itself within a sync pass.
+pub fn load_draft_for_message(db: &Db, message_id: i64, now_ms: i64) -> Result<Option<Draft>> {
+    db.write(ensure_compose_schema)?;
+    let gmail_message_id: Option<String> = db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT gmail_message_id FROM messages WHERE id = ?1 AND is_draft = 1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .ok())
+    })?;
+    let Some(gmail_message_id) = gmail_message_id else {
+        return Ok(None);
+    };
+    if let Some(draft_id) = gmail_message_id.strip_prefix(super::mirror::MIRROR_PREFIX) {
+        return load_draft(db, draft_id);
+    }
+    let existing: Option<Draft> = db.read(|conn| {
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {DRAFT_COLUMNS} FROM compose_drafts WHERE gmail_message_id = ?1 \
+                     ORDER BY updated_at DESC LIMIT 1"
+                ),
+                [&gmail_message_id],
+                map_draft,
+            )
+            .ok())
+    })?;
+    match existing {
+        // Mach's own row wins whenever there is one. It holds the text as the
+        // editor last left it, which may be newer than the copy that came down
+        // from Gmail, and re-adopting over it would throw away the difference.
+        Some(draft) => Ok(Some(draft)),
+        None => adopt_remote_draft(db, message_id, now_ms),
+    }
+}
+
+/// Take over a draft written in another client.
+///
+/// # What this is for
+///
+/// A draft written on the phone arrives through ordinary message sync as an
+/// ordinary message carrying the `DRAFT` label, and Mach used to stop there:
+/// the row said "Draft", and activating it said the draft was not editable
+/// here. The missing piece was never the text — that had synced like any other
+/// message — it was the **draft id**, which `users.messages.get` does not carry
+/// and only `users.drafts.list` reports. `sync::mail` now learns it and writes
+/// it onto the message; this is where it is spent.
+///
+/// # What is copied, and what is not
+///
+/// Recipients, subject and the body come from the message row Mach already has,
+/// so no network is in the path and the composer opens on a local read like
+/// everything else. The kind is [`DraftKind::Adopted`], which is what keeps the
+/// body verbatim — see that variant for why re-quoting would be a corruption
+/// rather than a nicety.
+///
+/// # One draft, still
+///
+/// The row is written in a single statement holding both the text *and* the
+/// Gmail identity, `synced` from the first instant. Two consequences, and both
+/// are the point. Adoption never pushes: the local copy is a faithful copy, so
+/// there is nothing to tell Google, and merely *opening* his phone's draft does
+/// not rewrite it. And there is no window in which a row exists with text but
+/// no `gmail_draft_id` — a row in that state is one `push` away from
+/// `drafts.create`, which is exactly how a draft becomes two.
+///
+/// The local id is derived from the Gmail draft id rather than minted, so
+/// adopting the same draft twice — two activations of the same row, or two
+/// windows — converges on one row instead of racing to make two.
+fn adopt_remote_draft(db: &Db, message_id: i64, now_ms: i64) -> Result<Option<Draft>> {
+    let Some(gmail_draft_id) = db.read(|conn| queries::message_draft_id(conn, message_id))? else {
+        return Ok(None);
+    };
+
+    let located: Option<(i64, i64)> = db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT account_id, thread_id FROM messages WHERE id = ?1 AND is_draft = 1",
+                [message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok())
+    })?;
+    let Some((account_id, thread_id)) = located else {
+        return Ok(None);
+    };
+
+    let detail = db
+        .read(|conn| queries::thread_with_messages(conn, thread_id))?
+        .ok_or(ComposeError::UnknownThread(thread_id))?;
+    let message = detail
+        .messages
+        .iter()
+        .find(|m| m.id == message_id)
+        .ok_or(ComposeError::UnknownMessage(message_id))?;
+
+    // The message this draft answers, if it answers one. A draft written on the
+    // phone as a fresh message has no parent, and must still open — so this is
+    // an `Option`, not a failure.
+    let parent = detail.messages.iter().rev().find(|m| !m.is_draft);
+
+    let body = message
+        .body_text
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| message.snippet.clone());
+
+    let draft = Draft {
+        id: adopted_draft_id(&gmail_draft_id),
+        account_id,
+        thread_id: Some(thread_id),
+        reply_to_id: parent.map(|p| p.id),
+        kind: DraftKind::Adopted,
+        to: mailboxes(&message.to),
+        cc: mailboxes(&message.cc),
+        bcc: mailboxes(&message.bcc),
+        subject: message.subject.clone(),
+        body,
+        updated_at: now_ms,
+        remote: DraftRemote {
+            state: RemoteState::Synced,
+            draft_id: Some(gmail_draft_id),
+            message_id: Some(message.gmail_message_id.clone()),
+            thread_id: Some(detail.thread.gmail_thread_id.clone()),
+            error: None,
+            synced_at: now_ms,
+        },
+    };
+
+    insert_adopted(db, &draft)?;
+    load_draft(db, &draft.id)
+}
+
+/// The local row id an adopted draft gets. Derived, so adoption is idempotent.
+fn adopted_draft_id(gmail_draft_id: &str) -> String {
+    format!("gmail-draft-{gmail_draft_id}")
+}
+
+/// Write an adopted draft: the editor's columns and the Gmail identity in one
+/// statement, because a row that has one without the other is a duplicate
+/// waiting for the next push. `DO NOTHING` on conflict, so a second adoption of
+/// the same draft finds the first one rather than overwriting it.
+fn insert_adopted(db: &Db, draft: &Draft) -> Result<()> {
+    db.write(ensure_compose_schema)?;
+    db.write(|conn| {
+        conn.execute(
+            "INSERT INTO compose_drafts
+                 (id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, bcc_json,
+                  subject, body, updated_at, gmail_draft_id, gmail_message_id, gmail_thread_id,
+                  remote_state, remote_error, remote_synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'synced', NULL, ?15)
+             ON CONFLICT(id) DO NOTHING",
+            rusqlite::params![
+                draft.id,
+                draft.account_id,
+                draft.thread_id,
+                draft.reply_to_id,
+                draft.kind.as_str(),
+                json(&draft.to),
+                json(&draft.cc),
+                json(&draft.bcc),
+                draft.subject,
+                draft.body,
+                draft.updated_at,
+                draft.remote.draft_id,
+                draft.remote.message_id,
+                draft.remote.thread_id,
+                draft.remote.synced_at,
+            ],
+        )?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Drop the composer's copy of every draft this account holds that Gmail no
+/// longer lists, and take its row out of the conversation.
+///
+/// Called by the drafts sweep in `sync::mail` with the complete set of draft ids
+/// Google returned, so anything missing from it was sent or deleted somewhere
+/// else. Without this, a draft thrown away on the phone would sit here for ever
+/// and — worse — the next edit would push it back, which is Mach resurrecting
+/// something the owner deliberately deleted.
+///
+/// Two guards, and both have a specific accident behind them.
+///
+/// `listed_at` is the instant *before* the request went out: a draft created
+/// here while the response was in flight is newer than the answer, and reaping
+/// it would delete a draft that had just been written. Rows synced at or after
+/// that instant are left alone.
+///
+/// The mirror is only taken out of the thread when the message row is still a
+/// draft. A draft **sent** from the phone also disappears from `drafts.list`,
+/// and its message is now an ordinary sent message in the conversation — which
+/// must survive.
+pub fn forget_drafts_missing_from(
+    db: &Db,
+    account_id: i64,
+    live: &[String],
+    listed_at: i64,
+) -> Result<Vec<String>> {
+    db.write(ensure_compose_schema)?;
+    let doomed: Vec<Draft> = db.read(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DRAFT_COLUMNS} FROM compose_drafts
+              WHERE account_id = ?1 AND gmail_draft_id IS NOT NULL AND remote_synced_at < ?2"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![account_id, listed_at], map_draft)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })?;
+
+    let mut removed = Vec::new();
+    for draft in doomed {
+        let Some(remote_id) = draft.remote.draft_id.clone() else {
+            continue;
+        };
+        if live.iter().any(|id| *id == remote_id) {
+            continue;
+        }
+        if still_a_draft_row(db, account_id, draft.remote.message_id.as_deref())? {
+            super::mirror::unmirror(db, &draft)?;
+        }
+        delete_draft(db, &draft.id)?;
+        removed.push(remote_id);
+    }
+    Ok(removed)
+}
+
+fn still_a_draft_row(db: &Db, account_id: i64, gmail_message_id: Option<&str>) -> Result<bool> {
+    let Some(gmail_message_id) = gmail_message_id.filter(|id| !id.is_empty()) else {
+        return Ok(false);
+    };
+    let id = gmail_message_id.to_string();
+    Ok(db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT is_draft FROM messages WHERE account_id = ?1 AND gmail_message_id = ?2",
+                rusqlite::params![account_id, id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false))
+    })?)
+}
+
+fn mailboxes(people: &[Participant]) -> Vec<Mailbox> {
+    people.iter().map(Mailbox::from_participant).collect()
 }
 
 pub fn delete_draft(db: &Db, id: &str) -> Result<()> {

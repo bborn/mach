@@ -561,6 +561,74 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
     Ok(id)
 }
 
+/// Record which Gmail draft a message is, as `users.drafts.list` reports it.
+///
+/// Returns whether a row was actually touched — `false` simply means the drafts
+/// sweep ran ahead of the message sync and the message is not stored yet, which
+/// the next pass resolves.
+///
+/// Deliberately not part of [`upsert_message`]: the ordinary message write knows
+/// nothing about draft ids, and folding this into it would mean every sync of a
+/// draft message overwrote the id with `NULL`.
+pub fn set_message_draft_id(
+    conn: &Connection,
+    account_id: i64,
+    gmail_message_id: &str,
+    gmail_draft_id: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE messages SET gmail_draft_id = ?3
+          WHERE account_id = ?1 AND gmail_message_id = ?2
+            AND (gmail_draft_id IS NULL OR gmail_draft_id <> ?3)",
+        params![account_id, gmail_message_id, gmail_draft_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// The Gmail draft id a message carries, if the sweep has learned one.
+pub fn message_draft_id(conn: &Connection, message_id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT gmail_draft_id FROM messages WHERE id = ?1",
+            [message_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .filter(|id| !id.is_empty()))
+}
+
+/// Forget every draft id this account holds that Gmail no longer lists.
+///
+/// The sweep hands in the complete set, so an id that is missing from it is a
+/// draft that was sent or deleted somewhere else. Clearing the column is what
+/// stops Mach from later addressing a draft that is not there — and, because
+/// `live` is the whole truth rather than a page of it, an empty list legitimately
+/// means "this account has no drafts at all".
+pub fn clear_missing_draft_ids(conn: &Connection, account_id: i64, live: &[String]) -> Result<usize> {
+    // Built rather than bound because SQLite has no array parameter. The values
+    // are Gmail draft ids, and they are still bound — only the number of
+    // placeholders is interpolated.
+    let placeholders = vec!["?"; live.len()].join(",");
+    let sql = if live.is_empty() {
+        "UPDATE messages SET gmail_draft_id = NULL
+          WHERE account_id = ?1 AND gmail_draft_id IS NOT NULL"
+            .to_string()
+    } else {
+        format!(
+            "UPDATE messages SET gmail_draft_id = NULL
+              WHERE account_id = ?1 AND gmail_draft_id IS NOT NULL
+                AND gmail_draft_id NOT IN ({placeholders})"
+        )
+    };
+    let mut values: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(live.len() + 1);
+    values.push(&account_id);
+    for id in live {
+        values.push(id);
+    }
+    Ok(conn.execute(&sql, values.as_slice())?)
+}
+
 pub fn set_message_unread(conn: &Connection, message_id: i64, unread: bool) -> Result<()> {
     conn.execute(
         "UPDATE messages SET is_unread = ?2 WHERE id = ?1",

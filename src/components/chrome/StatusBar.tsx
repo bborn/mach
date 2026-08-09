@@ -1,8 +1,7 @@
 import { usePendingSequence } from "@/hooks/useKeymap";
 import { useMach } from "@/hooks/useMach";
 import { formatBinding } from "@/lib/keymap";
-import { describeUndo, peekUndo } from "@/lib/undo-stack";
-import { Hint, Kbd } from "@/components/ui/kbd";
+import { Hint } from "@/components/ui/kbd";
 import { SyncIndicator } from "./SyncIndicator";
 
 const MAIL_HINTS: [string[], string][] = [
@@ -23,34 +22,40 @@ const CALENDAR_HINTS: [string[], string][] = [
 
 /**
  * The bottom rail carries what is *true*, not what just happened: how much is
- * in front of you, what ⌘Z would take back, where a half-typed sequence stands,
- * and the bindings for the current mode.
+ * in front of you, where a half-typed sequence stands, and the bindings for the
+ * current mode.
  *
  * It used to carry the transient status message as well, and that was the whole
  * problem — an acknowledgement of something that just moved rows off screen,
  * set in 11px on a 24px rail beside the sync spinner. `chrome/Toast.tsx` shows
- * it now, loudly and with the button attached. The rail kept the half that
- * outlives the message: ⌘Z's own name, quietly, for as long as the stack has
- * something in it.
+ * it now, loudly and with the button attached.
+ *
+ * # Nothing here is a copy of a message
+ *
+ * The rail kept one piece of that for a while: a permanent "⌘Z Undo archived 1
+ * conversation", on the argument that a key nobody can name is a key nobody
+ * presses. The toast already names it, at the moment it means something, with
+ * the button attached — so the line was a second copy of a transient message,
+ * sitting in the corner of the window long after the archive it described. ⌘Z
+ * works exactly as it did; the stack still never expires. It simply is not
+ * announced by furniture any more.
+ *
+ * What is left passes the same test: every item is a fact about the current
+ * view that nothing else on screen states. The count of conversations, the
+ * count selected, the pending `g …`, the fixture warning, and the sync
+ * indicator — which renders nothing at all unless a sync is running or has
+ * failed. The hints are a reference card rather than news.
  */
 export function StatusBar() {
-  const { ui, visibleThreads, hasMore, live, actions, undoState } = useMach();
+  const { ui, visibleThreads, hasMore, live } = useMach();
   const pending = usePendingSequence();
   const hints = ui.mode === "mail" ? MAIL_HINTS : CALENDAR_HINTS;
   const selected = ui.mode === "mail" ? ui.selection.ids.length : 0;
-  /*
-   * What ⌘Z would do, named — "Undo archived 3 conversations".
-   *
-   * An undo nobody can see is worse than none: press it, something changes
-   * somewhere off screen, and the only way to find out what is to go looking.
-   * So the rail says it, and it says it from the *stack* rather than from the
-   * status message, which is what makes it survive the status message timing
-   * out. Nothing to undo, nothing shown.
-   */
-  const undoLabel = describeUndo(peekUndo(undoState));
 
   return (
-    <footer className="flex h-6 shrink-0 items-center gap-3 overflow-hidden border-t border-border bg-surface px-3">
+    // No border of its own: the container in `App.tsx` draws the one edge the
+    // bottom of the window needs, whichever of these strips is topmost.
+    <footer className="flex h-6 shrink-0 items-center gap-3 overflow-hidden bg-surface px-3">
       {/* How many rows the next keystroke will act on. It sits *beside* the
           status message rather than inside it: the message is transient, and
           the count has to survive it or the number the user is acting on
@@ -61,26 +66,10 @@ export function StatusBar() {
         </span>
       )}
 
-      <span className="flex min-w-0 items-center gap-2">
-        <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-faint-foreground">
-          {ui.mode === "mail"
-            ? `${visibleThreads.length}${hasMore ? "+" : ""} conversations`
-            : `${ui.calendarView} view`}
-        </span>
-        {/* The quiet, durable version of the toast's offer — because the toast
-            times out and ⌘Z does not, and a key whose effect is unnamed is a
-            key nobody presses. */}
-        {undoLabel && (
-          <button
-            type="button"
-            title={undoLabel}
-            onClick={actions.undo}
-            className="flex min-w-0 items-center gap-1 text-faint-foreground hover:text-foreground"
-          >
-            <Kbd keys="mod+z" />
-            <span className="truncate text-micro">{undoLabel}</span>
-          </button>
-        )}
+      <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-faint-foreground">
+        {ui.mode === "mail"
+          ? `${visibleThreads.length}${hasMore ? "+" : ""} conversations`
+          : `${ui.calendarView} view`}
       </span>
 
       {pending && (

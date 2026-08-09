@@ -5,7 +5,7 @@ import { mailboxName } from "@/lib/mailboxes";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { MailboxNotice } from "./MailboxNotice";
-import { ThreadRow } from "./ThreadRow";
+import { GMAIL_DRAFT, ThreadRow } from "./ThreadRow";
 
 export function ThreadList() {
   const {
@@ -114,6 +114,9 @@ export function ThreadList() {
                 cursor={thread.id === ui.threadId}
                 checked={isRowSelected(thread.id)}
                 selecting={selectedCount > 0}
+                // Everything in Drafts is a draft; the mark belongs where the
+                // fact is news, which is Inbox, a label, or the unified list.
+                draft={ui.labelId !== GMAIL_DRAFT && thread.labelIds.includes(GMAIL_DRAFT)}
                 // Which gesture this is depends on the modifiers; the state
                 // layer owns the rules, this just reports what was held.
                 onSelect={(event) =>

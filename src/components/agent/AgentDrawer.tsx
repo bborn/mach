@@ -8,7 +8,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import {
   approve,
   artifactAction,
@@ -24,6 +24,7 @@ import { errorMessage } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
+import { parseMarkdown, type MarkdownLine, type Segment } from "./markdown";
 
 /**
  * One session, expanded.
@@ -45,14 +46,31 @@ import { Kbd } from "@/components/ui/kbd";
  * - **the approval bar**, when an outbound action is waiting. It names the
  *   consequence — who, and when — because approving a sentence you cannot read
  *   is not approving anything.
+ *
+ * # Why it is nearly ruleless now
+ *
+ * Every one of those regions used to be fenced off with a one-pixel line, and
+ * stacked in a panel a few hundred pixels tall they read as a stack of nothing
+ * in particular: a rule under the title, a rule under the context chips, a rule
+ * over the dock, a rule over the status bar. A rule earns its place by
+ * separating two things that could be confused for each other, and a title and
+ * the conversation it titles are not two such things — space says it. What is
+ * left is the boundary between the drawer and the app behind it (drawn by the
+ * container in `App.tsx`, and doubling as the drag handle), and the one between
+ * the record and the box you type into, which are genuinely different kinds of
+ * thing. The approval bar keeps its warning-coloured edge because that one is
+ * an alarm, not a fence.
  */
 export function AgentDrawer({
   session,
+  height,
   onMinimise,
   onClose,
   onOpenArtifact,
 }: {
   session: AgentSession;
+  /** What the divider above it says. See `drawer-height.ts` for the clamp. */
+  height: number;
   onMinimise: () => void;
   onClose: () => void;
   /** Put the owner in front of something a tool made. See `Artifact`. */
@@ -78,9 +96,10 @@ export function AgentDrawer({
   return (
     <section
       aria-label={`Agent session: ${session.title}`}
-      className="flex h-80 shrink-0 flex-col overflow-hidden border-t border-border bg-background"
+      style={{ height }}
+      className="flex shrink-0 flex-col overflow-hidden bg-background"
     >
-      <header className="flex h-8 shrink-0 items-center gap-2 border-b border-border px-3">
+      <header className="flex h-9 shrink-0 items-center gap-2 px-3">
         <span className="truncate text-list text-foreground">{session.title}</span>
         <StatusLabel session={session} />
         {/*
@@ -105,7 +124,7 @@ export function AgentDrawer({
       </header>
 
       {session.context.length > 0 && (
-        <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-border px-3 py-1.5">
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5 px-3 pb-1.5">
           {session.context.map((item) => (
             <ContextChip key={item.id} sessionId={session.id} item={item} />
           ))}
@@ -122,8 +141,8 @@ export function AgentDrawer({
         ))}
         {session.streaming && (
           <p className="whitespace-pre-wrap py-1 text-list text-foreground">
-            {session.streaming}
-            <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-accent align-middle" />
+            <Prose text={session.streaming} />
+            <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-accent align-middle motion-reduce:animate-none" />
           </p>
         )}
         {session.error && (
@@ -249,7 +268,11 @@ function EntryRow({
     );
   }
   if (entry.role === "agent") {
-    return <p className="whitespace-pre-wrap py-1 text-list text-foreground">{entry.text}</p>;
+    return (
+      <p className="whitespace-pre-wrap py-1 text-list text-foreground">
+        <Prose text={entry.text} />
+      </p>
+    );
   }
   return (
     <p
@@ -282,6 +305,51 @@ function EntryRow({
       <span className="shrink-0 text-faint-foreground opacity-60">{entry.name}</span>
     </p>
   );
+}
+
+/**
+ * What the agent said, with its Markdown honoured rather than printed.
+ *
+ * Spans only, and no layout of its own: the paragraph around it is
+ * `whitespace-pre-wrap`, so the answer's own line breaks are the layout and
+ * this decides nothing but weight. See `markdown.ts` for what is covered.
+ */
+function Prose({ text }: { text: string }) {
+  return (
+    <>
+      {parseMarkdown(text).map((line, index) => (
+        <Fragment key={index}>
+          {index > 0 && "\n"}
+          <Line line={line} />
+        </Fragment>
+      ))}
+    </>
+  );
+}
+
+function Line({ line }: { line: MarkdownLine }) {
+  const runs = line.segments.map((segment, index) => <Run key={index} segment={segment} />);
+  // A heading in three sentences of chat is a label, not a title: the weight
+  // is the whole of it, and a type scale here would only make the drawer
+  // louder than the mail behind it.
+  return line.kind === "heading" ? <span className="font-medium">{runs}</span> : <>{runs}</>;
+}
+
+function Run({ segment }: { segment: Segment }) {
+  switch (segment.kind) {
+    case "strong":
+      return <strong className="font-medium text-foreground">{segment.text}</strong>;
+    case "em":
+      return <em>{segment.text}</em>;
+    case "code":
+      return (
+        <code className="rounded-[3px] bg-surface-raised px-1 font-mono text-micro">
+          {segment.text}
+        </code>
+      );
+    default:
+      return <>{segment.text}</>;
+  }
 }
 
 /** Tool rows are identified by their tool-use id; prose rows by position. */

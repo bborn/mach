@@ -575,6 +575,16 @@ export interface UiSession {
   accountId: number | null;
   labelId: string;
   listWidth: number;
+  /**
+   * How tall the agent drawer stands, in pixels.
+   *
+   * The same kind of value as `listWidth` and remembered the same way: a
+   * divider somebody dragged, not a decision they would go looking for in ⌘,.
+   * What the window can actually afford is decided at render — see
+   * `components/agent/drawer-height.ts` — because a height that fitted the
+   * window it was dragged in may not fit the one it is restored into.
+   */
+  agentDrawerHeight: number;
   /** Account ids whose calendar group is folded up in the sidebar. */
   collapsedCalendarAccounts: number[];
   /** Mail rail sections folded up — `"inbox"`, `"folders"`, `"favorites"`. */
@@ -593,6 +603,15 @@ export const SESSION_KEY = "uiSession";
  * paint one pane at full width before the first drag corrected it.
  */
 export const LIST_WIDTH_BOUNDS: Bounds = { min: 280, max: 640 };
+
+/**
+ * The height bounds the agent drawer is held to, for the same reason.
+ *
+ * The maximum here is the largest height that could ever make sense, not the
+ * largest that fits: the window is the other half of that answer and it is not
+ * known in this file. `clampDrawerHeight` applies both.
+ */
+export const AGENT_DRAWER_HEIGHT_BOUNDS: Bounds = { min: 160, max: 900 };
 
 const MODES = new Set<string>(["mail", "calendar"]);
 const CALENDAR_VIEWS = new Set<string>(["day", "week", "month"]);
@@ -623,6 +642,9 @@ export function parseSession(raw: unknown): Partial<UiSession> {
   if (typeof raw.labelId === "string" && raw.labelId.length > 0) out.labelId = raw.labelId;
   if (typeof raw.listWidth === "number" && Number.isFinite(raw.listWidth)) {
     out.listWidth = clamp(Math.round(raw.listWidth), LIST_WIDTH_BOUNDS);
+  }
+  if (typeof raw.agentDrawerHeight === "number" && Number.isFinite(raw.agentDrawerHeight)) {
+    out.agentDrawerHeight = clamp(Math.round(raw.agentDrawerHeight), AGENT_DRAWER_HEIGHT_BOUNDS);
   }
   if (Array.isArray(raw.collapsedCalendarAccounts)) {
     out.collapsedCalendarAccounts = raw.collapsedCalendarAccounts.filter(

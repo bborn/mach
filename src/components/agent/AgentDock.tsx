@@ -26,8 +26,12 @@ import {
   type AgentSession,
 } from "@/lib/agent";
 import { errorMessage } from "@/lib/ipc";
+import { AGENT_DRAWER_HEIGHT_BOUNDS } from "@/lib/prefs";
+import { useUiSession } from "@/components/prefs/PreferencesProvider";
+import { RESIZE_STEP, Resizer } from "@/components/ui/split";
 import { AgentDrawer } from "./AgentDrawer";
 import { AgentPill } from "./AgentPill";
+import { DEFAULT_AGENT_DRAWER_HEIGHT, clampDrawerHeight } from "./drawer-height";
 
 /**
  * The bottom bar, and everything that owns session state.
@@ -48,6 +52,11 @@ import { AgentPill } from "./AgentPill";
  *    function with no access to `useMach`;
  * 3. **⇥.** The palette owns its input as local state, so the keystroke is
  *    claimed here at a higher priority and reads the query the resolver saw.
+ *
+ * …and, since the drawer became draggable, **how tall it stands**. That is not
+ * session state about mail, so it does not go near `useMach`'s reducer: it is
+ * one component remembering one thing about itself through `uiSession`, which
+ * is what the rail's folded sections and the calendar sidebar already do.
  */
 export function AgentDock() {
   const mach = useMach();
@@ -129,9 +138,71 @@ export function AgentDock() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nonce]);
 
+  /* ------------------------------------------------------------ the height */
+
+  const { session: where, remember } = useUiSession();
+  const [chosen, setChosen] = useState(DEFAULT_AGENT_DRAWER_HEIGHT);
+  const restoredHeight = useRef(false);
+  const viewport = useViewportHeight();
+
+  // The stored height lands a tick after mount, like the rest of the session,
+  // and only the first one counts: `remember` writes back into the same object,
+  // so a second restore would fight every drag.
+  const stored = where.agentDrawerHeight;
+  useEffect(() => {
+    if (restoredHeight.current || stored === undefined) return;
+    restoredHeight.current = true;
+    setChosen(stored);
+  }, [stored]);
+
+  /*
+   * What he chose and what fits are two different numbers, and only the second
+   * one is a height.
+   *
+   * Keeping the choice unclamped is what makes a narrow window a temporary
+   * condition rather than a decision: shrink the window and the drawer gives
+   * way, and the height he dragged to is still what comes back on a display
+   * that can hold it.
+   */
+  const height = clampDrawerHeight(chosen, viewport);
+  const maxHeight = clampDrawerHeight(AGENT_DRAWER_HEIGHT_BOUNDS.max, viewport);
+
+  const resize = useCallback(
+    (next: number) => {
+      const clamped = clampDrawerHeight(next, viewport);
+      setChosen(clamped);
+      remember({ agentDrawerHeight: clamped });
+    },
+    [remember, viewport],
+  );
+
   /* ------------------------------------------------------------- keystrokes */
 
   useKeyBindings([
+    /*
+     * The keyboard's own route to the divider.
+     *
+     * The handle is a focus stop and answers ↑ ↓ once it has focus, but ⇥ is
+     * claimed by both modes for their rail-and-list loop, so focus is not
+     * always a keystroke away. These are: they work from anywhere the drawer
+     * is open, including from inside its own input, and `?` lists them.
+     */
+    {
+      keys: "mod+alt+up",
+      group: "Agent",
+      description: "Taller",
+      allowInInput: true,
+      when: () => openId !== null,
+      handler: () => resize(height + RESIZE_STEP),
+    },
+    {
+      keys: "mod+alt+down",
+      group: "Agent",
+      description: "Shorter",
+      allowInInput: true,
+      when: () => openId !== null,
+      handler: () => resize(height - RESIZE_STEP),
+    },
     {
       // The palette's own ⇥ is a placeholder from before this unit existed;
       // this claims the keystroke at a higher priority while the palette is
@@ -178,8 +249,23 @@ export function AgentDock() {
   return (
     <>
       {open && (
+        <Resizer
+          axis="y"
+          size={height}
+          onResize={resize}
+          min={AGENT_DRAWER_HEIGHT_BOUNDS.min}
+          max={maxHeight}
+          label="Agent panel height"
+          // Full width, and pulled up over the border the bottom furniture
+          // already draws — see `App.tsx`. The line it lights while it moves
+          // is that same edge, not a second one.
+          className="w-full"
+        />
+      )}
+      {open && (
         <AgentDrawer
           session={open}
+          height={height}
           onMinimise={() => setOpenId(null)}
           onClose={() => close(open.id)}
           // Opening what the agent made is navigation, and navigation belongs
@@ -193,9 +279,12 @@ export function AgentDock() {
         />
       )}
 
+      {/* No rule above the pills: the drawer's own background already ends
+          where they begin, and when there is no drawer the container in
+          `App.tsx` draws the one edge the bottom of the window needs. */}
       <div
         aria-label="Agent sessions"
-        className="flex h-8 shrink-0 items-center gap-1.5 overflow-x-auto border-t border-border bg-surface px-3"
+        className="flex h-8 shrink-0 items-center gap-1.5 overflow-x-auto bg-surface px-3"
       >
         <Sparkles size={12} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
         {starting && sessions.length === 0 && (
@@ -213,4 +302,24 @@ export function AgentDock() {
       </div>
     </>
   );
+}
+
+/**
+ * How tall the window is, as state, so a resize re-clamps the drawer.
+ *
+ * Without it a drawer dragged tall on an external display would still be tall
+ * on the laptop the window was moved to, with the mail list behind it reduced
+ * to a strip.
+ */
+function useViewportHeight(): number {
+  const [height, setHeight] = useState(() =>
+    typeof window === "undefined" ? 0 : window.innerHeight,
+  );
+  useEffect(() => {
+    const measure = () => setHeight(window.innerHeight);
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
+  return height;
 }

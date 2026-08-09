@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_DRAWER_HEIGHT_BOUNDS,
   DEFAULT_PREFERENCES,
   LIST_WIDTH_BOUNDS,
   NO_NOTIFICATIONS,
@@ -353,6 +354,27 @@ describe("parseSession", () => {
 
   it("rejects an empty label id — 'no mailbox' is not a mailbox", () => {
     expect(parseSession({ labelId: "" }).labelId).toBeUndefined();
+  });
+
+  it("clamps a stored drawer height, and forgets one it cannot read", () => {
+    expect(parseSession({ agentDrawerHeight: 9000 }).agentDrawerHeight).toBe(
+      AGENT_DRAWER_HEIGHT_BOUNDS.max,
+    );
+    expect(parseSession({ agentDrawerHeight: 2 }).agentDrawerHeight).toBe(
+      AGENT_DRAWER_HEIGHT_BOUNDS.min,
+    );
+    expect(parseSession({ agentDrawerHeight: 320.4 }).agentDrawerHeight).toBe(320);
+    expect(parseSession({ agentDrawerHeight: "320" }).agentDrawerHeight).toBeUndefined();
+    expect(parseSession({ agentDrawerHeight: Number.NaN }).agentDrawerHeight).toBeUndefined();
+    expect(parseSession({}).agentDrawerHeight).toBeUndefined();
+  });
+
+  it("remembers the drawer height beside the divider, in the one session blob", () => {
+    // One key, one write: the drawer must not have invented a second store.
+    expect(parseSession({ listWidth: 480, agentDrawerHeight: 420 })).toEqual({
+      listWidth: 480,
+      agentDrawerHeight: 420,
+    });
   });
 });
 

@@ -11,8 +11,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::types::{
-    encode_base64url, AttachmentBody, Draft, HistoryListResponse, HistorySweep, Label,
-    LabelsListResponse, Message, MessageRef, MessagesListResponse, Profile, ThreadsListResponse,
+    encode_base64url, AttachmentBody, Draft, DraftsListResponse, HistoryListResponse, HistorySweep,
+    Label, LabelsListResponse, Message, MessageRef, MessagesListResponse, Profile,
+    ThreadsListResponse,
 };
 use super::{
     GoogleError, HttpMethod, HttpTransport, Page, RestClient, RetryPolicy, Sleeper, TokenProvider,
@@ -395,6 +396,66 @@ impl GmailClient {
     }
 
     // --------------------------------------------------------------- drafts
+
+    /// `users.drafts.list`, one page.
+    ///
+    /// # Why this endpoint has to exist
+    ///
+    /// A draft written on the phone arrives here through ordinary message sync,
+    /// carrying the `DRAFT` label — so Mach has the message and can show it, and
+    /// cannot edit it, because **the draft id is not on the message resource**.
+    /// `users.messages.get` will never return it, at any format. This is the only
+    /// endpoint that pairs a draft id with the message id it holds, which makes
+    /// it the only way `drafts.update` can ever address a draft Mach did not
+    /// create. Without it the alternatives are both wrong: refuse to edit, or
+    /// create a second draft beside the original.
+    ///
+    /// It is also cheap. The response carries ids only — no headers and no
+    /// bodies, whatever `format` a caller might wish for — so a mailbox with
+    /// four drafts answers in a few hundred bytes.
+    pub async fn drafts_list_page(
+        &self,
+        user_id: &str,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+    ) -> Result<Page<Draft>, GoogleError> {
+        let mut url = self.rest.endpoint(&["users", user_id, "drafts"])?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            if let Some(n) = max_results {
+                pairs.append_pair("maxResults", &n.to_string());
+            }
+            if let Some(token) = page_token {
+                pairs.append_pair("pageToken", token);
+            }
+        }
+        let response: DraftsListResponse = self.rest.send_json(HttpMethod::Get, url, None).await?;
+        Ok(Page::new(response.drafts, response.next_page_token))
+    }
+
+    /// Every draft in the mailbox, following `nextPageToken` to the end.
+    ///
+    /// Unpaged by design at the call site: the sweep that uses this has to know
+    /// the *whole* set, because a draft id it does not see is a draft that was
+    /// deleted somewhere else, and half an answer would read as half a deletion.
+    pub async fn drafts_list_all(
+        &self,
+        user_id: &str,
+        page_size: Option<u32>,
+    ) -> Result<Vec<Draft>, GoogleError> {
+        let mut out: Vec<Draft> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .drafts_list_page(user_id, page_size, token.as_deref())
+                .await?;
+            out.extend(page.items);
+            match page.next_page_token {
+                Some(next) => token = Some(next),
+                None => return Ok(out),
+            }
+        }
+    }
 
     /// `users.drafts.create`.
     ///

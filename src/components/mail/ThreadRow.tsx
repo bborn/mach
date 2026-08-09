@@ -22,9 +22,20 @@ interface ThreadRowProps {
    * space belongs to the subject.
    */
   context?: string;
+  /**
+   * Mark the preview as your own unsent text.
+   *
+   * Defaults to "does this conversation carry Gmail's `DRAFT` label", which is
+   * the fact; the Drafts mailbox passes `false`, because there the answer is
+   * the same on every row and the mark would be furniture.
+   */
+  draft?: boolean;
   onSelect: (event: MouseEvent) => void;
   onToggle: () => void;
 }
+
+/** The label Gmail files an unsent message under. Not a local invention. */
+export const GMAIL_DRAFT = "DRAFT";
 
 /**
  * Three lines: who, what, and a taste of it.
@@ -65,6 +76,15 @@ interface ThreadRowProps {
  * the cursor", and the cursor falls back to the quieter hover tone. Two states
  * on one row need two weights, and the loud one belongs to the set that is
  * about to be archived.
+ *
+ * # The preview line can be your own words
+ *
+ * A conversation whose most recent message is your unsent draft shows that
+ * draft as the preview, because it *is* the last thing on the conversation and
+ * hiding it would put stale text on the row. What was missing is whose words
+ * they are: an unsent reply read exactly like a received one. So the line is
+ * prefixed with **Draft**, in words rather than in colour, which is the same
+ * mark the message carries inside the thread.
  */
 export const ThreadRow = memo(function ThreadRow({
   thread,
@@ -74,6 +94,7 @@ export const ThreadRow = memo(function ThreadRow({
   checked,
   selecting,
   context,
+  draft = thread.labelIds.includes(GMAIL_DRAFT),
   onSelect,
   onToggle,
 }: ThreadRowProps) {
@@ -188,7 +209,11 @@ export const ThreadRow = memo(function ThreadRow({
           {thread.subject}
         </div>
 
-        <div className="truncate leading-tight text-faint-foreground">{thread.snippet}</div>
+        <div className="truncate leading-tight text-faint-foreground">
+          {draft && <span className="font-medium text-danger">Draft</span>}
+          {draft && <span className="text-faint-foreground"> · </span>}
+          {thread.snippet}
+        </div>
       </div>
     </div>
   );

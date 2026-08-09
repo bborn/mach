@@ -11,7 +11,7 @@
 //! | `op` | argument | returns |
 //! |---|---|---|
 //! | `prepare` | `threadId`, `kind` | `{ draft }` |
-//! | `loadDraft` | `draftId` or `threadId` | `{ draft \| null }` |
+//! | `loadDraft` | `draftId`, `messageId` or `threadId` | `{ draft \| null }` |
 //! | `saveDraft` | `draft` | `{ draft }` |
 //! | `discardDraft` | `draftId` | `{ ok }` |
 //! | `preview` | `draft` | `{ rfc822, headers }` |
@@ -101,17 +101,25 @@ pub async fn dispatch(
             Ok(json!({ "draft": prepared }))
         }
 
+        // Three keys, narrowest first. `messageId` is the reading pane's: it
+        // holds a row that *is* a draft and needs the editable copy behind it,
+        // and a thread can carry two drafts, so the thread-keyed lookup would
+        // hand back whichever was touched last rather than the one activated.
+        //
+        // It is also the one that can *write*: a draft written in another client
+        // has no editable copy here until the first time it is opened, and that
+        // is what `draft::load_draft_for_message` adopts.
         "loadDraft" => {
-            let found = match payload.get("draftId").and_then(Value::as_str) {
-                Some(id) => draft::load_draft(db, id)?,
-                None => match payload.get("threadId").and_then(Value::as_i64) {
-                    Some(thread_id) => draft::load_draft_for_thread(db, thread_id)?,
-                    None => {
-                        return Err(ComposeError::invalid(
-                            "loadDraft needs a draftId or a threadId",
-                        ))
-                    }
-                },
+            let found = if let Some(id) = payload.get("draftId").and_then(Value::as_str) {
+                draft::load_draft(db, id)?
+            } else if let Some(message_id) = payload.get("messageId").and_then(Value::as_i64) {
+                draft::load_draft_for_message(db, message_id, now)?
+            } else if let Some(thread_id) = payload.get("threadId").and_then(Value::as_i64) {
+                draft::load_draft_for_thread(db, thread_id)?
+            } else {
+                return Err(ComposeError::invalid(
+                    "loadDraft needs a draftId, a messageId or a threadId",
+                ));
             };
             Ok(json!({ "draft": found }))
         }

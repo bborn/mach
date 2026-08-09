@@ -537,6 +537,66 @@ describe("requests", () => {
     expect(detail?.messages[0]?.timestamp).toBe(1_700_000_000_000);
   });
 
+  it("carries `isDraft` across, so an unsent message is not drawn as a sent one", async () => {
+    // The fourth time this mapper has eaten a field, and the first with a
+    // safety consequence rather than a cosmetic one. `mapMessage` builds a
+    // fresh object literal and `WireMessage` is our own hand-written
+    // description of the wire, so a field nobody names is dropped with no type
+    // error — see the three tripwires at the bottom of `describe("events")`.
+    //
+    // Rust has serialized `isDraft` on every message since `compose::mirror`
+    // shipped. It arrived here as `undefined`, so a draft rendered in its
+    // thread exactly like a reply that had already gone out, while the agent
+    // told the owner the same thread carried a DRAFT label.
+    const { transport } = fakeTransport({
+      get_thread: {
+        thread: WIRE_THREAD,
+        messages: [
+          {
+            id: 900,
+            threadId: 41,
+            accountId: 2,
+            from: { email: "marcus@lumen.example" },
+            internalDate: 1_700_000_000_000,
+            snippet: "Started around 02:40 UTC",
+          },
+          {
+            id: 901,
+            threadId: 41,
+            accountId: 2,
+            from: { email: "alex@lumen.example" },
+            internalDate: 1_700_000_100_000,
+            bodyText: "Looking now — will have numbers by",
+            isDraft: true,
+          },
+        ],
+      },
+    });
+
+    const detail = await createIpcSource(transport).getThread(41);
+
+    expect(detail?.messages[0]?.isDraft).toBe(false);
+    expect(detail?.messages[1]?.isDraft).toBe(true);
+  });
+
+  it("treats a message the wire said nothing about as sent, not as a draft", async () => {
+    // The permissive direction is the other way round here than it is on a
+    // calendar: "the seam did not say" must not mark somebody's sent mail
+    // unsent, which would be a false alarm on every row of every thread.
+    const { transport } = fakeTransport({
+      get_thread: {
+        thread: WIRE_THREAD,
+        messages: [
+          { id: 900, threadId: 41, accountId: 2, snippet: "hi", isDraft: null },
+          { id: 901, threadId: 41, accountId: 2, snippet: "hi" },
+        ],
+      },
+    });
+
+    const detail = await createIpcSource(transport).getThread(41);
+    expect(detail?.messages.map((m) => m.isDraft)).toEqual([false, false]);
+  });
+
   it("returns null for a thread the store does not have", async () => {
     const { transport } = fakeTransport({ get_thread: null });
     expect(await createIpcSource(transport).getThread(1)).toBeNull();

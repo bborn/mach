@@ -321,6 +321,23 @@ pub struct ThreadsListResponse {
     pub result_size_estimate: Option<i64>,
 }
 
+/// `users.drafts.list`.
+///
+/// Each entry is a `{ id, message: { id, threadId } }` triple and nothing else —
+/// no headers, no bodies, however the request is formatted. That is the whole
+/// reason this endpoint is worth calling on every pass: it is the only place the
+/// draft id can be learned, and it costs one small request to learn all of them.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftsListResponse {
+    #[serde(default)]
+    pub drafts: Vec<Draft>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+    #[serde(default)]
+    pub result_size_estimate: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryMessage {

@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import { useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
+import { LIST_WIDTH_BOUNDS } from "@/lib/prefs";
 import { FlexPane, Pane, Resizer } from "@/components/ui/split";
 import { AccountRail } from "./AccountRail";
 import { ComposerDock } from "./ComposerDock";
@@ -266,7 +267,13 @@ export function MailMode() {
           <ThreadList />
         </SearchView>
       </Pane>
-      <Resizer width={ui.listWidth} onResize={onResize} />
+      <Resizer
+        size={ui.listWidth}
+        onResize={onResize}
+        min={LIST_WIDTH_BOUNDS.min}
+        max={LIST_WIDTH_BOUNDS.max}
+        label="Conversation list width"
+      />
       <FlexPane>
         {/* The composer grows at the bottom of the conversation it answers, so
             the message being replied to never leaves the screen. */}

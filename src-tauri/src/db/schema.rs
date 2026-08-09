@@ -50,7 +50,45 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 8,
         sql: M8_DRAFT_LOOKUP,
     },
+    Migration {
+        version: 9,
+        sql: M9_MESSAGE_DRAFT_ID,
+    },
 ];
+
+/// Migration 9 — which Gmail draft a message *is*.
+///
+/// A draft written in Gmail on the phone or on the web reaches Mach through
+/// ordinary message sync, carrying the `DRAFT` label, and that is where it
+/// stopped: the message was here, marked correctly, and could not be edited,
+/// because `drafts.update` is addressed by a **draft id** and the draft id is
+/// not on the message resource. It comes from `users.drafts.list` and from
+/// nowhere else.
+///
+/// So this is where it is kept: one nullable column on the message it belongs
+/// to, written only by the drafts sweep in `sync::mail`, read when a draft row
+/// is opened. It is deliberately *not* a table. The mapping is one string per
+/// draft, its lifetime is exactly the message's lifetime, and it is only ever
+/// read by message — three facts that describe a column.
+///
+/// It is also not a second copy of `compose_drafts.gmail_draft_id`, which
+/// answers a different question. This column says what **Gmail** reports about a
+/// message; that one says which draft the composer's editable row has bound
+/// itself to. They meet once, when a draft is first opened here and the id is
+/// copied across, and after that the composer's row is the only thing that
+/// pushes. Keeping them apart is what stops adoption from becoming the fourth
+/// duplicate-draft bug: sync can never rewrite what the editor owns, and the
+/// editor can never invent a draft id.
+///
+/// The index is partial because drafts are a handful of rows in a table of tens
+/// of thousands, and the one query that scans by this column — forgetting the
+/// ids of drafts Gmail no longer has — should cost the size of the draft set
+/// rather than the size of the mailbox.
+const M9_MESSAGE_DRAFT_ID: &str = r#"
+ALTER TABLE messages ADD COLUMN gmail_draft_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_messages_gmail_draft
+    ON messages (account_id, gmail_draft_id) WHERE gmail_draft_id IS NOT NULL;
+"#;
 
 /// Migration 8 — find a conversation by the draft in it.
 ///

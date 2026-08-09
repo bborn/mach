@@ -594,6 +594,11 @@ export function TimeGrid({
         {dragging && ghostPaint && (
           <div
             ref={ghost}
+            // Marks a live drag for anything that has to stand out of its way.
+            // Trackpad period navigation reads this: a swipe while a block is
+            // being dragged is the grid being scrolled, not a week being asked
+            // for. See `use-period-wheel.ts`.
+            data-calendar-drag
             className="pointer-events-none absolute overflow-hidden px-1.5 py-[2px]"
             style={{
               left:

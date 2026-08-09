@@ -10,8 +10,8 @@
 
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import type { Attachment } from "@/types";
-import { AttachmentRow } from "./ThreadMessage";
+import type { Attachment, Message } from "@/types";
+import { AttachmentRow, ThreadMessage } from "./ThreadMessage";
 
 function attachment(over: Partial<Attachment> = {}): Attachment {
   return {
@@ -109,5 +109,84 @@ describe("the attachment row", () => {
   it("renders nothing but the list when there is no status to report", () => {
     const html = row([attachment()]);
     expect(html).not.toContain('role="status"');
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+function message(over: Partial<Message> = {}): Message {
+  return {
+    id: 10,
+    threadId: 1,
+    accountId: 1,
+    from: { name: "Bruno Bornsztein", email: "bruno@example.com" },
+    to: [{ name: "Marcus Oyelaran", email: "marcus@lumen.example" }],
+    cc: [],
+    timestamp: Date.UTC(2026, 7, 9, 12, 2),
+    bodyText: "Numbers look right to me — shipping Thursday.",
+    attachments: [],
+    isDraft: false,
+    ...over,
+  };
+}
+
+function threadMessage(over: Partial<Message> = {}, expanded = false): string {
+  return renderToStaticMarkup(
+    <ThreadMessage
+      message={message(over)}
+      live={false}
+      expanded={expanded}
+      onToggle={() => {}}
+      onOpenDraft={() => {}}
+    />,
+  );
+}
+
+/**
+ * The claim: a message you have not sent cannot be mistaken for one you have.
+ *
+ * The bug this pins down shipped: the mirror put the draft in the conversation,
+ * the Drafts mailbox found it, Gmail synced it — and the row in the thread was
+ * pixel-identical to a sent reply, while the agent went on describing the
+ * thread as carrying a DRAFT label. The app and the agent contradicting each
+ * other in front of the owner is the failure; a colour swap would not have
+ * fixed it.
+ */
+describe("a draft inside a conversation", () => {
+  it("says the word, so it survives greyscale and a screen reader", () => {
+    const html = threadMessage({ isDraft: true });
+    expect(html).toContain(">Draft<");
+    // Colour is reinforcement on top of the word, never the thing carrying it.
+    expect(html).toContain("text-danger");
+  });
+
+  it("marks nothing on an ordinary message", () => {
+    const html = threadMessage();
+    expect(html).not.toContain(">Draft<");
+    expect(html).not.toContain("text-danger");
+    expect(html).not.toContain("data-draft");
+  });
+
+  it("is a real button, so the keyboard reaches it with no help", () => {
+    const html = threadMessage({ isDraft: true });
+    // Tab order, Enter and Space, and a focus ring, all for free. A div with an
+    // onClick looks the same and gives none of them.
+    expect(html).toContain('<button type="button"');
+    expect(html).not.toContain('role="button"');
+    expect(html).not.toContain("tabindex");
+    expect(html).toContain('title="Edit draft"');
+  });
+
+  it("does not pretend to expand, because editing is the only thing to do with it", () => {
+    // `aria-expanded` on a control that opens a composer would announce a
+    // disclosure that never discloses.
+    expect(threadMessage({ isDraft: true }, true)).not.toContain("aria-expanded");
+    expect(threadMessage({}, true)).toContain('aria-expanded="true"');
+  });
+
+  it("shows the draft's own text rather than an address, expanded or not", () => {
+    const html = threadMessage({ isDraft: true }, true);
+    expect(html).toContain("Numbers look right to me");
+    expect(html).not.toContain("bruno@example.com");
   });
 });

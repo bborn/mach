@@ -1835,3 +1835,160 @@ async fn editing_a_pushed_draft_does_not_grow_a_second_mirror() {
         .unwrap();
     assert!(drafts_mailbox(&db).is_empty());
 }
+
+// ============================================ opening a draft from its thread
+//
+// The mirror made a draft *visible* in the conversation. These cover the other
+// half: a row in the reading pane is a message id, and the thing behind it that
+// can actually be typed into is a `compose_drafts` row keyed by draft id.
+// Without a way across, the owner saw a message he had not sent and had no way
+// to finish it — "don't know how to edit it if it is a draft".
+
+/// The placeholder case: written locally, Gmail not told yet.
+#[tokio::test]
+async fn a_draft_row_in_a_thread_resolves_to_the_draft_it_is() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let saved = save_body(&db, &out, thread, "Both tax items are handled.", NOW).await;
+    let id = saved["id"].as_str().unwrap().to_string();
+
+    let mirror = messages_in(&db, thread)
+        .into_iter()
+        .find(|m| m.is_draft)
+        .expect("the draft is in the conversation");
+    assert!(
+        mirror.gmail_message_id.starts_with("mach-draft:"),
+        "not pushed yet, so it is still under the placeholder"
+    );
+
+    let found = dispatch(
+        &db,
+        &out,
+        json!({ "op": "loadDraft", "messageId": mirror.id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(found["draft"]["id"].as_str(), Some(id.as_str()));
+    assert_eq!(
+        found["draft"]["body"].as_str(),
+        Some("Both tax items are handled."),
+        "the body has to come back intact, or the composer opens empty over it"
+    );
+
+    // A message somebody actually sent has no draft behind it. Answering with
+    // the thread's nearest one would put another person's mail in the editor.
+    let sent = messages_in(&db, thread)
+        .into_iter()
+        .find(|m| !m.is_draft)
+        .unwrap();
+    let none = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": sent.id }))
+        .await
+        .unwrap();
+    assert!(none["draft"].is_null());
+}
+
+/// The adopted case, and the reason this is resolved in Rust rather than by
+/// parsing the placeholder in the UI. `adopt` renames the mirror to Gmail's own
+/// message id the moment a push lands — within a second of the first keystroke
+/// — and after that there is no `mach-draft:` prefix left to read.
+#[tokio::test]
+async fn a_pushed_draft_row_still_resolves_after_gmail_renames_it() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"r-draft-8","message":{"id":"gmsg-a","threadId":"gthread-1"}}"#,
+    ))]);
+    let out = outbox(&db, Arc::clone(&transport));
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+
+    let saved = save_body(&db, &out, thread, "first pass", NOW).await;
+    let id = saved["id"].as_str().unwrap().to_string();
+    sync.push(&id, NOW).await.unwrap();
+
+    let mirror = messages_in(&db, thread)
+        .into_iter()
+        .find(|m| m.is_draft)
+        .expect("still one draft in the conversation");
+    assert_eq!(mirror.gmail_message_id, "gmsg-a", "renamed by adopt");
+
+    let found = dispatch(
+        &db,
+        &out,
+        json!({ "op": "loadDraft", "messageId": mirror.id }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(found["draft"]["id"].as_str(), Some(id.as_str()));
+}
+
+/// Why the row is asked about by message rather than by thread: a conversation
+/// can hold two drafts — the agent leaves one, the owner starts another — and
+/// the thread-keyed lookup hands back whichever was typed in last, which is not
+/// necessarily the one that was activated.
+#[tokio::test]
+async fn two_drafts_on_one_thread_open_the_one_that_was_activated() {
+    let (db, account, thread, message) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    for (id, body, now) in [("d-older", "older text", NOW), ("d-newer", "newer text", NOW + 5_000)] {
+        dispatch(
+            &db,
+            &out,
+            json!({
+                "op": "saveDraft",
+                "draft": {
+                    "id": id,
+                    "accountId": account,
+                    "threadId": thread,
+                    "replyToId": message,
+                    "kind": "reply",
+                    "to": [{ "email": "dana@partner.com" }],
+                    "subject": "Re: Series A data room",
+                    "body": body,
+                },
+                "now": now,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let mirrors: Vec<_> = messages_in(&db, thread)
+        .into_iter()
+        .filter(|m| m.is_draft)
+        .collect();
+    assert_eq!(mirrors.len(), 2, "two drafts, two rows in the conversation");
+
+    for mirror in mirrors {
+        let expected = mirror
+            .gmail_message_id
+            .strip_prefix("mach-draft:")
+            .unwrap()
+            .to_string();
+        let found = dispatch(
+            &db,
+            &out,
+            json!({ "op": "loadDraft", "messageId": mirror.id }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found["draft"]["id"].as_str(), Some(expected.as_str()));
+    }
+
+    // The thread-keyed lookup is still what reopening a conversation uses, and
+    // still answers with the most recent — the two are different questions.
+    let by_thread = dispatch(&db, &out, json!({ "op": "loadDraft", "threadId": thread }))
+        .await
+        .unwrap();
+    assert_eq!(by_thread["draft"]["id"].as_str(), Some("d-newer"));
+}
+
+/// An empty payload is a bug in the caller, not an empty composer.
+#[tokio::test]
+async fn load_draft_still_refuses_a_payload_that_names_nothing() {
+    let (db, _a, _t, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let error = dispatch(&db, &out, json!({ "op": "loadDraft" })).await;
+    assert!(error.is_err());
+}

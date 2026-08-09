@@ -164,6 +164,8 @@ interface WireMessage {
   bodyText?: Nullable<string>;
   bodyHtml?: Nullable<string>;
   snippet?: Nullable<string>;
+  /** `db::models::Message.is_draft` — an unsent draft mirrored into the thread. */
+  isDraft?: Nullable<boolean>;
   attachments?: Nullable<WireAttachment[]>;
 }
 
@@ -486,6 +488,12 @@ export function mapMessage(wire: WireMessage): Message {
     // pane until the sandboxed iframe lands; the snippet is what Gmail shows.
     bodyText: text(wire.bodyText) || text(wire.snippet),
     bodyHtml: optional(wire.bodyHtml),
+    // Named here or it does not exist. Rust has serialized `isDraft` on every
+    // message since the mirror shipped; this literal dropped it, so a draft in
+    // a thread rendered as an ordinary sent message while the agent went on
+    // saying the thread carried a DRAFT label. Same trap as `recurringEventId`
+    // and all of migration 5 — see the tripwires in `ipc.test.ts`.
+    isDraft: wire.isDraft === true,
     attachments: (wire.attachments ?? []).map(mapAttachment),
   };
 }

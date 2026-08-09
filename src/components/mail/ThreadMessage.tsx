@@ -36,6 +36,11 @@ export interface ThreadMessageProps {
   live: boolean;
   expanded: boolean;
   onToggle: () => void;
+  /**
+   * Reopen this message in the composer. Only ever called for a draft; the
+   * reading pane resolves the row back to its editable copy.
+   */
+  onOpenDraft?: () => void;
 }
 
 /**
@@ -46,25 +51,62 @@ export interface ThreadMessageProps {
  * what keeps a forty-message thread cheap to open. Attachments follow the same
  * rule and take it further: expanding a message renders the chips, and nothing
  * is downloaded until one of them is activated.
+ *
+ * # A draft is not a message you sent
+ *
+ * A draft is mirrored into the conversation it answers, which is what puts it
+ * in the Drafts mailbox and on the phone. It used to render here identically to
+ * a sent reply: no mark, nothing to activate, and the agent meanwhile telling
+ * the owner the thread carried a DRAFT label. Somebody was going to close that
+ * thread believing they had answered it.
+ *
+ * So a draft row says **Draft**, in words. The colour is reinforcement and
+ * never the signal — the pill is bordered and labelled, so it survives being
+ * read in greyscale or by a screen reader. And the row *does* something:
+ * activating it opens the draft in the composer rather than unfolding a
+ * read-only copy of text nobody has finished writing. There is no expand state
+ * for a draft, because editing it is the only thing anyone wants from it.
  */
-export function ThreadMessage({ message, live, expanded, onToggle }: ThreadMessageProps) {
+export function ThreadMessage({
+  message,
+  live,
+  expanded,
+  onToggle,
+  onOpenDraft,
+}: ThreadMessageProps) {
   const attachments = message.attachments;
+  const draft = message.isDraft;
 
   return (
-    <article className="border-t border-border py-3 first:border-t-0">
+    <article
+      data-draft={draft || undefined}
+      className={cn(
+        "border-t border-border py-3 first:border-t-0",
+        // A second, redundant mark, for the reader scanning down the left edge
+        // rather than reading the row. Redundancy is the point: neither this
+        // nor the pill is the only thing saying "unsent".
+        draft && "-ml-3 border-l-2 border-l-danger pl-2.5",
+      )}
+    >
       <button
         type="button"
-        onClick={onToggle}
-        aria-expanded={expanded}
+        onClick={draft ? onOpenDraft : onToggle}
+        aria-expanded={draft ? undefined : expanded}
+        title={draft ? "Edit draft" : undefined}
         className={cn(
           "-mx-2 flex w-[calc(100%+1rem)] items-baseline gap-2 rounded-[var(--radius)] px-2 py-1 text-left",
           "hover:bg-row-hover",
         )}
       >
+        {draft && (
+          <span className="shrink-0 rounded-[3px] border border-danger px-1 font-medium text-micro uppercase tracking-wide text-danger">
+            Draft
+          </span>
+        )}
         <span className="shrink-0 truncate text-body font-medium text-foreground">
           {message.from.name}
         </span>
-        {expanded ? (
+        {expanded && !draft ? (
           <span className="min-w-0 flex-1 truncate text-micro text-faint-foreground">
             {message.from.email}
           </span>
@@ -81,7 +123,7 @@ export function ThreadMessage({ message, live, expanded, onToggle }: ThreadMessa
         </span>
       </button>
 
-      {expanded && (
+      {expanded && !draft && (
         <>
           <div className="mt-0.5 truncate text-micro text-faint-foreground">
             to {message.to.map((p) => p.name).join(", ") || "—"}

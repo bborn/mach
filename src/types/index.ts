@@ -88,6 +88,16 @@ export interface Message {
   bodyText: string;
   bodyHtml?: string;
   attachments: Attachment[];
+  /**
+   * Your own unsent text, mirrored into the conversation it answers.
+   *
+   * `messages.is_draft` in SQLite, set by `compose::mirror` for a draft Mach
+   * wrote and by the sync pass for one carrying Gmail's `DRAFT` label. Required
+   * rather than optional because every message has an answer to it and absent
+   * would only mean "the mapper forgot" — which is exactly what it did mean
+   * until this field was named in `mapMessage`.
+   */
+  isDraft: boolean;
 }
 
 export interface ThreadDetail {

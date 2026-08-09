@@ -124,8 +124,19 @@ pub struct MailSync {
 }
 
 impl MailSync {
-    /// One full pass: labels, then either a backfill or a history replay.
+    /// One full pass: labels, then either a backfill or a history replay, then
+    /// the draft ids.
     pub async fn run(&self) -> Result<u64, SyncError> {
+        let written = self.run_messages().await?;
+        // Deliberately last. The sweep writes onto message rows, so running it
+        // after the replay means a draft that appeared during *this* pass gets
+        // its id in the same pass rather than a minute later — which is the
+        // difference between "open it" and "open it in a moment".
+        self.sync_drafts().await?;
+        Ok(written)
+    }
+
+    async fn run_messages(&self) -> Result<u64, SyncError> {
         self.cancel.check()?;
         self.sync_labels().await?;
 
@@ -175,6 +186,88 @@ impl MailSync {
             }
             Ok(())
         })?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- drafts
+
+    /// Learn which Gmail draft each draft message is, and forget the ones Gmail
+    /// no longer has.
+    ///
+    /// # Why this runs on every pass
+    ///
+    /// `drafts.list` is one request returning ids only — no headers, no bodies —
+    /// and it is the only source of the draft id, without which a draft written
+    /// on the phone cannot be edited here at all. So the cadence is simply the
+    /// mail cadence: a minute by default, or whatever the sync-interval
+    /// preference says, because a draft *is* mail and someone typing on a phone
+    /// changes one every few seconds.
+    ///
+    /// That is the opposite end of the scale from
+    /// [`CALENDAR_LIST_MAX_AGE_MS`](crate::sync::calendar::CALENDAR_LIST_MAX_AGE_MS),
+    /// where six hours is right because the calendar list moves a few times a
+    /// year and re-fetching it every minute bought nothing. Here the same
+    /// arithmetic points the other way: five quota units against a daily budget
+    /// of 1.2 million, and the thing being fetched is what makes the feature
+    /// work.
+    ///
+    /// # Why a failure is not the pass's failure
+    ///
+    /// Mail is the point; the draft ids are what make the drafts among it
+    /// editable. A refused `drafts.list` should not take down the sync of an
+    /// entire mailbox — the same judgement `calendar::calendars` makes about
+    /// `calendarList.list`. The failure is not swallowed silently either: the
+    /// consequence shows up exactly where it matters, as a draft that says it
+    /// has not synced yet when it is opened, and the next pass clears it.
+    async fn sync_drafts(&self) -> Result<(), SyncError> {
+        self.cancel.check()?;
+        // Read before the request, not after: a draft created here while the
+        // response is in flight is newer than the answer, and must not be reaped
+        // by it. See `draft::forget_drafts_missing_from`.
+        let listed_at = now_ms();
+        let page_size = self.config.list_page_size;
+
+        let drafts = {
+            let _permit = self.limiter.acquire().await;
+            match self.gmail.drafts_list_all("me", Some(page_size)).await {
+                Ok(drafts) => drafts,
+                Err(_) => return Ok(()),
+            }
+        };
+        self.cancel.check()?;
+
+        let pairs: Vec<(String, String)> = drafts
+            .iter()
+            .filter(|d| !d.id.is_empty() && !d.message.id.is_empty())
+            .map(|d| (d.message.id.clone(), d.id.clone()))
+            .collect();
+        let live: Vec<String> = drafts
+            .iter()
+            .map(|d| d.id.clone())
+            .filter(|id| !id.is_empty())
+            .collect();
+
+        let account_id = self.account_id;
+        self.db.write(|conn| {
+            for (gmail_message_id, gmail_draft_id) in &pairs {
+                queries::set_message_draft_id(conn, account_id, gmail_message_id, gmail_draft_id)?;
+            }
+            queries::clear_missing_draft_ids(conn, account_id, &live)?;
+            Ok(())
+        })?;
+
+        // The composer's own rows are the other half of "deleted elsewhere
+        // stays deleted". They live in a table this module does not own, so the
+        // reaping is the composer's own function, called from here — the same
+        // arrangement `ipc::compose` documents for the module's path.
+        crate::ipc::compose::engine::draft::forget_drafts_missing_from(
+            &self.db,
+            account_id,
+            &live,
+            listed_at,
+        )
+        .map_err(|e| SyncError::Db(DbError::Other(format!("draft sweep: {e}"))))?;
+
         Ok(())
     }
 
@@ -462,11 +555,7 @@ impl MailSync {
     }
 
     fn window_start_ms(&self) -> i64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        now - self.config.backfill_window_days * 24 * 60 * 60 * 1000
+        now_ms() - self.config.backfill_window_days * 24 * 60 * 60 * 1000
     }
 
     // ------------------------------------------------------------ incremental

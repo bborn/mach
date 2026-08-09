@@ -38,6 +38,7 @@ import {
   type EventForm,
 } from "@/lib/calendar-edit";
 import { googleCalendarUrl } from "@/lib/calendar-links";
+import { usePeriodWheel } from "./use-period-wheel";
 import {
   DAY,
   MINUTE,
@@ -172,6 +173,31 @@ export function CalendarMode() {
   const finderOpen = finder !== null;
   const active =
     ui.mode === "calendar" && !ui.paletteOpen && !createOpen && !modalOpen && !finderOpen;
+
+  /**
+   * Two-finger navigation between periods. An addition to `n`/`p`/`j`/`k`/`t`
+   * and never a replacement: it is gated on the same `active` as the key
+   * bindings are, so the two surfaces agree about when the calendar is
+   * listening, and nothing on the calendar is reachable by gesture alone.
+   *
+   * Week and day give horizontal to the period and keep vertical for the hour
+   * grid, which is real scrollable content and the reason the grid exists.
+   * Month has nothing to scroll, so vertical moves a month there as well —
+   * which is the gesture people reach for first when a grid fills the window.
+   */
+  const grid = useRef<HTMLDivElement>(null);
+  usePeriodWheel({
+    ref: grid,
+    vertical: ui.calendarView === "month",
+    enabled: active,
+    // The same call `n`, `p` and the arrow buttons make. `shiftPeriod` reads the
+    // anchor out of the render it was built in, which would collapse two
+    // gestures into one if React had not committed between them; it always has,
+    // because a wheel stream puts a task boundary between every pair of events
+    // and the batch flushes on the microtask before it. Four quick flicks move
+    // four weeks with nothing forcing the issue.
+    onStep: (delta) => actions.shiftPeriod(delta),
+  });
 
   useEffect(() => {
     window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -1361,7 +1387,7 @@ export function CalendarMode() {
           onSettings={setSettings}
         />
 
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div ref={grid} className="flex min-h-0 min-w-0 flex-1 flex-col">
           {ui.calendarView === "month" ? (
             <MonthGrid
               days={days}

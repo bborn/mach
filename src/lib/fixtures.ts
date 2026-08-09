@@ -254,6 +254,9 @@ function build(): { threads: Thread[]; messages: Map<number, Message[]> } {
         timestamp: timestamp - (messageCount - 1 - m) * 47 * MINUTE,
         bodyText: seededBody(i + m, m === messageCount - 1 ? snippet : subject),
         attachments,
+        // Fixture mail is all sent mail. A draft only exists once the composer
+        // has written one, and there is no composer store behind `bun run dev`.
+        isDraft: false,
       });
     }
     messages.set(id, thread);
@@ -263,6 +266,51 @@ function build(): { threads: Thread[]; messages: Map<number, Message[]> } {
 }
 
 const built = build();
+
+/**
+ * One conversation carries an unfinished reply of your own.
+ *
+ * In the real store this row is written by `compose::mirror`: saving a draft
+ * puts an ordinary `messages` row with `is_draft = 1` inside the thread it
+ * answers, and a `DRAFT` label on the thread. Without one here, `bun run dev`
+ * could not render the single mailbox state where a message is *not* something
+ * somebody sent — which is exactly the state the reading pane got wrong.
+ *
+ * `src/lib/compose.ts` seeds the matching editable copy, so the draft opens.
+ */
+export const DRAFT_THREAD_ID = 2;
+export const DRAFT_MESSAGE_ID = 290;
+export const DRAFT_ID = "draft-fixture-2";
+export const DRAFT_BODY =
+  "Rolling back the autocomplete change now. I'll post before/after conversion once we have an hour of clean data —";
+
+function attachDraft(): void {
+  const thread = built.threads.find((t) => t.id === DRAFT_THREAD_ID);
+  const messages = built.messages.get(DRAFT_THREAD_ID);
+  const last = messages?.[messages.length - 1];
+  if (!thread || !messages || !last) return;
+  const account = accounts.find((a) => a.id === thread.accountId)!;
+  messages.push({
+    id: DRAFT_MESSAGE_ID,
+    threadId: DRAFT_THREAD_ID,
+    accountId: thread.accountId,
+    from: { name: ME.name, email: account.email },
+    to: [last.from],
+    cc: [],
+    timestamp: thread.timestamp + 4 * MINUTE,
+    bodyText: DRAFT_BODY,
+    attachments: [],
+    isDraft: true,
+  });
+  // The thread follows its newest message, draft or not — that is what the
+  // mirror does to `threads.snippet` and `threads.last_message_at`.
+  thread.labelIds = [...thread.labelIds, "DRAFT"];
+  thread.snippet = DRAFT_BODY;
+  thread.timestamp = thread.timestamp + 4 * MINUTE;
+  thread.messageCount = messages.length;
+}
+attachDraft();
+
 export const threads: Thread[] = built.threads;
 export const messagesByThread: Map<number, Message[]> = built.messages;
 

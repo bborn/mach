@@ -361,6 +361,10 @@ export function ComposerDock() {
 
   const hasThread = threadId !== null && detail !== null;
   const holding = pending !== null && pending.state === "holding";
+  // An unsent draft mirrored into this conversation. Read off the messages
+  // rather than asked of the store, so the strip and the row the reader is
+  // looking at cannot disagree.
+  const threadDraft = detail?.messages.some((message) => message.isDraft) ?? false;
 
   // A conversation is no longer the only reason this exists: `c` opens a draft
   // with no thread behind it, and the undo strip has to survive whatever the
@@ -419,6 +423,18 @@ export function ComposerDock() {
 
   if (!draft) {
     if (!hasThread) return null;
+    /*
+     * What the strip may honestly offer depends on whether this conversation
+     * already holds an unsent draft.
+     *
+     * `open()` resumes an existing draft ahead of preparing a new one — for
+     * every kind, because half-written text must not be thrown away by a
+     * keystroke. The consequence is that while a draft exists, `r`, `a` and
+     * `f` all do the same thing: they reopen it. Offering three labels for one
+     * behaviour is the same fault as drawing one control twice, so the strip
+     * collapses to the two things that remain true: a new message, and the
+     * draft.
+     */
     return (
       <div className="shrink-0 border-t border-border">
         <div className="mx-auto flex max-w-[72ch] items-center gap-3 px-5 py-2 text-micro text-faint-foreground">
@@ -429,27 +445,39 @@ export function ComposerDock() {
           >
             <Kbd keys={COMPOSER_KEYS.compose} /> new
           </button>
-          <button
-            type="button"
-            onClick={() => open("reply")}
-            className="inline-flex items-center gap-1.5 hover:text-foreground"
-          >
-            <Kbd keys={COMPOSER_KEYS.reply} /> reply
-          </button>
-          <button
-            type="button"
-            onClick={() => open("replyAll")}
-            className="inline-flex items-center gap-1.5 hover:text-foreground"
-          >
-            <Kbd keys={COMPOSER_KEYS.replyAll} /> reply all
-          </button>
-          <button
-            type="button"
-            onClick={() => open("forward")}
-            className="inline-flex items-center gap-1.5 hover:text-foreground"
-          >
-            <Kbd keys={COMPOSER_KEYS.forward} /> forward
-          </button>
+          {threadDraft ? (
+            <button
+              type="button"
+              onClick={() => open("reply")}
+              className="inline-flex items-center gap-1.5 text-danger hover:brightness-110"
+            >
+              <Kbd keys={COMPOSER_KEYS.reply} /> edit draft
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => open("reply")}
+                className="inline-flex items-center gap-1.5 hover:text-foreground"
+              >
+                <Kbd keys={COMPOSER_KEYS.reply} /> reply
+              </button>
+              <button
+                type="button"
+                onClick={() => open("replyAll")}
+                className="inline-flex items-center gap-1.5 hover:text-foreground"
+              >
+                <Kbd keys={COMPOSER_KEYS.replyAll} /> reply all
+              </button>
+              <button
+                type="button"
+                onClick={() => open("forward")}
+                className="inline-flex items-center gap-1.5 hover:text-foreground"
+              >
+                <Kbd keys={COMPOSER_KEYS.forward} /> forward
+              </button>
+            </>
+          )}
         </div>
       </div>
     );
