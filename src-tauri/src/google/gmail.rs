@@ -395,6 +395,79 @@ impl GmailClient {
             .await
     }
 
+    /// `users.messages.send` on the **upload** host.
+    ///
+    /// # Why a second way to send
+    ///
+    /// The ordinary endpoint takes the whole message base64url-encoded inside a
+    /// JSON field. That is fine for a reply and hopeless for a reply with a
+    /// photograph attached: the encoding costs a third on top, the JSON string
+    /// escaping costs more, and Google's request limit for the non-upload host
+    /// is far below the 25 MB message Gmail will actually accept. The upload
+    /// host takes the bytes as bytes.
+    ///
+    /// `uploadType=multipart` rather than `media` because the message is not the
+    /// only thing that has to arrive: `threadId` is what makes a reply land in
+    /// its conversation, and only the multipart form has anywhere to put it.
+    /// The body is a `multipart/related` document with two parts — the JSON
+    /// metadata, then the RFC822 message as `message/rfc822`.
+    ///
+    /// The response is an ordinary `Message`, so a caller cannot tell which road
+    /// the bytes took, which is the point: [`Outbox`](crate::compose::Outbox)
+    /// picks by size and nothing downstream branches.
+    pub async fn messages_send_upload(
+        &self,
+        user_id: &str,
+        rfc822: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<Message, GoogleError> {
+        let url = self.upload_endpoint(&["users", user_id, "messages", "send"])?;
+        let metadata = match thread_id {
+            Some(thread_id) => json!({ "threadId": thread_id }).to_string(),
+            None => "{}".to_string(),
+        };
+        let (content_type, body) = multipart_related(&metadata, rfc822);
+        self.rest
+            .send_as(HttpMethod::Post, url, Some(body), Some(&content_type))
+            .await
+            .and_then(json_body)
+    }
+
+    /// The upload host's URL for an endpoint.
+    ///
+    /// Google serves uploads from the same domain under a `/upload` prefix, so
+    /// this rewrites the path rather than the host — which keeps a test's
+    /// `with_base_url` pointing the upload path at the same fake server as
+    /// everything else.
+    fn upload_endpoint(&self, segments: &[&str]) -> Result<url::Url, GoogleError> {
+        let base = self.rest.base_url().trim_end_matches('/');
+        let (root, version) = match base.rsplit_once('/') {
+            Some((root, version)) if version.starts_with('v') => (root, version),
+            _ => (base, ""),
+        };
+        let upload_base = if version.is_empty() {
+            format!("{root}/upload")
+        } else {
+            format!("{root}/upload/{version}")
+        };
+        let mut url = url::Url::parse(&upload_base).map_err(|e| GoogleError::InvalidRequest {
+            message: format!("bad upload url {upload_base:?}: {e}"),
+        })?;
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| GoogleError::InvalidRequest {
+                    message: format!("upload url {upload_base:?} cannot have a path"),
+                })?;
+            path.pop_if_empty();
+            for segment in segments {
+                path.push(segment);
+            }
+        }
+        url.query_pairs_mut().append_pair("uploadType", "multipart");
+        Ok(url)
+    }
+
     // --------------------------------------------------------------- drafts
 
     /// `users.drafts.list`, one page.
@@ -692,6 +765,52 @@ impl GmailClient {
         let url = self.rest.endpoint(&["users", user_id, "profile"])?;
         self.rest.send_json(HttpMethod::Get, url, None).await
     }
+}
+
+/// A `multipart/related` body for the upload host: JSON metadata, then the
+/// message itself as bytes.
+///
+/// The boundary is derived from the length of the payload and a counter rather
+/// than being random. It only has to not occur in the parts, and a 60-character
+/// token of hex is not going to; making it unpredictable would buy nothing,
+/// because both parts are ours and the request is over TLS to one host.
+fn multipart_related(metadata: &str, rfc822: &[u8]) -> (String, Vec<u8>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let boundary = format!("mach-{:x}-{:x}", rfc822.len(), n);
+
+    let mut body: Vec<u8> = Vec::with_capacity(rfc822.len() + metadata.len() + 512);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n\
+             --{boundary}\r\nContent-Type: message/rfc822\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(rfc822);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    (
+        format!("multipart/related; boundary={boundary}"),
+        body,
+    )
+}
+
+/// Deserialize a response this module fetched with [`RestClient::send_as`],
+/// which returns the raw response rather than a typed one.
+fn json_body<T: serde::de::DeserializeOwned>(
+    response: super::HttpResponse,
+) -> Result<T, GoogleError> {
+    serde_json::from_slice(&response.body).map_err(|e| GoogleError::Deserialize {
+        message: format!(
+            "{e}; body started: {}",
+            String::from_utf8_lossy(&response.body)
+                .chars()
+                .take(256)
+                .collect::<String>()
+        ),
+    })
 }
 
 /// The `message` object a draft write takes: the bytes, and the conversation

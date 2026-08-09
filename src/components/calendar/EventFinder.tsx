@@ -54,7 +54,7 @@ export function EventFinder({
   const typed = query.trim().length > 0;
 
   return (
-    <div className="flex shrink-0 items-center gap-2 border-b border-border bg-surface-raised px-3 py-1.5">
+    <div className="flex shrink-0 items-center gap-2 border-b border-border bg-surface-raised px-3 py-1">
       <Search size={12} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
       <BareInput
         ref={field}

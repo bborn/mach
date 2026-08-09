@@ -59,6 +59,15 @@ const RETRY_BACKOFF_MS: i64 = 30_000;
 /// After this many failures the message stops trying and waits for a human.
 const MAX_ATTEMPTS: i64 = 5;
 
+/// Above this many raw bytes, a message goes to Gmail's upload host instead of
+/// being base64'd into a JSON field.
+///
+/// Five megabytes is well under where the JSON endpoint starts refusing and
+/// well over any message without a file attached, which is the property that
+/// matters: the ordinary path stays the ordinary path, and the one that only
+/// exists for attachments is only taken by messages that have them.
+pub const UPLOAD_ABOVE_BYTES: usize = 5 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OutboxState {
@@ -417,13 +426,20 @@ impl Outbox {
         })?;
 
         let client = self.clients.gmail(entry.account_id)?;
-        let result = client
-            .messages_send(
-                &self.user_id,
-                &rfc822,
-                entry.gmail_thread_id.as_deref(),
-            )
-            .await;
+        // Which road the bytes take is decided here and nowhere else. Below the
+        // threshold the JSON endpoint is one request with one encoding; above
+        // it, base64 inside a JSON string is both slower and — past a few
+        // megabytes — refused outright, so the upload host takes the message as
+        // bytes. Nothing else changes: the response is the same `Message`.
+        let result = if rfc822.len() > UPLOAD_ABOVE_BYTES {
+            client
+                .messages_send_upload(&self.user_id, &rfc822, entry.gmail_thread_id.as_deref())
+                .await
+        } else {
+            client
+                .messages_send(&self.user_id, &rfc822, entry.gmail_thread_id.as_deref())
+                .await
+        };
 
         match result {
             Ok(message) => {

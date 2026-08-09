@@ -1119,3 +1119,194 @@ fn restoring_an_empty_store_asks_for_nothing() {
     let needs = restore_accounts(&db, &MemoryTokenStore::default()).expect("restore accounts");
     assert!(needs.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// the wire sample
+// ---------------------------------------------------------------------------
+
+/// One fully-populated row of every shape the frontend maps, written out as
+/// JSON for `src/lib/ipc.test.ts` to read.
+///
+/// The frontend builds fresh object literals out of these payloads, so a field
+/// Rust starts sending is dropped in silence unless somebody names it in
+/// `mapThread`, `mapMessage`, `mapEvent` or `mapCalendar`. That has happened
+/// five times — `recurringEventId`, `htmlLink`, migration 5, migration 7,
+/// `isDraft` — and every time the field was missing from *both* the mapper and
+/// the frontend's hand-written description of the wire, so no amount of
+/// TypeScript could have caught it. Only the real payload can.
+///
+/// The chain that makes it hold:
+///
+///  1. These are struct literals with no `..Default::default()`, so a new
+///     column stops this file compiling until it is given a value here.
+///  2. The value is serialized through the real `serde` impls, so the key is
+///     spelled exactly as the frontend will receive it.
+///  3. The result is compared against the checked-in file, so a sample that
+///     was not regenerated fails here rather than passing quietly.
+///  4. `ipc.test.ts` then refuses to let the new key through unmapped.
+///
+/// Deliberately not a `TempDb` round trip: reading rows back would only test
+/// the columns the insert helper happens to fill, which is the same "only what
+/// somebody thought of" hole one layer down.
+#[test]
+fn the_wire_sample_is_what_the_frontend_will_receive() {
+    let participant = Participant {
+        name: Some("Alex Rivera".into()),
+        email: "alex@example.com".into(),
+    };
+
+    let thread = ThreadSummary {
+        id: 41,
+        account_id: 3,
+        account_email: "alex@example.com".into(),
+        account_colour_index: 2,
+        gmail_thread_id: "18f0c0ffee".into(),
+        participants: vec![participant.clone()],
+        subject: "Quarterly review".into(),
+        snippet: "Sending the deck ahead of Thursday".into(),
+        last_message_at: 1_700_000_000_000,
+        is_unread: true,
+        message_count: 4,
+        has_attachments: true,
+        label_ids: vec!["INBOX".into(), "STARRED".into()],
+    };
+
+    let message = Message {
+        id: 512,
+        thread_id: 41,
+        account_id: 3,
+        gmail_message_id: "18f0c0ffee01".into(),
+        rfc822_message_id: Some("<abc@example.com>".into()),
+        in_reply_to: Some("<prior@example.com>".into()),
+        references: Some("<root@example.com> <prior@example.com>".into()),
+        from: participant.clone(),
+        reply_to: vec![participant.clone()],
+        to: vec![participant.clone()],
+        cc: vec![participant.clone()],
+        bcc: vec![participant.clone()],
+        subject: "Quarterly review".into(),
+        body_html: Some("<p>Deck attached.</p>".into()),
+        // Empty on purpose, and it is not padding. `mapMessage` reads the
+        // snippet only when the plaintext body is empty, so a sample with both
+        // filled in would let a short-circuit pass for a field that is never
+        // read. Values here are chosen so no `||` or `??` hides a mapper's
+        // reach into the payload.
+        body_text: Some(String::new()),
+        snippet: "Deck attached.".into(),
+        internal_date: 1_700_000_000_000,
+        is_unread: true,
+        is_draft: true,
+        attachments: vec![Attachment {
+            id: 9,
+            message_id: 512,
+            gmail_attachment_id: Some("ANGjdJ".into()),
+            filename: "deck.pdf".into(),
+            mime_type: "application/pdf".into(),
+            size_bytes: 84_213,
+            local_path: Some("/tmp/deck.pdf".into()),
+        }],
+    };
+
+    let event = Event {
+        id: 77,
+        account_id: 3,
+        calendar_id: "primary".into(),
+        google_event_id: "evt_1".into(),
+        title: "Quarterly review".into(),
+        description: Some("Bring the deck".into()),
+        location: Some("Room 4".into()),
+        start_ts: 1_700_000_000_000,
+        end_ts: 1_700_003_600_000,
+        is_all_day: false,
+        attendees: vec![participant.clone()],
+        rsvp_status: Some(RsvpStatus::Accepted),
+        recurring_event_id: Some("evt_series".into()),
+        recurrence: vec!["RRULE:FREQ=WEEKLY;BYDAY=TH".into()],
+        reminders: Some(EventReminders {
+            use_default: false,
+            overrides: vec![EventReminder {
+                method: "popup".into(),
+                minutes: 10,
+            }],
+        }),
+        ical_uid: Some("evt_1@google.com".into()),
+        guests: vec![EventGuest {
+            email: "sam@example.com".into(),
+            name: Some("Sam Okafor".into()),
+            response: Some(RsvpStatus::Tentative),
+            optional: true,
+            organizer: false,
+            is_self: false,
+            resource: false,
+            comment: Some("Might be late".into()),
+        }],
+        conference: Some(EventConference {
+            id: Some("abc-defg-hij".into()),
+            name: Some("Google Meet".into()),
+            entry_points: vec![ConferenceEntry {
+                kind: "video".into(),
+                uri: "https://meet.google.com/abc-defg-hij".into(),
+                label: Some("meet.google.com/abc-defg-hij".into()),
+                pin: Some("123456".into()),
+                region_code: Some("US".into()),
+            }],
+            notes: Some("This meeting is being recorded".into()),
+        }),
+        creator: Some(participant.clone()),
+        attachments: vec![EventAttachment {
+            title: "Deck".into(),
+            url: "https://drive.google.com/file/d/1".into(),
+            mime_type: Some("application/pdf".into()),
+        }],
+        visibility: Some("private".into()),
+        transparency: Some("opaque".into()),
+        organizer: Some(participant.clone()),
+        organizer_self: Some(true),
+        guests_can_modify: Some(true),
+        status: "confirmed".into(),
+        html_link: Some("https://calendar.google.com/event?eid=1".into()),
+        updated_at: 1_700_000_100_000,
+    };
+
+    let calendar = mach_lib::ipc::types::Calendar {
+        id: "primary".into(),
+        account_id: 3,
+        account_email: "alex@example.com".into(),
+        name: "Alex Rivera".into(),
+        colour_index: 2,
+        event_count: 12,
+        description: Some("Work".into()),
+        background_color: Some("#0b8043".into()),
+        foreground_color: Some("#ffffff".into()),
+        color_id: Some("10".into()),
+        access_role: Some("owner".into()),
+        time_zone: Some("America/Chicago".into()),
+        primary: true,
+        selected: true,
+        deleted: false,
+    };
+
+    let sample = serde_json::json!({
+        "thread": thread,
+        "message": message,
+        "event": event,
+        "calendar": calendar,
+    });
+
+    let mut rendered = serde_json::to_string_pretty(&sample).expect("serialize sample");
+    rendered.push('\n');
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../src/lib/wire-sample.json");
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    if current != rendered {
+        // Rewritten rather than merely reported, because the next thing anyone
+        // would do is copy it out of the failure message by hand.
+        std::fs::write(&path, &rendered).expect("write wire sample");
+        panic!(
+            "src/lib/wire-sample.json was out of date and has been regenerated.\n\
+             Re-run the frontend tests: a field Rust now sends has to be mapped \
+             in src/lib/ipc.ts, or named as deliberately unmapped there."
+        );
+    }
+}

@@ -29,6 +29,29 @@
  * unread state. The spacing is one spacing: there is no density setting, and
  * `--spacing-row` below is the three-line thread row, which is the tallest
  * thing in the app that repeats.
+ *
+ * # The spacing grid is 4pt
+ *
+ * Padding, gaps and margins come from **4 / 8 / 12 / 16 / 20 / 24** — Tailwind's
+ * `-1 -2 -3 -4 -5 -6`. The half-steps are not available: `gap-1.5`, `px-2.5`,
+ * `py-[3px]` and friends put 6px, 10px and 3px into a layout built on 4s, and a
+ * half-step between two grid values is what makes a screen feel unresolved
+ * without anyone being able to point at the element responsible. A measurement
+ * of the calendar on 2026-08-09 found 6px 109 times, against 8px 114 times.
+ *
+ * Three things are allowed off the grid:
+ *
+ *   1. **1px** for borders, dividers, and the hairline between two event blocks.
+ *   2. **2px, inside a painted block.** An event block's height comes from its
+ *      duration; a 30-minute meeting is 24px tall and holds one 15px line, so
+ *      its vertical inset is 2px or it is zero. `EventBlock.tsx` is the only
+ *      place this applies.
+ *   3. **The measured values in `calendar-geometry.ts`** — the 56px time gutter,
+ *      the 13px drag-create strip, the 6px resize handle, the 22px all-day chip
+ *      on a 24px pitch. Those are Google Calendar's numbers, recorded in
+ *      `docs/calendar-ux-brief.md`, which exists so that we copy them rather
+ *      than round them. Each is a hit target, a height or an offset. None of
+ *      them is the space between two things.
  */
 
 :root {
@@ -175,11 +198,42 @@
   --spacing-rail: var(--rail-width);
   --spacing-list: var(--list-width);
 
-  /* Dense UI type ramp. `list` is the workhorse — thread rows and grid labels. */
+  /*
+   * The type ramp: five steps, each with one job.
+   *
+   * It used to be four, and the calendar used the bottom two — 11px and 13px,
+   * with a hardcoded 12px inside the blocks. Measured across the week grid that
+   * came out as 11px×77, 12px×63, 13px×9: a day header, an event title and a
+   * footer hint within 2px of each other, and nothing anywhere for the eye to
+   * land on. What the ramp was short of was a step above `reading`, which is
+   * what an anchor gets promoted to.
+   *
+   *   micro    11  metadata that is read second: times, counts, key hints,
+   *                the hour gutter, the all-day label, group headers
+   *   list     13  the workhorse — rows, buttons, controls, sender names
+   *   body     14  the line a surface is read *for*: a thread's subject
+   *   reading  15  prose, and the period a view is showing
+   *   title    17  one per view, and only one: the calendar's day number, the
+   *                open conversation's subject
+   *
+   * Density pays nothing for this. The three sizes that carry most of the
+   * pixels (micro, list, body) are unchanged, and the step above them is spent
+   * on two elements per surface. The thread row is still three lines in the
+   * same 4.25rem: the subject going 13→14 is paid for by the preview going
+   * 13→11.
+   *
+   * The event grid keeps its own 12px, set in `calendar-geometry.ts` rather than
+   * here: it is a density figure measured off Google Calendar, not a step of
+   * this ramp, and no class ever asks for it.
+   *
+   * `cn()` in `lib/utils.ts` has to know every name here — see the comment there
+   * for what happens when it does not.
+   */
   --text-micro: 0.6875rem;
   --text-list: 0.8125rem;
   --text-body: 0.875rem;
   --text-reading: 0.9375rem;
+  --text-title: 1.0625rem;
 
   --font-sans:
     ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI",

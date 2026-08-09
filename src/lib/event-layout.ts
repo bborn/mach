@@ -23,6 +23,8 @@
  * event only overlaps something it sits strictly inside.
  */
 
+import { clusterPlan } from "./calendar-geometry";
+
 export interface LayoutInput {
   /** Any stable identity: local row ids are numbers, tests use strings. */
   id: string | number;
@@ -103,10 +105,33 @@ function layoutCluster<T extends LayoutInput>(cluster: readonly T[]): LaidOutEve
 }
 
 /**
- * Percentage geometry for a laid-out event, with a hairline gutter so adjacent
+ * Where a laid-out event actually sits, with a hairline gutter so adjacent
  * blocks read as separate cards rather than one striped rectangle.
+ *
+ * Two shapes, chosen by `clusterPlan` — see the long note in
+ * `calendar-geometry.ts` for why a deep cluster stops dividing:
+ *
+ *   **divide**   the columns share the width. Percentages, so this is correct
+ *                before anything has been measured and at any window size.
+ *   **cascade**  every block starts at its own offset and runs to the right
+ *                edge of the cluster, drawn over the one before it. Pixels,
+ *                because the offset is a legibility floor rather than a
+ *                fraction: 18px stays 18px whatever the column is doing.
+ *
+ * `clusterWidth` is the measured width of the day column's block area. Zero
+ * means not measured yet, and divides — which is what the first frame wants.
  */
-export function columnGeometry(laid: LaidOutEvent): { left: string; width: string } {
+export function columnGeometry(
+  laid: LaidOutEvent,
+  clusterWidth = 0,
+): { left: string; width: string } {
+  const plan = clusterPlan(laid.columns, clusterWidth);
+
+  if (plan.mode === "cascade") {
+    const left = Math.round(laid.column * plan.step);
+    return { left: `${left + 1}px`, width: `calc(100% - ${left + 2}px)` };
+  }
+
   const unit = 100 / laid.columns;
   return {
     left: `calc(${laid.column * unit}% + 1px)`,

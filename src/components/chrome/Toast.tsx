@@ -152,7 +152,7 @@ export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastL
       // rows underneath stay clickable right up to the toast's own edges.
       className={cn(
         "pointer-events-auto flex w-fit max-w-[26rem] items-center gap-2",
-        "rounded-[var(--radius)] border bg-surface-raised px-2.5 py-1.5",
+        "rounded-[var(--radius)] border bg-surface-raised px-3 py-2",
         "shadow-[0_6px_20px_-4px_rgb(0_0_0/0.28)]",
         error ? "border-danger" : "border-border-strong",
         /*
@@ -210,7 +210,7 @@ export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastL
           aria-label={action.title}
           title={action.title}
           className={cn(
-            "ml-1 inline-flex shrink-0 items-center gap-1 rounded-[3px] px-1.5 py-0.5",
+            "ml-1 inline-flex shrink-0 items-center gap-1 rounded-[3px] px-2 py-1",
             "text-list text-accent transition-colors hover:bg-row-hover",
           )}
         >
@@ -224,7 +224,7 @@ export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastL
         onClick={onDismiss}
         aria-label="Dismiss"
         title="Dismiss"
-        className="shrink-0 rounded-[3px] p-0.5 text-faint-foreground transition-colors hover:text-foreground"
+        className="shrink-0 rounded-[3px] p-1 text-faint-foreground transition-colors hover:text-foreground"
       >
         <X size={12} strokeWidth={2} aria-hidden />
       </button>

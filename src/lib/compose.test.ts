@@ -1,8 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createKeymap, type KeyEventLike } from "./keymap";
+import { withHtmlSignature } from "./email-html";
 import {
+  bodyAsHtml,
   COMPOSER_KEYS,
   createAutosave,
+  hasWrittenBody,
+  humanSize,
+  isDraftEmpty,
   formatRecipients,
   isLocalOnly,
   newDraft,
@@ -387,5 +392,143 @@ describe("a draft written in another client", () => {
     // in the conversation it was written into, so it keeps the dock.
     const adopted: Draft = { ...newDraft(1), kind: "adopted", threadId: 41 };
     expect(adopted.kind === "new").toBe(false);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The body, and what counts as an empty draft                                 */
+/* -------------------------------------------------------------------------- */
+
+describe("bodyAsHtml", () => {
+  it("hands back HTML untouched", () => {
+    const draft: Draft = { ...newDraft(1), body: "<div>Hi</div>", bodyFormat: "html" };
+    expect(bodyAsHtml(draft)).toBe("<div>Hi</div>");
+  });
+
+  it("renders a draft written before the editor was rich text", () => {
+    // The one place the old grammar is still read. A reply half-written last
+    // week opens with its `**bold**` already bold rather than showing the owner
+    // his own asterisks.
+    const draft: Draft = { ...newDraft(1), body: "**Yes** — on it.", bodyFormat: "markdown" };
+    expect(bodyAsHtml(draft)).toBe("<p><strong>Yes</strong> — on it.</p>");
+  });
+
+  it("treats a row with no format at all as the old one", () => {
+    // The SQLite default is `markdown` for exactly this reason, and a payload
+    // that omits the field has to agree with the column.
+    const draft = { ...newDraft(1), body: "*hi*", bodyFormat: undefined } as Draft;
+    expect(bodyAsHtml(draft)).toBe("<p><em>hi</em></p>");
+  });
+});
+
+describe("isDraftEmpty", () => {
+  const html = (body: string): Draft => ({ ...newDraft(1), body, bodyFormat: "html" });
+
+  it("knows an untouched rich-text editor is empty", () => {
+    expect(isDraftEmpty(html(""))).toBe(true);
+    // What a contenteditable contains when nothing has been typed into it.
+    expect(isDraftEmpty(html("<div><br></div>"))).toBe(true);
+  });
+
+  it("does not count the signature as something the user wrote", () => {
+    // A composer that opened, signed itself and was closed again must not leave
+    // a draft row behind — or the conversation offers an empty reply for ever.
+    const signed = html(withHtmlSignature("<div><br></div>", "Bruno\nMach"));
+    expect(isDraftEmpty(signed)).toBe(true);
+    expect(hasWrittenBody(signed)).toBe(false);
+  });
+
+  it("counts a recipient, a subject or a file as content on their own", () => {
+    expect(isDraftEmpty({ ...html(""), to: [{ email: "a@b.c" }] })).toBe(false);
+    expect(isDraftEmpty({ ...html(""), subject: "Numbers" })).toBe(false);
+    expect(
+      isDraftEmpty({
+        ...html(""),
+        attachments: [
+          { id: "a1", draftId: "d1", filename: "q3.csv", mimeType: "text/csv", sizeBytes: 12 },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it("counts typing as content", () => {
+    expect(isDraftEmpty(html("<div>ok</div>"))).toBe(false);
+  });
+});
+
+describe("humanSize", () => {
+  it("says what a person would say", () => {
+    expect(humanSize(512)).toBe("512 bytes");
+    expect(humanSize(2048)).toBe("2 KB");
+    expect(humanSize(5 * 1024 * 1024)).toBe("5.0 MB");
+  });
+});
+
+describe("the composer's keys", () => {
+  it("does not claim a key another live binding already has", () => {
+    // `mod+backspace` is the calendar's "delete this event" as well, and both
+    // are registered — but the calendar's only lives while its modal is up, so
+    // the two can never be offered at once. `conflicts` reports same-priority
+    // ties among *live* bindings, which is the question that matters.
+    const keymap = createKeymap("meta");
+    keymap.register({
+      keys: COMPOSER_KEYS.discard,
+      priority: 100,
+      allowInInput: true,
+      handler: () => {},
+    });
+    keymap.register({
+      keys: COMPOSER_KEYS.attach,
+      priority: 100,
+      allowInInput: true,
+      handler: () => {},
+    });
+    keymap.register({
+      keys: "mod+backspace",
+      priority: 120,
+      when: () => false, // the event modal, which is not up
+      handler: () => {},
+    });
+    expect(keymap.conflicts()).toEqual([]);
+  });
+
+  it("keeps ⌘K for the editor's link only while a composer has it", () => {
+    const keymap = createKeymap("meta");
+    let palette = 0;
+    let link = 0;
+    keymap.register({
+      keys: "mod+k",
+      allowInInput: true,
+      priority: 200,
+      handler: () => {
+        palette += 1;
+      },
+    });
+    let composing = false;
+    keymap.register({
+      keys: "mod+k",
+      allowInInput: true,
+      priority: 210,
+      when: () => composing,
+      handler: () => {
+        link += 1;
+      },
+    });
+
+    const press = (): KeyEventLike => ({
+      key: "k",
+      code: "KeyK",
+      metaKey: true,
+      ctrlKey: false,
+      altKey: false,
+      shiftKey: false,
+    });
+    keymap.handle(press());
+    expect([palette, link]).toEqual([1, 0]);
+
+    composing = true;
+    keymap.handle(press());
+    expect([palette, link]).toEqual([1, 1]);
+    expect(keymap.conflicts()).toEqual([]);
   });
 });

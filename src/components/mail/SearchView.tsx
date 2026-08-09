@@ -30,7 +30,7 @@ import {
 import type { Label, Thread, ThreadCursor } from "@/types";
 import { getDataSource } from "@/lib/data";
 import { useKeyBindings } from "@/hooks/useKeymap";
-import { useMach } from "@/hooks/useMach";
+import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { mailboxName } from "@/lib/mailboxes";
 import {
   SEARCH_OPERATORS,
@@ -69,7 +69,7 @@ export function SearchView({ children }: { children: ReactNode }) {
   const input = useRef<HTMLInputElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
 
-  const live = open && ui.mode === "mail" && !ui.paletteOpen;
+  const live = open && ui.mode === "mail" && !overlayOwnsKeyboard(ui);
   // Bindings that move a cursor must not fire while the caret is in the box —
   // `j` there is a letter. The registry already refuses non-`allowInInput`
   // bindings inside an input; this is the same question asked of *our* input,
@@ -216,7 +216,14 @@ export function SearchView({ children }: { children: ReactNode }) {
 
   /* ---------------------------------------------------------- keyboard --- */
 
-  const mail = ui.mode === "mail" && !ui.paletteOpen;
+  /*
+   * `/` and ⌘F are registered above the palette at 210, which also puts them
+   * above the floor a dialog's claim on the keyboard imposes — so unlike the
+   * rest of mail they are not silenced by it and have to say so themselves.
+   * Searching the list behind preferences is not destructive; it is still the
+   * list answering a key that was not aimed at it.
+   */
+  const mail = ui.mode === "mail" && !overlayOwnsKeyboard(ui);
 
   useKeyBindings([
     {

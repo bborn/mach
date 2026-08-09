@@ -1,0 +1,178 @@
+{
+  "calendar": {
+    "accessRole": "owner",
+    "accountEmail": "alex@example.com",
+    "accountId": 3,
+    "backgroundColor": "#0b8043",
+    "colorId": "10",
+    "colourIndex": 2,
+    "deleted": false,
+    "description": "Work",
+    "eventCount": 12,
+    "foregroundColor": "#ffffff",
+    "id": "primary",
+    "name": "Alex Rivera",
+    "primary": true,
+    "selected": true,
+    "timeZone": "America/Chicago"
+  },
+  "event": {
+    "accountId": 3,
+    "attachments": [
+      {
+        "mimeType": "application/pdf",
+        "title": "Deck",
+        "url": "https://drive.google.com/file/d/1"
+      }
+    ],
+    "attendees": [
+      {
+        "email": "alex@example.com",
+        "name": "Alex Rivera"
+      }
+    ],
+    "calendarId": "primary",
+    "conference": {
+      "entryPoints": [
+        {
+          "kind": "video",
+          "label": "meet.google.com/abc-defg-hij",
+          "pin": "123456",
+          "regionCode": "US",
+          "uri": "https://meet.google.com/abc-defg-hij"
+        }
+      ],
+      "id": "abc-defg-hij",
+      "name": "Google Meet",
+      "notes": "This meeting is being recorded"
+    },
+    "creator": {
+      "email": "alex@example.com",
+      "name": "Alex Rivera"
+    },
+    "description": "Bring the deck",
+    "endTs": 1700003600000,
+    "googleEventId": "evt_1",
+    "guests": [
+      {
+        "comment": "Might be late",
+        "email": "sam@example.com",
+        "isSelf": false,
+        "name": "Sam Okafor",
+        "optional": true,
+        "organizer": false,
+        "resource": false,
+        "response": "tentative"
+      }
+    ],
+    "guestsCanModify": true,
+    "htmlLink": "https://calendar.google.com/event?eid=1",
+    "iCalUID": "evt_1@google.com",
+    "id": 77,
+    "isAllDay": false,
+    "location": "Room 4",
+    "organizer": {
+      "email": "alex@example.com",
+      "name": "Alex Rivera"
+    },
+    "organizerSelf": true,
+    "recurrence": [
+      "RRULE:FREQ=WEEKLY;BYDAY=TH"
+    ],
+    "recurringEventId": "evt_series",
+    "reminders": {
+      "overrides": [
+        {
+          "method": "popup",
+          "minutes": 10
+        }
+      ],
+      "useDefault": false
+    },
+    "rsvpStatus": "accepted",
+    "startTs": 1700000000000,
+    "status": "confirmed",
+    "title": "Quarterly review",
+    "transparency": "opaque",
+    "updatedAt": 1700000100000,
+    "visibility": "private"
+  },
+  "message": {
+    "accountId": 3,
+    "attachments": [
+      {
+        "filename": "deck.pdf",
+        "gmailAttachmentId": "ANGjdJ",
+        "id": 9,
+        "localPath": "/tmp/deck.pdf",
+        "messageId": 512,
+        "mimeType": "application/pdf",
+        "sizeBytes": 84213
+      }
+    ],
+    "bcc": [
+      {
+        "email": "alex@example.com",
+        "name": "Alex Rivera"
+      }
+    ],
+    "bodyHtml": "<p>Deck attached.</p>",
+    "bodyText": "",
+    "cc": [
+      {
+        "email": "alex@example.com",
+        "name": "Alex Rivera"
+      }
+    ],
+    "from": {
+      "email": "alex@example.com",
+      "name": "Alex Rivera"
+    },
+    "gmailMessageId": "18f0c0ffee01",
+    "id": 512,
+    "inReplyTo": "<prior@example.com>",
+    "internalDate": 1700000000000,
+    "isDraft": true,
+    "isUnread": true,
+    "references": "<root@example.com> <prior@example.com>",
+    "replyTo": [
+      {
+        "email": "alex@example.com",
+        "name": "Alex Rivera"
+      }
+    ],
+    "rfc822MessageId": "<abc@example.com>",
+    "snippet": "Deck attached.",
+    "subject": "Quarterly review",
+    "threadId": 41,
+    "to": [
+      {
+        "email": "alex@example.com",
+        "name": "Alex Rivera"
+      }
+    ]
+  },
+  "thread": {
+    "accountColourIndex": 2,
+    "accountEmail": "alex@example.com",
+    "accountId": 3,
+    "gmailThreadId": "18f0c0ffee",
+    "hasAttachments": true,
+    "id": 41,
+    "isUnread": true,
+    "labelIds": [
+      "INBOX",
+      "STARRED"
+    ],
+    "lastMessageAt": 1700000000000,
+    "messageCount": 4,
+    "participants": [
+      {
+        "email": "alex@example.com",
+        "name": "Alex Rivera"
+      }
+    ],
+    "snippet": "Sending the deck ahead of Thursday",
+    "subject": "Quarterly review"
+  }
+}

@@ -110,9 +110,25 @@ function shadowFor(
   selected: boolean,
   chip: boolean,
   gap: string,
+  /**
+   * A cascaded block's left edge, one pixel wide.
+   *
+   * In a cluster that cascades, blocks overlap rather than sitting in their own
+   * columns, so the 1px gutter that separates two divided blocks is not there.
+   * Two events on the same calendar would otherwise merge into one long
+   * rectangle with a rounded notch in it.
+   *
+   * The hairline is the block's own ink, which is what the selection cursor's
+   * inner band uses and for the same reason: `paintFor` chose it to clear 4.5:1
+   * against this fill, so the separation is guaranteed. It is suppressed while
+   * selected, because the cursor's gap band starts 2px out and a hairline drawn
+   * over it would nick the mark.
+   */
+  cascadeEdge?: string,
 ): string | undefined {
   const layers = [
     border,
+    selected ? undefined : cascadeEdge,
     selected ? (chip ? selectionShadowChip(gap) : selectionShadow(gap)) : undefined,
   ];
   const drawn = layers.filter((layer): layer is string => layer !== undefined);
@@ -154,6 +170,12 @@ export interface EventBlockProps {
   height: number;
   /** Rendered width in px. Under ~120px only the start time fits. */
   width: number;
+  /**
+   * This block is cascaded over the one to its left, so it draws its own edge.
+   * Only ever true for a block whose cluster stopped dividing — see
+   * `clusterPlan` in `calendar-geometry.ts`.
+   */
+  cascaded?: boolean;
   /** True while this block is the one being dragged — the ghost has it now. */
   dimmed?: boolean;
   /**
@@ -211,6 +233,7 @@ export function EventBlock({
   copies,
   height,
   width,
+  cascaded = false,
   dimmed = false,
   resizable = false,
   style,
@@ -220,7 +243,7 @@ export function EventBlock({
   onPointerEnter,
   onPointerLeave,
 }: EventBlockProps) {
-  const plan = blockPlan(height, { hasLocation: Boolean(event.location) });
+  const plan = blockPlan(height, { hasLocation: Boolean(event.location), width });
   const painted = paintFor(color, tone, { dark, past });
   const paint = dimmed ? faded(painted) : painted;
   // A half-width block cannot hold "1:30p – 2:15p" without ellipsising the one
@@ -295,7 +318,13 @@ export function EventBlock({
         // Selection is a halo on the outside; `:focus-visible` in globals.css
         // draws its outline on the inside. Two different marks, so "the cursor
         // is here" and "the browser focus is here" never read as one thing.
-        boxShadow: shadowFor(ring, selected, false, painted.selectionGap),
+        boxShadow: shadowFor(
+          ring,
+          selected,
+          false,
+          painted.selectionGap,
+          cascaded ? `-1px 0 0 0 ${painted.selectionGap}` : undefined,
+        ),
         // A dashed border cannot be faked with an inset shadow; tentative
         // events get a real one, inset so it does not change the geometry.
         // A sliver has no room for one either — see `sliverOutline` above.
@@ -304,7 +333,11 @@ export function EventBlock({
             ? `1px dashed ${paint.border}`
             : undefined,
         outlineOffset: paint.borderStyle === "dashed" && !sliverOutline ? -1 : undefined,
-        padding: plan.tier === "full" || plan.tier === "twoLine" ? "2px 6px" : 0,
+        // 2px is the documented exception to the 4pt grid (see globals.css): a
+        // 30-minute block is 24px tall and holds one 15px line, so its vertical
+        // inset is 2 or it is zero. The horizontal inset is on the grid at 4,
+        // which also returns four pixels to the title in a crowded column.
+        padding: plan.tier === "full" || plan.tier === "twoLine" ? "2px 4px" : 0,
         touchAction: onGrab ? "none" : undefined,
         ...style,
       }}
@@ -398,7 +431,7 @@ function SliverLine({
 }) {
   return (
     <span
-      className="pointer-events-none absolute inset-x-0 flex items-center gap-1 overflow-hidden px-1.5"
+      className="pointer-events-none absolute inset-x-0 flex items-center gap-1 overflow-hidden px-1"
       style={{
         top: "50%",
         transform: "translateY(-50%)",
@@ -410,14 +443,19 @@ function SliverLine({
       }}
     >
       <span
-        className={cn("min-w-0 shrink overflow-hidden font-medium", strike && "line-through")}
+        className={cn("min-w-0 shrink overflow-hidden font-semibold", strike && "line-through")}
         style={{ textOverflow: "ellipsis", color: titleColor }}
       >
-        {title},
+        {plan.showTime ? `${title},` : title}
       </span>
-      <span className="shrink-0 tabular-nums" style={{ color: paint }}>
-        {time}
-      </span>
+      {plan.showTime && (
+        <span
+          className="shrink-0 tabular-nums font-normal"
+          style={{ color: paint, fontSize: plan.timeFontPx }}
+        >
+          {time}
+        </span>
+      )}
     </span>
   );
 }
@@ -441,36 +479,56 @@ function Stacked({
   };
 
   // One line, comma-joined. The title ellipsises; the time never does, because
-  // the time is what disambiguates two blocks with similar names.
+  // the time is what disambiguates two blocks with similar names — right up
+  // until the block is too narrow for both, at which point the title wins and
+  // the grid position is left to say when.
   if (plan.inlineTime) {
     return (
-      <span className="flex items-center gap-1 px-1.5" style={lineStyle}>
-        <span className={cn("min-w-0 shrink truncate font-medium", strike && "line-through")}>
-          {event.title},
+      <span className="flex items-center gap-1 px-1" style={lineStyle}>
+        <span className={cn("min-w-0 shrink truncate font-semibold", strike && "line-through")}>
+          {plan.showTime ? `${event.title},` : event.title}
         </span>
-        <span className="shrink-0 tabular-nums" style={{ color: timeColor }}>
-          {time}
-        </span>
+        {plan.showTime && (
+          <span
+            className="shrink-0 tabular-nums font-normal"
+            style={{ color: timeColor, fontSize: plan.timeFontPx }}
+          >
+            {time}
+          </span>
+        )}
       </span>
     );
   }
+
+  const secondary: CSSProperties = {
+    color: timeColor,
+    opacity: 0.85,
+    fontSize: plan.timeFontPx,
+    fontWeight: 400,
+  };
 
   return (
     <span className="block" style={lineStyle}>
       <span
         className={cn(
-          "block font-medium",
-          plan.wrapTitle ? "line-clamp-2" : "truncate",
+          "block font-semibold",
+          plan.titleLines === 3
+            ? "line-clamp-3"
+            : plan.titleLines === 2
+              ? "line-clamp-2"
+              : "truncate",
           strike && "line-through",
         )}
       >
         {event.title}
       </span>
-      <span className="block truncate tabular-nums" style={{ color: timeColor, opacity: 0.85 }}>
-        {time}
-      </span>
+      {plan.showTime && (
+        <span className="block truncate tabular-nums" style={secondary}>
+          {time}
+        </span>
+      )}
       {plan.showLocation && (
-        <span className="block truncate" style={{ color: timeColor, opacity: 0.85 }}>
+        <span className="block truncate" style={secondary}>
           {event.location}
         </span>
       )}
@@ -482,7 +540,7 @@ function Stacked({
 function MergeMark({ count }: { count: number }) {
   return (
     <span
-      className="pointer-events-none absolute right-[3px] top-[3px] opacity-80"
+      className="pointer-events-none absolute right-1 top-1 opacity-80"
       title={`On ${count} calendars`}
       aria-label={`On ${count} calendars`}
     >
@@ -561,12 +619,18 @@ export function EventChip({
         padding: "0 8px",
         fontSize: 12,
         lineHeight: "20px",
-        fontWeight: 500,
+        // 600, matching the timed block's title. A chip is all title — there is
+        // no second line for the weight to be contrasted against — so it takes
+        // the same weight the title takes everywhere else on the grid.
+        fontWeight: 600,
         ...style,
       }}
     >
       {showTime && !event.allDay && (
-        <span className="shrink-0 tabular-nums" style={{ color: paint.timeColor, opacity: 0.85 }}>
+        <span
+          className="shrink-0 font-normal tabular-nums"
+          style={{ color: paint.timeColor, opacity: 0.85, fontSize: 11 }}
+        >
           {shortTime(event.start)}
         </span>
       )}

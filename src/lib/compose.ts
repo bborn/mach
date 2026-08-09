@@ -27,6 +27,7 @@
 
 import * as fixtures from "./fixtures";
 import { isTauri } from "./ipc";
+import { isBlankHtml, withoutSignature } from "./email-html";
 
 /* -------------------------------------------------------------------------- */
 /* Types — the wire shapes, camelCase, mirroring `compose::draft`              */
@@ -67,6 +68,27 @@ export interface DraftRemote {
   syncedAt?: number;
 }
 
+/**
+ * How to read `Draft.body`. Mirrors `compose::draft::BodyFormat`.
+ *
+ * `markdown` is what every draft written before the editor became a rich-text
+ * one holds, and it is the column default in SQLite for exactly that reason.
+ * The composer converts one to HTML when it opens it; nothing writes markdown
+ * any more.
+ */
+export type BodyFormat = "markdown" | "html";
+
+/** One file waiting to go out with a draft. Mirrors `compose::attach::Attachment`. */
+export interface DraftAttachment {
+  id: string;
+  draftId: string;
+  /** Already sanitized by Rust: this is the name the recipient will see. */
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  addedAt?: number;
+}
+
 export interface Draft {
   id: string;
   accountId: number;
@@ -78,16 +100,64 @@ export interface Draft {
   cc: Mailbox[];
   bcc: Mailbox[];
   subject: string;
-  /** Markdown-ish source, exactly as typed. */
+  /** The body, in whichever format `bodyFormat` names. */
   body: string;
+  bodyFormat?: BodyFormat;
   updatedAt: number;
   /** Absent on a draft that has never been through Rust. See `DraftRemote`. */
   remote?: DraftRemote;
+  /**
+   * Read-only here, like `remote`: files are added and removed through their
+   * own calls, and a draft object rebuilt on every keystroke must not be able
+   * to drop one by leaving the field out.
+   */
+  attachments?: DraftAttachment[];
 }
 
 /** True when this draft exists here and nowhere else, and Google said why. */
 export function isLocalOnly(draft: Draft): boolean {
   return draft.remote?.state === "failed";
+}
+
+/**
+ * The draft's body as HTML, whatever it was stored as.
+ *
+ * The one place the old grammar is still read. A draft written in the
+ * `<textarea>` composer opens in the rich-text one with its `**bold**` already
+ * bold, rather than showing the owner his own asterisks; the conversion happens
+ * once, when the composer opens it, and the first save writes HTML.
+ */
+export function bodyAsHtml(draft: Draft): string {
+  if ((draft.bodyFormat ?? "markdown") === "html") return draft.body;
+  return draft.body.trim() === "" ? "" : markdownToHtml(draft.body);
+}
+
+/**
+ * Nothing worth keeping — no recipients, no subject, no files, and no words.
+ *
+ * Every "is this draft worth a row / a push / a confirmation before it is
+ * thrown away" question runs through here. It reads the body as *text* because
+ * an untouched rich-text editor is not an empty string: it holds
+ * `<div><br></div>`, and a signature on top of that is still an untouched
+ * composer.
+ */
+export function hasWrittenBody(draft: Draft): boolean {
+  const body = bodyAsHtml(draft);
+  // The signature does not count as having written anything: a composer that
+  // opened, signed itself and was closed again is an untouched composer.
+  const written = (draft.bodyFormat ?? "markdown") === "html" ? withoutSignature(body) : body;
+  return !isBlankHtml(written);
+}
+
+export function isDraftEmpty(draft: Draft): boolean {
+  return (
+    !hasWrittenBody(draft) &&
+    draft.subject.trim() === "" &&
+    draft.to.length === 0 &&
+    draft.cc.length === 0 &&
+    draft.bcc.length === 0 &&
+    (draft.attachments?.length ?? 0) === 0
+  );
 }
 
 export type OutboxState = "holding" | "sending" | "sent" | "failed";
@@ -162,7 +232,9 @@ export function newDraft(accountId: number): Draft {
     bcc: [],
     subject: "",
     body: "",
+    bodyFormat: "html",
     updatedAt: 0,
+    attachments: [],
   };
 }
 
@@ -208,12 +280,78 @@ export async function saveDraft(draft: Draft): Promise<Draft> {
   return result.draft;
 }
 
-export async function discardDraft(draftId: string): Promise<void> {
+/**
+ * What became of the Gmail copy when a draft was thrown away.
+ *
+ * `failed` is the one worth saying out loud: the row and the mirror are gone
+ * here, the draft is still on his phone, and the next sync pass will adopt it
+ * straight back into the conversation he just cleared.
+ */
+export interface DiscardResult {
+  ok: boolean;
+  remote: "none" | "deleted" | "failed";
+  error?: string | null;
+}
+
+export async function discardDraft(draftId: string): Promise<DiscardResult> {
   if (!isTauri()) {
     localForget(draftId);
-    return;
+    return { ok: true, remote: "none" };
   }
-  await call({ op: "discardDraft", draftId });
+  const result = await call<Partial<DiscardResult>>({ op: "discardDraft", draftId });
+  // A build of Rust that predates the remote half answers `{ ok: true }` alone.
+  return { ok: result.ok ?? true, remote: result.remote ?? "none", error: result.error };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Attachments                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/** What an attach call did. `refused` is per file, and is never silent. */
+export interface AttachResult {
+  attachments: DraftAttachment[];
+  added: DraftAttachment[];
+  refused: string[];
+}
+
+/**
+ * Open the system panel and attach whatever is chosen.
+ *
+ * The panel is Rust's: the capability file grants JavaScript no `dialog:`
+ * permission, so the only thing this side can ask for is "let him pick files
+ * for *this* draft".
+ */
+export async function chooseAttachments(draftId: string): Promise<AttachResult> {
+  if (!isTauri()) return { attachments: localAttachments(draftId), added: [], refused: [] };
+  return call<AttachResult>({ op: "attachChoose", draftId });
+}
+
+/** Attach files already named — what a drop on the composer produces. */
+export async function attachPaths(draftId: string, paths: string[]): Promise<AttachResult> {
+  if (!isTauri()) return { attachments: localAttachments(draftId), added: [], refused: [] };
+  return call<AttachResult>({ op: "attachAdd", draftId, paths });
+}
+
+export async function removeAttachment(attachmentId: string): Promise<DraftAttachment[]> {
+  if (!isTauri()) return [];
+  const result = await call<{ attachments: DraftAttachment[] }>({
+    op: "attachRemove",
+    attachmentId,
+  });
+  return result.attachments ?? [];
+}
+
+/** Gmail's ceiling on a message, which is the only limit worth having. */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+export function humanSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} bytes`;
+}
+
+function localAttachments(draftId: string): DraftAttachment[] {
+  return localLookup(draftId)?.attachments ?? [];
 }
 
 export interface SendResult {
@@ -609,7 +747,12 @@ function localSeed(): void {
     bcc: [],
     subject: "Re: Checkout conversion dropped 6% overnight",
     body: fixtures.DRAFT_BODY,
+    // The fixture body is the old grammar, which is exactly what makes it a
+    // useful seed: opening it in a browser tab exercises the conversion a real
+    // draft written last week goes through.
+    bodyFormat: "markdown",
     updatedAt: 0,
+    attachments: [],
   };
   localDrafts.set(seed.id, seed);
   localDrafts.set(`thread:${fixtures.DRAFT_THREAD_ID}`, seed);
@@ -690,10 +833,28 @@ export const COMPOSER_KEYS = {
   send: "mod+enter",
   schedule: "ctrl+s",
   close: "escape",
+  /**
+   * Throw the draft away. Apple Mail's key for the same act, and free here —
+   * the calendar's `mod+backspace` deletes an event and is only live while the
+   * event modal is up, so the two can never both be offered.
+   */
+  discard: "mod+backspace",
+  /** Attach files. Gmail has no key for this; ⇧⌘A is free and reads as "attach". */
+  attach: "shift+mod+a",
   /** Recall a message inside its window. */
   undoSend: "mod+z",
   /** Gmail's `c`. Mode-scoped: the calendar's `c` creates an event. */
   compose: "c",
+  /**
+   * A second message while the first one is still open.
+   *
+   * `c` cannot do this job on its own: it is a bare letter, so it is dead while
+   * you are typing, and the new-message overlay traps focus inside a panel where
+   * you always are. Gmail has no key for it because Gmail opens its composers
+   * from the list. This is the smallest addition that makes "more than one at a
+   * time" reachable without the mouse.
+   */
+  composeAnother: "shift+mod+c",
   reply: "r",
   replyAll: "a",
   forward: "f",

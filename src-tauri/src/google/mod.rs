@@ -638,7 +638,25 @@ impl RestClient {
         url: Url,
         body: Option<Vec<u8>>,
     ) -> Result<HttpResponse, GoogleError> {
+        self.send_as(method, url, body, None).await
+    }
+
+    /// [`send`](Self::send) with the request's `Content-Type` chosen by the
+    /// caller.
+    ///
+    /// Everything in this crate posts JSON except one endpoint: Gmail's upload
+    /// host, which takes `multipart/related` with the raw message inside it and
+    /// answers `400` to anything labelled `application/json`. That is the whole
+    /// reason this variant exists.
+    pub async fn send_as(
+        &self,
+        method: HttpMethod,
+        url: Url,
+        body: Option<Vec<u8>>,
+        content_type: Option<&str>,
+    ) -> Result<HttpResponse, GoogleError> {
         let url = url.to_string();
+        let content_type = content_type.unwrap_or("application/json; charset=UTF-8");
         let mut attempt: u32 = 0;
         loop {
             let token = self.tokens.access_token().await?;
@@ -647,10 +665,7 @@ impl RestClient {
                 ("Accept".to_string(), "application/json".to_string()),
             ];
             if body.is_some() {
-                headers.push((
-                    "Content-Type".to_string(),
-                    "application/json; charset=UTF-8".to_string(),
-                ));
+                headers.push(("Content-Type".to_string(), content_type.to_string()));
             }
 
             let request = HttpRequest {

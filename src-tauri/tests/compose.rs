@@ -416,8 +416,10 @@ fn a_fresh_message_has_no_threading_headers_at_all() {
         bcc: vec![],
         subject: "Hello".into(),
         body: "Hi there.".into(),
+        body_format: Default::default(),
         updated_at: 0,
         remote: Default::default(),
+        attachments: Vec::new(),
     };
     let headers = headers_of(&built_bytes(&db, &fresh));
     assert!(!headers.contains("In-Reply-To"), "{headers}");
@@ -550,6 +552,7 @@ fn a_non_ascii_display_name_is_a_bare_encoded_word_not_a_quoted_one() {
         subject: "Hola".into(),
         text: "Hola".into(),
         html: "<p>Hola</p>".into(),
+        attachments: vec![],
         in_reply_to: None,
         references: vec![],
         message_id: "m1@example.com".into(),
@@ -586,6 +589,7 @@ fn an_ascii_name_that_needs_quoting_gets_quoted_and_one_that_does_not_stays_bare
         subject: "x".into(),
         text: "x".into(),
         html: "<p>x</p>".into(),
+        attachments: vec![],
         in_reply_to: None,
         references: vec![],
         message_id: "m@x".into(),
@@ -617,7 +621,15 @@ fn the_raw_field_is_base64url_and_round_trips() {
 #[test]
 fn every_message_is_multipart_alternative_with_both_parts() {
     let (db, _a, thread, _m) = seeded();
-    let bytes = built_bytes(&db, &reply_draft(&db, thread, DraftKind::Reply, "**Yes** — sending now."));
+    let bytes = built_bytes(
+        &db,
+        &reply_draft(
+            &db,
+            thread,
+            DraftKind::Reply,
+            "<div><b>Yes</b> — sending now.</div>",
+        ),
+    );
     let text = String::from_utf8_lossy(&bytes).into_owned();
 
     assert!(text.contains("multipart/alternative"), "{text}");
@@ -627,10 +639,28 @@ fn every_message_is_multipart_alternative_with_both_parts() {
     let parsed = MessageParser::new().parse(&bytes).unwrap();
     let plain = parsed.body_text(0).expect("text part");
     let html = parsed.body_html(0).expect("html part");
-    // The markdown source is the plain-text part; the HTML is rendered from it.
-    assert!(plain.contains("**Yes** — sending now."), "{plain}");
+    // The editor's HTML *is* the html part; the plain part is read back out of
+    // it, which is why the emphasis survives in one and not the other.
+    assert!(html.contains("<b>Yes</b>"), "{html}");
+    assert!(plain.contains("Yes — sending now."), "{plain}");
+    assert!(!plain.contains("<b>"), "{plain}");
+}
+
+#[test]
+fn a_draft_written_before_the_editor_was_rich_text_still_renders_as_markdown() {
+    // The column default is `markdown` and this is why: a row written by the
+    // old `<textarea>` composer is still in the store, and reading its
+    // asterisks as HTML would send a message with none of the emphasis in it.
+    let (db, _a, thread, _m) = seeded();
+    let mut legacy = reply_draft(&db, thread, DraftKind::Reply, "**Yes** — sending now.");
+    legacy.body_format = mach_lib::ipc::compose::engine::BodyFormat::Markdown;
+    let bytes = built_bytes(&db, &legacy);
+
+    let parsed = MessageParser::new().parse(&bytes).unwrap();
+    let plain = parsed.body_text(0).expect("text part");
+    let html = parsed.body_html(0).expect("html part");
     assert!(html.contains("<strong>Yes</strong>"), "{html}");
-    assert!(!html.contains("**"), "{html}");
+    assert!(plain.contains("**Yes** — sending now."), "{plain}");
 }
 
 #[test]
@@ -769,6 +799,7 @@ fn a_message_with_no_recipients_is_refused_before_it_is_built() {
         subject: "x".into(),
         text: "x".into(),
         html: "<p>x</p>".into(),
+        attachments: vec![],
         in_reply_to: None,
         references: vec![],
         message_id: "m@x".into(),
@@ -787,6 +818,7 @@ fn bcc_rides_in_the_headers_because_that_is_all_gmail_gives_us() {
         subject: "x".into(),
         text: "x".into(),
         html: "<p>x</p>".into(),
+        attachments: vec![],
         in_reply_to: None,
         references: vec![],
         message_id: "m@x".into(),
@@ -2066,7 +2098,7 @@ async fn a_draft_written_on_the_phone_opens_in_the_composer() {
     assert!(!found["draft"].is_null(), "it has to open");
     assert_eq!(
         found["draft"]["body"].as_str(),
-        Some("Sending the link this afternoon."),
+        Some("<div>Sending the link this afternoon.</div>"),
         "the text comes from the message Mach already has, not from a request"
     );
     assert_eq!(
@@ -2198,7 +2230,11 @@ async fn a_draft_with_no_conversation_behind_it_still_opens() {
         .await
         .unwrap();
 
-    assert_eq!(found["draft"]["body"].as_str(), Some("Thursday?"));
+    assert_eq!(
+        found["draft"]["body"].as_str(),
+        Some("<div>Thursday?</div>"),
+        "a phone's plain text arrives wrapped, because the editor renders HTML"
+    );
     assert!(
         found["draft"]["replyToId"].is_null(),
         "nothing to answer, so nothing is claimed as a parent"
@@ -2360,7 +2396,7 @@ async fn a_draft_edited_elsewhere_after_adoption_brings_the_newer_text_back() {
     );
     assert_eq!(
         reopened["draft"]["body"].as_str(),
-        Some("First thought, rewritten on the train."),
+        Some("<div>First thought, rewritten on the train.</div>"),
         "the phone wrote last, so the phone's words are the ones to show"
     );
     assert_eq!(
@@ -2426,5 +2462,384 @@ async fn a_local_edit_newer_than_the_remote_one_is_not_overwritten() {
     assert_eq!(
         reopened["draft"]["remote"]["messageId"].as_str(),
         Some("gmsg-remote-2")
+    );
+}
+
+// ===================================================== the editor's own HTML
+//
+// The composer emits HTML now, so two derivations replaced the markdown one:
+// `html::sanitize`, which decides what may leave, and `html::to_text`, which
+// produces the `text/plain` half of the message. `src/lib/email-html.ts` mirrors
+// both for the editor; the table below is the one both answer to.
+
+use compose::{attach, html};
+
+/// The same cases as `TEXT_CASES` in `src/lib/email-html.test.ts`. Two
+/// implementations of one derivation exist because the editor needs the answer
+/// without a round trip and this side needs it to put on the wire; if they
+/// drift, both suites fail.
+const TEXT_CASES: &[(&str, &str)] = &[
+    ("<div>Hello.</div>", "Hello."),
+    ("<div>one</div><div>two</div>", "one\ntwo"),
+    ("<p>one</p><p>two</p>", "one\n\ntwo"),
+    ("<div>one<br>two</div>", "one\ntwo"),
+    ("<div><b>bold</b> and <i>italic</i></div>", "bold and italic"),
+    ("<ul><li>one</li><li>two</li></ul>", "- one\n- two"),
+    ("<ol><li>one</li><li>two</li></ol>", "1. one\n2. two"),
+    ("<blockquote><div>quoted</div></blockquote>", "> quoted"),
+    (
+        "<div>see <a href=\"https://example.com/a\">the page</a></div>",
+        "see the page <https://example.com/a>",
+    ),
+    (
+        "<div><a href=\"https://example.com\">https://example.com</a></div>",
+        "https://example.com",
+    ),
+    ("<div>a &amp; b &nbsp;c</div>", "a & b c"),
+    ("<div><br></div>", ""),
+];
+
+#[test]
+fn the_plain_text_twin_renders_exactly_these_cases() {
+    for (html_source, expected) in TEXT_CASES {
+        assert_eq!(html::to_text(html_source), *expected, "input: {html_source:?}");
+    }
+}
+
+#[test]
+fn outgoing_html_carries_no_classes_no_ids_and_no_modern_css() {
+    let pasted = "<p class=\"MsoNormal\" id=\"x\" style=\"color:var(--brand);font-weight:700\">\
+                  <o:p></o:p>Quarterly <b>numbers</b></p>\
+                  <style>p{color:red}</style><script>alert(1)</script>";
+    let cleaned = html::sanitize(pasted);
+
+    assert!(!cleaned.contains("class="), "{cleaned}");
+    assert!(!cleaned.contains("id="), "{cleaned}");
+    assert!(!cleaned.contains("var("), "{cleaned}");
+    assert!(!cleaned.contains("<style"), "{cleaned}");
+    assert!(!cleaned.contains("alert"), "{cleaned}");
+    // The declaration that survives is the one Outlook honours.
+    assert!(cleaned.contains("font-weight: 700"), "{cleaned}");
+    assert!(cleaned.contains("<b>numbers</b>"), "{cleaned}");
+}
+
+#[test]
+fn sanitizing_is_idempotent_because_every_autosave_does_it_again() {
+    let once = html::sanitize("<div style=\"color:#333\">Hi <a href=\"https://x/y\">there</a></div>");
+    assert_eq!(html::sanitize(&once), once);
+}
+
+#[test]
+fn a_link_with_a_scheme_no_mail_client_should_follow_is_not_a_link() {
+    let cleaned = html::sanitize("<a href=\"javascript:alert(1)\">click</a>");
+    assert!(!cleaned.contains("javascript:"), "{cleaned}");
+    assert!(cleaned.contains("click"), "the words are not the problem: {cleaned}");
+}
+
+#[test]
+fn the_two_parts_of_an_html_draft_come_from_the_same_html() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = reply_draft(
+        &db,
+        thread,
+        DraftKind::Reply,
+        "<div>Numbers:</div><ul><li>one</li><li>two</li></ul>",
+    );
+    let (text, rendered) = draft::body_parts(&draft);
+    assert_eq!(text, "Numbers:\n\n- one\n- two");
+    assert!(rendered.contains("<ul>"), "{rendered}");
+}
+
+// ================================================================ attachments
+
+#[test]
+fn an_attached_file_makes_the_message_multipart_mixed_around_the_alternative() {
+    let (db, _a, thread, _m) = seeded();
+    let mut draft = reply_draft(&db, thread, DraftKind::Reply, "<div>Numbers attached.</div>");
+    draft = draft::save_draft(&db, &draft, NOW).unwrap();
+    attach::add_bytes(&db, &draft.id, "q3 numbers.csv", b"a,b\n1,2\n", NOW).unwrap();
+    let draft = draft::load_draft(&db, &draft.id).unwrap().unwrap();
+
+    let bytes = built_bytes(&db, &draft);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    assert!(text.contains("multipart/mixed"), "{text}");
+    assert!(text.contains("multipart/alternative"), "{text}");
+
+    let parsed = MessageParser::new().parse(&bytes).unwrap();
+    let attachment = parsed.attachments().next().expect("one attachment");
+    assert_eq!(
+        mail_parser::MimeHeaders::attachment_name(attachment),
+        Some("q3 numbers.csv")
+    );
+    assert_eq!(attachment.contents(), b"a,b\n1,2\n");
+    // The alternative is still intact underneath.
+    assert!(parsed.body_text(0).is_some());
+    assert!(parsed.body_html(0).is_some());
+}
+
+#[test]
+fn a_file_larger_than_gmail_will_send_is_refused_when_it_is_chosen() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let huge = vec![0u8; (attach::MAX_ATTACHMENT_BYTES + 1) as usize];
+    let refused = attach::add_bytes(&db, &draft.id, "huge.bin", &huge, NOW);
+    assert!(refused.is_err(), "a 25 MB ceiling is Gmail's, not ours to ignore");
+    assert!(attach::list(&db, &draft.id).unwrap().is_empty());
+}
+
+#[test]
+fn several_files_are_refused_as_a_total_rather_than_one_at_a_time() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let chunk = vec![0u8; 10 * 1024 * 1024];
+    attach::add_bytes(&db, &draft.id, "one.bin", &chunk, NOW).unwrap();
+    attach::add_bytes(&db, &draft.id, "two.bin", &chunk, NOW).unwrap();
+    let third = attach::add_bytes(&db, &draft.id, "three.bin", &chunk, NOW);
+    assert!(third.is_err(), "30 MB is past what Gmail will take");
+    assert_eq!(attach::list(&db, &draft.id).unwrap().len(), 2);
+}
+
+#[test]
+fn a_senders_filename_is_sanitized_before_it_is_ever_stored() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let stored = attach::add_bytes(&db, &draft.id, "../../etc/passwd", b"x", NOW).unwrap();
+    assert!(!stored.filename.contains('/'), "{}", stored.filename);
+    assert!(!stored.filename.contains(".."), "{}", stored.filename);
+}
+
+#[test]
+fn forgetting_a_draft_takes_its_files_with_it() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    attach::add_bytes(&db, &draft.id, "note.txt", b"hello", NOW).unwrap();
+    draft::delete_draft(&db, &draft.id).unwrap();
+    assert!(attach::list(&db, &draft.id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_message_over_the_json_limit_goes_to_the_upload_host_instead() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>Photos.</div>"),
+        NOW,
+    )
+    .unwrap();
+    let big = vec![7u8; 6 * 1024 * 1024];
+    attach::add_bytes(&db, &draft.id, "photo.jpg", &big, NOW).unwrap();
+    let draft = draft::load_draft(&db, &draft.id).unwrap().unwrap();
+
+    let built = draft::build(&db, &draft, NOW, 1).unwrap();
+    out.queue(&built, NOW, NOW).unwrap();
+    out.flush_due(NOW + 1).await.unwrap();
+
+    let requests = transport.requests();
+    let send = requests.last().expect("one send");
+    assert!(send.url.contains("/upload/"), "{}", send.url);
+    assert!(send.url.contains("uploadType=multipart"), "{}", send.url);
+    let content_type = send
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    assert!(content_type.starts_with("multipart/related"), "{content_type}");
+    // The message rides as bytes, not as base64 inside a JSON string.
+    let body = String::from_utf8_lossy(send.body.as_deref().unwrap_or_default()).into_owned();
+    assert!(body.contains("message/rfc822"), "the RFC822 part is missing");
+    assert!(body.contains("\"threadId\""), "the conversation is named in the metadata part");
+}
+
+#[tokio::test]
+async fn an_ordinary_reply_still_takes_the_ordinary_endpoint() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let built = draft::build(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>On it.</div>"),
+        NOW,
+        1,
+    )
+    .unwrap();
+    out.queue(&built, NOW, NOW).unwrap();
+    out.flush_due(NOW + 1).await.unwrap();
+
+    let requests = transport.requests();
+    let send = requests.last().expect("one send");
+    assert!(!send.url.contains("/upload/"), "{}", send.url);
+}
+
+// =================================================================== discard
+
+#[tokio::test]
+async fn discarding_removes_the_row_the_mirror_and_the_gmail_draft() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let saved = dispatch(
+        &db,
+        &out,
+        json!({
+            "op": "saveDraft",
+            "draft": reply_draft(&db, thread, DraftKind::Reply, "<div>Half a thought.</div>"),
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap();
+    let draft_id = saved["draft"]["id"].as_str().unwrap().to_string();
+    // Give the row a Gmail identity, as a successful push would.
+    draft::set_remote(
+        &db,
+        &draft_id,
+        &compose::draft::DraftRemote {
+            state: compose::draft::RemoteState::Synced,
+            draft_id: Some("r-1234".into()),
+            message_id: Some("gmsg-1234".into()),
+            thread_id: Some("t-1".into()),
+            error: None,
+            synced_at: NOW,
+        },
+    )
+    .unwrap();
+    assert!(messages_in(&db, thread).iter().any(|m| m.is_draft));
+
+    let result = dispatch(
+        &db,
+        &out,
+        json!({ "op": "discardDraft", "draftId": draft_id, "now": NOW + 1000 }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["remote"].as_str(), Some("deleted"));
+    assert!(draft::load_draft(&db, &draft_id).unwrap().is_none(), "the row");
+    assert!(
+        !messages_in(&db, thread).iter().any(|m| m.is_draft),
+        "the mirror in the conversation"
+    );
+    let deletes: Vec<_> = transport
+        .requests()
+        .into_iter()
+        .filter(|r| r.url.contains("/drafts/r-1234"))
+        .collect();
+    assert_eq!(deletes.len(), 1, "exactly one drafts.delete");
+}
+
+#[tokio::test]
+async fn a_discard_gmail_refuses_says_so_rather_than_pretending() {
+    let (db, _a, thread, _m) = seeded();
+    // Nothing reaches Google: the push fails, and so does the delete. The row's
+    // Gmail identity is written by hand below, which is the state a draft is in
+    // after a push that landed and a network that has since gone away.
+    let transport = FakeTransport::always_failing(500, r#"{"error":{"message":"nope"}}"#);
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let saved = dispatch(
+        &db,
+        &out,
+        json!({
+            "op": "saveDraft",
+            "draft": reply_draft(&db, thread, DraftKind::Reply, "<div>Half a thought.</div>"),
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap();
+    let draft_id = saved["draft"]["id"].as_str().unwrap().to_string();
+    draft::set_remote(
+        &db,
+        &draft_id,
+        &compose::draft::DraftRemote {
+            state: compose::draft::RemoteState::Synced,
+            draft_id: Some("r-1".into()),
+            message_id: Some("gmsg-1".into()),
+            thread_id: Some("t-1".into()),
+            error: None,
+            synced_at: NOW,
+        },
+    )
+    .unwrap();
+
+    let result = dispatch(
+        &db,
+        &out,
+        json!({ "op": "discardDraft", "draftId": draft_id, "now": NOW + 1000 }),
+    )
+    .await
+    .unwrap();
+
+    // Local rows are gone either way — the UI never waits on Google — but the
+    // sentence about the copy that is still on his phone is the whole point.
+    assert!(draft::load_draft(&db, &draft_id).unwrap().is_none());
+    assert_eq!(result["remote"].as_str(), Some("failed"));
+    assert!(result["error"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn saving_a_discarded_draft_id_again_does_not_resurrect_two_rows() {
+    // The duplicate hazard, from the discard side: the composer's autosave can
+    // be in flight when the draft is thrown away. The second save writes a new
+    // row, and it must be *one* row with one mirror, not a second copy beside a
+    // stale one.
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let draft = reply_draft(&db, thread, DraftKind::Reply, "<div>Half a thought.</div>");
+
+    for _ in 0..2 {
+        dispatch(
+            &db,
+            &out,
+            json!({ "op": "saveDraft", "draft": draft, "now": NOW }),
+        )
+        .await
+        .unwrap();
+    }
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "discardDraft", "draftId": draft.id, "now": NOW + 10 }),
+    )
+    .await
+    .unwrap();
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "saveDraft", "draft": draft, "now": NOW + 20 }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        messages_in(&db, thread).iter().filter(|m| m.is_draft).count(),
+        1,
+        "one draft in the conversation, whatever order the writes arrived in"
     );
 }

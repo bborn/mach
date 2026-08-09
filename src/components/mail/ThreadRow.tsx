@@ -108,7 +108,7 @@ export const ThreadRow = memo(function ThreadRow({
       data-checked={checked || undefined}
       onClick={onSelect}
       className={cn(
-        "group relative flex h-row cursor-default items-center gap-2 pl-3 pr-2.5",
+        "group relative flex h-row cursor-default items-center gap-2 px-3",
         "border-b border-border/60 text-list",
         checked
           ? "bg-row-selected"
@@ -160,7 +160,7 @@ export const ThreadRow = memo(function ThreadRow({
       />
 
       <div className="flex min-w-0 flex-1 flex-col gap-px">
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
           <span
             className={cn(
               "min-w-0 truncate leading-tight",
@@ -200,16 +200,31 @@ export const ThreadRow = memo(function ThreadRow({
           </span>
         </div>
 
+        {/*
+          Three lines used to be three 13px lines separated only by weight and by
+          how grey they were, so the row read as a texture. The subject, which is
+          what anyone reads a list of mail for, sits one step up at `text-body`;
+          the preview sits one step down at `text-micro`. That puts three pixels
+          between the line you scan for and the line you glance at.
+
+          It costs no height: 14px and 11px at `leading-tight` come to the same
+          49px the three 13px lines did, `--spacing-row` is untouched, and the
+          list shows as many conversations as it did.
+
+          The preview goes darker as it goes smaller, `muted` rather than
+          `faint`. The size is already carrying the demotion, and 11px at the
+          faint step would be paying for it twice.
+        */}
         <div
           className={cn(
-            "truncate leading-tight",
+            "truncate text-body leading-tight",
             unread ? "font-medium text-foreground" : "text-foreground/80",
           )}
         >
           {thread.subject}
         </div>
 
-        <div className="truncate leading-tight text-faint-foreground">
+        <div className="truncate text-micro leading-tight text-muted-foreground">
           {draft && <span className="font-medium text-danger">Draft</span>}
           {draft && <span className="text-faint-foreground"> · </span>}
           {thread.snippet}

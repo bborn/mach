@@ -202,7 +202,7 @@ export function assignHues(calendarIds: readonly string[]): Map<string, number> 
  *   unanswered       page-coloured fill, dark title, time and 1px border in the
  *                    calendar's colour
  *   tentative        the unanswered treatment, plus a dashed border
- *   past             the same fill at 60% opacity, colour intact
+ *   past             the same hue, washed 40% towards the page
  *   declined         outlined, title struck through (hidden by default)
  */
 export type EventTone = "solid" | "outline" | "tentative" | "declined";
@@ -247,29 +247,49 @@ export function paintFor(
   const hit = paintCache.get(key);
   if (hit) return hit;
 
-  const opacity = past ? 0.6 : 1;
+  /*
+   * A past event fades by washing its paint towards the page, not by setting
+   * `opacity` on the block.
+   *
+   * Both compute `0.6 × colour + 0.4 × page`, so they are the same picture while
+   * a block has nothing behind it but the grid. They differ once two blocks
+   * overlap: a cluster too deep to divide cascades, and a 60%-opaque block
+   * cascaded over its neighbour shows the neighbour's title through itself.
+   * Three overlapping past meetings came out as two titles crossing each other.
+   *
+   * It was also costing the selection cursor. `EventBlock.tsx` explains at
+   * length why the cursor cannot be drawn with anything `opacity` can reach, and
+   * then every event earlier than now was drawn at 60%, cursor included.
+   * `selectionGap` below is left unwashed, so the mark is at full strength on a
+   * past block as it is on a future one.
+   */
+  const wash = (value: string, keep: number) =>
+    past ? `color-mix(in oklab, ${value} ${keep}%, var(--background))` : value;
+  const PAST_KEEP = 60;
+
   let paint: BlockPaint;
 
   if (tone === "solid") {
     const fill = calendarFill(color, dark);
     const ink = inkOn(fill);
     paint = {
-      background: fill,
-      color: ink,
-      timeColor: ink,
-      opacity,
+      background: wash(fill, PAST_KEEP),
+      color: wash(ink, PAST_KEEP),
+      timeColor: wash(ink, PAST_KEEP),
+      opacity: 1,
       strikethrough: false,
       selectionGap: ink,
     };
   } else {
     const ink = calendarInk(color, dark);
     paint = {
+      // An outlined block already *is* the page, so there is nothing to wash.
       background: "var(--background)",
-      color: "var(--foreground)",
-      border: ink,
+      color: wash("var(--foreground)", PAST_KEEP),
+      border: wash(ink, PAST_KEEP),
       borderStyle: tone === "tentative" ? "dashed" : "solid",
-      timeColor: ink,
-      opacity: tone === "declined" ? Math.min(opacity, 0.7) : opacity,
+      timeColor: wash(ink, PAST_KEEP),
+      opacity: tone === "declined" ? 0.7 : 1,
       strikethrough: tone === "declined",
       // An outlined block *is* the page, so there is nothing for a gap to
       // separate it from; the accent band does the whole job.

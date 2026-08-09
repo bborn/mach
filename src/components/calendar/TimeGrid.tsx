@@ -28,6 +28,7 @@ import {
   Z_EVENT_SELECTED,
   Z_NOW,
   blockHeight,
+  clusterPlan,
   nowScrollTop,
   offsetForTime,
   packRows,
@@ -439,10 +440,20 @@ export function TimeGrid({
     >
       <div className="sticky top-0 z-30 flex border-b border-border bg-background">
         <div className="shrink-0 border-r border-border" style={{ width: TIME_GUTTER }} />
+        {/*
+          The column header carries the biggest type in the grid, and it is the
+          only thing that does.
+
+          It used to be an 11px weekday beside a 13px date: two sizes two pixels
+          apart, in a view where 11px and 12px carried everything else, so the
+          header did not read as a header and the week had no horizontal anchor.
+          The date is `text-title` (17px) against the weekday's 11px, skipping a
+          step of the ramp between them. The row is the same 30px it was.
+        */}
         {days.map((day) => (
           <div
             key={day.getTime()}
-            className="flex min-w-0 flex-1 items-baseline gap-1.5 border-r border-border px-2 last:border-r-0"
+            className="flex min-w-0 flex-1 items-baseline gap-2 border-r border-border px-2 last:border-r-0"
             style={{ height: HEADER_HEIGHT }}
           >
             <span
@@ -455,8 +466,8 @@ export function TimeGrid({
             </span>
             <span
               className={cn(
-                "self-center font-mono text-list tabular-nums",
-                isToday(day) ? "text-accent" : "text-foreground",
+                "self-center font-mono text-title tabular-nums leading-none",
+                isToday(day) ? "font-semibold text-accent" : "text-foreground",
               )}
             >
               {day.getDate()}
@@ -479,9 +490,12 @@ export function TimeGrid({
           >
             all-day
           </div>
+          {/* No padding: every child here is absolutely positioned, and an
+              absolutely positioned box is laid out against the padding box, so
+              the 2px this used to carry moved nothing at all. */}
           <div
             className="relative min-w-0 flex-1"
-            style={{ height: shownRows * ALL_DAY_ROW_PITCH + 4, paddingTop: 2 }}
+            style={{ height: shownRows * ALL_DAY_ROW_PITCH + 4 }}
           >
             {days.map((_, index) => (
               <div
@@ -548,12 +562,15 @@ export function TimeGrid({
             <div
               key={hour}
               className="absolute -translate-y-1/2 text-right tabular-nums text-muted-foreground"
+              // Regular weight. The gutter is read by position rather than word
+              // by word, and it repeats 23 times down every screen; at 500 it
+              // competed with the event titles it exists to locate.
               style={{
                 top: hour * HOUR_HEIGHT,
                 right: TIME_GUTTER_INSET,
                 fontSize: 11,
                 lineHeight: "16px",
-                fontWeight: 500,
+                fontWeight: 400,
               }}
             >
               {hour % 12 === 0 ? 12 : hour % 12}
@@ -599,7 +616,7 @@ export function TimeGrid({
             // being dragged is the grid being scrolled, not a week being asked
             // for. See `use-period-wheel.ts`.
             data-calendar-drag
-            className="pointer-events-none absolute overflow-hidden px-1.5 py-[2px]"
+            className="pointer-events-none absolute overflow-hidden px-1 py-[2px]"
             style={{
               left:
                 TIME_GUTTER + dragging.originDayIndex * ghostColumnWidth + 1,
@@ -628,7 +645,7 @@ export function TimeGrid({
             }}
           >
             <span
-              className="block truncate font-medium"
+              className="block truncate font-semibold"
               style={{ fontSize: 12, lineHeight: "15px" }}
             >
               {dragging.title}
@@ -636,7 +653,7 @@ export function TimeGrid({
             <span
               ref={ghostLabel}
               className="block truncate tabular-nums"
-              style={{ fontSize: 12, lineHeight: "15px", opacity: 0.85 }}
+              style={{ fontSize: 11, lineHeight: "15px", opacity: 0.85 }}
             >
               {dragLabel(dragging.outcome)}
             </span>
@@ -769,6 +786,22 @@ function DayColumn({
     return layoutEvents(clamped);
   }, [events, dayStart, dayEnd]);
 
+  /*
+   * Paint order is column order.
+   *
+   * A cascaded cluster overlaps its blocks, so which one is on top has to be
+   * decided rather than inherited. Every unselected block sits at
+   * `Z_EVENT`, which leaves the DOM to break the tie — and the DOM is in start
+   * order, which is *nearly* column order but not reliably: a short event
+   * squeezed into a cluster after two longer ones takes column 2 while a later
+   * event reuses column 1, and column 1 would then paint over column 2's strip.
+   *
+   * Sorting the render list by column fixes it in one line and costs nothing
+   * elsewhere: keyboard order comes from the keymap, not from the DOM, and
+   * clusters never overlap each other in space, so no two clusters can fight.
+   */
+  const painted = useMemo(() => [...laid].sort((a, b) => a.column - b.column), [laid]);
+
   const showNow = now >= dayStart && now < dayEnd;
 
   function timeAt(clientY: number): number {
@@ -872,7 +905,7 @@ function DayColumn({
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
       >
-        {laid.map((item) => {
+        {painted.map((item) => {
           const merged = item.event.merged;
           const event = merged.event;
           const columns = visibleColumns(item.columns, width);
@@ -880,7 +913,16 @@ function DayColumn({
           const height = blockHeight(item.event.end - item.event.start);
           const expanded = hovered === event.id;
           const span = Math.max(1, Math.min(item.span, columns - item.column));
-          const geometry = columnGeometry({ ...item, columns, span });
+          const geometry = columnGeometry({ ...item, columns, span }, width);
+          const cluster = clusterPlan(columns, width);
+          // A cascaded block runs to the right edge of the cluster and is only
+          // *covered* by the blocks after it, so the width its text is laid out
+          // in is the whole remainder — not the strip you can currently see.
+          // That is what makes selecting one reveal its title with no reflow.
+          const rendered =
+            cluster.mode === "cascade"
+              ? Math.max(width - item.column * cluster.step, 0)
+              : (width * span) / columns;
           // A block clipped by the day boundary is a *slice* of the event: its
           // top and bottom are the day's edges, not the event's, so neither
           // dragging nor resizing it could mean what it looks like it means.
@@ -907,7 +949,8 @@ function DayColumn({
                 dimmed={event.id === draggingId || (dimIds?.has(event.id) ?? false)}
                 copies={merged.copies.length}
                 height={height}
-                width={expanded ? width : (width * span) / columns}
+                width={expanded ? width : rendered}
+                cascaded={cluster.mode === "cascade" && item.column > 0}
                 resizable={wholeInThisDay}
                 blockRef={(node) => registerBlock(event.id, node)}
                 onSelect={() => onOpen(event.id)}
@@ -1046,7 +1089,7 @@ function DraftBlock({
   };
 
   return (
-    <div data-draft className="absolute overflow-hidden px-1.5 py-[2px]" style={style}>
+    <div data-draft className="absolute overflow-hidden px-1 py-[2px]" style={style}>
       {editing ? (
         <input
           ref={input}
@@ -1054,7 +1097,7 @@ function DraftBlock({
           onChange={(e) => setTitle(e.target.value)}
           placeholder="New event"
           className="w-full bg-transparent outline-none placeholder:opacity-70"
-          style={{ fontSize: 12, lineHeight: "15px", fontWeight: 500, color: paint.color }}
+          style={{ fontSize: 12, lineHeight: "15px", fontWeight: 600, color: paint.color }}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
@@ -1070,12 +1113,12 @@ function DraftBlock({
           onBlur={() => onCancel()}
         />
       ) : (
-        <span style={{ fontSize: 12, lineHeight: "15px", fontWeight: 500 }}>
+        <span style={{ fontSize: 12, lineHeight: "15px", fontWeight: 600 }}>
           {shortTime(draft.start)} – {shortTime(draft.end)}
         </span>
       )}
       {editing && height >= 34 && (
-        <span className="block tabular-nums" style={{ fontSize: 12, lineHeight: "15px", opacity: 0.85 }}>
+        <span className="block tabular-nums" style={{ fontSize: 11, lineHeight: "15px", opacity: 0.85 }}>
           {shortTime(draft.start)} – {shortTime(draft.end)}
         </span>
       )}

@@ -445,3 +445,128 @@ describe("the wildcard", () => {
     expect(fired).toBe(true);
   });
 });
+
+/**
+ * An overlay owning the keyboard.
+ *
+ * The bug: with preferences open, `e` still reached the thread list and
+ * archived a conversation the user could not see. Every mode gate had been
+ * written against `!ui.paletteOpen`, so the palette was the only surface any of
+ * them had heard of, and each new dialog re-opened the hole.
+ *
+ * These hold the mechanism that replaced that — a claim on the registry — and
+ * the case that made it worth having.
+ */
+describe("a claim on the keyboard", () => {
+  const archive = (k: Keymap, spy: () => void) =>
+    // The shape MailMode registers `e` in: priority 10, mode-scoped.
+    k.register({ keys: "e", priority: 10, description: "Archive", handler: spy });
+
+  it("stops `e` archiving behind a dialog", () => {
+    const k = createKeymap("meta");
+    const archived = vi.fn();
+    archive(k, archived);
+
+    const release = k.claimKeyboard();
+    k.handle(press("e"));
+    expect(archived).not.toHaveBeenCalled();
+
+    // And the list gets its keys back the moment the dialog closes, rather
+    // than staying deaf until something else re-registers.
+    release();
+    k.handle(press("e"));
+    expect(archived).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the key to the DOM rather than swallowing it", () => {
+    // Nothing matched, so nothing may call preventDefault: a button inside the
+    // dialog still activates on Space, and a select menu still reads its arrows.
+    const k = createKeymap("meta");
+    archive(k, vi.fn());
+    k.claimKeyboard();
+
+    const event = press("e");
+    expect(k.handle(event)).toBe(false);
+    expect(event.prevented).toBe(false);
+  });
+
+  it("keeps the surface's own keys, Escape included", () => {
+    const k = createKeymap("meta");
+    let closed = false;
+    k.register({ keys: "escape", priority: 125, handler: () => { closed = true; } });
+    k.claimKeyboard();
+
+    k.handle(press("Escape"));
+    expect(closed).toBe(true);
+  });
+
+  it("nests — a menu inside a dialog, a confirmation inside a panel", () => {
+    const k = createKeymap("meta");
+    const archived = vi.fn();
+    archive(k, archived);
+
+    const dialog = k.claimKeyboard();
+    const inner = k.claimKeyboard();
+    expect(k.claims()).toBe(2);
+
+    // Releasing the inner surface must not hand the keyboard back to the list
+    // while the outer one is still on screen.
+    inner();
+    k.handle(press("e"));
+    expect(archived).not.toHaveBeenCalled();
+    expect(k.claims()).toBe(1);
+
+    dialog();
+    k.handle(press("e"));
+    expect(archived).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases once, however many times it is asked to", () => {
+    // React can run a cleanup more than once; a claim released twice must not
+    // take a second surface's claim down with it.
+    const k = createKeymap("meta");
+    const outer = k.claimKeyboard();
+    k.claimKeyboard();
+    outer();
+    outer();
+    expect(k.claims()).toBe(1);
+  });
+
+  it("drops a half-typed sequence, so `g` cannot complete against a dialog", () => {
+    const k = createKeymap("meta");
+    const inbox = vi.fn();
+    k.register({ keys: "g i", handler: inbox });
+
+    k.handle(press("g"));
+    k.claimKeyboard();
+    k.handle(press("i"));
+    expect(inbox).not.toHaveBeenCalled();
+  });
+
+  it("reports the suppressed bindings as neither live nor conflicting", () => {
+    const k = createKeymap("meta");
+    k.register({ keys: "e", priority: 10, description: "Archive", handler: () => {} });
+    k.register({ keys: "e", priority: 10, description: "Also archive", handler: () => {} });
+    expect(k.conflicts()).toHaveLength(1);
+
+    // Fewer live bindings can only mean fewer ties — a claim never invents one.
+    k.claimKeyboard();
+    expect(k.conflicts()).toHaveLength(0);
+    expect(k.active()).toHaveLength(0);
+  });
+
+  it("tells subscribers, because the gates that read it are rendered", () => {
+    const k = createKeymap("meta");
+    const changed = vi.fn();
+    const stop = k.subscribe(changed);
+
+    const release = k.claimKeyboard();
+    expect(changed).toHaveBeenCalledTimes(1);
+    release();
+    expect(changed).toHaveBeenCalledTimes(2);
+
+    stop();
+    k.claimKeyboard();
+    expect(changed).toHaveBeenCalledTimes(2);
+  });
+});

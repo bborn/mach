@@ -39,8 +39,101 @@ export const ALL_DAY_CHIP_HEIGHT = 22;
 export const ALL_DAY_ROW_PITCH = 24;
 export const ALL_DAY_MAX_ROWS = 3;
 
-/** Below this a column is hopeless whatever you put in it (§2). */
+/* -------------------------------------------------------------------------- */
+/* Overlapping clusters                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Three concurrent events used to render as `Intervi staf…`, `OKR…` and
+ * `Wareh cost…`.
+ *
+ * A week column at 1440px is 168px wide, 155px of it usable. Divided three ways
+ * that is 51px per block, which after the block's own inset leaves about four
+ * characters. Five ways it is 31px. Even division is right for two events and
+ * wrong for five, and the numbers below are where it changes.
+ *
+ * The two references answer it differently:
+ *
+ *   - **Google Calendar** keeps the first words legible by dropping everything
+ *     that is not the title once a block gets narrow. The time goes first,
+ *     because a block's position in the grid already says when it is.
+ *   - **Fantastical** stops dividing past a certain depth and *cascades*: each
+ *     event is offset and drawn over the one before, so one of them is readable
+ *     in full rather than all of them being unreadable.
+ *
+ * Mach takes both, at different thresholds. Under `NARROW_BLOCK_WIDTH` a block
+ * spends its whole self on the title (Google). Under `READABLE_COLUMN_WIDTH`,
+ * and only from three events up, the cluster cascades (Fantastical).
+ *
+ * A cascaded block runs from its own offset to the right edge of the cluster,
+ * so its title is laid out at full width and then covered. Selecting it lifts it
+ * above its neighbours (`Z_EVENT_SELECTED` over `Z_EVENT`) and the whole title
+ * is already there, with no reflow and no geometry change; arrowing through a
+ * five-deep cluster reads every one of them in turn. Every event stays on the
+ * grid throughout, keeping its colour, its true top and bottom, and its own
+ * click target.
+ */
+
+/** Below this an evenly-divided column cannot hold a title. */
+export const READABLE_COLUMN_WIDTH = 76;
+
+/**
+ * Below this a block shows its title and nothing else.
+ *
+ * 88px less the block's 4px insets is 80px of text, which is about thirteen
+ * characters at 12px. Above that a line spent on the time is a line the title
+ * did not need; below it, it is the line the title needed most.
+ *
+ * It sits under the 97px a full-width column has at a 1040px window, so
+ * narrowing the window leaves the times alone and only crowding removes them.
+ */
+export const NARROW_BLOCK_WIDTH = 88;
+
+/** What the cascade aims to leave the block on top. */
+export const CASCADE_TOP_WIDTH = 76;
+
+/**
+ * The narrowest strip a cascaded block may reveal.
+ *
+ * 18px is under two characters, so the strip at this size says *another event
+ * is here, on this calendar, running this long* and offers a target for the
+ * pointer and the arrow keys. Below it the cluster stops adding columns and
+ * spends the last one on a `+N` chip.
+ */
+export const CASCADE_STEP_MIN = 18;
+
+/** A block narrower than this is a colour rather than a label (§2). */
 export const MIN_COLUMN_WIDTH = 40;
+
+export type ClusterMode = "divide" | "cascade";
+
+export interface ClusterPlan {
+  mode: ClusterMode;
+  /** Pixels between one cascaded block's left edge and the next. 0 when dividing. */
+  step: number;
+}
+
+/**
+ * Divide or cascade, and by how much.
+ *
+ * Two events always divide. Side-by-side halves is the idiom every calendar
+ * uses, and 48px each at a narrow window still shows a word apiece: worse than a
+ * cascade for one of the two, better for the other.
+ */
+export function clusterPlan(columns: number, clusterWidth: number): ClusterPlan {
+  if (columns <= 2 || clusterWidth <= 0) return { mode: "divide", step: 0 };
+  const share = clusterWidth / columns;
+  if (share >= READABLE_COLUMN_WIDTH) return { mode: "divide", step: 0 };
+  // `clamp` prefers its minimum when the range inverts, which is what a cluster
+  // narrower than the top block's target needs: every step is the floor, and the
+  // block on top takes whatever is left rather than the width it asked for.
+  const step = clamp(
+    (clusterWidth - CASCADE_TOP_WIDTH) / (columns - 1),
+    CASCADE_STEP_MIN,
+    share,
+  );
+  return { mode: "cascade", step };
+}
 
 /**
  * Named layers instead of Google's magic 5 / 507.
@@ -145,12 +238,32 @@ export interface BlockPlan {
   tier: BlockTier;
   /** 12px normal, 11px compressed. Two sizes in the grid, and only two. */
   fontPx: 11 | 12;
+  /**
+   * The secondary line — the time, and the location under it.
+   *
+   * It used to be `fontPx` as well, so a block's title and its time were the
+   * same size and the block read as two equal lines. At 12 over 11 the title
+   * reads as the label and the time as the footnote, and the block costs no
+   * more height, because 11px sits on the same 15px line.
+   */
+  timeFontPx: 11;
   /** The text line's height. Constant, which is why a sliver can overflow. */
   lineHeightPx: 15;
   /** Title and time on one comma-joined line. */
   inlineTime: boolean;
+  /**
+   * Whether the time is drawn at all.
+   *
+   * False on a narrow block, which is Google's rule. The time costs a whole
+   * line in a stacked block and about 30px on an inline one, and the grid is
+   * already a picture of when the event is. It stays in the tooltip and in the
+   * modal.
+   */
+  showTime: boolean;
   /** Title may run to a second line. Never true below 48px. */
   wrapTitle: boolean;
+  /** How many lines the title may take. Three only when the time has gone. */
+  titleLines: 1 | 2 | 3;
   showLocation: boolean;
   /** The text is allowed to spill outside the block's bounds. */
   overflow: boolean;
@@ -158,16 +271,23 @@ export interface BlockPlan {
 
 export function blockPlan(
   height: number,
-  options: { hasLocation?: boolean } = {},
+  options: { hasLocation?: boolean; width?: number } = {},
 ): BlockPlan {
   const tier = blockTier(height);
+  // Width is optional so a caller that only cares about the height ladder — the
+  // tests, and anything reasoning about duration alone — gets the roomy plan.
+  const narrow = options.width !== undefined && options.width < NARROW_BLOCK_WIDTH;
+  const titleLines = tier === "full" ? (narrow ? 3 : 2) : 1;
   return {
     tier,
     fontPx: tier === "sliver" ? 11 : 12,
+    timeFontPx: 11,
     lineHeightPx: 15,
     inlineTime: tier === "oneLine" || tier === "sliver",
-    wrapTitle: tier === "full",
-    showLocation: tier === "full" && options.hasLocation === true,
+    showTime: !narrow,
+    wrapTitle: titleLines > 1,
+    titleLines,
+    showLocation: tier === "full" && !narrow && options.hasLocation === true,
     overflow: tier === "sliver",
   };
 }
@@ -189,12 +309,6 @@ export function blockTier(height: number): BlockTier {
   return "sliver";
 }
 
-/**
- * How many columns a cluster may actually show before slivers stop being
- * readable, and how many events that hides. Below 40px per column, cap the
- * columns and spend the last one on a `+N` chip rather than rendering a 12px
- * sliver of a title.
- */
 /**
  * Row packing for the all-day strip.
  *
@@ -227,9 +341,20 @@ export function packRows<T extends RowItem>(items: readonly T[]): (T & { row: nu
   });
 }
 
+/**
+ * How many columns a cluster may show before the last one becomes a `+N` chip.
+ *
+ * This used to be `floor(width / 40)`, how many 40px columns fit side by side.
+ * That let three 51px columns through, which is where the unreadable cluster
+ * came from, and it refused a fourth event that a cascade has room for. Now
+ * that a deep cluster cascades, the question it asks is how many 18px strips
+ * fit beside a block wide enough to read: seven at 1440px, against three.
+ *
+ * Two is never capped. Half of a very narrow column is still an event you can
+ * see and click.
+ */
 export function visibleColumns(columns: number, columnWidth: number): number {
-  if (columns <= 1 || columnWidth <= 0) return Math.max(columns, 1);
-  const fits = Math.floor(columnWidth / MIN_COLUMN_WIDTH);
-  if (fits >= columns) return columns;
-  return Math.max(1, fits);
+  if (columns <= 2 || columnWidth <= 0) return Math.max(columns, 1);
+  const fits = 1 + Math.floor((columnWidth - MIN_COLUMN_WIDTH) / CASCADE_STEP_MIN);
+  return clamp(fits, 1, columns);
 }

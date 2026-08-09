@@ -121,7 +121,12 @@ export function CalendarSidebar({
                       : [...collapsed, account.id],
                   )
                 }
-                className="flex min-w-0 flex-1 items-center gap-1 text-left text-micro text-muted-foreground hover:text-foreground"
+                // Smaller and fainter than the calendars under it. An address
+                // answers "whose", once per group, so it takes the metadata step
+                // of the ramp while the names take the reading one. It is left
+                // in its own case, because an address set in caps is harder to
+                // read as an address.
+                className="flex min-w-0 flex-1 items-center gap-1 text-left text-micro font-medium text-faint-foreground hover:text-foreground"
                 title={account.email}
               >
                 {isCollapsed ? (
@@ -162,7 +167,7 @@ export function CalendarSidebar({
                     // indicator and a swatch cannot be read aloud.
                     aria-pressed={!off}
                     title={calendarTooltip(calendar, off, slot)}
-                    className="flex items-center gap-1.5 rounded-[3px] py-[3px] pl-4 pr-1 text-left hover:bg-row-hover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    className="flex items-center gap-2 rounded-[3px] py-1 pl-4 pr-1 text-left hover:bg-row-hover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   >
                     <span
                       className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
@@ -187,9 +192,17 @@ export function CalendarSidebar({
                      * which is why the tooltip leads with the name rather than
                      * with the verb.
                      */}
+                    {/*
+                      `text-list`, where the account address above it stays at
+                      `text-micro`. The rail used to be one size top to bottom,
+                      so a group header and its members read as one list of
+                      eleven-pixel strings. A step between them says which is the
+                      heading, and the calendar's name is what anyone comes to
+                      this rail to find.
+                    */}
                     <span
                       className={cn(
-                        "min-w-0 flex-1 truncate text-micro",
+                        "min-w-0 flex-1 truncate text-list",
                         off ? "text-faint-foreground" : "text-foreground",
                       )}
                     >
@@ -241,7 +254,7 @@ function Toggle({
   // right and announced itself as a button with no state. Same pixels, real
   // `role="checkbox"` and `aria-checked`.
   return (
-    <Label title={hint} className="cursor-pointer gap-1.5 rounded-[3px] px-1 py-[3px] hover:bg-row-hover">
+    <Label title={hint} className="cursor-pointer gap-2 rounded-[3px] px-1 py-1 hover:bg-row-hover">
       <Checkbox checked={on} onCheckedChange={onChange} />
       <span className="min-w-0 flex-1 truncate text-micro text-muted-foreground">{label}</span>
     </Label>

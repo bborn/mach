@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMach } from "@/hooks/useMach";
+import { useKeyBindings } from "@/hooks/useKeymap";
 import { getDataSource } from "@/lib/data";
 import { toMailboxError } from "@/hooks/useThreadStream";
 import { cn } from "@/lib/utils";
@@ -61,6 +62,27 @@ export function AddAccountDialog() {
   }, [actions]);
 
   const busy = phase.step === "opening" || phase.step === "waiting";
+
+  /*
+   * Escape, which this surface never had.
+   *
+   * It went unnoticed while an unclaimed key fell through to the list behind
+   * the dialog — Escape did *something*, it just closed a conversation nobody
+   * was looking at. Now that an overlay holds the keyboard, the key would do
+   * nothing at all, and a dialog you cannot dismiss from the keyboard is the
+   * one thing this app does not ship. Not while the browser is mid-consent:
+   * the loopback listener is still bound and closing the window would strand
+   * it, which is the same reason the backdrop declines then too.
+   */
+  useKeyBindings([
+    {
+      keys: "escape",
+      priority: 125,
+      allowInInput: true,
+      when: () => open && !busy,
+      handler: () => actions.setAddAccount(false),
+    },
+  ]);
 
   return (
     <Overlay

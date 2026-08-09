@@ -114,10 +114,12 @@ export function ReadingPane() {
       <header className="shrink-0 border-b border-border px-5 py-3">
         <div className="flex items-start gap-3">
           <div className="min-w-0 flex-1">
-            <h1 className="truncate text-reading font-medium text-foreground">{thread.subject}</h1>
+            {/* The one `text-title` in mail: what this pane is about. It was
+                `text-reading`, the same size as the message bodies below it. */}
+            <h1 className="truncate text-title font-semibold text-foreground">{thread.subject}</h1>
             <div className="mt-1 flex min-w-0 items-center gap-2 text-micro text-faint-foreground">
               {account && (
-                <span className="flex min-w-0 items-center gap-1.5">
+                <span className="flex min-w-0 items-center gap-1">
                   <span
                     className={cn(
                       "h-1.5 w-1.5 shrink-0 rounded-full",

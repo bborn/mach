@@ -7,8 +7,10 @@ import {
   useReducer,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { useKeymap } from "@/hooks/useKeymap";
 import type {
   Account,
   AccountId,
@@ -178,6 +180,17 @@ interface UiState {
   railIndex: number;
   eventId: EventId | null;
   paletteOpen: boolean;
+  /**
+   * How many modal surfaces are on screen. Zero means the app has the keyboard.
+   *
+   * Mirrored from the keymap's claim stack rather than reduced, because the
+   * thing that knows a dialog is up is the dialog — `Overlay` claims the
+   * keyboard as it opens and releases it as it closes, and every surface in the
+   * app is an `Overlay`. There is deliberately no action for it: a reducer case
+   * would be a second way to say a dialog is open, and a second way to get it
+   * wrong. See `overlayOwnsKeyboard` for what reads it.
+   */
+  overlays: number;
   addAccountOpen: boolean;
   listWidth: number;
   hiddenCalendars: CalendarId[];
@@ -240,6 +253,7 @@ export const initialUi: UiState = {
   railIndex: -1,
   eventId: null,
   paletteOpen: false,
+  overlays: 0,
   addAccountOpen: false,
   listWidth: 520,
   hiddenCalendars: [],
@@ -333,6 +347,20 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
     case "status":
       return { ...state, status: action.status };
   }
+}
+
+/**
+ * True while a dialog is up, and therefore while no mode binding may fire.
+ *
+ * The one place the rule is written down, so that "is anything covering the
+ * list?" is a question with a single answer rather than one `!ui.somethingOpen`
+ * per surface, appended to as dialogs are added and forgotten as often as not.
+ * The keymap enforces the same rule underneath (see `claimKeyboard`); this is
+ * how a mode says it out loud, and what the archive-behind-a-dialog regression
+ * test holds on to.
+ */
+export function overlayOwnsKeyboard(ui: Pick<UiState, "overlays">): boolean {
+  return ui.overlays > 0;
 }
 
 function uniq<T>(values: T[]): T[] {
@@ -476,6 +504,17 @@ export function MachProvider({ children }: { children: ReactNode }) {
   // instead; this one is what that wrapper calls, and what `run` uses to avoid
   // recording an action twice.
   const [ui, dispatchUi] = useReducer(uiReducer, initialUi);
+  /*
+   * The open-dialog count, read off the registry the dialogs claim.
+   *
+   * Subscribed rather than polled because a gate written as `when: () => …` is
+   * only re-read when the component that declared it renders, and a dialog
+   * opening two levels away renders nothing here on its own. Every consumer of
+   * this hook already re-renders together, so one subscription puts the whole
+   * app's gates back in step at once.
+   */
+  const keymap = useKeymap();
+  const overlays = useSyncExternalStore(keymap.subscribe, keymap.claims, keymap.claims);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [labels, setLabels] = useState<Label[]>([]);
   const [calendars, setCalendars] = useState<Calendar[]>([]);
@@ -1290,8 +1329,11 @@ export function MachProvider({ children }: { children: ReactNode }) {
     undoHost,
   ]);
 
+  const uiWithOverlays = useMemo(() => ({ ...ui, overlays }), [ui, overlays]);
+
   const value: MachValue = {
-    ui,
+    // The reducer's state plus the one field it does not own — see `UiState`.
+    ui: uiWithOverlays,
     accounts,
     labels,
     calendars,

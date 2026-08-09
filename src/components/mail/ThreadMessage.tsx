@@ -85,7 +85,7 @@ export function ThreadMessage({
         // A second, redundant mark, for the reader scanning down the left edge
         // rather than reading the row. Redundancy is the point: neither this
         // nor the pill is the only thing saying "unsent".
-        draft && "-ml-3 border-l-2 border-l-danger pl-2.5",
+        draft && "-ml-3 border-l-2 border-l-danger pl-3",
       )}
     >
       <button
@@ -125,7 +125,7 @@ export function ThreadMessage({
 
       {expanded && !draft && (
         <>
-          <div className="mt-0.5 truncate text-micro text-faint-foreground">
+          <div className="mt-1 truncate text-micro text-faint-foreground">
             to {message.to.map((p) => p.name).join(", ") || "—"}
             {message.cc.length > 0 && ` · cc ${message.cc.map((p) => p.name).join(", ")}`}
           </div>
@@ -242,7 +242,7 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
                     })
                   }
                   className={cn(
-                    "flex min-w-0 items-center gap-1.5 px-2 py-1 text-left",
+                    "flex min-w-0 items-center gap-1 px-2 py-1 text-left",
                     "hover:bg-row-hover disabled:opacity-60",
                   )}
                 >
@@ -280,7 +280,7 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
                     })
                   }
                   className={cn(
-                    "flex shrink-0 items-center border-l border-border px-1.5",
+                    "flex shrink-0 items-center border-l border-border px-2",
                     "hover:bg-row-hover disabled:opacity-60",
                   )}
                 >
@@ -296,7 +296,7 @@ export function AttachmentRow({ attachments, live }: AttachmentRowProps) {
         <div
           role="status"
           className={cn(
-            "mt-1.5 flex items-center gap-1.5 text-micro",
+            "mt-2 flex items-center gap-1 text-micro",
             status.error ? "text-danger" : "text-muted-foreground",
           )}
         >

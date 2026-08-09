@@ -413,7 +413,7 @@ export function EventModal({
         {error && (
           <p
             role="alert"
-            className="flex items-start gap-1.5 rounded-sm border border-danger/40 bg-danger/10 px-2 py-1.5 text-micro text-danger"
+            className="flex items-start gap-2 rounded-sm border border-danger/40 bg-danger/10 px-2 py-1 text-micro text-danger"
           >
             <AlertTriangle size={12} strokeWidth={1.75} className="mt-[1px] shrink-0" />
             <span className="min-w-0">{error}</span>
@@ -427,7 +427,7 @@ export function EventModal({
             you can still RSVP, and that Google Calendar can edit it — are both
             visible controls a few rows down. */}
         {!canEdit && (
-          <p className="flex items-center gap-1.5 rounded-sm border border-border bg-surface-raised px-2 py-1.5 text-micro text-muted-foreground">
+          <p className="flex items-center gap-2 rounded-sm border border-border bg-surface-raised px-2 py-1 text-micro text-muted-foreground">
             <Lock size={12} strokeWidth={1.75} className="shrink-0" />
             <span className="min-w-0 truncate">
               {event?.organizer?.email
@@ -479,7 +479,7 @@ export function EventModal({
                 disabled={!canEdit}
               />
               <div className="flex items-center gap-3">
-                <Label className="cursor-pointer gap-1.5 text-micro text-muted-foreground">
+                <Label className="cursor-pointer gap-2 text-micro text-muted-foreground">
                   {/* The end date means the same thing on both sides of this
                       tick — the last day the event covers — so it is left
                       alone. Collapsing it to the start date, which this used
@@ -598,7 +598,7 @@ export function EventModal({
               <Users size={11} strokeWidth={1.75} />
               Who
             </FieldLabel>
-            <div className="flex min-w-0 flex-col gap-1.5">
+            <div className="flex min-w-0 flex-col gap-2">
               <Textarea
                 id={ids.attendees}
                 autoSize
@@ -637,7 +637,7 @@ export function EventModal({
                 <Paperclip size={11} strokeWidth={1.75} />
                 Files
               </RowCaption>
-              <div className="flex min-w-0 flex-col gap-0.5">
+              <div className="flex min-w-0 flex-col gap-1">
                 {event.attachments?.map((file) => {
                   const url = joinUrl(file.url);
                   return url ? (
@@ -684,7 +684,7 @@ export function EventModal({
                   const owner = accounts.find((a) => a.id === calendar.accountId);
                   return (
                     <SelectItem key={calendar.id} value={calendar.id}>
-                      <span className="flex min-w-0 items-center gap-1.5">
+                      <span className="flex min-w-0 items-center gap-1">
                         <span
                           className="h-2 w-2 shrink-0 rounded-[2px]"
                           style={{ backgroundColor: calendarFill(colorFor(calendar.id), dark) }}
@@ -768,7 +768,7 @@ export function EventModal({
           onCancel={() => setScopePrompt(null)}
         />
       ) : (
-        <div className="flex items-center gap-1.5 border-t border-border px-3 py-2">
+        <div className="flex items-center gap-2 border-t border-border px-3 py-2">
           {event && canEdit && (
             <>
               <Button
@@ -803,7 +803,7 @@ export function EventModal({
               </Button>
             </>
           )}
-          <div className="ml-auto flex items-center gap-1.5">
+          <div className="ml-auto flex items-center gap-2">
             <Button size="sm" onClick={onClose}>
               {canEdit ? "Cancel" : "Close"}
             </Button>
@@ -901,7 +901,7 @@ function ConferenceBlock({
 
   return (
     <div className="flex min-w-0 flex-col gap-1">
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-0 items-center gap-1">
         {join && (
           <Button size="sm" variant="default" onClick={() => onOpenExternal(join)}>
             <Video size={12} strokeWidth={1.75} />
@@ -993,15 +993,15 @@ function GuestList({ guests }: { guests: readonly EventGuest[] }) {
     .map(([n, word]) => `${n} ${word}`);
 
   return (
-    <div className="flex min-w-0 flex-col gap-0.5">
+    <div className="flex min-w-0 flex-col gap-1">
       <span className="text-micro text-faint-foreground">
         {guests.length} {guests.length === 1 ? "guest" : "guests"}
         {parts.length > 0 ? ` · ${parts.join(", ")}` : ""}
       </span>
-      <ul className="flex min-w-0 flex-col gap-0.5">
+      <ul className="flex min-w-0 flex-col gap-1">
         {guests.map((guest) => (
           <li key={guest.email} className="min-w-0 text-micro">
-            <span className="flex min-w-0 items-center gap-1.5">
+            <span className="flex min-w-0 items-center gap-1">
               <span className="min-w-0 truncate text-muted-foreground">
                 {guest.name || guest.email}
               </span>
@@ -1056,7 +1056,7 @@ function EndRow({
   disabled: boolean;
 }) {
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex items-center gap-2">
       <span className="w-6 shrink-0 text-micro text-faint-foreground">{caption}</span>
       <DateField
         id={dateId}
@@ -1126,7 +1126,7 @@ function ScopePrompt({
       <p className="text-micro text-muted-foreground">
         This event repeats. {action === "delete" ? "Delete" : "Change"} which occurrences?
       </p>
-      <div className="flex items-center gap-1.5">
+      <div className="flex items-center gap-2">
         <Button
           ref={first}
           size="sm"

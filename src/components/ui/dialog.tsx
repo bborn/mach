@@ -1,4 +1,5 @@
-import { useEffect, useRef, type ReactNode, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useRef, type ReactNode, type RefObject } from "react";
+import { useKeymap } from "@/hooks/useKeymap";
 import { cn } from "@/lib/utils";
 
 interface OverlayProps {
@@ -32,11 +33,20 @@ interface OverlayProps {
 }
 
 /**
- * A modal surface with a real focus trap and focus restoration.
+ * A modal surface with a real focus trap, focus restoration, and the keyboard.
  *
  * Escape is *not* handled here — it belongs to the keymap registry so that
  * precedence between the palette, an open thread and the shell is decided in
  * one place instead of by whoever bubbles first.
+ *
+ * The keyboard is. A focus trap only decides where the caret is, and the app's
+ * bindings never asked: they are window-level, so with preferences open `e`
+ * still archived the conversation underneath it, `x` still ticked a row nobody
+ * could see, and the only overlay any of them had heard of was the palette. So
+ * an open overlay claims the keyboard from the registry for as long as it is
+ * up, which fixes the whole class at the one place every dialog in the app
+ * already passes through rather than one dialog at a time. `claimKeyboard`
+ * explains what survives a claim.
  */
 export function Overlay({
   open,
@@ -50,6 +60,18 @@ export function Overlay({
 }: OverlayProps) {
   const panel = useRef<HTMLDivElement>(null);
   const restoreTo = useRef<HTMLElement | null>(null);
+  const keymap = useKeymap();
+
+  /*
+   * Layout effect, not effect: the claim has to be in force before anything can
+   * be typed at the surface that just opened. React flushes layout effects
+   * before it yields to the browser, so there is no frame in which the dialog
+   * is on screen and the list behind it still owns `e`.
+   */
+  useLayoutEffect(() => {
+    if (!open) return;
+    return keymap.claimKeyboard();
+  }, [open, keymap]);
 
   useEffect(() => {
     if (!open) return;

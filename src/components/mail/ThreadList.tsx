@@ -5,6 +5,7 @@ import { mailboxName } from "@/lib/mailboxes";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { MailboxNotice } from "./MailboxNotice";
+import { ThreadContextMenu } from "./ThreadContextMenu";
 import { GMAIL_DRAFT, ThreadRow } from "./ThreadRow";
 
 export function ThreadList() {
@@ -105,6 +106,7 @@ export function ThreadList() {
           <MailboxNotice />
         ) : (
           <>
+            <ThreadContextMenu>
             {visibleThreads.map((thread) => (
               <ThreadRow
                 key={thread.id}
@@ -128,6 +130,7 @@ export function ThreadList() {
                 onToggle={() => actions.clickThread(thread.id, { extend: false, toggle: true })}
               />
             ))}
+            </ThreadContextMenu>
             <div ref={sentinel} aria-hidden className="h-px" />
             {hasMore && (
               <div className="px-3 py-2 text-micro text-faint-foreground">

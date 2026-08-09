@@ -36,7 +36,7 @@ use crate::db::models::{NewMessage, NewThread, Participant};
 use crate::db::{command_queries, queries, Db};
 
 use super::draft::Draft;
-use super::markdown;
+
 use super::mime::Mailbox;
 use super::{ensure_compose_schema, ComposeError, Result};
 
@@ -84,8 +84,7 @@ pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
     };
 
     let gmail_message_id = current_id(draft);
-    let body_text = markdown::to_text(&draft.body);
-    let body_html = markdown::to_html(&draft.body);
+    let (body_text, body_html) = super::draft::body_parts(draft);
     let snippet = snippet(&body_text);
     let subject = draft.subject.clone();
     let to = participants(&draft.to);
@@ -111,7 +110,7 @@ pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
                     last_message_at: now_ms,
                     is_unread: false,
                     message_count: 1,
-                    has_attachments: false,
+                    has_attachments: !draft.attachments.is_empty(),
                     label_ids: vec!["DRAFT".to_string()],
                 },
             )?,

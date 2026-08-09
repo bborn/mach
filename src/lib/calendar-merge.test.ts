@@ -148,11 +148,22 @@ describe("the calendar palette", () => {
     expect(pending.border).toBeDefined();
   });
 
-  it("pushes a past event back with opacity, keeping its hue", () => {
+  /*
+   * Washed towards the page rather than made translucent, so that two past
+   * events cascaded over one another do not show through each other — and so
+   * that the selection cursor, which is drawn outside the block and cannot
+   * survive `opacity`, stays at full strength on a block that has already
+   * happened.
+   */
+  it("pushes a past event back by washing it towards the page, keeping its hue", () => {
     const past = paintFor("#4986e7", "solid", { dark: false, past: true });
     const now = paintFor("#4986e7", "solid", { dark: false });
-    expect(past.opacity).toBe(0.6);
-    expect(past.background).toBe(now.background);
+    expect(past.opacity).toBe(1);
+    expect(past.background).toBe(
+      `color-mix(in oklab, ${now.background} 60%, var(--background))`,
+    );
+    // The cursor's inner band is the one thing the fade does not reach.
+    expect(past.selectionGap).toBe(now.selectionGap);
   });
 
   it("strikes a declined event through rather than recolouring it", () => {

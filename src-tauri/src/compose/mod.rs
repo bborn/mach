@@ -42,7 +42,9 @@
 //! no-op for this call.
 
 pub mod address;
+pub mod attach;
 pub mod draft;
+pub mod html;
 pub mod markdown;
 pub mod mime;
 pub mod mirror;
@@ -56,12 +58,13 @@ use crate::db::{DbError, Result as DbResult};
 use crate::google::GoogleError;
 
 pub use address::{dedupe, reply_recipients, Recipients};
+pub use attach::{Attachment, MAX_ATTACHMENT_BYTES, MAX_TOTAL_ATTACHMENT_BYTES};
 pub use draft::{
-    delete_draft, load_draft, load_draft_for_thread, prepare, save_draft, Draft, DraftKind,
-    DraftRemote, RemoteState, ReplyContext,
+    delete_draft, load_draft, load_draft_for_thread, prepare, save_draft, BodyFormat, Draft,
+    DraftKind, DraftRemote, RemoteState, ReplyContext,
 };
 pub use remote::DraftRemoteSync;
-pub use mime::{build_rfc822, Mailbox, Outgoing};
+pub use mime::{build_rfc822, Mailbox, Outgoing, OutgoingAttachment};
 pub use outbox::{Outbox, OutboxEntry, OutboxState, UNDO_WINDOW_MS};
 
 // ---------------------------------------------------------------------------
@@ -120,6 +123,27 @@ CREATE TABLE IF NOT EXISTS compose_outbox (
     sent_message_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_compose_outbox_due ON compose_outbox (state, send_after);
+
+-- Files waiting to go out with a draft.
+--
+-- The bytes are a BLOB rather than a path for the same reason
+-- `compose_outbox.rfc822` is: a draft that references a file the owner has
+-- since moved, renamed or deleted is a send that fails at the last moment, and
+-- the whole point of the outbox is that once a message is queued nothing
+-- outside the store can stop it. It also means one delete statement takes an
+-- abandoned draft's files with it, with no orphan directory to sweep.
+CREATE TABLE IF NOT EXISTS compose_attachments (
+    id         TEXT    PRIMARY KEY,
+    draft_id   TEXT    NOT NULL,
+    -- Already through `attachments::names::safe_filename`. This is the name the
+    -- recipient sees, so it is also the name shown in the composer.
+    filename   TEXT    NOT NULL,
+    mime_type  TEXT    NOT NULL DEFAULT 'application/octet-stream',
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    bytes      BLOB    NOT NULL,
+    added_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_compose_attachments_draft ON compose_attachments (draft_id);
 "#;
 
 /// The columns that tie a local draft to the Gmail draft it was pushed to.
@@ -139,6 +163,11 @@ CREATE INDEX IF NOT EXISTS idx_compose_outbox_due ON compose_outbox (state, send
 ///    this draft upserts *onto* Mach's row instead of inserting beside it.
 ///  * `remote_state` — `pending`, `synced` or `failed`. A draft is never
 ///    silently local-only; `failed` is what the composer says out loud.
+///  * `body_format` — `markdown` or `html`. The default is `markdown` and it is
+///    load-bearing: every row written before the editor became a rich-text one
+///    holds markdown-ish source, and reading it as HTML would show the owner his
+///    own asterisks and send a message with none of the emphasis he asked for.
+///    See [`draft::BodyFormat`].
 const DRAFT_REMOTE_COLUMNS: &[(&str, &str)] = &[
     ("gmail_draft_id", "TEXT"),
     ("gmail_message_id", "TEXT"),
@@ -146,6 +175,7 @@ const DRAFT_REMOTE_COLUMNS: &[(&str, &str)] = &[
     ("remote_state", "TEXT NOT NULL DEFAULT 'pending'"),
     ("remote_error", "TEXT"),
     ("remote_synced_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("body_format", "TEXT NOT NULL DEFAULT 'markdown'"),
 ];
 
 /// Idempotent. Called by every entry point into this module, so no caller has

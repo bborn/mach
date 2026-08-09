@@ -7,16 +7,20 @@ import {
   type Ref,
   type RefObject,
 } from "react";
+import { Paperclip, X } from "lucide-react";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { Kbd } from "@/components/ui/kbd";
 import { cn } from "@/lib/utils";
+import { RichTextEditor, type RichTextEditorHandle } from "./RichTextEditor";
 import {
   COMPOSER_KEYS,
   formatRecipients,
+  humanSize,
   isLocalOnly,
   parseRecipients,
   scheduleOptions,
   type Draft,
+  type DraftAttachment,
 } from "@/lib/compose";
 
 /**
@@ -34,12 +38,22 @@ export type ComposerPresentation = "dock" | "overlay";
 
 interface ComposerProps {
   draft: Draft;
+  /** The body as HTML — converted once by the dock, never re-derived here. */
+  html: string;
   onChange: (draft: Draft) => void;
+  onBodyChange: (html: string) => void;
   onSend: (scheduleAt?: number) => void;
   onClose: () => void;
+  onDiscard: () => void;
+  onAttach: () => void;
+  onRemoveAttachment: (attachmentId: string) => void;
   /** Set while the send is in flight — the fields go read-only, not blank. */
   busy?: boolean;
   presentation?: ComposerPresentation;
+  /** False for a composer sitting behind another one: its keys are not live. */
+  active?: boolean;
+  /** Files are being dragged over this composer. */
+  dropping?: boolean;
   /**
    * Somewhere for the surface around this to hold on to the To field.
    *
@@ -51,21 +65,20 @@ interface ComposerProps {
   toRef?: RefObject<HTMLInputElement | null>;
 }
 
-/** Two-line minimum, then it grows; past this it scrolls instead. */
-const MAX_EDITOR_HEIGHT = 15 * 22;
-
 /**
  * The composer.
  *
- * A `<textarea>`, three address fields, and two keys. There is no toolbar
- * because a toolbar is a confession that the editor cannot simply be typed
- * into, and no rich-text surface because the source of truth is the characters
- * you typed: `**bold**` stays `**bold**` in the plain-text part of the message
- * and becomes `<strong>` in the HTML one, which is the only behaviour that is
- * honest in both.
+ * Three address fields, a rich-text editor, the files going with it, and a
+ * legend of keys.
  *
  * The decisions worth knowing:
  *
+ *  * **The editor is HTML, and so is the message.** It was a `<textarea>` of
+ *    markdown-ish source, which made the two MIME parts trivial to derive and
+ *    made `**bold**` the thing you looked at while writing. `RichTextEditor`
+ *    replaced it; the `text/plain` part is now read back out of the HTML. The
+ *    toolbar is four formats and a link, all of which have keys — it is there so
+ *    the formatting is *visible*, which is the half a keyboard cannot do.
  *  * **The header is the subject, and for a reply it is not editable.** A
  *    reply's subject is derived, not chosen; offering the field is how the
  *    "Re: Re: Re:" chains this codebase goes out of its way to prevent get
@@ -76,27 +89,34 @@ const MAX_EDITOR_HEIGHT = 15 * 22;
  *    keystroke and rendering the result back would eat the comma the moment you
  *    typed it. The draft carries the parsed value; the field carries what you
  *    are typing.
- *  * **The editor grows with the text.** Growing rather than scrolling is what
- *    keeps the message being answered on screen, which is the entire reason the
- *    composer is inline.
- *  * **The footer is a legend, not a button bar.**
+ *  * **The footer is a legend, not a button bar.** The two exceptions are the
+ *    two acts with consequences outside this panel: attaching a file, and
+ *    throwing the draft away.
  */
 export function Composer({
   draft,
+  html,
   onChange,
+  onBodyChange,
   onSend,
   onClose,
+  onDiscard,
+  onAttach,
+  onRemoveAttachment,
   busy = false,
   presentation = "dock",
+  active = true,
+  dropping = false,
   toRef,
 }: ComposerProps) {
-  const editor = useRef<HTMLTextAreaElement>(null);
+  const editor = useRef<RichTextEditorHandle>(null);
   const ownToField = useRef<HTMLInputElement>(null);
   const toField = toRef ?? ownToField;
   const [showCc, setShowCc] = useState(draft.cc.length > 0 || draft.bcc.length > 0);
   const [scheduling, setScheduling] = useState(false);
 
   const isReply = draft.kind === "reply" || draft.kind === "replyAll";
+  const attachments = draft.attachments ?? [];
 
   // What the address fields display. Seeded from the draft when the composer
   // opens on a different draft, and owned by the fields after that.
@@ -118,19 +138,10 @@ export function Composer({
   // Focus lands in the body for a reply, whose recipients are already right,
   // and in the To field for anything the user still has to address.
   useEffect(() => {
+    if (!active) return;
     if (draft.to.length === 0 && toField.current) toField.current.focus();
     else editor.current?.focus();
-  }, [draft.id]); // eslint-disable-line -- on open, not on every keystroke
-
-  // Grow to fit. Measured rather than counted, because a wrapped line is not a
-  // newline.
-  const resize = useCallback(() => {
-    const node = editor.current;
-    if (!node) return;
-    node.style.height = "auto";
-    node.style.height = `${Math.min(node.scrollHeight, MAX_EDITOR_HEIGHT)}px`;
-  }, []);
-  useEffect(resize, [draft.body, showCc, resize]);
+  }, [draft.id, active]); // eslint-disable-line -- on open, not on every keystroke
 
   const options = useMemo(() => scheduleOptions(), [scheduling]);
 
@@ -149,6 +160,7 @@ export function Composer({
       description: "Send",
       allowInInput: true,
       priority: 100,
+      when: () => active,
       handler: () => send(),
     },
     {
@@ -157,7 +169,26 @@ export function Composer({
       description: "Schedule send",
       allowInInput: true,
       priority: 100,
+      when: () => active,
       handler: () => setScheduling((open) => !open),
+    },
+    {
+      keys: COMPOSER_KEYS.attach,
+      group: "Composer",
+      description: "Attach files",
+      allowInInput: true,
+      priority: 100,
+      when: () => active && !busy,
+      handler: () => onAttach(),
+    },
+    {
+      keys: COMPOSER_KEYS.discard,
+      group: "Composer",
+      description: "Discard this draft",
+      allowInInput: true,
+      priority: 100,
+      when: () => active && !busy,
+      handler: () => onDiscard(),
     },
     {
       keys: COMPOSER_KEYS.close,
@@ -165,6 +196,7 @@ export function Composer({
       description: "Close, keeping the draft",
       allowInInput: true,
       priority: 120,
+      when: () => active,
       handler: () => {
         if (scheduling) setScheduling(false);
         else onClose();
@@ -184,7 +216,14 @@ export function Composer({
     // shadow, and it is not attached to anything above it — so it gets neither
     // the top rule that joins the dock to the reading pane nor the reading
     // pane's own measure.
-    <div className={cn(!overlay && "shrink-0 border-t border-border bg-surface")}>
+    <div
+      className={cn(
+        !overlay && "shrink-0 border-t border-border bg-surface",
+        // A drop target has to say so before the file is let go, or the only
+        // feedback is whether it worked.
+        dropping && "ring-1 ring-inset ring-accent",
+      )}
+    >
       <div className={cn("px-5", overlay ? "py-4" : "mx-auto max-w-[72ch] py-3")}>
         <div className="flex items-baseline gap-2">
           {isReply ? (
@@ -236,21 +275,28 @@ export function Composer({
           )}
         </div>
 
-        <textarea
-          ref={editor}
-          value={draft.body}
+        <RichTextEditor
+          docKey={draft.id}
+          initialHtml={html}
+          onChange={onBodyChange}
           disabled={busy}
-          spellCheck
-          rows={4}
-          onChange={(event) => onChange({ ...draft, body: event.target.value })}
-          onInput={resize}
-          placeholder="**bold**, `code`, - lists"
-          className={cn(
-            "mt-3 block w-full resize-none overflow-y-auto bg-transparent",
-            "text-reading leading-[1.6] text-foreground",
-            "placeholder:text-faint-foreground focus:outline-none disabled:opacity-60",
-          )}
+          active={active}
+          handle={editor}
+          maxHeight={overlay ? 340 : 15 * 22}
         />
+
+        {attachments.length > 0 && (
+          <ul className="mt-2 flex flex-wrap gap-1.5">
+            {attachments.map((file) => (
+              <AttachmentChip
+                key={file.id}
+                file={file}
+                disabled={busy}
+                onRemove={() => onRemoveAttachment(file.id)}
+              />
+            ))}
+          </ul>
+        )}
 
         {scheduling && (
           <div className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-border pt-2">
@@ -278,6 +324,22 @@ export function Composer({
           <span className="inline-flex items-center gap-1">
             <Kbd keys={COMPOSER_KEYS.schedule} /> later
           </span>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onAttach}
+            className="inline-flex items-center gap-1 hover:text-foreground"
+          >
+            <Paperclip className="size-3" /> attach
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onDiscard}
+            className="inline-flex items-center gap-1 hover:text-danger"
+          >
+            discard
+          </button>
           <span className="inline-flex items-center gap-1">
             <Kbd keys={COMPOSER_KEYS.close} /> close
           </span>
@@ -305,6 +367,40 @@ export function Composer({
         </div>
       </div>
     </div>
+  );
+}
+
+function AttachmentChip({
+  file,
+  disabled,
+  onRemove,
+}: {
+  file: DraftAttachment;
+  disabled?: boolean;
+  onRemove: () => void;
+}) {
+  return (
+    <li
+      className={cn(
+        "inline-flex max-w-[22ch] items-center gap-1.5 rounded-[var(--radius)]",
+        "border border-border px-2 py-0.5 text-micro text-muted-foreground",
+      )}
+    >
+      <Paperclip className="size-3 shrink-0" />
+      <span className="min-w-0 truncate" title={file.filename}>
+        {file.filename}
+      </span>
+      <span className="shrink-0 text-faint-foreground">{humanSize(file.sizeBytes)}</span>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={onRemove}
+        aria-label={`Remove ${file.filename}`}
+        className="shrink-0 text-faint-foreground hover:text-danger"
+      >
+        <X className="size-3" />
+      </button>
+    </li>
   );
 }
 

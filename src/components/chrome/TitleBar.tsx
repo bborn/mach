@@ -39,7 +39,7 @@ export function TitleBar() {
         <Kbd keys="mod+k" className="border-none bg-transparent px-0" />
       </button>
 
-      <div className="ml-auto flex shrink-0 items-center gap-1.5" title="Accounts">
+      <div className="ml-auto flex shrink-0 items-center gap-1" title="Accounts">
         {accounts.map((account) => (
           <span
             key={account.id}

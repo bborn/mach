@@ -96,7 +96,7 @@ export function MonthGrid({
             <div
               key={key}
               className={cn(
-                "flex min-h-0 min-w-0 flex-col gap-0.5 border-b border-r border-border p-1",
+                "flex min-h-0 min-w-0 flex-col gap-1 border-b border-r border-border p-1",
                 open ? "overflow-y-auto" : "overflow-hidden",
                 outside && "bg-surface",
               )}
@@ -107,14 +107,16 @@ export function MonthGrid({
                     {monthShort(day)}
                   </span>
                 )}
+                {/* The date is the cell's anchor, so it is a step above the
+                    chips under it rather than the same 11px they are. */}
                 <span
                   className={cn(
-                    "font-mono text-micro tabular-nums",
+                    "font-mono text-list font-medium tabular-nums leading-none",
                     isToday(day)
                       ? "rounded-full bg-accent px-1 text-accent-foreground"
                       : outside
                         ? "text-faint-foreground"
-                        : "text-muted-foreground",
+                        : "text-foreground",
                   )}
                 >
                   {day.getDate()}
@@ -142,7 +144,7 @@ export function MonthGrid({
                   dimmed={dimIds?.has(item.event.id) ?? false}
                   copies={item.copies.length}
                   showTime={item.event.end - item.event.start < 24 * HOUR}
-                  style={{ height: 18, lineHeight: "18px", fontSize: 11, padding: "0 5px" }}
+                  style={{ height: 18, lineHeight: "18px", fontSize: 11, padding: "0 4px" }}
                   onSelect={() => onSelect(item.event.id)}
                 />
               ))}

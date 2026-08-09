@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useMach } from "@/hooks/useMach";
+import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { LIST_WIDTH_BOUNDS } from "@/lib/prefs";
 import { FlexPane, Pane, Resizer } from "@/components/ui/split";
@@ -11,11 +11,18 @@ import { ThreadList } from "./ThreadList";
 
 export function MailMode() {
   const { ui, dispatch, actions, accounts } = useMach();
-  // Two gates, not one. `mail` is "this mode is on screen" — enough for the
-  // account switches, which mean the same thing wherever the cursor is. `list`
-  // adds "and the keyboard is in the list", which is what keeps `j`/`k`/Enter
-  // from being claimed by both the list and the rail at the same moment.
-  const mail = ui.mode === "mail" && !ui.paletteOpen;
+  /*
+   * Two gates, not one. `mail` is "this mode is on screen" — enough for the
+   * account switches, which mean the same thing wherever the cursor is. `list`
+   * adds "and the keyboard is in the list", which is what keeps `j`/`k`/Enter
+   * from being claimed by both the list and the rail at the same moment.
+   *
+   * `overlayOwnsKeyboard` covers every dialog, the palette included, and
+   * replaces the `!ui.paletteOpen` this used to read: the palette was never
+   * special, it was only the one overlay this line had heard of. With
+   * preferences open, `e` archived a conversation the user could not see.
+   */
+  const mail = ui.mode === "mail" && !overlayOwnsKeyboard(ui);
   const active = mail && ui.focus === "list";
   const selecting = ui.selection.ids.length > 0;
 

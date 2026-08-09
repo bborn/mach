@@ -79,6 +79,18 @@ impl Mailbox {
     }
 }
 
+/// One file riding along with a message.
+///
+/// The bytes are owned rather than borrowed because they come out of SQLite and
+/// go into `mail-builder`, and the two have no lifetime in common.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    /// Already sanitized by [`attach::add_bytes`](super::attach::add_bytes).
+    pub filename: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Everything needed to produce one RFC822 message. No clock, no database, no
 /// network — so every field of the output is a pure function of this struct and
 /// the tests can assert on the bytes.
@@ -93,6 +105,9 @@ pub struct Outgoing {
     pub text: String,
     /// `text/html` part.
     pub html: String,
+    /// Files. Empty for most messages, and when it is empty the structure is
+    /// exactly what it always was — `multipart/alternative` at the top.
+    pub attachments: Vec<OutgoingAttachment>,
     /// Bare id, no angle brackets — they are added on write.
     pub in_reply_to: Option<String>,
     /// Bare ids, oldest first.
@@ -160,6 +175,18 @@ pub fn build_rfc822(msg: &Outgoing) -> Result<Vec<u8>> {
     // html-only reply is unreadable in the ones that refuse HTML, and lands in
     // more spam filters.
     builder = builder.text_body(msg.text.clone()).html_body(msg.html.clone());
+
+    // With files, the shape becomes `multipart/mixed` wrapping that same
+    // `multipart/alternative` — the nesting order every mail client expects, and
+    // the reason the alternative is built first rather than being flattened
+    // alongside the attachments.
+    for file in &msg.attachments {
+        builder = builder.attachment(
+            file.mime_type.clone(),
+            file.filename.clone(),
+            file.bytes.clone(),
+        );
+    }
 
     builder
         .write_to_vec()

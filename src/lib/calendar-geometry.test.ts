@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  CASCADE_STEP_MIN,
   HOUR_HEIGHT,
   MIN_BLOCK_HEIGHT,
+  NARROW_BLOCK_WIDTH,
+  READABLE_COLUMN_WIDTH,
   blockHeight,
   blockPlan,
   blockTier,
+  clusterPlan,
   nowScrollTop,
   offsetForTime,
   snapTime,
@@ -118,8 +122,43 @@ describe("progressive degradation", () => {
   });
 
   it("uses two type sizes and no more", () => {
-    const sizes = new Set([11, 20, 24, 34, 48, 96].map((h) => blockPlan(h).fontPx));
+    const heights = [11, 20, 24, 34, 48, 96];
+    const sizes = new Set([
+      ...heights.map((h) => blockPlan(h).fontPx),
+      ...heights.map((h) => blockPlan(h).timeFontPx),
+    ]);
     expect([...sizes].sort()).toEqual([11, 12]);
+  });
+
+  it("draws the time one step below the title", () => {
+    const plan = blockPlan(48);
+    expect(plan.timeFontPx).toBeLessThan(plan.fontPx);
+  });
+
+  /*
+   * Google's rule, and the cheapest width there is: a block's position on the
+   * grid already says when it is, so the time is what a narrow block gives up.
+   */
+  it("drops the time and the location once the block is narrow", () => {
+    const roomy = blockPlan(60, { hasLocation: true, width: NARROW_BLOCK_WIDTH });
+    expect(roomy.showTime).toBe(true);
+    expect(roomy.showLocation).toBe(true);
+
+    const narrow = blockPlan(60, { hasLocation: true, width: NARROW_BLOCK_WIDTH - 1 });
+    expect(narrow.showTime).toBe(false);
+    expect(narrow.showLocation).toBe(false);
+  });
+
+  it("spends the line the time gave up on a third line of title", () => {
+    expect(blockPlan(60, { width: 200 }).titleLines).toBe(2);
+    expect(blockPlan(60, { width: 51 }).titleLines).toBe(3);
+    // Only a full block ever wraps, narrow or not.
+    expect(blockPlan(24, { width: 51 }).titleLines).toBe(1);
+  });
+
+  it("assumes room when no width is given", () => {
+    expect(blockPlan(60, { hasLocation: true }).showTime).toBe(true);
+    expect(blockPlan(60, { hasLocation: true }).showLocation).toBe(true);
   });
 
   it("lets only the sliver overflow its bounds, at a constant 15px line", () => {
@@ -131,17 +170,79 @@ describe("progressive degradation", () => {
 });
 
 describe("visibleColumns", () => {
-  it("leaves a cluster alone when every column clears 40px", () => {
+  it("leaves an ordinary cluster alone", () => {
     expect(visibleColumns(3, 156)).toBe(3);
     expect(visibleColumns(1, 20)).toBe(1);
   });
 
-  it("caps the columns rather than rendering a 12px sliver", () => {
-    expect(visibleColumns(5, 156)).toBe(3);
-    expect(visibleColumns(8, 100)).toBe(2);
+  /*
+   * The old rule was "how many 40px columns fit", which capped a 156px column at
+   * three events and then rendered those three at 52px each — the unreadable
+   * cluster the dogfood pass measured. A cascade asks a different question: how
+   * many 18px strips fit beside something worth reading. Same width, five
+   * events on the grid instead of three, and the one on top is legible.
+   */
+  it("counts cascade strips, not columns", () => {
+    expect(visibleColumns(5, 156)).toBe(5);
+    expect(visibleColumns(8, 100)).toBe(4);
+  });
+
+  it("spends the last column on a +N chip once the strips stop fitting", () => {
+    expect(visibleColumns(12, 156)).toBe(7);
+  });
+
+  it("never caps two — half a narrow column is still an event you can click", () => {
+    expect(visibleColumns(2, 44)).toBe(2);
   });
 
   it("always keeps at least one column", () => {
     expect(visibleColumns(4, 10)).toBe(1);
+  });
+});
+
+describe("clusterPlan", () => {
+  it("divides one and two events, whatever the width", () => {
+    expect(clusterPlan(1, 155).mode).toBe("divide");
+    expect(clusterPlan(2, 60).mode).toBe("divide");
+  });
+
+  it("divides three events when a third of the column is still readable", () => {
+    expect(clusterPlan(3, 3 * READABLE_COLUMN_WIDTH).mode).toBe("divide");
+  });
+
+  /*
+   * The measured defect: a 1440px window gives a week column 155px, and three
+   * concurrent events divided that into 51px each — about four characters.
+   */
+  it("cascades three events in a week column", () => {
+    const plan = clusterPlan(3, 155);
+    expect(plan.mode).toBe("cascade");
+    // Two strips and a readable block on top, and the whole width spent.
+    expect(plan.step).toBeCloseTo((155 - 76) / 2, 5);
+    expect(155 - 2 * plan.step).toBeGreaterThanOrEqual(READABLE_COLUMN_WIDTH);
+  });
+
+  it("keeps every strip at or above the floor as the cluster deepens", () => {
+    for (const columns of [3, 4, 5, 6, 7]) {
+      const plan = clusterPlan(columns, 155);
+      expect(plan.mode).toBe("cascade");
+      expect(plan.step).toBeGreaterThanOrEqual(CASCADE_STEP_MIN);
+    }
+  });
+
+  it("gives the floor to the strips and the remainder to the top when it cannot have both", () => {
+    // A narrow window: 97px of usable column, three events.
+    const plan = clusterPlan(3, 97);
+    expect(plan.step).toBe(CASCADE_STEP_MIN);
+    expect(97 - 2 * plan.step).toBeGreaterThan(0);
+  });
+
+  it("never offsets a block by more than its even share", () => {
+    for (const width of [60, 97, 120, 155, 200]) {
+      for (const columns of [3, 4, 5]) {
+        const plan = clusterPlan(columns, width);
+        if (plan.mode === "cascade") expect(plan.step).toBeLessThanOrEqual(width);
+      }
+    }
   });
 });

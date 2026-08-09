@@ -17,9 +17,33 @@
  * recently registered binding, so a dialog's Escape beats the shell's Escape
  * for as long as the dialog is mounted. A handler returning `false` declines
  * and the next candidate is tried.
+ *
+ * Modal surfaces go further than precedence: they *claim* the keyboard, and
+ * everything below the claim's floor stops being live at all. See
+ * `claimKeyboard`.
  */
 
 export const SEQUENCE_TIMEOUT_MS = 900;
+
+/**
+ * The priority at which a binding is saying "I belong to a modal surface".
+ *
+ * A claim on the keyboard silences every binding below this line, which is how
+ * one fix covers every dialog instead of each dialog gating each mode by hand.
+ * The number is not new — the convention that shell bindings sit at 0 and
+ * overlays at 100 predates this and every dialog in the app already follows it,
+ * which is what makes a single floor able to tell the two apart.
+ *
+ * The cost of the convention is that a binding which borrowed a high priority
+ * to win one local fight now reads as overlay-class and survives the claim.
+ * Three do, and none of them is a dialog: the calendar's `/` and the Escape
+ * that closes the finder it opens (220 and 230, above the palette's `/` on
+ * purpose), and the agent drawer's Escape at 150. All three still answer from
+ * behind an open dialog. None of them writes anything, and the fix in each case
+ * is one clause — `&& !overlayOwnsKeyboard(ui)` on the surface's own `active` —
+ * in a file this change was not free to edit.
+ */
+export const OVERLAY_KEY_FLOOR = 100;
 
 /** The subset of KeyboardEvent the dispatcher touches — so it is testable. */
 export interface KeyEventLike {
@@ -203,6 +227,29 @@ export interface Keymap {
    */
   conflicts(): KeyConflict[];
   clear(): void;
+  /**
+   * Hand the keyboard to a modal surface until the returned function is called.
+   *
+   * While a claim is held, only bindings at or above `floor` are live — they do
+   * not merely lose a tie, they stop being candidates, so an unclaimed key
+   * reaches the DOM untouched and the dialog's own inputs, buttons and popup
+   * menus behave exactly as they would with no registry at all.
+   *
+   * This is the answer to a whole class of bug rather than to one key: with
+   * Preferences open, `e` still archived the conversation behind it, because
+   * every mode gate had been written against the one overlay anybody remembered
+   * to gate on. Nothing is more likely to be forgotten than the next dialog, so
+   * the surface every dialog already renders through claims the keyboard for
+   * all of them — see `Overlay` in `components/ui/dialog.tsx`.
+   *
+   * Claims nest: a select menu inside preferences, a confirmation inside the
+   * plugins panel. The floor in force is the highest one claimed.
+   */
+  claimKeyboard(floor?: number): () => void;
+  /** How many modal surfaces hold a claim. Zero means the app has the keys. */
+  claims(): number;
+  /** Notified when the claim count changes, for gates that render off it. */
+  subscribe(listener: () => void): () => void;
 }
 
 export interface KeyConflict {
@@ -217,9 +264,20 @@ export function createKeymap(mod: ModKey = detectModKey()): Keymap {
   let order = 0;
   let pendingSeq: string[] = [];
   let pendingAt = 0;
+  /* One entry per modal surface currently up; the value is its floor. */
+  const held = new Set<{ floor: number }>();
+  const listeners = new Set<() => void>();
+
+  function floor(): number {
+    let highest = Number.NEGATIVE_INFINITY;
+    for (const claim of held) highest = Math.max(highest, claim.floor);
+    return highest;
+  }
 
   function candidates(): Registered[] {
+    const cutoff = floor();
     return [...bindings]
+      .filter((b) => (b.priority ?? 0) >= cutoff)
       .filter((b) => (b.when ? b.when() : true))
       .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || b.order - a.order);
   }
@@ -316,6 +374,33 @@ export function createKeymap(mod: ModKey = detectModKey()): Keymap {
 
     clear() {
       pendingSeq = [];
+    },
+
+    claimKeyboard(floor = OVERLAY_KEY_FLOOR) {
+      const claim = { floor };
+      held.add(claim);
+      /*
+       * A half-typed `g` belongs to the surface that was on screen when it was
+       * pressed. Dropping it here means the sequence cannot complete against a
+       * dialog it was never aimed at.
+       */
+      pendingSeq = [];
+      for (const listener of listeners) listener();
+      return () => {
+        if (!held.delete(claim)) return;
+        for (const listener of listeners) listener();
+      };
+    },
+
+    claims() {
+      return held.size;
+    },
+
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
     },
   };
 }

@@ -13,7 +13,11 @@
 //! | `prepare` | `threadId`, `kind` | `{ draft }` |
 //! | `loadDraft` | `draftId`, `messageId` or `threadId` | `{ draft \| null }` |
 //! | `saveDraft` | `draft` | `{ draft }` |
-//! | `discardDraft` | `draftId` | `{ ok }` |
+//! | `discardDraft` | `draftId` | `{ ok, remote }` |
+//! | `attachChoose` | `draftId` | `{ attachments, added, refused }` |
+//! | `attachAdd` | `draftId`, `paths` | `{ attachments, added, refused }` |
+//! | `attachRemove` | `attachmentId` | `{ ok, attachments }` |
+//! | `attachList` | `draftId` | `{ attachments }` |
 //! | `preview` | `draft` | `{ rfc822, headers }` |
 //! | `send` | `draft`, `scheduleAt?` | `{ entry, undoUntil }` |
 //! | `undo` | `outboxId` | `{ cancelled }` |
@@ -55,6 +59,7 @@ use super::state::AppState;
 
 #[tauri::command]
 pub async fn send_message(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     draft: Value,
 ) -> Result<Value, IpcError> {
@@ -63,7 +68,84 @@ pub async fn send_message(
         Arc::clone(&state.dispatcher.clients),
     )
     .map_err(IpcError::from)?;
+    // One operation needs the application itself: choosing files is a system
+    // panel, and a panel needs a window to be modal to. Everything else runs
+    // through `dispatch`, which is a plain function so the tests can drive it.
+    if payload_op(&draft) == "attachChoose" {
+        let draft_id = required_str(&draft, "draftId")?;
+        let paths = open_panel(&app).await?;
+        return attach_paths(&state.db, &draft_id, &paths, now_ms())
+            .map_err(Into::into);
+    }
     dispatch(&state.db, &outbox, draft).await.map_err(Into::into)
+}
+
+fn payload_op(payload: &Value) -> &str {
+    payload.get("op").and_then(Value::as_str).unwrap_or("send")
+}
+
+/// Read the chosen files and hang them on the draft.
+///
+/// Shared by the panel and by drag-and-drop, which arrives from the webview as
+/// a list of paths and must not be a second, subtly different implementation of
+/// "attach these files".
+fn attach_paths(
+    db: &crate::db::Db,
+    draft_id: &str,
+    paths: &[String],
+    now: i64,
+) -> Result<Value, ComposeError> {
+    let mut added = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    for path in paths {
+        let path = std::path::Path::new(path);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".to_string());
+        // Read first, then cap on what was actually read: the metadata size is
+        // a claim about a file that could change between the two calls, and the
+        // number that matters is the number of bytes now in memory.
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                refused.push(format!("{name}: {error}"));
+                continue;
+            }
+        };
+        match engine::attach::add_bytes(db, draft_id, &name, &bytes, now) {
+            Ok(attachment) => added.push(attachment),
+            Err(error) => refused.push(error.to_string()),
+        }
+    }
+    Ok(json!({
+        "attachments": engine::attach::list(db, draft_id)?,
+        "added": added,
+        "refused": refused,
+    }))
+}
+
+/// The system open panel, on a thread that is allowed to block.
+///
+/// Nothing about it is reachable from JavaScript: the capability file grants no
+/// `dialog:` permission, and this calls the Rust API directly — the same
+/// arrangement, and the same reasoning, as the save panel in
+/// [`super::attachments`].
+async fn open_panel(app: &tauri::AppHandle) -> Result<Vec<String>, IpcError> {
+    let app = app.clone();
+    let chosen = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog().file().blocking_pick_files()
+    })
+    .await
+    .map_err(|e| IpcError::internal(format!("the file panel did not answer: {e}")))?;
+
+    Ok(chosen
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|file| file.into_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
 }
 
 /// The router, as a plain function over `&Db` — a `#[tauri::command]` cannot be
@@ -151,10 +233,69 @@ pub async fn dispatch(
             Ok(json!({ "draft": saved }))
         }
 
+        // Throw a draft away, everywhere it exists.
+        //
+        // The remote half is **awaited** here, unlike the one on the send path.
+        // Both orders have a failure mode and only one of them is honest: the
+        // local rows go first so the UI never waits on Google, and then the
+        // `drafts.delete` is waited for, because if it fails the draft is still
+        // on his phone — and the next sync pass, finding a `DRAFT` message with
+        // no local draft row, will adopt it right back into the conversation he
+        // just cleared. That is worth a sentence on screen rather than silence.
         "discardDraft" => {
             let id = required_str(&payload, "draftId")?;
-            forget_draft(db, outbox, &id)?;
-            Ok(json!({ "ok": true }))
+            let existing = draft::load_draft(db, &id)?;
+            forget_draft_locally(db, &id)?;
+            let Some(remote_id) = existing.as_ref().and_then(|d| d.remote.draft_id.clone()) else {
+                return Ok(json!({ "ok": true, "remote": "none" }));
+            };
+            let account_id = existing.map(|d| d.account_id).unwrap_or_default();
+            match engine::remote::DraftRemoteSync::new(db.clone(), outbox.clients())
+                .delete(&remote_id, account_id)
+                .await
+            {
+                Ok(()) => Ok(json!({ "ok": true, "remote": "deleted" })),
+                Err(error) => Ok(json!({
+                    "ok": true,
+                    "remote": "failed",
+                    "error": error.to_string(),
+                })),
+            }
+        }
+
+        // Attach files already on disk. The panel route goes through
+        // `send_message` because it needs the application; this is what
+        // drag-and-drop uses, and what a test can call.
+        "attachAdd" => {
+            let draft_id = required_str(&payload, "draftId")?;
+            let paths: Vec<String> = payload
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            attach_paths(db, &draft_id, &paths, now)
+        }
+
+        "attachRemove" => {
+            let id = required_str(&payload, "attachmentId")?;
+            let attachment = engine::attach::get(db, &id)?;
+            let removed = engine::attach::remove(db, &id)?;
+            let draft_id = attachment.map(|a| a.draft_id).unwrap_or_default();
+            Ok(json!({
+                "ok": removed,
+                "attachments": engine::attach::list(db, &draft_id)?,
+            }))
+        }
+
+        "attachList" => {
+            let draft_id = required_str(&payload, "draftId")?;
+            Ok(json!({ "attachments": engine::attach::list(db, &draft_id)? }))
         }
 
         // The generated message, without sending it. Exists because "is the
@@ -234,6 +375,13 @@ pub async fn dispatch(
             Ok(json!({ "ok": outbox.discard(&id)? }))
         }
 
+        // Handled one level up, in `send_message`, because a system panel needs
+        // the application. Saying so beats "unknown operation" for the next
+        // person who calls `dispatch` directly from a test.
+        "attachChoose" => Err(ComposeError::invalid(
+            "attachChoose needs the application; call send_message, or attachAdd with paths",
+        )),
+
         other => Err(ComposeError::invalid(format!(
             "unknown compose operation {other:?}"
         ))),
@@ -253,10 +401,7 @@ fn forget_draft(
     draft_id: &str,
 ) -> Result<(), ComposeError> {
     let existing = draft::load_draft(db, draft_id)?;
-    if let Some(draft) = &existing {
-        engine::mirror::unmirror(db, draft)?;
-    }
-    draft::delete_draft(db, draft_id)?;
+    forget_draft_locally(db, draft_id)?;
     if let Some(draft) = existing {
         if let Some(remote_id) = draft.remote.draft_id {
             engine::remote::spawn_delete(
@@ -268,6 +413,19 @@ fn forget_draft(
         }
     }
     Ok(())
+}
+
+/// The two local halves of forgetting a draft: the mirror in the conversation,
+/// then the row and the files it was carrying.
+///
+/// In that order. Taking the row out first would leave [`mirror::unmirror`]
+/// nothing to look the message up by, and the phantom draft in the middle of
+/// the thread is exactly the thing being removed.
+fn forget_draft_locally(db: &crate::db::Db, draft_id: &str) -> Result<(), ComposeError> {
+    if let Some(draft) = draft::load_draft(db, draft_id)? {
+        engine::mirror::unmirror(db, &draft)?;
+    }
+    draft::delete_draft(db, draft_id)
 }
 
 // ---------------------------------------------------------------------------

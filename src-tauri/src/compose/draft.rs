@@ -25,6 +25,7 @@ use super::address::{forward_recipients, reply_recipients};
 use super::markdown;
 use super::mime::{
     forward_subject, generate_message_id, references_for_reply, reply_subject, Mailbox, Outgoing,
+    OutgoingAttachment,
 };
 use super::{ensure_compose_schema, ComposeError, Result};
 
@@ -85,6 +86,68 @@ impl DraftKind {
             self,
             DraftKind::Reply | DraftKind::ReplyAll | DraftKind::Adopted
         )
+    }
+}
+
+/// How to read [`Draft::body`].
+///
+/// # Why this is stored rather than sniffed
+///
+/// The composer used to be a `<textarea>` and the body used to be markdown-ish
+/// source. It is now a rich-text editor and the body is HTML. Both kinds of row
+/// exist in the same table on the same Mac: a reply half-written last week is
+/// still markdown, and there is no honest way to tell one from the other by
+/// looking — `<b>hi</b>` is a legal thing to have *typed* into the old editor,
+/// and a plain sentence with no tags is a legal thing for the new one to emit.
+///
+/// So the row says which it is. Old rows say `markdown` because that is the
+/// column default, which is the whole reason the default is not `html`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BodyFormat {
+    /// The markdown-ish grammar in [`super::markdown`]. Read, never written.
+    #[default]
+    Markdown,
+    /// HTML, as the editor emits it. Cleaned by [`super::html::sanitize`] on the
+    /// way out rather than on the way in, so what the editor holds is exactly
+    /// what it put there.
+    Html,
+}
+
+impl BodyFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BodyFormat::Markdown => "markdown",
+            BodyFormat::Html => "html",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "html" => BodyFormat::Html,
+            _ => BodyFormat::Markdown,
+        }
+    }
+}
+
+/// The two body parts of a message, derived from whichever format the draft is
+/// in. `(text, html)`.
+///
+/// **The direction of the derivation is the change.** Under markdown the source
+/// was the `text/plain` part and the HTML was generated from it. Under HTML
+/// there is no source but the HTML, so the plain part is read *back out* of it
+/// by [`super::html::to_text`] — structure and all, because a plain-text part
+/// with the tags merely removed is one run-on paragraph.
+pub fn body_parts(draft: &Draft) -> (String, String) {
+    match draft.body_format {
+        BodyFormat::Markdown => (
+            markdown::to_text(&draft.body),
+            markdown::to_html(&draft.body),
+        ),
+        BodyFormat::Html => {
+            let html = super::html::sanitize(&draft.body);
+            (super::html::to_text(&html), html)
+        }
     }
 }
 
@@ -176,19 +239,48 @@ pub struct Draft {
     pub bcc: Vec<Mailbox>,
     #[serde(default)]
     pub subject: String,
-    /// Markdown-ish source, exactly as typed.
+    /// The body, exactly as the editor left it. [`body_format`](Self::body_format)
+    /// says what it is.
     #[serde(default)]
     pub body: String,
+    /// HTML or markdown-ish source. Owned by the editor, unlike [`remote`](Self::remote).
+    #[serde(default)]
+    pub body_format: BodyFormat,
     #[serde(default)]
     pub updated_at: i64,
     /// Read-only from the editor's side; see [`DraftRemote`].
     #[serde(default)]
     pub remote: DraftRemote,
+    /// Read-only from the editor's side, like [`remote`](Self::remote): files
+    /// are added and removed through their own operations, and a draft object
+    /// rebuilt on every keystroke must not be able to drop one by omission.
+    #[serde(default)]
+    pub attachments: Vec<super::attach::Attachment>,
 }
 
 impl Draft {
+    /// Nothing worth keeping. Used to decide whether a draft is worth a row, a
+    /// push to Gmail, or a confirmation before it is thrown away.
+    ///
+    /// An attachment counts as content even with no text at all: "here, look at
+    /// this" with the file and no sentence is a message somebody meant to write.
     pub fn is_empty(&self) -> bool {
-        self.body.trim().is_empty() && self.subject.trim().is_empty() && self.to.is_empty()
+        self.body_text().trim().is_empty()
+            && self.subject.trim().is_empty()
+            && self.to.is_empty()
+            && self.cc.is_empty()
+            && self.bcc.is_empty()
+            && self.attachments.is_empty()
+    }
+
+    /// The body as prose, whichever format it is in — so "is there anything in
+    /// this?" is not answered `true` by `<div><br></div>`, which is what an
+    /// untouched rich-text editor contains.
+    pub fn body_text(&self) -> String {
+        match self.body_format {
+            BodyFormat::Markdown => self.body.clone(),
+            BodyFormat::Html => super::html::to_text(&self.body),
+        }
     }
 }
 
@@ -274,8 +366,13 @@ pub fn prepare(db: &Db, thread_id: i64, kind: DraftKind, draft_id: String) -> Re
         bcc: Vec::new(),
         subject,
         body: String::new(),
+        // A prepared draft has no body at all, so either format would render
+        // the same nothing. `Html` is the honest answer: the editor that is
+        // about to open is a rich-text one, and the first keystroke is HTML.
+        body_format: BodyFormat::Html,
         updated_at: 0,
         remote: DraftRemote::default(),
+        attachments: Vec::new(),
     })
 }
 
@@ -335,8 +432,7 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
         _ => (None, Vec::new()),
     };
 
-    let body_text = markdown::to_text(&draft.body);
-    let body_html = markdown::to_html(&draft.body);
+    let (body_text, body_html) = body_parts(draft);
 
     // `Adopted` is absent from both arms on purpose: its body already contains
     // whatever the client that wrote it quoted, and quoting the parent a second
@@ -366,6 +462,18 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
         None => None,
     };
 
+    // The bytes, not the metadata: this is the one moment they are needed, and
+    // the one place they are read. A draft object handed round the UI carries
+    // filenames and sizes only.
+    let attachments = super::attach::list_with_bytes(db, &draft.id)?
+        .into_iter()
+        .map(|(meta, bytes)| OutgoingAttachment {
+            filename: meta.filename,
+            mime_type: meta.mime_type,
+            bytes,
+        })
+        .collect();
+
     Ok(Built {
         outgoing: Outgoing {
             from: from.clone(),
@@ -375,6 +483,7 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
             subject: draft.subject.clone(),
             text,
             html,
+            attachments,
             in_reply_to,
             references,
             message_id: generate_message_id(&from.email, now_ms, entropy),
@@ -583,8 +692,8 @@ pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
         conn.execute(
             "INSERT INTO compose_drafts
                  (id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, bcc_json,
-                  subject, body, updated_at, remote_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending')
+                  subject, body, body_format, updated_at, remote_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'pending')
              ON CONFLICT(id) DO UPDATE SET
                  account_id   = excluded.account_id,
                  thread_id    = excluded.thread_id,
@@ -595,6 +704,7 @@ pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
                  bcc_json     = excluded.bcc_json,
                  subject      = excluded.subject,
                  body         = excluded.body,
+                 body_format  = excluded.body_format,
                  updated_at   = excluded.updated_at,
                  remote_state = 'pending'",
             rusqlite::params![
@@ -608,6 +718,7 @@ pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
                 json(&saved.bcc),
                 saved.subject,
                 saved.body,
+                saved.body_format.as_str(),
                 saved.updated_at,
             ],
         )?;
@@ -661,7 +772,7 @@ pub fn drafts_needing_push(db: &Db) -> Result<Vec<Draft>> {
 
 pub fn load_draft(db: &Db, id: &str) -> Result<Option<Draft>> {
     db.write(ensure_compose_schema)?;
-    Ok(db.read(|conn| {
+    let found = db.read(|conn| {
         Ok(conn
             .query_row(
                 &format!("SELECT {DRAFT_COLUMNS} FROM compose_drafts WHERE id = ?1"),
@@ -669,14 +780,15 @@ pub fn load_draft(db: &Db, id: &str) -> Result<Option<Draft>> {
                 map_draft,
             )
             .ok())
-    })?)
+    })?;
+    with_attachments(db, found)
 }
 
 /// The most recently touched draft for a conversation — what reopening a thread
 /// should put back in the composer.
 pub fn load_draft_for_thread(db: &Db, thread_id: i64) -> Result<Option<Draft>> {
     db.write(ensure_compose_schema)?;
-    Ok(db.read(|conn| {
+    let found = db.read(|conn| {
         Ok(conn
             .query_row(
                 &format!(
@@ -687,7 +799,8 @@ pub fn load_draft_for_thread(db: &Db, thread_id: i64) -> Result<Option<Draft>> {
                 map_draft,
             )
             .ok())
-    })?)
+    })?;
+    with_attachments(db, found)
 }
 
 /// The draft that a message row in a conversation *is*.
@@ -810,7 +923,9 @@ fn reconcile_adopted(
         updated.cc = mailboxes(&fresh.message.cc);
         updated.bcc = mailboxes(&fresh.message.bcc);
         updated.subject = fresh.message.subject.clone();
-        updated.body = body_of(&fresh.message);
+        let (body, body_format) = body_of(&fresh.message);
+        updated.body = body;
+        updated.body_format = body_format;
         updated.updated_at = fresh.message.internal_date;
         updated.reply_to_id = fresh.parent_id;
         // Nothing to push: this text *is* what Gmail holds.
@@ -870,6 +985,7 @@ fn adopt_remote_draft(
         return Ok(None);
     };
 
+    let (body, body_format) = body_of(&fresh.message);
     let draft = Draft {
         id: adopted_draft_id(&gmail_draft_id),
         account_id: fresh.message.account_id,
@@ -880,7 +996,8 @@ fn adopt_remote_draft(
         cc: mailboxes(&fresh.message.cc),
         bcc: mailboxes(&fresh.message.bcc),
         subject: fresh.message.subject.clone(),
-        body: body_of(&fresh.message),
+        body,
+        body_format,
         updated_at: now_ms,
         remote: DraftRemote {
             state: RemoteState::Synced,
@@ -890,6 +1007,7 @@ fn adopt_remote_draft(
             error: None,
             synced_at: now_ms,
         },
+        attachments: Vec::new(),
     };
 
     write_adopted(db, &draft, false)?;
@@ -944,15 +1062,35 @@ fn read_draft_message(db: &Db, message_id: i64) -> Result<Option<DraftMessage>> 
     }))
 }
 
-/// The text to edit. Gmail's plain-text alternative, and the snippet only when
-/// there is nothing else — an empty composer over a draft that plainly has words
-/// in it would be worse than not opening at all.
-fn body_of(message: &Message) -> String {
-    message
+/// The body to edit, and what format it is in.
+///
+/// Gmail's own HTML alternative when the draft has one, cleaned — a draft
+/// written on the phone with a bold word in it should open here with the word
+/// still bold, and the editor is a rich-text editor now, so it can hold it. The
+/// plain-text alternative is wrapped rather than handed over raw, because the
+/// editor renders what it is given and a `<` in somebody's draft would otherwise
+/// eat the rest of the message.
+///
+/// The snippet only when there is neither: an empty composer over a draft that
+/// plainly has words in it would be worse than not opening at all.
+fn body_of(message: &Message) -> (String, BodyFormat) {
+    if let Some(html) = message
+        .body_html
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
+        let cleaned = super::html::sanitize(html);
+        if !cleaned.trim().is_empty() {
+            return (cleaned, BodyFormat::Html);
+        }
+    }
+    let text = message
         .body_text
         .clone()
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| message.snippet.clone())
+        .unwrap_or_else(|| message.snippet.clone());
+    (super::html::from_plain_text(&text), BodyFormat::Html)
 }
 
 /// The local row id an adopted draft gets. Derived, so adoption is idempotent.
@@ -982,6 +1120,7 @@ fn write_adopted(db: &Db, draft: &Draft, overwrite: bool) -> Result<()> {
              bcc_json         = excluded.bcc_json,
              subject          = excluded.subject,
              body             = excluded.body,
+             body_format      = excluded.body_format,
              updated_at       = excluded.updated_at,
              gmail_draft_id   = excluded.gmail_draft_id,
              gmail_message_id = excluded.gmail_message_id,
@@ -996,8 +1135,8 @@ fn write_adopted(db: &Db, draft: &Draft, overwrite: bool) -> Result<()> {
         "INSERT INTO compose_drafts
              (id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, bcc_json,
               subject, body, updated_at, gmail_draft_id, gmail_message_id, gmail_thread_id,
-              remote_state, remote_error, remote_synced_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, ?16)
+              remote_state, remote_error, remote_synced_at, body_format)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, ?16, ?17)
          ON CONFLICT(id) {conflict}"
     );
     db.write(|conn| {
@@ -1020,6 +1159,7 @@ fn write_adopted(db: &Db, draft: &Draft, overwrite: bool) -> Result<()> {
                 draft.remote.thread_id,
                 draft.remote.state.as_str(),
                 draft.remote.synced_at,
+                draft.body_format.as_str(),
             ],
         )?;
         Ok(())
@@ -1100,8 +1240,14 @@ fn mailboxes(people: &[Participant]) -> Vec<Mailbox> {
     people.iter().map(Mailbox::from_participant).collect()
 }
 
+/// Forget the row, and everything it was carrying.
+///
+/// The files go with it in the same call rather than being swept later: a
+/// `compose_attachments` row whose draft is gone is 25 MB of database nothing
+/// can reach, and there is no other owner to inherit it.
 pub fn delete_draft(db: &Db, id: &str) -> Result<()> {
     db.write(ensure_compose_schema)?;
+    super::attach::delete_for_draft(db, id)?;
     db.write(|conn| {
         conn.execute("DELETE FROM compose_drafts WHERE id = ?1", [id])?;
         Ok(())
@@ -1112,14 +1258,21 @@ pub fn delete_draft(db: &Db, id: &str) -> Result<()> {
 const DRAFT_COLUMNS: &str = "id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, \
                              bcc_json, subject, body, updated_at, gmail_draft_id, \
                              gmail_message_id, gmail_thread_id, remote_state, remote_error, \
-                             remote_synced_at";
+                             remote_synced_at, body_format";
 
+/// Row → draft, **without** the attachment list.
+///
+/// The list is a second query, so it is added by [`with_attachments`] at the
+/// handful of places that hand a draft to the UI or build a message from it.
+/// Doing it here instead would put a query per row inside every sweep that
+/// walks the table.
 fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
     let kind: String = row.get(4)?;
     let to: String = row.get(5)?;
     let cc: String = row.get(6)?;
     let bcc: String = row.get(7)?;
     let remote_state: String = row.get(14)?;
+    let body_format: String = row.get(17)?;
     Ok(Draft {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -1131,6 +1284,7 @@ fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
         bcc: serde_json::from_str(&bcc).unwrap_or_default(),
         subject: row.get(8)?,
         body: row.get(9)?,
+        body_format: BodyFormat::parse(&body_format),
         updated_at: row.get(10)?,
         remote: DraftRemote {
             draft_id: row.get(11)?,
@@ -1140,7 +1294,18 @@ fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
             error: row.get(15)?,
             synced_at: row.get(16)?,
         },
+        attachments: Vec::new(),
     })
+}
+
+/// Fill in what a draft is carrying.
+fn with_attachments(db: &Db, draft: Option<Draft>) -> Result<Option<Draft>> {
+    let Some(draft) = draft else { return Ok(None) };
+    let attachments = super::attach::list(db, &draft.id)?;
+    Ok(Some(Draft {
+        attachments,
+        ..draft
+    }))
 }
 
 fn json(list: &[Mailbox]) -> String {

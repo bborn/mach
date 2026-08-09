@@ -1279,7 +1279,11 @@ export function CalendarMode() {
             type="button"
             onClick={() => setDateOpen(true)}
             title="Go to date (g then d)"
-            className="ml-1 min-w-0 truncate text-list font-medium text-foreground hover:text-accent"
+            // The period the view is showing is what the whole header is about,
+            // and it used to be 13px medium — the same size as the buttons
+            // either side of it. `text-reading` semibold puts two steps of the
+            // ramp between it and them.
+            className="ml-1 min-w-0 truncate text-reading font-semibold text-foreground hover:text-accent"
           >
             {title}
           </button>
@@ -1304,7 +1308,7 @@ export function CalendarMode() {
                 type="button"
                 onClick={() => actions.setCalendarView(view.id)}
                 className={cn(
-                  "flex h-5 items-center gap-1.5 rounded-[3px] px-2 text-micro transition-colors",
+                  "flex h-5 items-center gap-1 rounded-[3px] px-2 text-micro transition-colors",
                   ui.calendarView === view.id
                     ? "bg-surface-raised text-foreground"
                     : "text-muted-foreground hover:text-foreground",
@@ -1328,7 +1332,7 @@ export function CalendarMode() {
       {failure && !modalOpen && (
         <div
           role="alert"
-          className="flex shrink-0 items-center gap-2 border-b border-danger/40 bg-danger/10 px-3 py-1.5"
+          className="flex shrink-0 items-center gap-2 border-b border-danger/40 bg-danger/10 px-3 py-1"
         >
           <AlertTriangle size={12} strokeWidth={1.75} className="shrink-0 text-danger" />
           <span className="min-w-0 flex-1 truncate text-micro text-danger">{failure.message}</span>

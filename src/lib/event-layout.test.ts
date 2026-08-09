@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { CASCADE_STEP_MIN, READABLE_COLUMN_WIDTH } from "./calendar-geometry";
 import { columnGeometry, layoutEvents, overlaps } from "./event-layout";
 
 const H = 3_600_000;
@@ -151,5 +152,67 @@ describe("columnGeometry", () => {
     const [a, b] = layoutEvents([ev("a", 9, 11), ev("b", 10, 12)]);
     expect(columnGeometry(a)).toEqual({ left: "calc(0% + 1px)", width: "calc(50% - 2px)" });
     expect(columnGeometry(b)).toEqual({ left: "calc(50% + 1px)", width: "calc(50% - 2px)" });
+  });
+
+  it("divides in percentages before anything has been measured", () => {
+    const [a] = layoutEvents([ev("a", 9, 11), ev("b", 9, 12), ev("c", 9, 10)]);
+    expect(columnGeometry(a, 0).left).toContain("%");
+  });
+
+  it("still divides two events at any width", () => {
+    const [a, b] = layoutEvents([ev("a", 9, 11), ev("b", 10, 12)]);
+    expect(columnGeometry(a, 90).width).toContain("50%");
+    expect(columnGeometry(b, 90).left).toContain("50%");
+  });
+
+  /*
+   * Three concurrent events in a 155px week column. Every block runs to the
+   * cluster's right edge and is merely covered by the ones after it, which is
+   * what makes selecting one reveal its whole title without moving anything.
+   */
+  describe("a cluster too deep to divide", () => {
+    const laid = byId(layoutEvents([ev("a", 13, 14), ev("b", 13, 14), ev("c", 13.5, 14)]));
+
+    it("offsets each block and runs it to the right edge", () => {
+      expect(columnGeometry(laid.a, 155)).toEqual({ left: "1px", width: "calc(100% - 2px)" });
+      expect(columnGeometry(laid.b, 155)).toEqual({ left: "41px", width: "calc(100% - 42px)" });
+      expect(columnGeometry(laid.c, 155)).toEqual({ left: "80px", width: "calc(100% - 81px)" });
+    });
+
+    /*
+     * Every block ends on the cluster's right edge, so its `width` is only ever
+     * the remainder of `left`. That identity is the cascade: what a covered
+     * block gives up is not width, it is *visibility*, and selecting it gets
+     * the width back with no reflow and no geometry change.
+     */
+    it("ends every block on the cluster's right edge", () => {
+      for (const laidOut of [laid.a, laid.b, laid.c]) {
+        const { left, width } = columnGeometry(laidOut, 155);
+        const offset = Number.parseInt(left, 10);
+        expect(width).toBe(`calc(100% - ${offset + 1}px)`);
+      }
+    });
+
+    it("leaves the block on top a readable width, less the hairline", () => {
+      const top = 155 - (Number.parseInt(columnGeometry(laid.c, 155).left, 10) + 1);
+      expect(top).toBeGreaterThanOrEqual(READABLE_COLUMN_WIDTH - 2);
+    });
+  });
+
+  it("keeps five concurrent events on the grid at a real width", () => {
+    const events = [0, 1, 2, 3, 4].map((n) => ev(`e${n}`, 13, 14 + n * 0.01));
+    const laid = layoutEvents(events);
+    const lefts = laid.map((l) => Number.parseInt(columnGeometry(l, 155).left, 10));
+    expect(new Set(lefts).size).toBe(5);
+    for (let i = 1; i < lefts.length; i++) {
+      expect(lefts[i] - lefts[i - 1]).toBeGreaterThanOrEqual(CASCADE_STEP_MIN - 1);
+    }
+  });
+
+  it("cascades a fifteen-minute event like any other", () => {
+    const laid = byId(
+      layoutEvents([ev("a", 13, 14), ev("b", 13, 14), ev("q", 13.25, 13.5)]),
+    );
+    expect(columnGeometry(laid.q, 155).left).toBe("80px");
   });
 });
