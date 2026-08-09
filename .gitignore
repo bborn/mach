@@ -41,3 +41,6 @@ client_secret*.json
 
 # Per-machine agent settings
 .claude/settings.local.json
+
+# Scratch directory for assets/logo/build.py.
+target-icons/

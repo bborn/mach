@@ -1,0 +1,9 @@
+<!-- Mach at 32px and below. `assets/logo/build.py` explains why this exists:
+     the mark's lightest lane is 1.25px at 16px and greys out, and its round caps
+     close the gaps to 1.0px. Heavier light lane, wider gaps, flat caps. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"
+     fill="none" stroke="currentColor">
+  <path d="M3 8.7 L29 3.5" stroke-width="3.0" stroke-linecap="butt"/>
+  <path d="M3 16.35 L29 11.15" stroke-width="4.5" stroke-linecap="butt"/>
+  <path d="M3 25.5 L29 20.3" stroke-width="6.0" stroke-linecap="butt"/>
+</svg>

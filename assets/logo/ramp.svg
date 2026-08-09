@@ -1,0 +1,8 @@
+<!-- Mach. Three lanes climbing right, separated by weight rather than colour.
+     Ink is currentColor so the mark sits on any surface. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"
+     fill="none" stroke="currentColor">
+  <path d="M5 8.45 L27 3.25" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M5 15.85 L27 10.65" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M5 25.25 L27 20.05" stroke-width="6.5" stroke-linecap="round"/>
+</svg>
