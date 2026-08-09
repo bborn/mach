@@ -163,6 +163,11 @@ cmd_up() {
   [ -f "$REPO/.env.local" ] || die "no .env.local — the app would boot 'not configured'"
   [ "$INSTANCE" = "main" ] || [ -f "$DB" ] || echo "qa[$INSTANCE]: no seeded store; starting empty (try: qa seed)"
 
+  # Same signature every build, so the Keychain stops treating each rebuild as
+  # a new program and re-asking for the login password. A no-op until the
+  # identity exists; see `scripts/sign --setup`.
+  "$REPO/scripts/sign" >/dev/null 2>&1 || true
+
   ensure_vite
   # `exec` matters: without it the subshell stays alive as the parent and $!
   # is the *wrapper's* pid, not the app's — so every window lookup misses and

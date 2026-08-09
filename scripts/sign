@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# scripts/sign — give every dev build the same identity, so the Keychain stops
+# asking.
+#
+# ---------------------------------------------------------------------------
+# THE PROBLEM
+# ---------------------------------------------------------------------------
+#
+# Refresh tokens live in the login Keychain. macOS guards each item with an ACL
+# naming the code allowed to read it, and it identifies that code by its
+# signature. `cargo build` produces an ad-hoc, linker-signed binary whose
+# identifier is derived from its own contents:
+#
+#     $ codesign -dv target/debug/mach
+#     Identifier=mach-a10f3327a97b6409     <- changes every single build
+#     Signature=adhoc
+#
+# So every rebuild is, to the Keychain, a different program. The ACL never
+# matches twice, and macOS asks for the login password again — over and over,
+# during exactly the edit-run-edit loop where you rebuild most.
+#
+# Worse than the nagging: until somebody answers that dialog, the read *blocks*.
+# That has already cost this project a launch hang with no window at all
+# (`ipc::state::restore_accounts_into`) and an attachment open that took the
+# sync loop down with it (`auth::tokens::load_refresh_token_unblocking`).
+#
+# ---------------------------------------------------------------------------
+# THE FIX
+# ---------------------------------------------------------------------------
+#
+# Sign each build with a self-signed certificate and a *fixed* identifier. The
+# Keychain then records a designated requirement of the form
+#
+#     identifier "com.mach.mail" and certificate leaf = H"<the cert>"
+#
+# which is a property of the certificate and the name, not of the bytes. Rebuild
+# as often as you like: the requirement still matches, and the ACL you approved
+# once keeps applying.
+#
+# You will still be asked *once* per item after the first signed build, because
+# the requirement genuinely changed that once. Click "Always Allow" and that is
+# the end of it.
+#
+# ---------------------------------------------------------------------------
+# SETUP (once)
+# ---------------------------------------------------------------------------
+#
+# `scripts/sign --setup` prints the commands. The certificate lives in
+# ~/.mach-dev-signing and is imported into the login keychain; trusting it for
+# code signing needs your password, which is why that step is yours to run.
+#
+# Nothing here is required to build or run Mach. With no identity present this
+# script says so and exits 0, and everything works exactly as it did before —
+# with the prompts.
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IDENTITY="${MACH_SIGN_IDENTITY:-Mach Dev Signing}"
+CERT_DIR="$HOME/.mach-dev-signing"
+
+# Stable identifiers. The app's is the bundle id it will ship under; the helper
+# binaries get their own so their ACL entries stay distinguishable.
+declare -a TARGETS=(
+  "src-tauri/target/debug/mach:com.mach.mail"
+  "src-tauri/target/debug/calendar_live:com.mach.mail.calendar-live"
+  "src-tauri/target/debug/plugin_probe:com.mach.mail.plugin-probe"
+)
+
+have_identity() {
+  security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"
+}
+
+print_setup() {
+  cat <<SETUP
+The signing identity "$IDENTITY" is not available yet.
+
+The certificate and key are already created and imported. What remains needs
+your password, because macOS will not let a program mark a certificate as
+trusted on your behalf:
+
+    security add-trusted-cert -r trustRoot -p codeSign \\
+      -k ~/Library/Keychains/login.keychain-db \\
+      $CERT_DIR/mach-dev.crt
+
+Approve the dialog it raises, then run \`scripts/sign\` again.
+
+To undo all of it:
+
+    security delete-certificate -c "$IDENTITY"
+    rm -rf $CERT_DIR
+SETUP
+}
+
+# Is this binary already carrying the signature we would give it?
+already_signed() {
+  local binary="$1" identifier="$2"
+  local info
+  info="$(codesign -dv --verbose=2 "$binary" 2>&1)" || return 1
+  grep -qF "Identifier=$identifier" <<<"$info" || return 1
+  # An ad-hoc signature is never ours, whatever identifier it carries.
+  grep -q "Signature=adhoc" <<<"$info" && return 1
+  codesign --verify "$binary" >/dev/null 2>&1
+}
+
+if [ "${1:-}" = "--setup" ]; then
+  print_setup
+  exit 0
+fi
+
+if ! have_identity; then
+  # Not an error: signing is an optional comfort, not a build step.
+  echo "sign: no \"$IDENTITY\" identity — skipping (run: scripts/sign --setup)" >&2
+  exit 0
+fi
+
+signed=0
+for entry in "${TARGETS[@]}"; do
+  binary="$REPO/${entry%%:*}"
+  identifier="${entry##*:}"
+  [ -f "$binary" ] || continue
+
+  if already_signed "$binary" "$identifier"; then
+    continue
+  fi
+
+  # `--force` because there is always an ad-hoc signature to replace, and
+  # `--options runtime` so the signature is the same shape a release build
+  # would carry rather than a special case that only exists in development.
+  if codesign --force --sign "$IDENTITY" --identifier "$identifier" \
+      --options runtime --timestamp=none "$binary" >/dev/null 2>&1; then
+    echo "sign: $(basename "$binary") → $identifier"
+    signed=$((signed + 1))
+  else
+    echo "sign: could not sign $(basename "$binary")" >&2
+  fi
+done
+
+[ "$signed" -gt 0 ] || echo "sign: everything already signed"
