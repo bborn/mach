@@ -364,6 +364,56 @@ async fn messages_send_posts_base64url_raw() {
     assert_eq!(body["threadId"], "18f2c4a9b1d3e5f0");
 }
 
+/// The pairing this endpoint exists for.
+///
+/// `users.messages.get` never returns a draft id, at any format, so a draft
+/// written on the phone reaches Mach as a message it cannot address. This is the
+/// only call that says which draft a message belongs to, and both halves of each
+/// pair have to survive parsing or the mapping is worthless.
+#[tokio::test]
+async fn drafts_list_pairs_a_draft_id_with_the_message_it_holds() {
+    let t = FakeTransport::new(vec![ok_json("drafts_list_page1.json")]);
+    let page = gmail(t.clone())
+        .drafts_list_page("me", Some(100), None)
+        .await
+        .expect("drafts.list");
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].id, "r-2009665542525810060");
+    assert_eq!(page.items[0].message.id, "19fe4a8c6a5bb04d");
+    assert_eq!(page.items[0].message.thread_id, "19fe4a8c6a5bb04c");
+    assert_eq!(page.next_page_token.as_deref(), Some("draft-page-2"));
+
+    let url = &t.requests()[0].url;
+    assert!(url.contains("/users/me/drafts"), "url {url}");
+    assert!(url.contains("maxResults=100"), "url {url}");
+}
+
+/// Every page, because the sweep treats what it did not see as deleted.
+#[tokio::test]
+async fn drafts_list_all_follows_next_page_token() {
+    let t = FakeTransport::new(vec![
+        ok_json("drafts_list_page1.json"),
+        ok_json("drafts_list_page2.json"),
+    ]);
+    let all = gmail(t.clone())
+        .drafts_list_all("me", Some(100))
+        .await
+        .expect("drafts.list all pages");
+
+    assert_eq!(all.len(), 3, "both pages should be concatenated");
+    assert_eq!(all[2].id, "r7758301783805686823");
+
+    let reqs = t.requests();
+    assert_eq!(reqs.len(), 2);
+    assert!(!reqs[0].url.contains("pageToken"));
+    assert!(
+        reqs[1].url.contains("pageToken=draft-page-2"),
+        "url {}",
+        reqs[1].url
+    );
+}
+
 #[tokio::test]
 async fn labels_list_parses() {
     let t = FakeTransport::new(vec![ok_json("labels_list.json")]);

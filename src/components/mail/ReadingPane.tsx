@@ -45,18 +45,19 @@ export function ReadingPane() {
         const draft = await loadDraftForMessage(messageId).catch(() => null);
         if (!draft) {
           /*
-           * Almost always a draft that came *down* from Gmail: the sync pass
-           * sets `is_draft` from the `DRAFT` label, so the row is real and
-           * correctly marked, but there is no `compose_drafts` copy and no
-           * `drafts.update` id to write back to. Opening it as a new draft
-           * would leave two on Google — the duplicate this unit has already
-           * been burned by twice.
+           * A draft written in another client is no longer refused: Rust adopts
+           * it on this call, building the editable copy from the message body
+           * already stored and carrying the Gmail draft id, so saving updates
+           * the draft that exists rather than creating a second one.
            *
-           * So: say so. A row that is plainly a draft and silently does
-           * nothing when activated is the same complaint as the one that
-           * started this, one step further in.
+           * One case is left, and it is narrow. The draft id comes from
+           * `users.drafts.list` and from nowhere else, so a draft that appeared
+           * between two sweeps is a message Mach has and an id it does not.
+           * The sweep runs at the end of every sync pass, after the replay that
+           * stored the message, so this is a gap of one failed request rather
+           * than of one pass — and it closes by itself.
            */
-          actions.setStatus("Draft from another client — not editable here", "error");
+          actions.setStatus("Draft not synced yet", "error");
           return;
         }
         actions.openArtifact({

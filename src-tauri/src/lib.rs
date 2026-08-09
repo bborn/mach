@@ -54,6 +54,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Links in message bodies. A plugin because the hook it needs
+        // (`on_navigation`) is below the web engine, which is the only layer a
+        // sandboxed message frame cannot silence — see `ipc::render::link_guard`.
+        .plugin(ipc::render::link_guard())
         .plugin(tauri_plugin_shell::init())
         // The save panel for attachments. Registered here rather than lazily on
         // first use; nothing `dialog:` is granted to JavaScript, so the only

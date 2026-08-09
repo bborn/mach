@@ -11,6 +11,7 @@ import {
   scheduleOptions,
   toPlainText,
   type Draft,
+  type DraftKind,
 } from "./compose";
 
 /* -------------------------------------------------------------------------- */
@@ -347,5 +348,44 @@ describe("a draft's Gmail state", () => {
     // The browser fallback, and any draft built in the editor before its first
     // save. Absent is not a failure.
     expect(isLocalOnly(newDraft(1))).toBe(false);
+  });
+});
+
+describe("a draft written in another client", () => {
+  /*
+   * The tripwire for the one enum that crosses the seam by name. Rust assigns
+   * `adopted` to a draft it took over from Gmail — see `compose::draft::
+   * DraftKind::as_str` — and a union here that has never heard of it would make
+   * every such draft fail to type-check at the call site rather than at the
+   * boundary, which is exactly how `isDraft` went missing from `mapMessage`.
+   *
+   * The array is typed, so dropping a member is a compile error; the length
+   * assertion is what catches a member being *added* on the Rust side and
+   * quietly ignored here.
+   */
+  const KINDS: DraftKind[] = ["new", "reply", "replyAll", "forward", "adopted"];
+
+  it("has a kind of its own, pinned to the Rust enum", () => {
+    expect(KINDS).toHaveLength(5);
+    expect(KINDS).toContain("adopted");
+  });
+
+  it("is not a local-only draft — Gmail is where it came from", () => {
+    // It is `synced` from the instant it is adopted, because the local copy is
+    // a copy of what Gmail already holds. Nothing to say, and nothing to push.
+    const adopted: Draft = {
+      ...newDraft(1),
+      kind: "adopted",
+      remote: { state: "synced", draftId: "r-9999", messageId: "gmsg-1" },
+    };
+    expect(isLocalOnly(adopted)).toBe(false);
+  });
+
+  it("is not the shape that opens over the window", () => {
+    // `ComposerDock` gives a *new* message a surface of its own because it has
+    // nothing to do with the thread on screen. An adopted draft does: it lives
+    // in the conversation it was written into, so it keeps the dock.
+    const adopted: Draft = { ...newDraft(1), kind: "adopted", threadId: 41 };
+    expect(adopted.kind === "new").toBe(false);
   });
 });

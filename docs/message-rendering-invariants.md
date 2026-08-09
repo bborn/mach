@@ -14,6 +14,13 @@ five mailboxes. Assume the sender knows exactly how the sanitizer works.
    The sanitizer emits no script; the sandbox is what survives the next ammonia
    CVE.
 
+   The frame is `allow-same-origin allow-popups`. `allow-popups` is required,
+   not incidental: it is the only way a click on a link reaches anything
+   outside the web engine — see invariant 3. It grants nothing on a frame that
+   cannot run scripts, since without scripting the only way to open a popup is
+   a person clicking an anchor. `allow-popups-to-escape-sandbox` is a different
+   flag and must never be added.
+
 2. **Content-Security-Policy**, at minimum:
 
    ```
@@ -31,8 +38,41 @@ five mailboxes. Assume the sender knows exactly how the sanitizer works.
 
 ## Handling sanitizer output
 
-3. **Navigation must be intercepted** and handed to the system browser. Rust
-   cannot stop the WebView from navigating.
+3. **Navigation must be intercepted** and handed to the system browser.
+
+   This used to say "Rust cannot stop the WebView from navigating", and that
+   was the mistake. Rust can, and on macOS it is the only thing that can.
+
+   The obvious implementation — the parent attaches a capture-phase `click`
+   listener to the frame's document — works in Blink and does nothing at all in
+   WebKit, which is the engine behind every macOS WebView. WebKit will not
+   invoke a listener whose target document has scripting disabled, and
+   invariant 1 disables scripting in that document by definition. The listener
+   attaches, reports success, and never fires. Nothing logs it. A link in a
+   message was dead for months and the bug was reported twice, because every
+   investigation started from the assumption that this listener ran.
+
+   Measured directly against WKWebView, on a real message, with a real mouse
+   event: with `allow-same-origin` alone the parent's listener recorded nothing
+   for a click on a link, and no navigation reached the app either — the
+   sanitizer forces `target="_blank"` onto every anchor, and WebKit refuses a
+   `_blank` navigation from a frame without `allow-popups` before anything
+   outside the engine is consulted. Removing `target` instead does not help: it
+   becomes a same-frame navigation, which the *app's* `frame-src` policy
+   refuses, again before anything can see it.
+
+   So interception lives at the navigation layer, in
+   `ipc::render::link_guard`, which is a Tauri plugin `on_navigation` hook —
+   below the web engine, consulted for subframes and new-window navigations
+   alike, and not silenceable by a sandbox flag. It cancels anything external
+   and opens it in the system browser. Cancelling there also happens *before*
+   the engine asks anything for a window, so a message's page is never rendered
+   inside Mach even briefly, and nothing in the app answers such a request in
+   any case.
+
+   The WebView-side listener stays, because `bun run dev` renders the same
+   frontend in a browser tab where it does run and is the only thing there. It
+   is not what makes links work in the app.
 
 4. **`data-mach-blocked-src` must be consumed as a DOM property**
    (`img.src = img.dataset.machBlockedSrc`), never concatenated into an HTML
@@ -60,6 +100,13 @@ five mailboxes. Assume the sender knows exactly how the sanitizer works.
 
 8. **Render off the UI thread.** Input is capped at 8 MiB, but a pathological
    body still costs CPU.
+
+9. **A link that could not be opened has to say so.** Every layer of this path
+   failed in silence at some point: a click with no listener, a listener with
+   no URL, an `openUrl` that rejected into a `console.warn`, a custom event
+   nothing listened for. `reportLinkFailure` and the `link-failed` event from
+   Rust both end at `LinkFailures`, which puts it in the toast. A dead click is
+   not an acceptable failure mode — it is what hid invariant 3 for months.
 
 ## Known gaps
 

@@ -37,10 +37,14 @@
 //!   `target="_blank"` and `rel="noopener noreferrer nofollow"`, overwriting
 //!   whatever the sender asked for. Links are *not* stripped or rewritten into
 //!   a custom scheme: the app intercepts navigation and opens the system
-//!   browser instead. `target="_blank"` is deliberate belt-and-braces — inside
-//!   a sandboxed iframe without `allow-popups` a `_blank` navigation that
-//!   escapes our interception does nothing at all, so the failure mode is a
-//!   dead click rather than a navigated WebView.
+//!   browser instead.
+//!
+//!   `target="_blank"` is not belt-and-braces, whatever this comment used to
+//!   claim. It is what makes a click a *new-window* navigation, and inside a
+//!   sandboxed message frame that is the only kind the app can see: a
+//!   same-frame navigation is refused by the app's own `frame-src` policy
+//!   before `ipc::render::link_guard` is consulted. Dropping this would make
+//!   every link in every message dead again.
 //!
 //! * **Remote images.** Rewritten to `data-mach-blocked-src` with a
 //!   transparent placeholder `src`, so nothing is loadable until the user opts

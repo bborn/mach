@@ -20,16 +20,18 @@
 //!
 //! Sanitizing is necessary and not sufficient. The WebView layer must also:
 //!
-//! * render the body in a **sandboxed iframe** (`sandbox="allow-popups"` at
-//!   most — never `allow-scripts`, and never `allow-same-origin` together with
-//!   `allow-scripts`);
+//! * render the body in a **sandboxed iframe** (`allow-same-origin
+//!   allow-popups` — never `allow-scripts`, and never `allow-same-origin`
+//!   together with `allow-scripts`);
 //! * serve it under a **Content-Security-Policy** of at least
 //!   `default-src 'none'; img-src data: <attachment scheme>; style-src
 //!   'unsafe-inline'; form-action 'none'; frame-src 'none'; script-src 'none';
 //!   base-uri 'none'`, widened to allow `https:` images only while the user has
 //!   opted in;
 //! * intercept navigation and open links in the system browser rather than
-//!   letting the WebView navigate;
+//!   letting the WebView navigate — at the navigation layer
+//!   (`ipc::render::link_guard`), because a click listener inside a
+//!   scripting-disabled frame never runs in WebKit;
 //! * run rendering off the UI thread, since a pathological body costs CPU.
 
 pub mod entities;

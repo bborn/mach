@@ -21,10 +21,13 @@ import {
   localTextRender,
   mapRenderedMessage,
   nextFrameHeight,
+  reportLinkFailure,
   revealBlockedImages,
   shouldAutoExpandQuote,
+  subscribeLinkFailures,
   FRAME_HEIGHT_EPSILON,
   FRAME_SANDBOX,
+  LINK_FAILED_EVENT,
   MAX_FRAME_HEIGHT,
   MIN_FRAME_HEIGHT,
   type BlockedImage,
@@ -94,16 +97,15 @@ describe("the message frame's sandbox", () => {
     <MessageFrame html="<p>hi</p>" allowRemoteImages={false} title="Message from Tawny" />,
   );
 
-  it("is exactly allow-same-origin", () => {
-    expect(attribute(markup, "sandbox")).toBe("allow-same-origin");
-    expect(FRAME_SANDBOX).toBe("allow-same-origin");
+  it("is exactly allow-same-origin allow-popups", () => {
+    expect(attribute(markup, "sandbox")).toBe("allow-same-origin allow-popups");
+    expect(FRAME_SANDBOX).toBe("allow-same-origin allow-popups");
   });
 
-  it("never grants scripts, popups, top navigation, forms or modals", () => {
+  it("never grants scripts, top navigation, forms or modals", () => {
     const sandbox = attribute(markup, "sandbox") ?? "";
     for (const capability of [
       "allow-scripts",
-      "allow-popups",
       "allow-top-navigation",
       "allow-top-navigation-by-user-activation",
       "allow-forms",
@@ -111,9 +113,24 @@ describe("the message frame's sandbox", () => {
       "allow-downloads",
       "allow-presentation",
       "allow-pointer-lock",
+      // The one that would make a popup a way *out* of the sandbox rather than
+      // a navigation the app cancels.
+      "allow-popups-to-escape-sandbox",
     ]) {
       expect(sandbox).not.toContain(capability);
     }
+  });
+
+  /*
+   * `allow-popups` is the fix for a link that could not be clicked, and it is
+   * the kind of thing a later tidy-up removes as "obviously unnecessary on a
+   * frame with no scripts". It is load-bearing: without it WebKit refuses the
+   * `target="_blank"` navigation the sanitizer forces onto every anchor, before
+   * anything outside the engine — including the guard that opens links — is
+   * consulted. See FRAME_SANDBOX.
+   */
+  it("grants allow-popups, which is what lets a link reach the navigation guard", () => {
+    expect(FRAME_SANDBOX.split(" ")).toContain("allow-popups");
   });
 
   it("is present on the element itself, not only in the constant", () => {
@@ -261,7 +278,7 @@ describe("quoted history", () => {
     expect(open).toContain("Hide quoted text");
     expect(open).toContain("older");
     // Second frame, same sandbox.
-    expect(open.match(/sandbox="allow-same-origin"/g)).toHaveLength(2);
+    expect(open.match(/sandbox="allow-same-origin allow-popups"/g)).toHaveLength(2);
   });
 });
 
@@ -286,6 +303,69 @@ describe("link handling", () => {
     ]) {
       expect(externalUrl(hostile)).toBeNull();
     }
+  });
+
+  /*
+   * The link that was reported twice.
+   *
+   * "Update payment method" in a Stripe billing mail: an `<a>` styled as a
+   * button, wrapping a `<span>`, on a click-tracking URL that has a whole
+   * second URL percent-encoded inside its path. Every one of those was a
+   * candidate cause and none of them was — the href survives the sanitizer
+   * unchanged and parses — but a URL this shape is exactly what a later
+   * "tighten the parsing" change would break, so it is pinned here verbatim.
+   */
+  const STRIPE_BUTTON_HREF =
+    "https://59.email.stripe.com/CL0/https:%2F%2Fbilling.stripe.com%2Fp%2Flogin%2F00g5kTbIE9S95448ww%3Freferer=upcoming_invoice/1/0101019fe6bf4100-2bdba2b0-dbea-4014-8a08-aca9987e05d5-000000/vtJFBTXU0xwGwuHByHespJ0_YUwby5osV8XV3vnCkA8=452";
+
+  it("opens a tracking URL with a second URL encoded inside it", () => {
+    expect(externalUrl(STRIPE_BUTTON_HREF)).toBe(STRIPE_BUTTON_HREF);
+  });
+
+  it("classifies that URL the way the Rust navigation guard has to", () => {
+    // The guard's rule is the mirror of this one: four schemes, and a host that
+    // is not the app itself. `is_external_link` in `ipc::render` is tested on
+    // the Rust side; this is the frontend's half of the same agreement.
+    const parsed = new URL(STRIPE_BUTTON_HREF);
+    expect(parsed.protocol).toBe("https:");
+    expect(parsed.host).toBe("59.email.stripe.com");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a failed link is not silent
+// ---------------------------------------------------------------------------
+
+describe("link failures", () => {
+  it("reaches a listener from inside the window", () => {
+    const seen: string[] = [];
+    const off = subscribeLinkFailures((message) => seen.push(message));
+    reportLinkFailure("Could not open that link: nope");
+    off();
+    reportLinkFailure("after unsubscribing");
+    expect(seen).toEqual(["Could not open that link: nope"]);
+  });
+
+  it("reaches the same listener from Rust, which is where the app opens links", () => {
+    const seen: string[] = [];
+    let deliver: ((payload: { message?: string } | null) => void) | null = null;
+    const off = subscribeLinkFailures(
+      (message) => seen.push(message),
+      async (event, handler) => {
+        expect(event).toBe(LINK_FAILED_EVENT);
+        deliver = handler;
+        return () => {
+          deliver = null;
+        };
+      },
+    );
+    return Promise.resolve().then(() => {
+      deliver?.({ message: "Could not open that link: no browser" });
+      deliver?.(null);
+      deliver?.({});
+      off();
+      expect(seen).toEqual(["Could not open that link: no browser"]);
+    });
   });
 });
 
@@ -619,6 +699,21 @@ describe("the frame stylesheet", () => {
 
   it("keeps a code block's lines instead of reflowing them", () => {
     expect(css).toContain("pre{white-space:pre;max-width:100%;overflow-x:auto;overflow-y:hidden}");
+  });
+
+  /*
+   * The collapsed column.
+   *
+   * `word-break:break-word` reads like a stronger `overflow-wrap:break-word`
+   * and is a different property: it also tells table layout that this content
+   * can be one character wide, which lets a sender's `width:24px` win over the
+   * word in the cell. A GitHub Actions notification rendered its "Status"
+   * header vertically, one letter per line, because of it — 25.9px wide and
+   * 176px tall, measured.
+   */
+  it("does not make one character the narrowest a table column can be", () => {
+    expect(css).toContain("overflow-wrap:break-word");
+    expect(css).not.toContain("word-break");
   });
 });
 

@@ -781,6 +781,13 @@ impl MailSync {
 // the backfill writer
 // ---------------------------------------------------------------------------
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Hand a batch to the writer, waiting if it is still behind.
 ///
 /// The wait is the backpressure that keeps memory bounded: a fetcher that can

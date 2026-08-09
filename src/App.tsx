@@ -8,6 +8,7 @@ import { StatusBar } from "@/components/chrome/StatusBar";
 import { Toast } from "@/components/chrome/Toast";
 import { TitleBar } from "@/components/chrome/TitleBar";
 import { CalendarMode } from "@/components/calendar/CalendarMode";
+import { LinkFailures } from "@/components/mail/LinkFailures";
 import { MailMode } from "@/components/mail/MailMode";
 import { CommandPalette } from "@/components/palette/CommandPalette";
 import { ShortcutSheet } from "@/components/chrome/ShortcutSheet";
@@ -270,6 +271,10 @@ function Shell() {
         the status message rather than a second one.
       */}
       <Toast />
+      {/* Renders nothing. A link that could not be opened is known about in
+          Rust, at the navigation layer, where there is no component to tell —
+          this is what carries that back to the toast. */}
+      <LinkFailures />
       <CommandPalette />
       <ShortcutSheet
         open={shortcuts !== null}

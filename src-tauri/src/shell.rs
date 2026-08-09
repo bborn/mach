@@ -13,10 +13,21 @@
 //! still running, the composer may still hold an unsent draft, and the only
 //! visible symptom is that the app is gone.
 //!
-//! So closing hides instead. The window comes back on a Dock click through
-//! [`reopen`], instantly, with the store already warm — which is the behaviour
-//! Mail and Messages have had for twenty years, and incidentally the fastest
-//! possible "launch". ⌘Q still quits.
+//! So closing hides instead, and the window comes back with the store already
+//! warm. ⌘Q still quits.
+//!
+//! The first version relied on a Dock click alone, arriving as
+//! `RunEvent::Reopen`, and that turned out to reproduce the bug it was meant to
+//! fix. macOS only sends that event when the application is *activated*, and an
+//! app whose last window just closed is already the active one — so clicking
+//! its Dock tile does nothing, and the owner was left frontmost with no windows
+//! and no way back. Reported as "I went to prefs, closed that window, now I
+//! have no windows".
+//!
+//! Hence two routes, and the second is the one that cannot fail: `Reopen` for
+//! the ordinary case, and a **Window ▸ Mach** menu item (⌘0) handled in Rust.
+//! The menu bar belongs to the application rather than to any window, so it is
+//! there precisely when no window is.
 //!
 //! # The menu is a replay device, not a second implementation
 //!
@@ -49,6 +60,9 @@
 
 use tauri::menu::{AboutMetadata, Menu, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, Manager, Runtime, Window};
+
+/// The Window menu item that brings a hidden window back. Handled in Rust.
+const SHOW_WINDOW_ID: &str = "mach://show-window";
 
 /// Carries a keymap token to the frontend, which replays it. See the module doc.
 pub const MENU_EVENT: &str = "mach://menu";
@@ -196,9 +210,27 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .item(&PredefinedMenuItem::fullscreen(app, Some("Toggle Full Screen"))?)
         .build()?;
 
+    // "Mach" reopens the hidden window, and it is not a convenience.
+    //
+    // Closing hides rather than destroys, and the way back was a Dock click
+    // arriving as `RunEvent::Reopen`. macOS does not send that when the app is
+    // already the active one — so closing the window left the app frontmost
+    // with no windows and no route back to itself, which is precisely the
+    // zombie state hiding was introduced to prevent.
+    //
+    // This item cannot fail the same way: the menu bar belongs to the
+    // application, not to a window, so it is there whether or not a window is.
+    // It is handled in Rust rather than replayed through the keymap, because a
+    // replay needs a webview and the whole point is that there is not one.
     let window_menu = SubmenuBuilder::new(app, "Window")
         .item(&PredefinedMenuItem::minimize(app, Some("Minimize"))?)
         .item(&PredefinedMenuItem::maximize(app, Some("Zoom"))?)
+        .separator()
+        .item(
+            &MenuItemBuilder::with_id(SHOW_WINDOW_ID, "Mach")
+                .accelerator("CmdOrCtrl+0")
+                .build(app)?,
+        )
         .separator()
         .item(&PredefinedMenuItem::close_window(app, Some("Close Window"))?)
         .build()?;
@@ -222,6 +254,12 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 /// The id *is* the token, so there is no table to keep in step. Predefined
 /// items never arrive here — Tauri handles those itself.
 pub fn on_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
+    // Handled here rather than replayed: it exists for the case where there is
+    // no webview to replay into.
+    if id == SHOW_WINDOW_ID {
+        reopen(app);
+        return;
+    }
     let _ = app.emit(MENU_EVENT, id);
 }
 

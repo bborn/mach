@@ -1992,3 +1992,439 @@ async fn load_draft_still_refuses_a_payload_that_names_nothing() {
     let error = dispatch(&db, &out, json!({ "op": "loadDraft" })).await;
     assert!(error.is_err());
 }
+
+// ==================================== drafts written in some other client
+
+/// A draft exactly as Gmail hands one down: an ordinary message carrying the
+/// `DRAFT` label, plus the draft id the `drafts.list` sweep learned for it.
+///
+/// Note what is *not* here — no `compose_drafts` row. That is the whole of the
+/// problem this section covers: Mach has the text and no way to address the
+/// draft it belongs to.
+fn seed_remote_draft(
+    db: &Db,
+    thread_id: i64,
+    account_id: i64,
+    gmail_message_id: &str,
+    gmail_draft_id: &str,
+    body: &str,
+) -> i64 {
+    let message_id = db
+        .write(|c| {
+            queries::upsert_message(
+                c,
+                &NewMessage {
+                    thread_id,
+                    account_id,
+                    gmail_message_id: gmail_message_id.to_string(),
+                    rfc822_message_id: None,
+                    in_reply_to: None,
+                    references: None,
+                    reply_to: vec![],
+                    from: person("Alex Rivera", "alex@example.com"),
+                    to: vec![person("Tawny Rivers", "tawny@partner.com")],
+                    cc: vec![],
+                    bcc: vec![],
+                    subject: "Re: Series A data room".to_string(),
+                    body_html: None,
+                    body_text: Some(body.to_string()),
+                    snippet: body.chars().take(60).collect(),
+                    internal_date: NOW,
+                    is_unread: false,
+                    is_draft: true,
+                },
+            )
+        })
+        .unwrap();
+    db.write(|c| {
+        queries::set_message_draft_id(c, account_id, gmail_message_id, gmail_draft_id)?;
+        Ok(())
+    })
+    .unwrap();
+    message_id
+}
+
+/// The complaint this whole section answers: "wtf is 'draft from another
+/// client'? aren't drafts in the API?"
+#[tokio::test]
+async fn a_draft_written_on_the_phone_opens_in_the_composer() {
+    let (db, account, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let row = seed_remote_draft(
+        &db,
+        thread,
+        account,
+        "gmsg-remote-1",
+        "r-9999",
+        "Sending the link this afternoon.",
+    );
+
+    let found = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+
+    assert!(!found["draft"].is_null(), "it has to open");
+    assert_eq!(
+        found["draft"]["body"].as_str(),
+        Some("Sending the link this afternoon."),
+        "the text comes from the message Mach already has, not from a request"
+    );
+    assert_eq!(
+        found["draft"]["remote"]["draftId"].as_str(),
+        Some("r-9999"),
+        "carrying the id, or the first save would create a second draft"
+    );
+    assert_eq!(found["draft"]["kind"].as_str(), Some("adopted"));
+    assert_eq!(
+        found["draft"]["remote"]["state"].as_str(),
+        Some("synced"),
+        "opening his phone's draft must not queue a push that rewrites it"
+    );
+}
+
+/// The duplicate hazard, from the new direction. Saving an adopted draft has to
+/// be `drafts.update` on the id Gmail already gave it.
+#[tokio::test]
+async fn saving_an_adopted_draft_updates_gmails_draft_rather_than_making_a_second() {
+    let (db, account, thread, _m) = seeded();
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"r-9999","message":{"id":"gmsg-remote-2","threadId":"gthread-1"}}"#,
+    ))]);
+    let out = outbox(&db, Arc::clone(&transport));
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "First pass.");
+
+    let found = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+    let mut draft = found["draft"].clone();
+    draft["body"] = json!("First pass, edited here.");
+    let saved = dispatch(&db, &out, json!({ "op": "saveDraft", "draft": draft, "now": NOW }))
+        .await
+        .unwrap();
+    sync.push(saved["draft"]["id"].as_str().unwrap(), NOW)
+        .await
+        .unwrap();
+
+    let drafts = transport.draft_requests();
+    assert_eq!(drafts.len(), 1, "one call, not two");
+    assert!(
+        drafts[0].url.ends_with("/drafts/r-9999"),
+        "addressed by the id Gmail gave it, url {}",
+        drafts[0].url
+    );
+    assert_eq!(drafts[0].method, mach_lib::google::HttpMethod::Put);
+
+    // And one draft row in the conversation, not two.
+    let in_thread = messages_in(&db, thread)
+        .into_iter()
+        .filter(|m| m.is_draft)
+        .count();
+    assert_eq!(in_thread, 1);
+}
+
+/// The quiet corruption an adopted draft could suffer, and the reason `adopted`
+/// is its own kind: the body already holds whatever the phone quoted, so quoting
+/// the parent again would send the original twice.
+#[tokio::test]
+async fn adopting_does_not_quote_the_original_a_second_time() {
+    let (db, account, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let body = "On it.\n\nOn Thu, 7 Aug 2026 at 12:00, Tawny Rivers <tawny@partner.com> wrote:\n> Can you send the data room link?";
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", body);
+
+    let found = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+    let parsed: Draft = serde_json::from_value(found["draft"].clone()).unwrap();
+    let bytes = built_bytes(&db, &parsed);
+    let plain = MessageParser::new()
+        .parse(&bytes)
+        .and_then(|m| m.body_text(0).map(|t| t.into_owned()))
+        .expect("a text part");
+
+    assert_eq!(
+        plain.matches("Can you send the data room link?").count(),
+        1,
+        "the original appears once, in the quote the phone wrote:\n{plain}"
+    );
+
+    // The headers that make it thread elsewhere are still there, taken from the
+    // message it answers rather than from the body.
+    let headers = headers_of(&bytes);
+    assert!(
+        headers.contains("In-Reply-To: <parent-1@mail.partner.com>"),
+        "headers:\n{headers}"
+    );
+}
+
+/// Two activations of the same row, or two windows. The local id is derived from
+/// the Gmail draft id, so they converge instead of racing.
+#[tokio::test]
+async fn adopting_the_same_draft_twice_leaves_one_row() {
+    let (db, account, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "Once.");
+
+    let first = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+    let second = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+
+    assert_eq!(first["draft"]["id"], second["draft"]["id"]);
+    let rows: i64 = db
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM compose_drafts", [], |r| r.get(0))
+                .unwrap_or(0))
+        })
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+/// A fresh message written on the phone — no conversation behind it — still has
+/// to open. It has no parent to thread onto, and that is not a failure.
+#[tokio::test]
+async fn a_draft_with_no_conversation_behind_it_still_opens() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "alex@example.com", Some("Alex Rivera"));
+    let thread = seed_thread(&db, account, "Lunch?");
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-3", "r-4242", "Thursday?");
+
+    let out = outbox(&db, FakeTransport::always_ok());
+    let found = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+
+    assert_eq!(found["draft"]["body"].as_str(), Some("Thursday?"));
+    assert!(
+        found["draft"]["replyToId"].is_null(),
+        "nothing to answer, so nothing is claimed as a parent"
+    );
+
+    let parsed: Draft = serde_json::from_value(found["draft"].clone()).unwrap();
+    let headers = headers_of(&built_bytes(&db, &parsed));
+    assert!(!headers.contains("In-Reply-To:"), "headers:\n{headers}");
+}
+
+/// Deleted on the phone stays deleted. The local copy is the only thing that
+/// could put it back, so the sweep takes it out — row and mirror together.
+#[tokio::test]
+async fn a_draft_deleted_elsewhere_is_not_resurrected() {
+    let (db, account, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "Half a thought.");
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "loadDraft", "messageId": row, "now": NOW }),
+    )
+    .await
+    .unwrap();
+
+    // Gmail's answer no longer mentions it.
+    let removed = draft::forget_drafts_missing_from(&db, account, &[], NOW + 60_000).unwrap();
+    assert_eq!(removed, vec!["r-9999".to_string()]);
+
+    let left: i64 = db
+        .read(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM compose_drafts", [], |r| r.get(0))
+                .unwrap_or(0))
+        })
+        .unwrap();
+    assert_eq!(left, 0, "nothing left here to push back");
+    assert!(
+        !messages_in(&db, thread).iter().any(|m| m.is_draft),
+        "and it is out of the conversation too"
+    );
+}
+
+/// A draft *sent* from the phone also vanishes from `drafts.list`, and its
+/// message is now an ordinary sent message. Reaping the row must not take the
+/// mail with it.
+#[tokio::test]
+async fn a_draft_sent_elsewhere_keeps_the_message_it_became() {
+    let (db, account, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "Sent from bed.");
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "loadDraft", "messageId": row, "now": NOW }),
+    )
+    .await
+    .unwrap();
+
+    // History got there first: the DRAFT label is gone, so this is now mail.
+    db.write(|c| {
+        c.execute("UPDATE messages SET is_draft = 0 WHERE id = ?1", [row])?;
+        Ok(())
+    })
+    .unwrap();
+
+    draft::forget_drafts_missing_from(&db, account, &[], NOW + 60_000).unwrap();
+
+    assert!(
+        messages_in(&db, thread).iter().any(|m| m.id == row),
+        "the message he actually sent has to survive"
+    );
+}
+
+/// The race the sweep would otherwise lose: a draft written here while
+/// `drafts.list` was in flight is newer than the answer, and reaping it would
+/// delete something that had just been typed.
+#[tokio::test]
+async fn a_draft_written_while_the_list_was_in_flight_survives_the_sweep() {
+    let (db, account, thread, _m) = seeded();
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"r-newer","message":{"id":"gmsg-newer","threadId":"gthread-1"}}"#,
+    ))]);
+    let out = outbox(&db, Arc::clone(&transport));
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+
+    let listed_at = NOW;
+    let saved = save_body(&db, &out, thread, "typed a moment ago", NOW + 1_000).await;
+    sync.push(saved["id"].as_str().unwrap(), NOW + 1_000)
+        .await
+        .unwrap();
+
+    let removed = draft::forget_drafts_missing_from(&db, account, &[], listed_at).unwrap();
+    assert!(removed.is_empty(), "removed {removed:?}");
+    assert!(
+        draft::load_draft(&db, saved["id"].as_str().unwrap())
+            .unwrap()
+            .is_some(),
+        "the draft the owner just wrote is still here"
+    );
+}
+
+/// Two writers, one draft. Mach adopted it; then it was edited on the phone,
+/// which replaced the message behind it — so the row Mach holds points at a
+/// message that no longer exists, and only the draft id says the two are the
+/// same draft.
+///
+/// Last write wins, by time. Here the phone wrote last.
+#[tokio::test]
+async fn a_draft_edited_elsewhere_after_adoption_brings_the_newer_text_back() {
+    let (db, account, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "First thought.");
+    let opened = dispatch(
+        &db,
+        &out,
+        json!({ "op": "loadDraft", "messageId": row, "now": NOW }),
+    )
+    .await
+    .unwrap();
+    let draft_id = opened["draft"]["id"].as_str().unwrap().to_string();
+
+    // He edits it on the phone. `drafts.update` mints a new message id, so the
+    // sync sees the old one deleted and a new one added.
+    db.write(|c| {
+        c.execute("DELETE FROM messages WHERE id = ?1", [row])?;
+        Ok(())
+    })
+    .unwrap();
+    let newer = seed_remote_draft(
+        &db,
+        thread,
+        account,
+        "gmsg-remote-2",
+        "r-9999",
+        "First thought, rewritten on the train.",
+    );
+    db.write(|c| {
+        c.execute(
+            "UPDATE messages SET internal_date = ?2 WHERE id = ?1",
+            rusqlite::params![newer, NOW + 60_000],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let reopened = dispatch(
+        &db,
+        &out,
+        json!({ "op": "loadDraft", "messageId": newer, "now": NOW + 120_000 }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        reopened["draft"]["id"].as_str(),
+        Some(draft_id.as_str()),
+        "still the same draft, not a second one"
+    );
+    assert_eq!(
+        reopened["draft"]["body"].as_str(),
+        Some("First thought, rewritten on the train."),
+        "the phone wrote last, so the phone's words are the ones to show"
+    );
+    assert_eq!(
+        reopened["draft"]["remote"]["messageId"].as_str(),
+        Some("gmsg-remote-2"),
+        "re-pointed, or the next save mirrors onto a message Gmail deleted"
+    );
+}
+
+/// The other side of the same rule: Mach wrote last, so what he typed here is
+/// what he sees — and the row is still re-pointed at the message that exists.
+#[tokio::test]
+async fn a_local_edit_newer_than_the_remote_one_is_not_overwritten() {
+    let (db, account, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "First thought.");
+    let opened = dispatch(
+        &db,
+        &out,
+        json!({ "op": "loadDraft", "messageId": row, "now": NOW }),
+    )
+    .await
+    .unwrap();
+
+    let mut draft = opened["draft"].clone();
+    draft["body"] = json!("Typed here, and later.");
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "saveDraft", "draft": draft, "now": NOW + 120_000 }),
+    )
+    .await
+    .unwrap();
+
+    // Gmail's copy is older than that save.
+    db.write(|c| {
+        c.execute("DELETE FROM messages WHERE id = ?1", [row])?;
+        Ok(())
+    })
+    .unwrap();
+    let older = seed_remote_draft(&db, thread, account, "gmsg-remote-2", "r-9999", "Stale copy.");
+    db.write(|c| {
+        c.execute(
+            "UPDATE messages SET internal_date = ?2 WHERE id = ?1",
+            rusqlite::params![older, NOW + 60_000],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let reopened = dispatch(
+        &db,
+        &out,
+        json!({ "op": "loadDraft", "messageId": older, "now": NOW + 180_000 }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        reopened["draft"]["body"].as_str(),
+        Some("Typed here, and later.")
+    );
+    assert_eq!(
+        reopened["draft"]["remote"]["messageId"].as_str(),
+        Some("gmsg-remote-2")
+    );
+}

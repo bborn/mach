@@ -37,7 +37,14 @@ export interface Mailbox {
   email: string;
 }
 
-export type DraftKind = "new" | "reply" | "replyAll" | "forward";
+/**
+ * `adopted` is a draft written somewhere else — the phone, the web — and taken
+ * over here. It is not a kind the UI ever asks for: Rust assigns it when a
+ * synced draft is opened for the first time, and it exists so that rebuilding
+ * the message leaves the body exactly as the other client wrote it. See
+ * `compose::draft::DraftKind`.
+ */
+export type DraftKind = "new" | "reply" | "replyAll" | "forward" | "adopted";
 
 /** Where a draft stands with Gmail. Mirrors `compose::draft::RemoteState`. */
 export type RemoteState = "pending" | "synced" | "failed";

@@ -736,13 +736,95 @@ pub fn load_draft_for_message(db: &Db, message_id: i64, now_ms: i64) -> Result<O
             )
             .ok())
     })?;
-    match existing {
-        // Mach's own row wins whenever there is one. It holds the text as the
-        // editor last left it, which may be newer than the copy that came down
-        // from Gmail, and re-adopting over it would throw away the difference.
-        Some(draft) => Ok(Some(draft)),
-        None => adopt_remote_draft(db, message_id, now_ms),
+    if let Some(draft) = existing {
+        // Mach's own row, still pointing at this message. It holds the text as
+        // the editor last left it.
+        return Ok(Some(draft));
     }
+
+    let Some(gmail_draft_id) = db.read(|conn| queries::message_draft_id(conn, message_id))? else {
+        return Ok(None);
+    };
+
+    // A row for this *draft*, filed under a message id that no longer exists.
+    // `drafts.update` mints a new message id every time, whoever calls it — so
+    // this is what a draft edited on the phone after Mach adopted it looks like
+    // from here, and following the draft id is the only way to recognise it as
+    // the same draft rather than a new one.
+    let by_draft: Option<Draft> = db.read(|conn| {
+        Ok(conn
+            .query_row(
+                &format!("SELECT {DRAFT_COLUMNS} FROM compose_drafts WHERE gmail_draft_id = ?1"),
+                [&gmail_draft_id],
+                map_draft,
+            )
+            .ok())
+    })?;
+
+    match by_draft {
+        Some(existing) => reconcile_adopted(db, existing, message_id, now_ms).map(Some),
+        None => adopt_remote_draft(db, message_id, gmail_draft_id, now_ms),
+    }
+}
+
+/// Two writers, one draft: Mach adopted it, and then it was edited somewhere
+/// else.
+///
+/// **Last write wins, decided by time rather than by which end asked.** Gmail
+/// stamps a draft's message with the moment it was saved, and this row carries
+/// the moment the editor last touched it, so the two are directly comparable
+/// and the newer one is kept. The alternative rules are both worse: "the local
+/// copy wins" silently discards what he typed on his phone, and "the remote
+/// copy wins" silently discards what he typed here.
+///
+/// It is still a loss when the two were edited in parallel — the older side's
+/// words go — and there is no merge that would not invent a message neither
+/// person wrote. What it will not do is lose the *newer* text, which is the one
+/// somebody is expecting to find.
+///
+/// Either way the row is re-pointed at the message that exists now. Leaving it
+/// on the old id would have the next save mirror a draft onto a message row
+/// Gmail has already deleted, and the conversation would show two.
+fn reconcile_adopted(
+    db: &Db,
+    existing: Draft,
+    message_id: i64,
+    now_ms: i64,
+) -> Result<Draft> {
+    let Some(fresh) = read_draft_message(db, message_id)? else {
+        return Ok(existing);
+    };
+
+    let remote_is_newer = fresh.message.internal_date > existing.updated_at;
+    let mut updated = Draft {
+        remote: DraftRemote {
+            message_id: Some(fresh.message.gmail_message_id.clone()),
+            thread_id: Some(fresh.gmail_thread_id.clone()),
+            ..existing.remote.clone()
+        },
+        thread_id: Some(fresh.thread_id),
+        ..existing
+    };
+    if remote_is_newer {
+        updated.to = mailboxes(&fresh.message.to);
+        updated.cc = mailboxes(&fresh.message.cc);
+        updated.bcc = mailboxes(&fresh.message.bcc);
+        updated.subject = fresh.message.subject.clone();
+        updated.body = body_of(&fresh.message);
+        updated.updated_at = fresh.message.internal_date;
+        updated.reply_to_id = fresh.parent_id;
+        // Nothing to push: this text *is* what Gmail holds.
+        updated.remote.state = RemoteState::Synced;
+        updated.remote.error = None;
+        updated.remote.synced_at = now_ms;
+        write_adopted(db, &updated, true)?;
+    } else {
+        // The text stays as he left it here; only the identity moves, so the
+        // next save mirrors onto the message that exists rather than the one
+        // Gmail replaced.
+        set_remote(db, &updated.id, &updated.remote)?;
+    }
+    Ok(load_draft(db, &updated.id)?.unwrap_or(updated))
 }
 
 /// Take over a draft written in another client.
@@ -778,24 +860,67 @@ pub fn load_draft_for_message(db: &Db, message_id: i64, now_ms: i64) -> Result<O
 /// The local id is derived from the Gmail draft id rather than minted, so
 /// adopting the same draft twice — two activations of the same row, or two
 /// windows — converges on one row instead of racing to make two.
-fn adopt_remote_draft(db: &Db, message_id: i64, now_ms: i64) -> Result<Option<Draft>> {
-    let Some(gmail_draft_id) = db.read(|conn| queries::message_draft_id(conn, message_id))? else {
+fn adopt_remote_draft(
+    db: &Db,
+    message_id: i64,
+    gmail_draft_id: String,
+    now_ms: i64,
+) -> Result<Option<Draft>> {
+    let Some(fresh) = read_draft_message(db, message_id)? else {
         return Ok(None);
     };
 
-    let located: Option<(i64, i64)> = db.read(|conn| {
+    let draft = Draft {
+        id: adopted_draft_id(&gmail_draft_id),
+        account_id: fresh.message.account_id,
+        thread_id: Some(fresh.thread_id),
+        reply_to_id: fresh.parent_id,
+        kind: DraftKind::Adopted,
+        to: mailboxes(&fresh.message.to),
+        cc: mailboxes(&fresh.message.cc),
+        bcc: mailboxes(&fresh.message.bcc),
+        subject: fresh.message.subject.clone(),
+        body: body_of(&fresh.message),
+        updated_at: now_ms,
+        remote: DraftRemote {
+            state: RemoteState::Synced,
+            draft_id: Some(gmail_draft_id),
+            message_id: Some(fresh.message.gmail_message_id.clone()),
+            thread_id: Some(fresh.gmail_thread_id.clone()),
+            error: None,
+            synced_at: now_ms,
+        },
+    };
+
+    write_adopted(db, &draft, false)?;
+    load_draft(db, &draft.id)
+}
+
+/// A draft message as the store holds it, with the two things around it an
+/// adopted draft needs: the conversation it is in, and the message it answers.
+struct DraftMessage {
+    message: Message,
+    thread_id: i64,
+    gmail_thread_id: String,
+    /// The last message in the thread somebody actually sent. `None` for a fresh
+    /// message written on the phone, which has nothing to answer and must still
+    /// open.
+    parent_id: Option<i64>,
+}
+
+fn read_draft_message(db: &Db, message_id: i64) -> Result<Option<DraftMessage>> {
+    let thread_id: Option<i64> = db.read(|conn| {
         Ok(conn
             .query_row(
-                "SELECT account_id, thread_id FROM messages WHERE id = ?1 AND is_draft = 1",
+                "SELECT thread_id FROM messages WHERE id = ?1 AND is_draft = 1",
                 [message_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .ok())
     })?;
-    let Some((account_id, thread_id)) = located else {
+    let Some(thread_id) = thread_id else {
         return Ok(None);
     };
-
     let detail = db
         .read(|conn| queries::thread_with_messages(conn, thread_id))?
         .ok_or(ComposeError::UnknownThread(thread_id))?;
@@ -803,43 +928,31 @@ fn adopt_remote_draft(db: &Db, message_id: i64, now_ms: i64) -> Result<Option<Dr
         .messages
         .iter()
         .find(|m| m.id == message_id)
+        .cloned()
         .ok_or(ComposeError::UnknownMessage(message_id))?;
+    let parent_id = detail
+        .messages
+        .iter()
+        .rev()
+        .find(|m| !m.is_draft)
+        .map(|m| m.id);
+    Ok(Some(DraftMessage {
+        message,
+        thread_id,
+        gmail_thread_id: detail.thread.gmail_thread_id,
+        parent_id,
+    }))
+}
 
-    // The message this draft answers, if it answers one. A draft written on the
-    // phone as a fresh message has no parent, and must still open — so this is
-    // an `Option`, not a failure.
-    let parent = detail.messages.iter().rev().find(|m| !m.is_draft);
-
-    let body = message
+/// The text to edit. Gmail's plain-text alternative, and the snippet only when
+/// there is nothing else — an empty composer over a draft that plainly has words
+/// in it would be worse than not opening at all.
+fn body_of(message: &Message) -> String {
+    message
         .body_text
         .clone()
         .filter(|t| !t.trim().is_empty())
-        .unwrap_or_else(|| message.snippet.clone());
-
-    let draft = Draft {
-        id: adopted_draft_id(&gmail_draft_id),
-        account_id,
-        thread_id: Some(thread_id),
-        reply_to_id: parent.map(|p| p.id),
-        kind: DraftKind::Adopted,
-        to: mailboxes(&message.to),
-        cc: mailboxes(&message.cc),
-        bcc: mailboxes(&message.bcc),
-        subject: message.subject.clone(),
-        body,
-        updated_at: now_ms,
-        remote: DraftRemote {
-            state: RemoteState::Synced,
-            draft_id: Some(gmail_draft_id),
-            message_id: Some(message.gmail_message_id.clone()),
-            thread_id: Some(detail.thread.gmail_thread_id.clone()),
-            error: None,
-            synced_at: now_ms,
-        },
-    };
-
-    insert_adopted(db, &draft)?;
-    load_draft(db, &draft.id)
+        .unwrap_or_else(|| message.snippet.clone())
 }
 
 /// The local row id an adopted draft gets. Derived, so adoption is idempotent.
@@ -849,18 +962,47 @@ fn adopted_draft_id(gmail_draft_id: &str) -> String {
 
 /// Write an adopted draft: the editor's columns and the Gmail identity in one
 /// statement, because a row that has one without the other is a duplicate
-/// waiting for the next push. `DO NOTHING` on conflict, so a second adoption of
-/// the same draft finds the first one rather than overwriting it.
-fn insert_adopted(db: &Db, draft: &Draft) -> Result<()> {
+/// waiting for the next push — a row with text and no `gmail_draft_id` is what
+/// `drafts.create` is reached from.
+///
+/// `overwrite` is the difference between adopting and reconciling. Adoption
+/// leaves an existing row alone (`DO NOTHING`), so two activations of the same
+/// draft row converge instead of racing; reconciliation has already decided that
+/// the remote copy is the newer one, and replaces the text with it.
+fn write_adopted(db: &Db, draft: &Draft, overwrite: bool) -> Result<()> {
     db.write(ensure_compose_schema)?;
+    let conflict = if overwrite {
+        "DO UPDATE SET
+             account_id       = excluded.account_id,
+             thread_id        = excluded.thread_id,
+             reply_to_id      = excluded.reply_to_id,
+             kind             = excluded.kind,
+             to_json          = excluded.to_json,
+             cc_json          = excluded.cc_json,
+             bcc_json         = excluded.bcc_json,
+             subject          = excluded.subject,
+             body             = excluded.body,
+             updated_at       = excluded.updated_at,
+             gmail_draft_id   = excluded.gmail_draft_id,
+             gmail_message_id = excluded.gmail_message_id,
+             gmail_thread_id  = excluded.gmail_thread_id,
+             remote_state     = excluded.remote_state,
+             remote_error     = NULL,
+             remote_synced_at = excluded.remote_synced_at"
+    } else {
+        "DO NOTHING"
+    };
+    let sql = format!(
+        "INSERT INTO compose_drafts
+             (id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, bcc_json,
+              subject, body, updated_at, gmail_draft_id, gmail_message_id, gmail_thread_id,
+              remote_state, remote_error, remote_synced_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, ?16)
+         ON CONFLICT(id) {conflict}"
+    );
     db.write(|conn| {
         conn.execute(
-            "INSERT INTO compose_drafts
-                 (id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, bcc_json,
-                  subject, body, updated_at, gmail_draft_id, gmail_message_id, gmail_thread_id,
-                  remote_state, remote_error, remote_synced_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'synced', NULL, ?15)
-             ON CONFLICT(id) DO NOTHING",
+            &sql,
             rusqlite::params![
                 draft.id,
                 draft.account_id,
@@ -876,6 +1018,7 @@ fn insert_adopted(db: &Db, draft: &Draft) -> Result<()> {
                 draft.remote.draft_id,
                 draft.remote.message_id,
                 draft.remote.thread_id,
+                draft.remote.state.as_str(),
                 draft.remote.synced_at,
             ],
         )?;

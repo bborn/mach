@@ -319,6 +319,37 @@ fn safe_link_schemes_survive_with_opener_protection() {
     }
 }
 
+/// The link that was reported twice: "Update payment method" in a Stripe
+/// billing mail.
+///
+/// A button-shaped `<a>` with a block display and a `<span>` inside it, on a
+/// click-tracking URL that carries a second, percent-encoded URL in its path.
+/// Every part of that was a suspect when the click did nothing, and none of it
+/// was the cause — which is the reason to pin it: a later tightening of the
+/// href rules must not quietly break the shape this mail actually has.
+///
+/// `target="_blank"` is asserted here as a *requirement*, not as a detail. It
+/// is what makes a click a new-window navigation, which is the only kind
+/// `ipc::render::link_guard` can see from inside a sandboxed frame.
+#[test]
+fn a_button_shaped_tracking_link_keeps_its_href() {
+    let href = "https://59.email.stripe.com/CL0/https:%2F%2Fbilling.stripe.com%2Fp%2Flogin%2F00g5kTbIE9S95448ww%3Freferer=upcoming_invoice/1/0101019fe6bf4100-2bdba2b0-dbea-4014-8a08-aca9987e05d5-000000/vtJFBTXU0xwGwuHByHespJ0_YUwby5osV8XV3vnCkA8=452";
+    let out = clean(&format!(
+        r#"<td align="" style="width: 100%; text-align: center; background-color: #031830; border-radius: 6px; height: 44px;">
+             <a style="display: block; text-align: center; padding-right: 60px; padding-left: 60px;" href="{href}" target="_self">
+               <span style="font-weight: 500; font-size: 16px; line-height: 44px;">Update payment method</span>
+             </a>
+           </td>"#
+    ));
+
+    assert!(out.contains(&format!(r#"href="{href}""#)), "href mangled: {out}");
+    assert!(out.contains(r#"target="_blank""#), "target not forced: {out}");
+    assert!(!out.contains(r#"target="_self""#), "sender's target survived: {out}");
+    assert!(out.contains("Update payment method"), "label eaten: {out}");
+    // The anchor still fills the button, or there is nothing to click.
+    assert!(out.contains("display:block"), "layout stripped: {out}");
+}
+
 #[test]
 fn attacker_supplied_target_and_rel_cannot_win() {
     // window.opener abuse: attacker asks for a named target and no rel.

@@ -19,7 +19,11 @@
 //! Nothing returned from here is safe to inject into the app document. It is
 //! safe to put inside a sandboxed, CSP-restricted iframe, which is what
 //! `src/components/mail/MessageFrame.tsx` does. Rust cannot sandbox the
-//! WebView and cannot stop it navigating; see the invariants doc.
+//! WebView; see the invariants doc.
+//!
+//! Stopping it *navigating* is this module's job after all — see
+//! [`link_guard`], which is the only layer that can, because the frame the
+//! WebView is asked to navigate cannot run the script that would say no.
 
 use rusqlite::OptionalExtension;
 use serde::Serialize;
@@ -167,22 +171,117 @@ fn load_message(db: &Db, message_id: i64) -> Result<Message, IpcError> {
 /// sufficiently determined message body.
 #[tauri::command]
 pub async fn open_external(app: tauri::AppHandle, url: String) -> Result<(), IpcError> {
-    let parsed = url::Url::parse(&url)
-        .map_err(|e| IpcError::internal(format!("not a URL: {url} ({e})")))?;
+    open_in_system_browser(&app, &url).map_err(IpcError::internal)
+}
 
-    match parsed.scheme() {
-        "http" | "https" | "mailto" | "tel" => {}
-        other => {
-            return Err(IpcError::internal(format!(
-                "refusing to open a {other}: URL from a message"
-            )))
-        }
+/// The one place a URL leaves the app, for both callers.
+///
+/// `Err` is a sentence fit to put on screen, because both callers put it there.
+fn open_in_system_browser<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: &str,
+) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("not a URL: {url} ({e})"))?;
+
+    if !OPENABLE_SCHEMES.contains(&parsed.scheme()) {
+        return Err(format!(
+            "refusing to open a {}: URL from a message",
+            parsed.scheme()
+        ));
     }
 
     // Via the app handle, so no direct dependency on the plugin crate is needed.
     use tauri_plugin_opener::OpenerExt;
-    app.opener().open_url(url.clone(), None::<&str>).map_err(|e| {
+    app.opener().open_url(url, None::<&str>).map_err(|e| {
         eprintln!("open_external failed for {url}: {e}");
-        IpcError::internal(format!("could not open {url}: {e}"))
+        format!("could not open {url}: {e}")
     })
+}
+
+/// The four schemes a message body is allowed to carry, and the only four this
+/// app will hand to the system. Mirrors `EXTERNAL_SCHEMES` in
+/// `src/lib/message-body.ts`.
+const OPENABLE_SCHEMES: [&str; 4] = ["http", "https", "mailto", "tel"];
+
+/// Hosts that are the app itself rather than somewhere on the internet.
+///
+/// `localhost` is the Vite dev server and the OAuth loopback listener; the
+/// `*.localhost` names are Tauri's own custom-protocol origins on the platforms
+/// that serve them over http.
+fn is_app_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+        || host.ends_with(".localhost")
+}
+
+/// Is this a navigation the app owns, or one that belongs in a browser?
+///
+/// Everything the app itself navigates to is either one of its own schemes
+/// (`tauri:`, `asset:`, `plugin:`, `about:` for the message frames) or one of
+/// its own hosts. Nothing else can appear here: the main frame only ever loads
+/// Mach, sign-in goes out through [`open_external`] rather than through the
+/// WebView, and the sanitizer restricts a message's `href` to four schemes. So
+/// an http(s), `mailto:` or `tel:` URL pointing anywhere else is a link in a
+/// message, and a link in a message is never followed in here.
+pub fn is_external_link(url: &url::Url) -> bool {
+    if !OPENABLE_SCHEMES.contains(&url.scheme()) {
+        return false;
+    }
+    match url.host_str() {
+        Some(host) => !is_app_host(host),
+        // `mailto:` and `tel:` have no host and are always somebody else's.
+        None => true,
+    }
+}
+
+/// The event a failed open lands on. `src/lib/message-body.ts` listens for it.
+pub const LINK_FAILED_EVENT: &str = "link-failed";
+
+#[derive(Debug, Clone, Serialize)]
+struct LinkFailure {
+    message: String,
+}
+
+/// Links in message bodies, opened where they belong.
+///
+/// # Why this is not in the WebView
+///
+/// It was, and it never once ran. `MessageFrame` attaches a capture-phase click
+/// listener to the message frame's document, which is the documented way to do
+/// this and is what every invariant assumed. WebKit will not invoke a listener
+/// whose target document has scripting disabled, and a frame sandboxed without
+/// `allow-scripts` — which is the first invariant of this whole unit — has
+/// scripting disabled. So the listener attached, the click did nothing, and
+/// there was no error in any log: a dead click, twice reported, with three
+/// theories checked against the wrong layer each time.
+///
+/// `on_navigation` is below the engine. It is the same hook WebKit uses to ask
+/// whether a navigation may proceed, it is consulted for subframes and for
+/// new-window navigations alike, and no sandbox flag can silence it. Cancelling
+/// here also happens *before* the engine asks anything to provide a window, so
+/// a message's page is never rendered inside Mach even for an instant.
+///
+/// Registered as a plugin rather than on a window builder because the window
+/// comes from `tauri.conf.json`; a plugin's hook reaches it either way.
+pub fn link_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("mach-links")
+        .on_navigation(|webview, url| {
+            if !is_external_link(url) {
+                return true;
+            }
+            use tauri::Manager;
+            let app = webview.app_handle();
+            if let Err(message) = open_in_system_browser(app, url.as_str()) {
+                // Invariant: a click that cannot open a link says so. This is
+                // the only place that knows, so it is the only place that can.
+                use tauri::Emitter;
+                let _ = app.emit(
+                    LINK_FAILED_EVENT,
+                    LinkFailure {
+                        message: format!("Could not open that link: {message}"),
+                    },
+                );
+            }
+            false
+        })
+        .build()
 }

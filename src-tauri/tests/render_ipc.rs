@@ -411,3 +411,68 @@ fn trackers_are_blocked_and_counted_when_images_are_allowed() {
         rendered.body.html
     );
 }
+
+// ---------------------------------------------------------------------------
+// the navigation guard
+// ---------------------------------------------------------------------------
+//
+// `link_guard` is what actually opens a link in a message, because the
+// WebView's own click interception cannot: WebKit will not invoke a listener
+// whose target document has scripting disabled, and the message frame's sandbox
+// disables scripting by design. The hook it uses is below the engine, and its
+// whole decision is `is_external_link` — so that predicate is the thing worth
+// testing. Getting it wrong in one direction follows a sender's link inside
+// Mach; in the other, it breaks the app's own navigation and there is no app.
+
+use mach_lib::ipc::render::is_external_link;
+
+fn external(url: &str) -> bool {
+    is_external_link(&url::Url::parse(url).expect("parse"))
+}
+
+#[test]
+fn the_app_navigates_to_itself_freely() {
+    // Production, and the dev server the same window loads from.
+    assert!(!external("tauri://localhost/index.html"));
+    assert!(!external("http://localhost:1420/"));
+    assert!(!external("http://localhost:1420/src/main.tsx"));
+    assert!(!external("http://127.0.0.1:1420/"));
+    // Tauri's own origins, and the message frames themselves.
+    assert!(!external("http://tauri.localhost/"));
+    assert!(!external("http://asset.localhost/x.png"));
+    assert!(!external("http://ipc.localhost/open_external"));
+    assert!(!external("asset://localhost/attachment"));
+    assert!(!external("plugin://conformance/index.html"));
+    assert!(!external("about:srcdoc"));
+    assert!(!external("about:blank"));
+    assert!(!external("data:text/html,x"));
+    assert!(!external("blob:http://localhost/abc"));
+}
+
+#[test]
+fn a_link_in_a_message_is_never_followed_in_here() {
+    // The one that was reported twice: a Stripe click-tracking URL with a
+    // second URL percent-encoded inside its path, from the "Update payment
+    // method" button of a billing mail.
+    assert!(external(
+        "https://59.email.stripe.com/CL0/https:%2F%2Fbilling.stripe.com%2Fp%2Flogin%2F00g5kTbIE9S95448ww%3Freferer=upcoming_invoice/1/0101019fe6bf4100-2bdba2b0-dbea-4014-8a08-aca9987e05d5-000000/vtJFBTXU0xwGwuHByHespJ0_YUwby5osV8XV3vnCkA8=452"
+    ));
+    assert!(external("https://github.com/bborn/mach/actions/runs/1"));
+    assert!(external("http://example.com/"));
+    assert!(external("mailto:someone@example.com"));
+    assert!(external("tel:+15551234567"));
+    // A host that merely ends in the app's name is somebody else's machine.
+    assert!(external("https://notlocalhost/"));
+    assert!(external("https://localhost.evil.test/"));
+}
+
+#[test]
+fn a_scheme_the_sanitizer_would_never_emit_is_not_opened_either() {
+    // `is_external_link` is also the gate on what leaves the process, so
+    // anything outside the four schemes is left for the WebView to refuse
+    // rather than handed to the system.
+    assert!(!external("file:///etc/passwd"));
+    assert!(!external("javascript:alert(1)"));
+    assert!(!external("vbscript:x"));
+    assert!(!external("ftp://example.com/x"));
+}

@@ -3,9 +3,14 @@
  *
  * `docs/message-rendering-invariants.md` is the contract this file implements.
  * The Rust sanitizer (`src-tauri/src/render/`) produces HTML that is safe to
- * *parse*; it cannot sandbox anything, cannot set a CSP, and cannot stop the
- * WebView navigating. Those three live here, plus the small pure decisions the
- * reading pane makes about what to show.
+ * *parse*; it cannot sandbox anything and cannot set a CSP. Those two live
+ * here, plus the small pure decisions the reading pane makes about what to
+ * show.
+ *
+ * Stopping the WebView from navigating used to be on that list and is not: it
+ * turned out to be the one thing this layer cannot do on macOS, because a
+ * listener attached to a scripting-disabled frame never runs in WebKit. That
+ * job belongs to `ipc::render::link_guard`; see [`FRAME_SANDBOX`].
  *
  * Everything in this module is a pure function or an injectable call, so
  * `src/components/mail/MessageBody.test.tsx` can assert on the security
@@ -178,17 +183,51 @@ export function escapeHtml(text: string): string {
  *
  * `allow-same-origin` on its own is not the dangerous half of that pair: the
  * pair is dangerous because a *script* in a same-origin frame can reach the
- * embedder, and there are no scripts here. What it buys is the two things the
- * invariants demand and a fully opaque frame cannot give: reading
- * `contentDocument.scrollHeight` to size the frame (invariant 5 of the unit
- * brief), and attaching the click listener that intercepts navigation
- * (invariant 3). Without it links would be dead ends rather than handed to the
- * system browser.
+ * embedder, and there are no scripts here. What it buys is reading
+ * `contentDocument` to size the frame and to restructure it (invariant 6).
  *
- * Absent, and deliberately so: `allow-scripts`, `allow-popups`,
- * `allow-top-navigation`, `allow-forms`, `allow-modals`, `allow-downloads`.
+ * # Why `allow-popups` is here
+ *
+ * Because without it a link in a message could not be opened at all, and for
+ * months was not.
+ *
+ * The interception in `MessageFrame` attaches a capture-phase click listener to
+ * the frame's document from the parent. In Blink that works. In WebKit — which
+ * is the engine every macOS WebView is — it does not: `JSEventListener` refuses
+ * to run a listener whose target's context has scripting disabled, and a frame
+ * sandboxed without `allow-scripts` has scripting disabled by definition. So
+ * the listener attaches, and never fires, and there is no error anywhere. That
+ * was measured directly against WKWebView, on this message: with
+ * `allow-same-origin` alone the parent's listener recorded nothing at all for a
+ * real click on a real link.
+ *
+ * With no listener, the click is whatever the markup says it is, and every
+ * anchor the sanitizer emits carries `target="_blank"`:
+ *
+ * - Without `allow-popups` the `_blank` navigation is refused inside WebKit
+ *   before anything outside the engine is consulted. Dead click. This is what
+ *   the reader was looking at.
+ * - Stripping `target` instead makes it a same-frame navigation, and that is
+ *   refused too — by the *app's* `frame-src` policy, again before anything can
+ *   see it. Also a dead click, also measured.
+ * - With `allow-popups` the navigation reaches
+ *   `decidePolicyForNavigationAction`, which is a hook outside the web engine
+ *   entirely. `ipc::render::link_guard` cancels it there and hands the URL to
+ *   the system browser. Nothing is opened inside Mach: cancelling the policy
+ *   happens *before* WebKit asks for a window, and nothing in the app answers
+ *   that request either, so the failure mode if the guard ever stops running is
+ *   the dead click we started with rather than the sender's page in a window.
+ *
+ * `allow-popups` grants nothing else here. A frame that cannot run scripts has
+ * no `window.open`, so the only way to reach it is a person clicking a link,
+ * which is the case being served. It does not carry
+ * `allow-popups-to-escape-sandbox`, so anything it did open would still be
+ * sandboxed.
+ *
+ * Absent, and deliberately so: `allow-scripts`, `allow-top-navigation`,
+ * `allow-forms`, `allow-modals`, `allow-downloads`.
  */
-export const FRAME_SANDBOX = "allow-same-origin";
+export const FRAME_SANDBOX = "allow-same-origin allow-popups";
 
 /** Tokens copied from the app document into the frame, so mail matches chrome. */
 export const FRAME_TOKENS = [
@@ -248,6 +287,32 @@ function tokenBlock(tokens: FrameTokens): string {
  * Base styles for the frame. Every colour comes from a token with a `currentColor`
  * or `transparent` fallback, so a missing token degrades to the browser default
  * rather than to an invented hex.
+ *
+ * # `overflow-wrap: break-word`, and not `word-break: break-word`
+ *
+ * They read as the same rule in two strengths. They are two properties with two
+ * consequences, and the difference is a column of mail rendered one letter per
+ * line.
+ *
+ * `overflow-wrap` breaks a word that would otherwise overflow its line: it is
+ * about a box that is already too narrow, and it leaves the box's *minimum*
+ * width alone. `word-break: break-word` is the legacy spelling of
+ * `overflow-wrap: anywhere`, which additionally tells every layout algorithm
+ * that the narrowest this content can ever be is one character.
+ *
+ * Mail is tables, and a table column is sized from exactly that number. A
+ * GitHub Actions notification asks for a 24px status column whose header
+ * happens to be the word "Status". Auto table layout normally refuses:
+ * "Status" is 45px at its narrowest, so the column is 45px and the 24px is
+ * ignored. Under the stronger rule its narrowest is one letter, the 24px is
+ * granted, and the header renders vertically — measured at 25.9px wide and
+ * 176px tall on that message, which is what the reader was looking at. Spark
+ * renders the same mail correctly.
+ *
+ * What the stronger rule was there for — a 400-character URL dragging the
+ * document sideways — is already covered, because `overflow-wrap` still breaks
+ * that URL. Where it leaves a table genuinely too wide, [`containWideContent`]
+ * gives that table its own scroller, which is the behaviour we want anyway.
  */
 function frameStyles(tokens: FrameTokens): string {
   return `:root{${tokenBlock(tokens)};color-scheme:light dark}
@@ -276,7 +341,9 @@ html,body{margin:0;padding:0;background:transparent}
    be unreachable. MessageFrame sets mach-capped when it clamps. */
 html:not(.mach-capped){overflow-x:auto;overflow-y:hidden;scrollbar-width:none}
 html:not(.mach-capped)::-webkit-scrollbar{width:0;height:0;display:none}
-body{color:var(--foreground,currentColor);font:0.9375rem/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;overflow-wrap:break-word;word-break:break-word;-webkit-font-smoothing:antialiased;-webkit-user-select:text;user-select:text}
+/* On the wrapping rule below, and the one that is deliberately not here, see
+   the note above frameStyles. */
+body{color:var(--foreground,currentColor);font:0.9375rem/1.6 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;overflow-wrap:break-word;-webkit-font-smoothing:antialiased;-webkit-user-select:text;user-select:text}
 img{max-width:100%;height:auto;border:0}
 /* A tracking pixel has no business occupying a box. The sanitizer already took
    its URL away, so this is about layout, not about privacy. */
@@ -558,14 +625,112 @@ export function externalUrl(href: string | null | undefined): string | null {
   return EXTERNAL_SCHEMES.has(parsed.protocol) ? parsed.href : null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Failed links say so                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The Tauri event `ipc::render` emits when it could not open a link.
+ *
+ * The navigation guard runs in Rust, so a failure there has no promise to
+ * reject and nothing in the window would otherwise hear about it.
+ */
+export const LINK_FAILED_EVENT = "link-failed";
+
+export type LinkFailureListener = (message: string) => void;
+
+/**
+ * Everyone currently willing to say a link failed. One in practice — `App`
+ * mounts `LinkFailures` once — and a set because the alternative is a single
+ * slot that a second subscriber silently steals.
+ */
+const linkFailureListeners = new Set<LinkFailureListener>();
+
+/**
+ * Say that a link could not be opened.
+ *
+ * This exists because the opposite was the rule for the life of this feature: a
+ * click that could not be turned into an open produced nothing anywhere — no
+ * toast, no log a reader could see, in one case not even a rejected promise —
+ * and the same bug was reported twice before anyone could tell whether it was
+ * the sanitizer, the URL, or the WebView. Whatever else changes, a click that
+ * cannot open a link now ends on screen.
+ *
+ * A plain listener set rather than a `window` event: the producers and the one
+ * consumer are all in this module graph, so there is nothing a global event
+ * buys, and this half of the mechanism can then be tested without a DOM.
+ */
+export function reportLinkFailure(message: string): void {
+  for (const listener of [...linkFailureListeners]) listener(message);
+}
+
+/** How `subscribeLinkFailures` reaches Tauri. Injected so tests need no app. */
+export type ListenFn = (
+  event: string,
+  handler: (payload: { message?: string } | null) => void,
+) => Promise<() => void>;
+
+/**
+ * Every way a link can fail to open, as one subscription.
+ *
+ * Two sources because there are two paths and either can be the one that fails:
+ * the in-window path ([`openExternal`], and the click that produced no URL at
+ * all), and the WebView's own navigation, which only Rust sees.
+ */
+export function subscribeLinkFailures(
+  handler: LinkFailureListener,
+  listen?: ListenFn,
+): () => void {
+  linkFailureListeners.add(handler);
+
+  let unlisten: (() => void) | null = null;
+  let cancelled = false;
+  const subscribe = listen ?? (isTauri() ? tauriListen : null);
+  if (subscribe) {
+    void subscribe(LINK_FAILED_EVENT, (payload) => {
+      if (payload?.message) handler(payload.message);
+    })
+      .then((off) => {
+        if (cancelled) off();
+        else unlisten = off;
+      })
+      // A subscription that could not be made is not something to report
+      // *through the subscription*; the in-window half still works.
+      .catch(() => {});
+  }
+
+  return () => {
+    cancelled = true;
+    linkFailureListeners.delete(handler);
+    unlisten?.();
+  };
+}
+
+const tauriListen: ListenFn = async (event, handler) => {
+  const { listen } = await import("@tauri-apps/api/event");
+  const off = await listen(event, (e) => handler(e.payload as { message?: string } | null));
+  return () => void off();
+};
+
 /**
  * Hand a link to the system browser. Never navigates the WebView.
+ *
+ * # This is no longer the path that opens links in the app
+ *
+ * It cannot be. It is called from `interceptNavigation`, and that listener does
+ * not run in WebKit — see [`FRAME_SANDBOX`] for the measurement. Inside Mach a
+ * message link is opened by `ipc::render::link_guard`, at the navigation layer,
+ * where no script is involved.
+ *
+ * What is left here still matters: `bun run dev` renders the same frontend in a
+ * plain browser tab, where the listener *does* run and there is no Rust to fall
+ * through to. And every other caller — a calendar link, a conference URL — is
+ * an ordinary click in the app document and reaches this normally.
  *
  * There is deliberately no `window.open` fallback inside the app: a WebView
  * that cannot reach the opener plugin would answer `window.open` by rendering
  * the sender's page *inside Mach*, which is the exact outcome the interception
- * exists to prevent. A dead click is the correct failure. In a plain browser
- * tab (`bun run dev`) there is no plugin and no such risk, so it opens a tab.
+ * exists to prevent. It is a reported failure now rather than a silent one.
  */
 export async function openExternal(url: string): Promise<void> {
   if (!isTauri()) {
@@ -587,13 +752,7 @@ export async function openExternal(url: string): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("could not open", url, error);
-    if (typeof window !== "undefined") {
-      window.dispatchEvent(
-        new CustomEvent("mach:status", {
-          detail: { message: `Could not open link: ${message}` },
-        }),
-      );
-    }
+    reportLinkFailure(`Could not open that link: ${message}`);
   }
 }
 

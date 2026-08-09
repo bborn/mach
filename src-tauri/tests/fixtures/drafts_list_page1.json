@@ -1,0 +1,20 @@
+{
+  "drafts": [
+    {
+      "id": "r-2009665542525810060",
+      "message": {
+        "id": "19fe4a8c6a5bb04d",
+        "threadId": "19fe4a8c6a5bb04c"
+      }
+    },
+    {
+      "id": "r1456368921955601092",
+      "message": {
+        "id": "19fe1852aa0b3627",
+        "threadId": "19fe1852aa0b3626"
+      }
+    }
+  ],
+  "nextPageToken": "draft-page-2",
+  "resultSizeEstimate": 3
+}

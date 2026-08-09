@@ -130,6 +130,9 @@ struct Mailbox {
     history: Vec<(u64, Value)>,
     history_id: u64,
     labels: Vec<(String, String, String)>,
+    /// `(draft id, message id)` — what `users.drafts.list` answers with, and the
+    /// only place the draft id of a draft written elsewhere can be learned.
+    drafts: Vec<(String, String)>,
     /// `calendarList.list` entries, verbatim. Whole JSON rather than
     /// `(id, primary)` because the metadata sweep reads names, colours and
     /// access roles off them now, and a tuple could only ever grow.
@@ -161,6 +164,7 @@ impl Mailbox {
                 ("STARRED".into(), "STARRED".into(), "system".into()),
                 ("Label_7".into(), "Receipts".into(), "user".into()),
             ],
+            drafts: Vec::new(),
             calendars: vec![calendar_entry("primary", true)],
             events: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -178,6 +182,13 @@ impl Mailbox {
     fn seed(&mut self, message: FakeMessage) {
         self.history_id += 1;
         self.messages.insert(message.id.clone(), message);
+    }
+
+    /// A draft written in another client: an ordinary message carrying the
+    /// `DRAFT` label, plus the entry `users.drafts.list` returns for it.
+    fn seed_draft(&mut self, draft_id: &str, message: FakeMessage) {
+        self.drafts.push((draft_id.into(), message.id.clone()));
+        self.seed(message.labels(&["DRAFT"]));
     }
 
     /// Drop every history record older than the current watermark. Anything
@@ -421,6 +432,25 @@ impl FakeGoogle {
                     .map(|(id, name, kind)| json!({ "id": id, "name": name, "type": kind }))
                     .collect();
                 HttpResponse::json(200, json!({ "labels": labels }).to_string())
+            }
+
+            ["drafts"] => {
+                let drafts: Vec<Value> = mailbox
+                    .drafts
+                    .iter()
+                    .map(|(draft_id, message_id)| {
+                        let thread_id = mailbox
+                            .messages
+                            .get(message_id)
+                            .map(|m| m.thread_id.clone())
+                            .unwrap_or_default();
+                        json!({
+                            "id": draft_id,
+                            "message": { "id": message_id, "threadId": thread_id },
+                        })
+                    })
+                    .collect();
+                HttpResponse::json(200, json!({ "drafts": drafts }).to_string())
             }
 
             ["messages"] => {
@@ -2314,4 +2344,107 @@ async fn the_background_loop_starts_syncs_and_shuts_down() {
         after,
         "no work may outlive shutdown"
     );
+}
+
+// ===========================================================================
+// drafts written somewhere else
+// ===========================================================================
+
+fn draft_id_of(db: &Db, gmail_message_id: &str) -> Option<String> {
+    db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT gmail_draft_id FROM messages WHERE gmail_message_id = ?1",
+                [gmail_message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten())
+    })
+    .unwrap()
+}
+
+/// The fact the whole feature turns on. A draft arrives as a message carrying
+/// the `DRAFT` label and nothing on that message says which draft it is —
+/// `users.drafts.list` is the only thing that does, so the pass has to make the
+/// call and keep the answer.
+#[tokio::test]
+async fn a_pass_learns_the_draft_id_of_a_draft_written_elsewhere() {
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    mailbox.seed(FakeMessage::new("m1", "t1").at(1_000));
+    mailbox.seed_draft("r-9999", FakeMessage::new("m2", "t1").at(2_000));
+    google.install(&format!("tok-{account_id}"), mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    let pass = engine.sync_once().await;
+    assert!(pass.account(account_id).unwrap().is_ok());
+
+    assert_eq!(
+        draft_id_of(&db, "m2").as_deref(),
+        Some("r-9999"),
+        "the id `drafts.update` is addressed by"
+    );
+    assert_eq!(
+        draft_id_of(&db, "m1"),
+        None,
+        "an ordinary message is not a draft and must not be given one"
+    );
+    assert_store_is_consistent(&db);
+}
+
+/// The id is learned in the same pass that stores the message, because the
+/// sweep runs after the replay. Otherwise a draft written on the phone would be
+/// visible for a minute before it could be opened.
+#[tokio::test]
+async fn a_draft_that_arrives_mid_session_is_editable_in_the_same_pass() {
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    mailbox.seed(FakeMessage::new("m1", "t1").at(1_000));
+    google.install(&format!("tok-{account_id}"), mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    engine.sync_once().await;
+
+    // He starts a reply on his phone.
+    google.with(&format!("tok-{account_id}"), |mailbox| {
+        mailbox.deliver(FakeMessage::new("m2", "t1").at(2_000).labels(&["DRAFT"]));
+        mailbox.drafts.push(("r-4242".into(), "m2".into()));
+    });
+
+    let pass = engine.sync_once().await;
+    assert!(pass.account(account_id).unwrap().is_ok());
+    assert_eq!(draft_id_of(&db, "m2").as_deref(), Some("r-4242"));
+}
+
+/// Thrown away on the phone. The sweep sees the complete set of drafts Google
+/// holds, so an id missing from it is one that is gone — and the local mapping
+/// has to go with it, or Mach would keep addressing a draft that is not there.
+#[tokio::test]
+async fn a_draft_deleted_elsewhere_loses_its_id_here() {
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    mailbox.seed(FakeMessage::new("m1", "t1").at(1_000));
+    mailbox.seed_draft("r-9999", FakeMessage::new("m2", "t1").at(2_000));
+    google.install(&format!("tok-{account_id}"), mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    engine.sync_once().await;
+    assert_eq!(draft_id_of(&db, "m2").as_deref(), Some("r-9999"));
+
+    google.with(&format!("tok-{account_id}"), |mailbox| {
+        mailbox.drafts.clear();
+    });
+    engine.sync_once().await;
+
+    assert_eq!(draft_id_of(&db, "m2"), None);
 }

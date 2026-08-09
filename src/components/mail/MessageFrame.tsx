@@ -6,6 +6,7 @@ import {
   nextFrameHeight,
   openExternal,
   readFrameTokens,
+  reportLinkFailure,
   revealBlockedImages,
   FRAME_SANDBOX,
   FRAME_TOKENS,
@@ -30,11 +31,15 @@ export interface MessageFrameProps {
  * This component *is* the WebView half of the security contract in
  * `docs/message-rendering-invariants.md`:
  *
- * 1. `sandbox="allow-same-origin"` — no `allow-scripts`, no `allow-popups`, no
- *    `allow-top-navigation`. Nothing in the frame can run.
+ * 1. `sandbox="allow-same-origin allow-popups"` — no `allow-scripts`, no
+ *    `allow-top-navigation`. Nothing in the frame can run. `allow-popups` is
+ *    what lets a link reach the navigation hook at all; see [`FRAME_SANDBOX`].
  * 2. A per-frame CSP, in a `<meta>` because `srcdoc` has no headers.
- * 3. Navigation is intercepted here, in the parent, and links go to the system
- *    browser. Rust cannot stop the WebView from navigating; this can.
+ * 3. Navigation is intercepted. In a browser tab that happens here, in the
+ *    parent; in the app it happens in `ipc::render::link_guard`, because a
+ *    listener attached to a scripting-disabled document never runs in WebKit.
+ *    Either way the URL goes to the system browser and the WebView does not
+ *    navigate.
  * 4. `data-mach-blocked-src` is read as a DOM property, never concatenated.
  *
  * The frame is sized to its content so the *pane* scrolls rather than the
@@ -256,6 +261,20 @@ function candidate(element: Element, doc: Document): WideCandidate {
  * cancelled. The `href` is re-validated even though the sanitizer restricted it
  * to four schemes, because at this point it is a DOM property and this is the
  * last check before the system browser.
+ *
+ * # This does not run in the app
+ *
+ * It runs in `bun run dev`, in a browser tab, and it is the only thing that
+ * opens a link there. Inside Mach it is dead code that looks alive: WebKit
+ * refuses to invoke a listener whose target document has scripting disabled,
+ * and the sandbox disables scripting in this document by design. Attaching
+ * succeeds; firing never happens; nothing says so. That cost this project two
+ * rounds of the same bug report — see [`FRAME_SANDBOX`] for the measurement and
+ * for what opens links instead.
+ *
+ * It stays because the browser path is real and because it is the stricter of
+ * the two: where it does run, it cancels the navigation outright rather than
+ * relying on a later hook to do it.
  */
 function interceptNavigation(event: Event): void {
   const node = event.target as Node | null;
@@ -274,7 +293,13 @@ function interceptNavigation(event: Event): void {
   event.stopPropagation();
 
   const url = externalUrl(anchor.getAttribute("href"));
-  if (url) void openExternal(url);
+  if (url) {
+    void openExternal(url);
+    return;
+  }
+  // A link whose href survived the sanitizer but not the URL parser. Rare, and
+  // exactly the shape of failure that used to end here in silence.
+  reportLinkFailure("That link does not go anywhere Mach can open");
 }
 
 function preventDefault(event: Event): void {
