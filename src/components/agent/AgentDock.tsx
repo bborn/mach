@@ -182,6 +182,14 @@ export function AgentDock() {
           session={open}
           onMinimise={() => setOpenId(null)}
           onClose={() => close(open.id)}
+          // Opening what the agent made is navigation, and navigation belongs
+          // to the shell. The drawer knows what was made; this knows where it
+          // lives. Minimising first, because the point of the button is to put
+          // the thing on screen, not the drawer that mentioned it.
+          onOpenArtifact={(artifact) => {
+            setOpenId(null);
+            actions.openArtifact(artifact);
+          }}
         />
       )}
 

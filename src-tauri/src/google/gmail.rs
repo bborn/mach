@@ -11,8 +11,8 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::types::{
-    encode_base64url, AttachmentBody, HistoryListResponse, HistorySweep, Label, LabelsListResponse,
-    Message, MessageRef, MessagesListResponse, Profile, ThreadsListResponse,
+    encode_base64url, AttachmentBody, Draft, HistoryListResponse, HistorySweep, Label,
+    LabelsListResponse, Message, MessageRef, MessagesListResponse, Profile, ThreadsListResponse,
 };
 use super::{
     GoogleError, HttpMethod, HttpTransport, Page, RestClient, RetryPolicy, Sleeper, TokenProvider,
@@ -394,6 +394,52 @@ impl GmailClient {
             .await
     }
 
+    // --------------------------------------------------------------- drafts
+
+    /// `users.drafts.create`.
+    ///
+    /// Same `raw` bytes as [`messages_send`](Self::messages_send) — a Gmail
+    /// draft *is* a message, filed under the `DRAFT` label — so the composer
+    /// builds one message and this decides not to send it. `thread_id` is what
+    /// makes a reply draft appear inside its conversation rather than as a
+    /// stray message, on the phone as well as here.
+    pub async fn drafts_create(
+        &self,
+        user_id: &str,
+        rfc822: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<Draft, GoogleError> {
+        let url = self.rest.endpoint(&["users", user_id, "drafts"])?;
+        let body = json!({ "message": draft_message(rfc822, thread_id) });
+        self.rest
+            .send_json(HttpMethod::Post, url, Some(body.to_string().into_bytes()))
+            .await
+    }
+
+    /// `users.drafts.update` — replaces the draft's content in place.
+    ///
+    /// In place matters: an update keeps the draft id, so editing a draft five
+    /// times leaves one draft on the phone rather than five.
+    pub async fn drafts_update(
+        &self,
+        user_id: &str,
+        draft_id: &str,
+        rfc822: &[u8],
+        thread_id: Option<&str>,
+    ) -> Result<Draft, GoogleError> {
+        let url = self.rest.endpoint(&["users", user_id, "drafts", draft_id])?;
+        let body = json!({ "id": draft_id, "message": draft_message(rfc822, thread_id) });
+        self.rest
+            .send_json(HttpMethod::Put, url, Some(body.to_string().into_bytes()))
+            .await
+    }
+
+    /// `users.drafts.delete`. Returns nothing on success.
+    pub async fn drafts_delete(&self, user_id: &str, draft_id: &str) -> Result<(), GoogleError> {
+        let url = self.rest.endpoint(&["users", user_id, "drafts", draft_id])?;
+        self.rest.send_empty(HttpMethod::Delete, url, None).await
+    }
+
     // -------------------------------------------------------------- history
 
     /// `users.history.list`, one page — the incremental sync path (2 quota
@@ -585,6 +631,16 @@ impl GmailClient {
         let url = self.rest.endpoint(&["users", user_id, "profile"])?;
         self.rest.send_json(HttpMethod::Get, url, None).await
     }
+}
+
+/// The `message` object a draft write takes: the bytes, and the conversation
+/// they belong to.
+fn draft_message(rfc822: &[u8], thread_id: Option<&str>) -> serde_json::Value {
+    let mut message = json!({ "raw": encode_base64url(rfc822) });
+    if let Some(thread_id) = thread_id {
+        message["threadId"] = json!(thread_id);
+    }
+    message
 }
 
 /// The largest response body that could still decode to `max_bytes`.

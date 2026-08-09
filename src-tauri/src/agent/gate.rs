@@ -168,8 +168,15 @@ impl ToolGate {
 
         match tools::execute(&self.ctx, name, input).await {
             Ok(outcome) => {
-                self.ui
-                    .tool_finished(call_id, name, ToolState::Ok, &outcome.summary);
+                // The artifact rides the completed line: whatever the call
+                // made, the drawer now has a way to open it.
+                self.ui.tool_produced(
+                    call_id,
+                    name,
+                    ToolState::Ok,
+                    &outcome.summary,
+                    outcome.artifact.clone(),
+                );
                 if outcome.mutated {
                     self.ui.threads_changed();
                 }

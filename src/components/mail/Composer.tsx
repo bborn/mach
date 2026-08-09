@@ -1,14 +1,36 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Ref } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Ref,
+  type RefObject,
+} from "react";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { Kbd } from "@/components/ui/kbd";
 import { cn } from "@/lib/utils";
 import {
   COMPOSER_KEYS,
   formatRecipients,
+  isLocalOnly,
   parseRecipients,
   scheduleOptions,
   type Draft,
 } from "@/lib/compose";
+
+/**
+ * Where this composer is being shown.
+ *
+ * Only the outer chrome differs — the fields, the keys, the draft and the send
+ * path are identical, which is why this is a prop rather than a second
+ * component. `dock` is the strip under the reading pane, correct for a reply
+ * because a reply *is* about the conversation above it. `overlay` is a panel
+ * floating over the window, for a new message, which is about nothing on
+ * screen: docked under whatever happened to be open, it read as part of that
+ * conversation.
+ */
+export type ComposerPresentation = "dock" | "overlay";
 
 interface ComposerProps {
   draft: Draft;
@@ -17,6 +39,16 @@ interface ComposerProps {
   onClose: () => void;
   /** Set while the send is in flight — the fields go read-only, not blank. */
   busy?: boolean;
+  presentation?: ComposerPresentation;
+  /**
+   * Somewhere for the surface around this to hold on to the To field.
+   *
+   * The overlay traps focus and places it, and its effect runs *after* this
+   * component's — so the composer focusing the field itself is not enough, and
+   * the overlay's own fallback ("the first input in the panel") lands on the
+   * subject. This is how it is told which field is the one to start in.
+   */
+  toRef?: RefObject<HTMLInputElement | null>;
 }
 
 /** Two-line minimum, then it grows; past this it scrolls instead. */
@@ -49,9 +81,18 @@ const MAX_EDITOR_HEIGHT = 15 * 22;
  *    composer is inline.
  *  * **The footer is a legend, not a button bar.**
  */
-export function Composer({ draft, onChange, onSend, onClose, busy = false }: ComposerProps) {
+export function Composer({
+  draft,
+  onChange,
+  onSend,
+  onClose,
+  busy = false,
+  presentation = "dock",
+  toRef,
+}: ComposerProps) {
   const editor = useRef<HTMLTextAreaElement>(null);
-  const toField = useRef<HTMLInputElement>(null);
+  const ownToField = useRef<HTMLInputElement>(null);
+  const toField = toRef ?? ownToField;
   const [showCc, setShowCc] = useState(draft.cc.length > 0 || draft.bcc.length > 0);
   const [scheduling, setScheduling] = useState(false);
 
@@ -136,9 +177,15 @@ export function Composer({ draft, onChange, onSend, onClose, busy = false }: Com
     onChange({ ...draft, [which]: parseRecipients(value) });
   };
 
+  const overlay = presentation === "overlay";
+
   return (
-    <div className="shrink-0 border-t border-border bg-surface">
-      <div className="mx-auto max-w-[72ch] px-5 py-3">
+    // The overlay's panel already provides the surface, the border and the
+    // shadow, and it is not attached to anything above it — so it gets neither
+    // the top rule that joins the dock to the reading pane nor the reading
+    // pane's own measure.
+    <div className={cn(!overlay && "shrink-0 border-t border-border bg-surface")}>
+      <div className={cn("px-5", overlay ? "py-4" : "mx-auto max-w-[72ch] py-3")}>
         <div className="flex items-baseline gap-2">
           {isReply ? (
             <h2 className="min-w-0 flex-1 truncate text-list font-medium text-foreground">
@@ -146,6 +193,7 @@ export function Composer({ draft, onChange, onSend, onClose, busy = false }: Com
             </h2>
           ) : (
             <input
+              id="composer-subject"
               value={draft.subject}
               disabled={busy}
               onChange={(event) => onChange({ ...draft, subject: event.target.value })}
@@ -240,6 +288,19 @@ export function Composer({ draft, onChange, onSend, onClose, busy = false }: Com
             What is left is the state you cannot see and might act on: a send
             already in flight, which is why the fields have gone dead.
           */}
+          {/*
+            A draft is written here and pushed to Gmail in the background, so
+            it is on his phone as well. When that push fails it is on this Mac
+            and nowhere else — which he would otherwise have no way of knowing,
+            and would find out by opening Gmail somewhere else and seeing
+            nothing. Google's own words on hover, because "why" is a second
+            question and only the first one is worth a line.
+          */}
+          {isLocalOnly(draft) && (
+            <span className="truncate text-danger" title={draft.remote?.error ?? undefined}>
+              Not in Gmail
+            </span>
+          )}
           <span className="ml-auto truncate">{busy ? "Sending" : null}</span>
         </div>
       </div>

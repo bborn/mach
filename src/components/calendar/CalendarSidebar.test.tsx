@@ -38,7 +38,7 @@ function render(calendars: Calendar[]): string {
       accounts={[ACCOUNT]}
       calendars={calendars}
       hidden={[]}
-      hueFor={() => 0}
+      colorFor={() => "#16a765"}
       dark={false}
       soloAccount={null}
       onToggle={() => {}}
@@ -102,7 +102,7 @@ describe("the calendar rail", () => {
         accounts={[ACCOUNT]}
         calendars={[calendar()]}
         hidden={["c1"]}
-        hueFor={() => 0}
+        colorFor={() => "#16a765"}
         dark={false}
         soloAccount={null}
         onToggle={() => {}}

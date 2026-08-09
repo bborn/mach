@@ -1,16 +1,20 @@
-import { Calendar, Mail, Search } from "lucide-react";
-import { useMach, type Mode } from "@/hooks/useMach";
+import { Search } from "lucide-react";
+import { useMach } from "@/hooks/useMach";
 import { ACCOUNT_BG } from "@/lib/colors";
 import { cn } from "@/lib/utils";
 import { Kbd } from "@/components/ui/kbd";
 
-const MODES: { id: Mode; label: string; icon: typeof Mail; keys: string }[] = [
-  { id: "mail", label: "Mail", icon: Mail, keys: "g i" },
-  { id: "calendar", label: "Calendar", icon: Calendar, keys: "g c" },
-];
-
+/*
+ * The Mail/Calendar segmented control used to live here.
+ *
+ * It has moved into the rail, where Inbox and Calendar sit as peers — which is
+ * where an app states what its surfaces are. The title bar is now what it
+ * should have been: the window's identity, its search, and who is signed in.
+ * ⌘1/⌘2 and `g m`/`g c` are unchanged, and the calendar's own header carries a
+ * Mail button so the trip back is not keyboard-only.
+ */
 export function TitleBar() {
-  const { ui, actions, accounts } = useMach();
+  const { actions, accounts } = useMach();
 
   return (
     <header
@@ -20,30 +24,6 @@ export function TitleBar() {
       <span className="select-none font-mono text-micro tracking-[0.12em] text-faint-foreground">
         MACH
       </span>
-
-      <nav className="flex items-center gap-px rounded-[var(--radius)] border border-border p-px">
-        {MODES.map((mode) => {
-          const Icon = mode.icon;
-          const active = ui.mode === mode.id;
-          return (
-            <button
-              key={mode.id}
-              type="button"
-              onClick={() => actions.setMode(mode.id)}
-              className={cn(
-                "flex h-5.5 items-center gap-1.5 rounded-[3px] px-2 py-0.5 text-micro transition-colors",
-                active
-                  ? "bg-surface-raised text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-              title={`${mode.label} — ${mode.keys}`}
-            >
-              <Icon size={12} strokeWidth={1.75} />
-              {mode.label}
-            </button>
-          );
-        })}
-      </nav>
 
       <button
         type="button"

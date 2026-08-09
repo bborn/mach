@@ -26,8 +26,9 @@
  * Discipline borrowed from Geist: the ink is the brand. There is no marketing
  * accent — every border, divider and disabled state sits on a deliberate step
  * of the gray ramp, and the single accent hue is reserved for selection and
- * unread state. Density targets Linear rather than Gmail: the list should show
- * 16+ rows where Spark shows 9.
+ * unread state. The spacing is one spacing: there is no density setting, and
+ * `--spacing-row` below is the three-line thread row, which is the tallest
+ * thing in the app that repeats.
  */
 
 :root {
@@ -66,46 +67,11 @@
   --account-4: oklch(0.62 0.22 350);
   --account-5: oklch(0.62 0.18 300);
 
-  /* Density */
-  --row-height: 2.25rem;
+  /* Layout */
   --rail-width: 13rem;
   --list-width: 24rem;
 
-  /*
-   * The type ramp, as overridable variables.
-   *
-   * These are indirected through `:root` rather than written literally into
-   * `@theme inline` below for one reason: `inline` means Tailwind bakes the
-   * value into the utility, so `text-list` would compile to a constant
-   * `font-size: 0.8125rem` that nothing at runtime could move. Pointing the
-   * theme tokens at these — exactly as `--spacing-row` already points at
-   * `--row-height` — is what makes the density preference able to change the
-   * type scale as well as the row height.
-   */
-  --size-micro: 0.6875rem;
-  --size-list: 0.8125rem;
-  --size-body: 0.875rem;
-  --size-reading: 0.9375rem;
-
   --radius: 0.375rem;
-}
-
-/*
- * Compact density.
- *
- * Set by the preference (`PreferencesProvider` writes `data-density` on the
- * root), and it is deliberately a *token* swap and nothing else: no component
- * knows this attribute exists, no layout branches on it, and the whole change
- * is four numbers and a row height. The type comes down with the rows because
- * a shorter row with the same type in it is not denser — it is cramped.
- */
-:root[data-density="compact"] {
-  --row-height: 1.75rem;
-
-  --size-micro: 0.625rem;
-  --size-list: 0.75rem;
-  --size-body: 0.8125rem;
-  --size-reading: 0.875rem;
 }
 
 .dark {
@@ -199,16 +165,21 @@
 
   --radius-DEFAULT: var(--radius);
 
-  --spacing-row: var(--row-height);
+  /*
+   * The thread row: sender, subject and preview, one under the other, plus the
+   * padding that keeps them off the divider. Written here as a literal because
+   * there is exactly one row height — see `ThreadRow.tsx` for why the row is
+   * three lines and why its height is fixed rather than grown from content.
+   */
+  --spacing-row: 4.25rem;
   --spacing-rail: var(--rail-width);
   --spacing-list: var(--list-width);
 
-  /* Dense UI type ramp. `list` is the workhorse — thread rows and grid labels.
-     Indirected through `:root` so density can move it; see the note there. */
-  --text-micro: var(--size-micro);
-  --text-list: var(--size-list);
-  --text-body: var(--size-body);
-  --text-reading: var(--size-reading);
+  /* Dense UI type ramp. `list` is the workhorse — thread rows and grid labels. */
+  --text-micro: 0.6875rem;
+  --text-list: 0.8125rem;
+  --text-body: 0.875rem;
+  --text-reading: 0.9375rem;
 
   --font-sans:
     ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI",

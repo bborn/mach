@@ -4,6 +4,8 @@ import {
   COMPOSER_KEYS,
   createAutosave,
   formatRecipients,
+  isLocalOnly,
+  newDraft,
   markdownToHtml,
   parseRecipients,
   scheduleOptions,
@@ -308,5 +310,42 @@ describe("⌃S", () => {
     const options = scheduleOptions(monday);
     const chosen = options.find((o) => o.label === "Monday, 8am")!;
     expect(new Date(chosen.at).getDate()).toBe(10);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* where a draft actually is                                                   */
+/* -------------------------------------------------------------------------- */
+
+describe("a draft's Gmail state", () => {
+  // A draft is written locally and pushed to Gmail in the background, so it is
+  // on his phone too. The only state worth saying out loud is the one where
+  // that failed — silence would leave him believing a draft was somewhere it
+  // is not.
+  it("says nothing while a draft is on its way", () => {
+    const draft: Draft = { ...newDraft(1), remote: { state: "pending" } };
+    expect(isLocalOnly(draft)).toBe(false);
+  });
+
+  it("says nothing once Gmail has it", () => {
+    const draft: Draft = {
+      ...newDraft(1),
+      remote: { state: "synced", draftId: "r-1", messageId: "m-1" },
+    };
+    expect(isLocalOnly(draft)).toBe(false);
+  });
+
+  it("speaks up when the push was refused", () => {
+    const draft: Draft = {
+      ...newDraft(1),
+      remote: { state: "failed", error: "Google refused" },
+    };
+    expect(isLocalOnly(draft)).toBe(true);
+  });
+
+  it("says nothing about a draft that has never been through Rust", () => {
+    // The browser fallback, and any draft built in the editor before its first
+    // save. Absent is not a failure.
+    expect(isLocalOnly(newDraft(1))).toBe(false);
   });
 });

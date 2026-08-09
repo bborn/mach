@@ -6,14 +6,14 @@
     <title>Mach — a fast Gmail and Google Calendar client for macOS</title>
     <meta
       name="description"
-      content="A keyboard-driven Gmail and Google Calendar desktop client for macOS. Renders from local SQLite, so it never waits on the network. Google only. Open source, built from source."
+      content="A keyboard-driven Gmail and Google Calendar desktop client for macOS. Every view renders from local SQLite. Google accounts only, MIT licensed, built from source."
     />
     <link rel="canonical" href="https://machmail.dev/" />
     <meta name="color-scheme" content="light dark" />
     <meta property="og:title" content="Mach" />
     <meta
       property="og:description"
-      content="A fast Gmail and Google Calendar client for macOS. Google only, keyboard-first, local-first."
+      content="A fast Gmail and Google Calendar client for macOS. Keyboard-driven, renders from local SQLite, Google accounts only."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://machmail.dev/" />
@@ -26,8 +26,8 @@
     <style>
       /* ------------------------------------------------------------------
        * Tokens, lifted from src/styles/globals.css. Same OKLCH ramp, same
-       * dense type scale, same single accent. The ink is the brand: there is
-       * no marketing colour here either.
+       * dense type scale, same single accent, so the page and the app share
+       * one palette.
        * ------------------------------------------------------------------ */
       :root {
         --background: oklch(1 0 0);
@@ -125,7 +125,7 @@
 
       /* --------------------------------------------------------- layout
        * One left-anchored measure for prose; figures break out to near the
-       * screenshots' native 1440px so they can be read rather than admired.
+       * screenshots' native 1440px so the UI in them stays legible.
        */
       .page {
         width: min(100% - (2 * var(--gutter)), 85rem);
@@ -219,7 +219,7 @@
         font-size: inherit;
       }
 
-      /* The app's own key hint: the glyph on a surface step, not a chiclet. */
+      /* The app's own key hint: the glyph on a surface step. */
       kbd {
         display: inline-flex;
         min-width: 1.125rem;
@@ -251,7 +251,7 @@
         color: var(--border-strong);
       }
       @media (max-width: 30rem) {
-        /* A separator stranded at the end of a wrapped line is just litter. */
+        /* Hide separators so none is stranded at the end of a wrapped line. */
         header .meta .sep,
         footer .colophon .sep {
           display: none;
@@ -464,10 +464,10 @@
           A fast Gmail and Google Calendar client for macOS.
         </h1>
         <p class="lede measure">
-          Keyboard-driven, several accounts in one stream, and an agent with real
-          tools over your mail and calendar. It talks to the Google APIs directly
-          and to nothing else — no IMAP, no Outlook, no Fastmail. That is a
-          decision, not a gap.
+          Keyboard-driven, with several accounts in one stream and an agent that
+          has real tools over your mail and calendar. It talks to the Gmail and
+          Google Calendar APIs. There is no IMAP and no support for other mail
+          providers.
         </p>
         <div class="meta">
           <span>macOS only</span>
@@ -496,9 +496,9 @@
           </picture>
         </div>
         <figcaption>
-          The unified inbox across five accounts. Shown running on the fixture
-          data the test suite uses — hence the marker in the status bar. Nobody
-          in it is real.
+          The unified inbox across five accounts. This is the fixture data the
+          test suite uses, which is what the marker in the status bar says. None
+          of the people in it are real.
         </figcaption>
       </figure>
 
@@ -506,62 +506,91 @@
         <span class="eyebrow">What it does</span>
 
         <p class="measure">
-          Every pixel renders from a local SQLite database. Opening a thread is a
-          local read, not a request — sub-millisecond, and it works with the
-          network off. Sync is a background loop writing into that database; the
-          UI reacts to the changes. This is the reason the app exists, not an
-          optimisation bolted on afterwards.
+          Every view renders from a local SQLite database. Opening a thread is a
+          local read: under a millisecond, and it works with the network off.
+          Sync runs in the background and writes into that database, and the UI
+          reacts to the changes.
         </p>
 
         <dl class="rows" style="margin-top: 1.75rem">
           <div>
-            <dt>Local first</dt>
+            <dt>Local data</dt>
             <dd>
               A 12-month backfill per account, then incremental history sync from
-              a stored watermark. Nothing in the UI blocks on Google.
+              a stored watermark. Nothing in the UI waits on Google.
             </dd>
           </div>
           <div>
-            <dt>Two-tier search</dt>
+            <dt>Search</dt>
             <dd>
-              FTS5 over the local window answers every keystroke in under 10 ms.
-              Gmail's own server search fires in parallel and merges in as older
-              results a moment later.
+              Gmail's operator syntax, parsed as you type and compiled to SQL
+              against an FTS5 index. <code>from:</code>,
+              <code>has:attachment</code>, <code>older_than:2m</code>, quoted
+              phrases, <code>OR</code> and <code>-</code> all work. Most queries
+              answer in single-digit to low-tens of milliseconds against a
+              61,000-message store.
             </dd>
           </div>
           <div>
-            <dt>Keyboard first</dt>
+            <dt>Keyboard</dt>
             <dd>
-              Gmail's own keys, so your hands already know them:
-              <kbd>J</kbd> <kbd>K</kbd> to move, <kbd>E</kbd> to archive,
-              <kbd>B</kbd> to snooze, <kbd>C</kbd> to write, <kbd>R</kbd> to
-              reply, <kbd>G</kbd> <kbd>I</kbd> for the inbox. <kbd>⌘K</kbd> for
-              search, commands and anything else; <kbd>?</kbd> for the rest.
-              Actions are undoable.
+              Gmail's own keys: <kbd>J</kbd> <kbd>K</kbd> to move,
+              <kbd>E</kbd> to archive, <kbd>B</kbd> to snooze, <kbd>C</kbd> to
+              write, <kbd>R</kbd> to reply, <kbd>G</kbd> <kbd>I</kbd> for the
+              inbox. <kbd>⌘K</kbd> for search and commands, <kbd>?</kbd> for the
+              full list. <kbd>⌘Z</kbd> undoes over a stack that does not expire.
             </dd>
           </div>
           <div>
             <dt>Several accounts</dt>
             <dd>
-              One ordered stream, with a colour bar per account on every row.
-              Replies infer the from-address from the account the thread arrived
-              on.
+              One ordered stream, with a colour bar per account on every row. A
+              reply goes out from the account the thread arrived on.
             </dd>
           </div>
           <div>
-            <dt>A real calendar</dt>
+            <dt>Calendar</dt>
             <dd>
-              Day, week and month, drag to create, drag to move — not a sidebar
-              of upcoming events.
+              Day, week and month views, with drag to create and drag to move.
+              Opening an event shows its guests and their answers, the recurrence
+              rule, reminders, and the Meet link if it has one.
+            </dd>
+          </div>
+          <div>
+            <dt>Attachments</dt>
+            <dd>
+              Fetched, cached, opened and saved, with inline images rendered in
+              the message. Image types come from the file's magic bytes rather
+              than the sender's Content-Type, and executables are refused.
+            </dd>
+          </div>
+          <div>
+            <dt>Notifications</dt>
+            <dd>
+              New mail raises a notification and a Dock badge. The rule is
+              narrow: unread, in the inbox, not from you, and either in Gmail's
+              Personal category or continuing a thread you have written to.
             </dd>
           </div>
           <div>
             <dt>An agent with real tools</dt>
             <dd>
-              Every action is a typed command in Rust, and those same commands are
-              the agent's entire tool surface. It gets no privileged path to
-              Google, so anything it does is undoable and shows up in the same log
-              as anything you did by hand.
+              Every action in Mach is a typed command in Rust, and those commands
+              are the agent's whole tool surface. It runs on the Claude Code CLI
+              when one is installed, so it uses the subscription you already have
+              and needs no API key. Sending mail and anything that reaches a guest
+              waits for your approval; the rest is undoable and lands in the same
+              log as the actions you took by hand. <kbd>⌘K</kbd> can also hand a
+              thread to an external agent you configure.
+            </dd>
+          </div>
+          <div>
+            <dt>Plugins</dt>
+            <dd>
+              Third-party actions run in a sandbox with no network, no file
+              access and no Google credentials. A plugin acts by dispatching the
+              same commands your keyboard does, within the capabilities you
+              granted it, so <kbd>⌘Z</kbd> undoes its work too.
             </dd>
           </div>
         </dl>
@@ -582,23 +611,22 @@
             </picture>
           </div>
           <figcaption>
-            Week view, five accounts' calendars in one grid. Fixture data again.
+            Week view, with five accounts' calendars in one grid. Fixture data
+            again.
           </figcaption>
         </figure>
       </section>
 
       <section>
-        <span class="eyebrow">What it deliberately isn't</span>
+        <span class="eyebrow">What it doesn't do</span>
 
         <p class="measure" style="margin-bottom: 1.25rem">
-          None of the following is a roadmap item. They are out of scope on
-          purpose, and saying so is the most useful thing on this page.
+          None of this is planned.
         </p>
 
         <ul class="plain">
           <li>
-            <strong>No IMAP or SMTP.</strong> The Gmail API only — the IMAP
-            architecture is the one this design rejects.
+            <strong>No IMAP or SMTP.</strong> Mach uses the Gmail API.
           </li>
           <li>
             <strong>No other providers.</strong> No Outlook, Fastmail, iCloud, or
@@ -609,8 +637,7 @@
             tokens live in the macOS Keychain and the UI is a WKWebView.
           </li>
           <li>
-            <strong>No teams, no sharing, no settings screens</strong> for
-            anything a constant already expresses.
+            <strong>No teams and no sharing.</strong> It is a single-user client.
           </li>
           <li>
             <strong>No packaged build, no releases, no auto-update.</strong> You
@@ -633,7 +660,11 @@
               </li>
               <li><a href="https://bun.sh">Bun</a></li>
               <li>A Google account you can create a Cloud project with</li>
-              <li>Optional: an Anthropic API key, for the in-app agent</li>
+              <li>
+                For the agent, either the
+                <a href="https://claude.com/claude-code">Claude Code</a> CLI or
+                an Anthropic API key. Mach uses the CLI when it finds one.
+              </li>
             </ul>
           </li>
 
@@ -641,32 +672,33 @@
             <h3>Bring your own Google OAuth app</h3>
             <p>
               Mach ships no credentials. Every user registers their own Google
-              Cloud project and OAuth client, because this app is not submitted to
-              Google for verification and never will be. Hand
+              Cloud project and OAuth client, because this app is not submitted
+              to Google for verification and never will be. Hand
               <a
                 href="https://github.com/bborn/mach/blob/main/skills/mach-setup/SKILL.md"
                 ><code>skills/mach-setup/SKILL.md</code></a
               >
               to a coding agent that can drive a browser and it will walk the
-              console with you — project, APIs, consent screen, a Desktop app
-              client, the six scopes, publishing, and writing
+              console with you: the project, the two APIs, the consent screen, a
+              Desktop app client, the six scopes, publishing, and writing
               <code>.env.local</code>. It stops and hands the keyboard back for
               your password and for accepting the User Data Policy. The same file
-              is a click-by-click checklist if you would rather do it yourself.
+              works as a click-by-click checklist if you would rather do it
+              yourself.
             </p>
             <div class="note">
               <p>
-                <strong>The scary screen is expected.</strong> The first time you
-                authorise each account, Google shows
+                <strong>Google will warn you about the app.</strong> The first
+                time you authorise each account it shows
                 <em>"Google hasn't verified this app"</em>. Click
-                <strong>Advanced → Go to Mach (unsafe)</strong> and continue. It is
-                a one-time cost per account and it is not a failure.
+                <strong>Advanced → Go to Mach (unsafe)</strong> and continue. It
+                happens once per account.
               </p>
               <p>
-                Publish the app to <strong>In production</strong> even though it is
-                unverified. Left in <em>Testing</em>, Google expires every refresh
-                token after seven days, which means re-authorising every account
-                every week.
+                Publish the app to <strong>In production</strong> even though it
+                is unverified. Left in <em>Testing</em>, Google expires every
+                refresh token after seven days, and you re-authorise every
+                account every week.
               </p>
             </div>
           </li>
@@ -678,9 +710,9 @@ cd mach
 bun install
 bun run tauri dev</code></pre>
             <p style="margin-top: 0.85rem">
-              Then <kbd>⌘K</kbd> → <strong>Add account</strong>. Missing
-              credentials are a state rather than a crash: the app boots, the
-              window paints, and the UI tells you it cannot add an account.
+              Then <kbd>⌘K</kbd> → <strong>Add account</strong>. If the
+              credentials are missing the app still boots and the window still
+              paints; the UI tells you it cannot add an account.
             </p>
           </li>
         </ol>
@@ -691,21 +723,22 @@ bun run tauri dev</code></pre>
 
         <p class="measure">
           This is one person's mail client, built for their own use and published
-          because someone else may find it useful. It is not a product, there is
-          no support, and there are no releases. It is in daily use by its author.
+          in case someone else finds it useful. It is not a product, there is no
+          support, and there are no releases. The author uses it every day.
         </p>
         <p class="measure">
-          Expect rough edges: no packaged build or auto-update, no first-run
-          onboarding beyond "add an account", and marketing-email HTML that renders
-          imperfectly. <code>cargo test</code> and <code>bunx vitest run</code> are
-          the safety net; there is no end-to-end suite. One command,
-          <kbd>⌘K</kbd> → <strong>Send feedback</strong>, files its result into the
-          author's own task runner, which you almost certainly do not have — it
-          says so rather than failing silently.
+          Expect rough edges. There is no packaged build or auto-update, no
+          first-run onboarding beyond adding an account, and marketing-email HTML
+          renders imperfectly. <code>cargo test</code> and
+          <code>bunx vitest run</code> are the safety net; there is no end-to-end
+          suite. <kbd>⌘K</kbd> → <strong>Send feedback</strong> captures the
+          window and files the result into the author's own task runner, which
+          you probably do not have. The command reports that it could not file
+          the task; the capture and annotation half still works.
         </p>
         <p class="measure">
-          The architecture, and the argument for it, is written down in the repo:
-          the
+          The architecture and the reasoning behind it are written down in the
+          repo, in the
           <a
             href="https://github.com/bborn/mach/blob/main/docs/superpowers/specs/2026-08-07-mail-calendar-client-design.md"
             >design record</a
@@ -724,7 +757,7 @@ bun run tauri dev</code></pre>
           <span class="sep">·</span>
           <span>Tauri v2, Rust, React, SQLite + FTS5</span>
           <span class="sep">·</span>
-          <span>Six OAuth scopes, no more</span>
+          <span>Six OAuth scopes</span>
         </div>
       </footer>
     </main>

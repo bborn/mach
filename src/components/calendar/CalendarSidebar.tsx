@@ -4,7 +4,7 @@ import type { Account, Calendar, CalendarId, AccountId } from "@/types";
 import { useUiSession } from "@/components/prefs/PreferencesProvider";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
-import { calendarFill, type HueIndex } from "@/lib/calendar-palette";
+import { calendarFill, calendarInk, type CalendarColor } from "@/lib/calendar-palette";
 import { cn } from "@/lib/utils";
 import { formatBinding } from "@/lib/keymap";
 
@@ -18,7 +18,7 @@ interface SidebarProps {
   accounts: Account[];
   calendars: Calendar[];
   hidden: CalendarId[];
-  hueFor: (id: CalendarId) => HueIndex;
+  colorFor: (id: CalendarId) => CalendarColor;
   dark: boolean;
   soloAccount: AccountId | null;
   onToggle: (id: CalendarId) => void;
@@ -38,7 +38,7 @@ export function CalendarSidebar({
   accounts,
   calendars,
   hidden,
-  hueFor,
+  colorFor,
   dark,
   soloAccount,
   onToggle,
@@ -167,9 +167,16 @@ export function CalendarSidebar({
                     <span
                       className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
                       style={{
-                        background: off ? "transparent" : calendarFill(hueFor(calendar.id), dark),
+                        // Filled, the swatch is the calendar's colour exactly —
+                        // it has to match the blocks in the grid. Emptied, it is
+                        // a 1px hairline, and a hairline of `#fbd75b` on a white
+                        // rail is not visible; the outlined form therefore uses
+                        // the same colour fitted for contrast against the page,
+                        // which is what an unanswered invitation's border does
+                        // for the same reason.
+                        background: off ? "transparent" : calendarFill(colorFor(calendar.id), dark),
                         boxShadow: off
-                          ? `inset 0 0 0 1px ${calendarFill(hueFor(calendar.id), dark)}`
+                          ? `inset 0 0 0 1px ${calendarInk(colorFor(calendar.id), dark)}`
                           : undefined,
                       }}
                     />

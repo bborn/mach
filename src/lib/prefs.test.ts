@@ -46,7 +46,6 @@ describe("parsePreferences", () => {
       parsePreferences({
         defaultAccountId: 7,
         signatures: { "7": "— Bruno" },
-        density: "compact",
         theme: "dark",
         syncIntervalSeconds: 300,
         undoWindowSeconds: 45,
@@ -63,7 +62,6 @@ describe("parsePreferences", () => {
     ).toEqual({
       defaultAccountId: 7,
       signatures: { "7": "— Bruno" },
-      density: "compact",
       theme: "dark",
       syncIntervalSeconds: 300,
       undoWindowSeconds: 45,
@@ -81,9 +79,9 @@ describe("parsePreferences", () => {
 
   it("keeps the good fields when one of them is rubbish", () => {
     // Per field, not per document: one bad row costs one setting.
-    const parsed = parsePreferences({ theme: "chartreuse", density: "compact" });
+    const parsed = parsePreferences({ theme: "chartreuse", weekStartsOn: 0 });
     expect(parsed.theme).toBe(DEFAULT_PREFERENCES.theme);
-    expect(parsed.density).toBe("compact");
+    expect(parsed.weekStartsOn).toBe(0);
   });
 
   it("ignores keys it has never heard of", () => {
@@ -101,9 +99,13 @@ describe("parsePreferences", () => {
       }
     });
 
-    it("accepts only the two densities", () => {
-      expect(parsePreferences({ density: "compact" }).density).toBe("compact");
-      expect(parsePreferences({ density: "cosy" }).density).toBe("comfortable");
+    it("drops a preference the app no longer has", () => {
+      // `density` was a setting until Mach settled on one display. A store
+      // written by that build still has the row; nothing reads it, and the
+      // parsed document must not grow a key back from it.
+      const parsed = parsePreferences({ density: "compact", theme: "dark" });
+      expect(parsed).not.toHaveProperty("density");
+      expect(parsed).toEqual(prefs({ theme: "dark" }));
     });
 
     it("accepts only Sunday, Monday and Saturday as week starts", () => {

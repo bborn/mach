@@ -24,6 +24,10 @@ pub const DEFAULT_PAGE_SIZE: u32 = 50;
 /// the entire mailbox.
 pub const MAX_PAGE_SIZE: u32 = 1000;
 
+/// Gmail's own id for the Drafts mailbox. Named because it is the one label
+/// whose membership this module answers from two places — see `list_threads`.
+pub const DRAFT_LABEL: &str = "DRAFT";
+
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
@@ -248,11 +252,32 @@ pub fn list_threads(conn: &Connection, query: &ThreadQuery) -> Result<Vec<Thread
     }
     if let Some(label) = &query.label_id {
         args.push(Value::Text(label.clone()));
-        sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM thread_labels tl \
-               WHERE tl.thread_id = t.id AND tl.gmail_label_id = ?{})",
+        let by_label = format!(
+            "EXISTS (SELECT 1 FROM thread_labels tl \
+              WHERE tl.thread_id = t.id AND tl.gmail_label_id = ?{})",
             args.len()
-        ));
+        );
+        // Drafts are the one mailbox the label set cannot answer on its own.
+        //
+        // `thread_labels` is derived: `sync_queries::recompute_thread` rebuilds
+        // it from the per-message label union on every pass, which is what
+        // makes a replayed history batch converge — and which also drops a
+        // `DRAFT` row written locally for a draft Google has not been told
+        // about yet. The draft appeared in the mailbox and then quietly left
+        // it again, which is the original bug wearing a different hat.
+        //
+        // `messages.is_draft` is the same fact from the durable side: set when
+        // Mach mirrors a draft locally (`compose::mirror`), and set by
+        // `sync::convert` from Gmail's own `DRAFT` label on the way in. Either
+        // is enough to be in Drafts. Indexed by migration 8.
+        if label == DRAFT_LABEL {
+            sql.push_str(&format!(
+                " AND ({by_label} OR EXISTS (SELECT 1 FROM messages m \
+                   WHERE m.thread_id = t.id AND m.is_draft = 1))"
+            ));
+        } else {
+            sql.push_str(&format!(" AND {by_label}"));
+        }
     }
     if query.unread_only {
         sql.push_str(" AND t.is_unread = 1");

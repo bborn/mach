@@ -38,13 +38,14 @@ import {
  * mounted above the one that asks. Nothing here depends on mail or on the
  * keymap, so being outermost costs nothing.
  *
- * # The two side effects
+ * # No side effects here
  *
- * Density is applied here, as a `data-density` attribute on the root element,
- * because it is a pure token swap and CSS is where the tokens live (see
- * `globals.css`). Everything else is applied at its point of use, so that a
- * preference and the behaviour it names cannot drift apart across a file
- * boundary — see the table in `lib/prefs.ts`.
+ * This provider stores preferences and writes them; it does not apply any. Each
+ * one is applied at its point of use, so that a preference and the behaviour it
+ * names cannot drift apart across a file boundary — see the table in
+ * `lib/prefs.ts`. There was one exception, `density`, which wrote a
+ * `data-density` attribute on the root element; the app has one display now and
+ * the attribute went with the setting.
  */
 
 interface PreferencesValue {
@@ -173,13 +174,6 @@ export function PreferencesProvider({ children }: { children: ReactNode }) {
     window.addEventListener(PREFERENCE_SET_EVENT, apply);
     return () => window.removeEventListener(PREFERENCE_SET_EVENT, apply);
   }, [set]);
-
-  // Density is a token swap and nothing more: the attribute selects a different
-  // `--row-height` and type ramp, and every component that already reads those
-  // reflows without knowing a preference exists.
-  useEffect(() => {
-    document.documentElement.dataset.density = prefs.density;
-  }, [prefs.density]);
 
   const value = useMemo<PreferencesValue>(
     () => ({ prefs, set, loaded, session, remember }),

@@ -50,7 +50,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { anyPopupOpen } from "@/lib/popups";
 import type { EventScope } from "@/lib/data";
-import { calendarFill, toneFor, type HueIndex } from "@/lib/calendar-palette";
+import { calendarFill, toneFor, type CalendarColor } from "@/lib/calendar-palette";
 import {
   conferenceLink,
   dialUrl,
@@ -85,7 +85,7 @@ export interface EventModalProps {
   target: ModalTarget | null;
   calendars: Calendar[];
   accounts: Account[];
-  hueFor: (id: CalendarId) => HueIndex;
+  colorFor: (id: CalendarId) => CalendarColor;
   dark: boolean;
   merged: MergedEvent | null;
   /** Default calendar for a new event — the first visible one. */
@@ -159,7 +159,7 @@ export function EventModal({
   target,
   calendars,
   accounts,
-  hueFor,
+  colorFor,
   dark,
   merged,
   defaultCalendarId,
@@ -343,7 +343,7 @@ export function EventModal({
 
   const account = event ? accounts.find((a) => a.id === event.accountId) : null;
   const conference = event ? conferenceLink(event) : null;
-  const hue = hueFor(form.calendarId);
+  const color = colorFor(form.calendarId);
   const tone = event ? toneFor(event.rsvp) : "solid";
   const set = (patch: Partial<EventForm>) => setForm((current) => ({ ...current!, ...patch }));
 
@@ -382,7 +382,7 @@ export function EventModal({
       <div className="flex items-center gap-2 border-b border-border px-3 py-2">
         <span
           className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
-          style={{ backgroundColor: calendarFill(hue, dark) }}
+          style={{ backgroundColor: calendarFill(color, dark) }}
         />
         <h2 id="event-title" className="min-w-0 flex-1 truncate text-list font-medium text-foreground">
           {event ? "Event" : "New event"}
@@ -675,7 +675,7 @@ export function EventModal({
               <SelectTrigger id={ids.calendar} aria-label="Calendar">
                 <span
                   className="h-2 w-2 shrink-0 rounded-[2px]"
-                  style={{ backgroundColor: calendarFill(hue, dark) }}
+                  style={{ backgroundColor: calendarFill(color, dark) }}
                 />
                 <SelectValue />
               </SelectTrigger>
@@ -687,7 +687,7 @@ export function EventModal({
                       <span className="flex min-w-0 items-center gap-1.5">
                         <span
                           className="h-2 w-2 shrink-0 rounded-[2px]"
-                          style={{ backgroundColor: calendarFill(hueFor(calendar.id), dark) }}
+                          style={{ backgroundColor: calendarFill(colorFor(calendar.id), dark) }}
                         />
                         <span className="truncate">{calendarLabel(calendar)}</span>
                         {owner && (

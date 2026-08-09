@@ -60,6 +60,72 @@ impl DraftKind {
     }
 }
 
+/// Where a draft stands with Gmail.
+///
+/// `Pending` is not a failure and is not worth saying out loud — it is the
+/// half-second between typing and the push landing. `Failed` is the one the
+/// composer shows, because a draft that exists only inside this Mac while the
+/// owner reads mail on his phone is exactly the thing that must never be
+/// silent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteState {
+    /// Written locally; Gmail has not been told, or has not been told this
+    /// version yet.
+    #[default]
+    Pending,
+    /// Gmail holds this text. It is on the phone.
+    Synced,
+    /// Google refused or could not be reached. The draft is local only, and
+    /// the UI says so.
+    Failed,
+}
+
+impl RemoteState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteState::Pending => "pending",
+            RemoteState::Synced => "synced",
+            RemoteState::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "synced" => RemoteState::Synced,
+            "failed" => RemoteState::Failed,
+            _ => RemoteState::Pending,
+        }
+    }
+}
+
+/// The Gmail half of a draft: its identity over there, and whether it got
+/// there.
+///
+/// Deliberately a block of its own rather than six fields on [`Draft`], because
+/// none of it is the editor's to set. [`save_draft`] writes the columns the
+/// editor owns and leaves these alone, so a draft that round-trips through the
+/// UI — which rebuilds the object on every keystroke — cannot lose the id that
+/// says which Gmail draft it *is*. Losing that id is how one draft becomes two.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftRemote {
+    pub state: RemoteState,
+    /// What `drafts.update` and `drafts.delete` address.
+    #[serde(default)]
+    pub draft_id: Option<String>,
+    /// The ordinary Gmail message id of the draft, once it has one.
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Why the last push failed, verbatim. `None` unless `state` is `Failed`.
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub synced_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Draft {
@@ -87,6 +153,9 @@ pub struct Draft {
     pub body: String,
     #[serde(default)]
     pub updated_at: i64,
+    /// Read-only from the editor's side; see [`DraftRemote`].
+    #[serde(default)]
+    pub remote: DraftRemote,
 }
 
 impl Draft {
@@ -117,9 +186,16 @@ pub fn context_for_thread(db: &Db, thread_id: i64) -> Result<ReplyContext> {
         .read(|conn| queries::thread_with_messages(conn, thread_id))?
         .ok_or(ComposeError::UnknownThread(thread_id))?;
 
+    // The last message somebody actually sent. Mach now writes a draft into the
+    // conversation it answers — that is what makes it visible in Drafts and on
+    // the phone — so `.last()` would happily thread a reply onto the user's own
+    // unsent text.
     let parent = detail
         .messages
-        .last()
+        .iter()
+        .rev()
+        .find(|m| !m.is_draft)
+        .or_else(|| detail.messages.last())
         .cloned()
         .ok_or_else(|| ComposeError::invalid("that conversation has no messages to reply to"))?;
 
@@ -171,6 +247,7 @@ pub fn prepare(db: &Db, thread_id: i64, kind: DraftKind, draft_id: String) -> Re
         subject,
         body: String::new(),
         updated_at: 0,
+        remote: DraftRemote::default(),
     })
 }
 
@@ -445,6 +522,16 @@ fn attribution_date(message: &Message) -> String {
 // persistence
 // ---------------------------------------------------------------------------
 
+/// Write what the editor owns, and nothing else.
+///
+/// The `ON CONFLICT` list is deliberately the editor's columns only. The Gmail
+/// identity is written by [`super::remote`] and read back below: the editor
+/// hands back an object it rebuilt from its own state on every keystroke, and
+/// letting that object write `gmail_draft_id` would mean one dropped field
+/// turned an update of a Gmail draft into a second one.
+///
+/// Saving always leaves the row `pending`, because it has just become newer
+/// than whatever Gmail holds.
 pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
     db.write(ensure_compose_schema)?;
     let saved = Draft {
@@ -455,19 +542,20 @@ pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
         conn.execute(
             "INSERT INTO compose_drafts
                  (id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, bcc_json,
-                  subject, body, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                  subject, body, updated_at, remote_state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending')
              ON CONFLICT(id) DO UPDATE SET
-                 account_id  = excluded.account_id,
-                 thread_id   = excluded.thread_id,
-                 reply_to_id = excluded.reply_to_id,
-                 kind        = excluded.kind,
-                 to_json     = excluded.to_json,
-                 cc_json     = excluded.cc_json,
-                 bcc_json    = excluded.bcc_json,
-                 subject     = excluded.subject,
-                 body        = excluded.body,
-                 updated_at  = excluded.updated_at",
+                 account_id   = excluded.account_id,
+                 thread_id    = excluded.thread_id,
+                 reply_to_id  = excluded.reply_to_id,
+                 kind         = excluded.kind,
+                 to_json      = excluded.to_json,
+                 cc_json      = excluded.cc_json,
+                 bcc_json     = excluded.bcc_json,
+                 subject      = excluded.subject,
+                 body         = excluded.body,
+                 updated_at   = excluded.updated_at,
+                 remote_state = 'pending'",
             rusqlite::params![
                 saved.id,
                 saved.account_id,
@@ -484,7 +572,50 @@ pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
         )?;
         Ok(())
     })?;
-    Ok(saved)
+    // Re-read rather than return what was passed in: the stored row is the one
+    // that knows which Gmail draft this is.
+    Ok(load_draft(db, &saved.id)?.unwrap_or(saved))
+}
+
+/// Record what Gmail said about a draft. Never touches the text.
+pub fn set_remote(db: &Db, draft_id: &str, remote: &DraftRemote) -> Result<()> {
+    db.write(ensure_compose_schema)?;
+    db.write(|conn| {
+        conn.execute(
+            "UPDATE compose_drafts
+                SET gmail_draft_id   = ?2,
+                    gmail_message_id = ?3,
+                    gmail_thread_id  = ?4,
+                    remote_state     = ?5,
+                    remote_error     = ?6,
+                    remote_synced_at = ?7
+              WHERE id = ?1",
+            rusqlite::params![
+                draft_id,
+                remote.draft_id,
+                remote.message_id,
+                remote.thread_id,
+                remote.state.as_str(),
+                remote.error,
+                remote.synced_at,
+            ],
+        )?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Every draft Gmail has not been told about yet — what a push pass walks.
+pub fn drafts_needing_push(db: &Db) -> Result<Vec<Draft>> {
+    db.write(ensure_compose_schema)?;
+    Ok(db.read(|conn| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DRAFT_COLUMNS} FROM compose_drafts \
+             WHERE remote_state <> 'synced' ORDER BY updated_at"
+        ))?;
+        let rows = stmt.query_map([], map_draft)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })?)
 }
 
 pub fn load_draft(db: &Db, id: &str) -> Result<Option<Draft>> {
@@ -528,13 +659,16 @@ pub fn delete_draft(db: &Db, id: &str) -> Result<()> {
 }
 
 const DRAFT_COLUMNS: &str = "id, account_id, thread_id, reply_to_id, kind, to_json, cc_json, \
-                             bcc_json, subject, body, updated_at";
+                             bcc_json, subject, body, updated_at, gmail_draft_id, \
+                             gmail_message_id, gmail_thread_id, remote_state, remote_error, \
+                             remote_synced_at";
 
 fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
     let kind: String = row.get(4)?;
     let to: String = row.get(5)?;
     let cc: String = row.get(6)?;
     let bcc: String = row.get(7)?;
+    let remote_state: String = row.get(14)?;
     Ok(Draft {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -547,6 +681,14 @@ fn map_draft(row: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
         subject: row.get(8)?,
         body: row.get(9)?,
         updated_at: row.get(10)?,
+        remote: DraftRemote {
+            draft_id: row.get(11)?,
+            message_id: row.get(12)?,
+            thread_id: row.get(13)?,
+            state: RemoteState::parse(&remote_state),
+            error: row.get(15)?,
+            synced_at: row.get(16)?,
+        },
     })
 }
 

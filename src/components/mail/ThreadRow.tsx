@@ -27,10 +27,32 @@ interface ThreadRowProps {
 }
 
 /**
- * One line. `--spacing-row` is 2.25rem, which puts 18–20 rows on screen where
- * Spark manages 9 — the whole point of the density target. Everything on the
- * row has a fixed or truncating box so nothing can ever push the time column
- * out of alignment.
+ * Three lines: who, what, and a taste of it.
+ *
+ * The row used to be one line, with sender, subject, snippet and date sharing
+ * a width none of them could have. What that bought was rows on screen; what it
+ * cost was the subject, which is the thing you are actually reading the list
+ * for — every one of them truncated mid-word, so scanning the list meant
+ * opening conversations to find out what they were about. Splitting the row
+ * gives the subject the full width of the list to itself, and that is the whole
+ * trade: fewer conversations visible, each of them legible.
+ *
+ * The height is fixed (`--spacing-row`) rather than grown from the content, so
+ * the list scrolls in a regular rhythm and the date column lands on the same
+ * pixel on every row. Everything on line one is either fixed-width or
+ * truncating for the same reason: nothing a sender puts in a display name can
+ * push the time out of alignment.
+ *
+ * Line one carries the metadata — sender, message count, the star and
+ * attachment marks, the date — because those are what you *sort* by eye. They
+ * are one cluster pinned to the right edge, and the date inside it shrink-wraps
+ * its text rather than sitting in a fixed-width box. It used to sit in one, so
+ * that "Yesterday" and "Fri" would share a left edge, and the cost was a hole:
+ * on every row with a shorter time the marks were pushed a couple of
+ * centimetres clear of the digits and looked like they belonged to nothing.
+ * What actually has to line up is the *right* edge of the dates, which the
+ * cluster's own alignment gives for free — `tabular-nums` keeps the digits from
+ * jittering as the minute changes.
  *
  * # Selection
  *
@@ -107,6 +129,8 @@ export const ThreadRow = memo(function ThreadRow({
         </button>
       )}
 
+      {/* Unread, in the left margin beside all three lines rather than on one
+          of them: it is a fact about the conversation, not about its sender. */}
       <span
         className={cn(
           "h-1.5 w-1.5 shrink-0 rounded-full",
@@ -114,54 +138,58 @@ export const ThreadRow = memo(function ThreadRow({
         )}
       />
 
-      <span
-        className={cn(
-          "w-28 shrink-0 truncate",
-          unread ? "font-medium text-foreground" : "text-muted-foreground",
-        )}
-      >
-        {sender}
-      </span>
+      <div className="flex min-w-0 flex-1 flex-col gap-px">
+        <div className="flex items-center gap-1.5">
+          <span
+            className={cn(
+              "min-w-0 truncate leading-tight",
+              unread ? "font-medium text-foreground" : "text-muted-foreground",
+            )}
+          >
+            {sender}
+          </span>
 
-      {thread.messageCount > 1 && (
-        <span className="shrink-0 font-mono text-micro tabular-nums text-faint-foreground">
-          {thread.messageCount}
-        </span>
-      )}
+          {thread.messageCount > 1 && (
+            <span className="shrink-0 font-mono text-micro tabular-nums text-faint-foreground">
+              {thread.messageCount}
+            </span>
+          )}
 
-      <span className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden">
-        <span
+          {context && (
+            <span className="shrink-0 rounded-[3px] border border-border px-1 text-micro text-faint-foreground">
+              {context}
+            </span>
+          )}
+
+          <span className="ml-auto flex shrink-0 items-center gap-1 pl-2">
+            {thread.starred && (
+              <Star size={12} strokeWidth={2} className="shrink-0 fill-warning text-warning" />
+            )}
+            {thread.hasAttachment && (
+              <Paperclip size={12} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
+            )}
+            <span
+              className={cn(
+                "whitespace-nowrap font-mono text-micro tabular-nums leading-tight",
+                unread ? "text-muted-foreground" : "text-faint-foreground",
+              )}
+            >
+              {listTime(thread.timestamp)}
+            </span>
+          </span>
+        </div>
+
+        <div
           className={cn(
-            "max-w-[66%] shrink-0 truncate",
+            "truncate leading-tight",
             unread ? "font-medium text-foreground" : "text-foreground/80",
           )}
         >
           {thread.subject}
-        </span>
-        <span className="min-w-0 flex-1 truncate text-faint-foreground">{thread.snippet}</span>
-      </span>
+        </div>
 
-      {context && (
-        <span className="shrink-0 rounded-[3px] border border-border px-1 text-micro text-faint-foreground">
-          {context}
-        </span>
-      )}
-
-      {thread.starred && (
-        <Star size={12} strokeWidth={2} className="shrink-0 fill-warning text-warning" />
-      )}
-      {thread.hasAttachment && (
-        <Paperclip size={12} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
-      )}
-
-      <span
-        className={cn(
-          "w-[4.5rem] shrink-0 text-right font-mono text-micro tabular-nums",
-          unread ? "text-muted-foreground" : "text-faint-foreground",
-        )}
-      >
-        {listTime(thread.timestamp)}
-      </span>
+        <div className="truncate leading-tight text-faint-foreground">{thread.snippet}</div>
+      </div>
     </div>
   );
 });

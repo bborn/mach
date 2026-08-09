@@ -1,4 +1,4 @@
-import { AlertTriangle, ChevronLeft, ChevronRight, X } from "lucide-react";
+import { AlertTriangle, ChevronLeft, ChevronRight, Mail, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AccountId, CalendarEvent, CalendarId, EventId, Rsvp } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
@@ -12,8 +12,8 @@ import {
   type EventScope,
 } from "@/lib/data";
 import type { KeyBinding } from "@/lib/keymap";
-import { assignHues, CALENDAR_HUES, type HueIndex } from "@/lib/calendar-palette";
-import { assignCalendarHues } from "@/lib/colors";
+import { assignHues, FALLBACK_FILLS, fallbackFill, type CalendarColor } from "@/lib/calendar-palette";
+import { assignCalendarColors } from "@/lib/colors";
 import { mergeDuplicates, type MergedEvent } from "@/lib/calendar-merge";
 import {
   arrowCursor,
@@ -190,18 +190,16 @@ export function CalendarMode() {
   const rangeStart = startOfDay(days[0]).getTime();
   const rangeEnd = startOfDay(days[days.length - 1]).getTime() + DAY;
 
-  // The hue Google's `backgroundColor` maps onto, so a calendar is the colour
-  // its owner actually chose — falling back to the id hash for the ones with no
-  // colour, which keeps them stable between sessions however sync orders things.
-  // See `assignCalendarHues` for why only the hue is taken and the lightness is
-  // left on the palette's contrast-tuned value.
-  const hues = useMemo(
-    () => assignCalendarHues(calendars, CALENDAR_HUES, assignHues),
+  // Google's `backgroundColor`, verbatim, so a calendar is the colour its owner
+  // actually chose — falling back to the id hash for the ones with no colour,
+  // which keeps them stable between sessions however sync orders things.
+  const colors = useMemo(
+    () => assignCalendarColors(calendars, FALLBACK_FILLS, assignHues),
     [calendars],
   );
-  const hueFor = useCallback(
-    (id: CalendarId): HueIndex => hues.get(id) ?? 0,
-    [hues],
+  const colorFor = useCallback(
+    (id: CalendarId): CalendarColor => colors.get(id) ?? fallbackFill(0),
+    [colors],
   );
 
   /**
@@ -1225,6 +1223,13 @@ export function CalendarMode() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex h-8 shrink-0 items-center gap-2 border-b border-border px-2">
+        {/* The way back to mail. The rail states the app's two surfaces, but
+            the rail is inert here — so calendar mode carries its own return,
+            and the trip is never keyboard-only. */}
+        <Button size="sm" title="Mail — ⌘1" onClick={() => actions.setMode("mail")}>
+          <Mail size={13} strokeWidth={1.75} />
+          Mail
+        </Button>
         <Button size="icon" title="Previous (k)" onClick={() => actions.shiftPeriod(-1)}>
           <ChevronLeft size={14} strokeWidth={1.75} />
         </Button>
@@ -1347,7 +1352,7 @@ export function CalendarMode() {
           accounts={accounts}
           calendars={calendars}
           hidden={ui.hiddenCalendars}
-          hueFor={hueFor}
+          colorFor={colorFor}
           dark={dark}
           soloAccount={soloAccount}
           onToggle={(id) => dispatch({ type: "toggleCalendar", calendarId: id })}
@@ -1362,7 +1367,7 @@ export function CalendarMode() {
               days={days}
               anchorMonth={ui.anchor}
               events={merged}
-              hueFor={hueFor}
+              colorFor={colorFor}
               dark={dark}
               selectedId={ui.eventId}
               dimIds={dimIds}
@@ -1372,7 +1377,7 @@ export function CalendarMode() {
             <TimeGrid
               days={days}
               events={merged}
-              hueFor={hueFor}
+              colorFor={colorFor}
               dark={dark}
               selectedId={ui.eventId}
               dimIds={dimIds}
@@ -1391,7 +1396,7 @@ export function CalendarMode() {
         target={modal}
         calendars={calendars}
         accounts={accounts}
-        hueFor={hueFor}
+        colorFor={colorFor}
         dark={dark}
         merged={modalEvent ? (mergedById.get(modalEvent.id) ?? null) : null}
         defaultCalendarId={defaultCalendarId}

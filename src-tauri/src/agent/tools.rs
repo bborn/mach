@@ -441,6 +441,45 @@ impl ToolContext {
     }
 }
 
+/// Something a tool made, and enough to put the owner in front of it.
+///
+/// # Why this is a shape and not a sentence
+///
+/// The agent drafted a reply, the drawer printed *"Drafted a reply to the
+/// bookkeeper…"*, and the draft was unreachable from anywhere in the app. Prose
+/// is not an affordance. A tool that brings something into being — a draft, an
+/// event, a conversation it moved — hands back one of these instead, the drawer
+/// renders it as a button, and the artifact stops being orphaned.
+///
+/// It is deliberately a small closed enum rather than a free-form link. Each
+/// variant is a thing the shell already knows how to open, so adding an
+/// affordance to a new tool is filling this in rather than teaching the UI a
+/// new kind of navigation. The label is what the artifact is *called*; the verb
+/// ("Open draft", "Show event") belongs to the UI, not to Rust.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum Artifact {
+    /// An unsent message. Opening it resumes it in the composer.
+    Draft {
+        draft_id: String,
+        /// The conversation it belongs to, so opening it navigates there first.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<i64>,
+        account_id: i64,
+        label: String,
+    },
+    /// A conversation worth landing on.
+    Thread { thread_id: i64, label: String },
+    /// A calendar entry the agent created. `start_ms` is carried because the
+    /// grid shows a window, and an event you cannot scroll to is as orphaned as
+    /// a draft you cannot open.
+    Event {
+        event_id: i64,
+        start_ms: i64,
+        label: String,
+    },
+}
+
 /// What a tool run came to. `summary` is the one line the drawer shows.
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
@@ -448,6 +487,8 @@ pub struct ToolOutcome {
     pub payload: Value,
     /// True when this changed the mailbox, so the UI has to re-read.
     pub mutated: bool,
+    /// What it made, when it made something. See [`Artifact`].
+    pub artifact: Option<Artifact>,
 }
 
 pub async fn execute(ctx: &ToolContext, name: &str, input: &Value) -> Result<ToolOutcome, AgentError> {
@@ -486,16 +527,31 @@ async fn run_plugin(ctx: &ToolContext, name: &str, input: &Value) -> Result<Tool
         // A plugin action's whole point is dispatching commands, and the UI has
         // no way to know which ones. Assume the mailbox moved.
         mutated: true,
+        artifact: None,
     })
 }
 
 async fn run_command(ctx: &ToolContext, name: &str, input: &Value) -> Result<ToolOutcome, AgentError> {
     let command = command_from_call(name, input)?;
+    // Read before the move: a create is the one command whose result the owner
+    // cannot find by looking where they already were.
+    let created = match &command {
+        Command::CreateEvent { draft, .. } => Some((draft.title.clone(), draft.start_ts)),
+        _ => None,
+    };
     let result = ctx.dispatcher.execute(command).await?;
+    let artifact = created.and_then(|(title, start_ms)| {
+        result.applied.first().map(|event_id| Artifact::Event {
+            event_id: *event_id,
+            start_ms,
+            label: title,
+        })
+    });
     Ok(ToolOutcome {
         summary: result.message.clone(),
         payload: serde_json::to_value(&result).unwrap_or(Value::Null),
         mutated: true,
+        artifact,
     })
 }
 
@@ -522,6 +578,7 @@ fn list_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentEr
         summary: format!("{} conversations", items.len()),
         payload: json!({ "threads": items }),
         mutated: false,
+        artifact: None,
     })
 }
 
@@ -537,6 +594,7 @@ fn search_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Agent
         summary: format!("{} matches for \u{201c}{query}\u{201d}", items.len()),
         payload: json!({ "threads": items }),
         mutated: false,
+        artifact: None,
     })
 }
 
@@ -581,6 +639,7 @@ fn get_thread(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErro
             "messages": messages,
         }),
         mutated: false,
+        artifact: None,
     })
 }
 
@@ -677,6 +736,7 @@ fn list_events(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErr
         summary: format!("{} events", items.len()),
         payload: json!({ "events": items }),
         mutated: false,
+        artifact: None,
     })
 }
 
@@ -691,6 +751,7 @@ fn list_labels(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErr
         summary: format!("{} labels", items.len()),
         payload: json!({ "labels": items }),
         mutated: false,
+        artifact: None,
     })
 }
 
@@ -704,6 +765,7 @@ fn list_accounts(ctx: &ToolContext) -> Result<ToolOutcome, AgentError> {
         summary: format!("{} accounts", items.len()),
         payload: json!({ "accounts": items }),
         mutated: false,
+        artifact: None,
     })
 }
 
@@ -749,13 +811,30 @@ async fn draft_reply(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Ag
         .await?;
     let draft = saved.get("draft").cloned().unwrap_or(Value::Null);
 
+    let subject = draft
+        .get("subject")
+        .and_then(Value::as_str)
+        .unwrap_or("(no subject)")
+        .to_string();
+    // The one line this whole change exists for: the drawer gets something to
+    // open, not just a sentence claiming a draft was written.
+    let artifact = draft
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|draft_id| Artifact::Draft {
+            draft_id: draft_id.to_string(),
+            thread_id: draft.get("threadId").and_then(Value::as_i64),
+            account_id: draft.get("accountId").and_then(Value::as_i64).unwrap_or(0),
+            label: subject.clone(),
+        });
+
     Ok(ToolOutcome {
-        summary: format!(
-            "Drafted \u{201c}{}\u{201d}",
-            draft.get("subject").and_then(Value::as_str).unwrap_or("(no subject)")
-        ),
+        summary: format!("Drafted \u{201c}{subject}\u{201d}"),
         payload: json!({ "draft": draft }),
-        mutated: false,
+        // The draft is now a row in the Drafts mailbox, so the list is stale —
+        // this is what makes it appear without a relaunch.
+        mutated: true,
+        artifact,
     })
 }
 
@@ -793,6 +872,7 @@ async fn send_draft(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Age
         },
         payload: sent,
         mutated: true,
+        artifact: None,
     })
 }
 

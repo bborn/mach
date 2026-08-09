@@ -4,7 +4,8 @@ import { useKeyBindings } from "@/hooks/useKeymap";
 import { usePreferences } from "@/components/prefs/PreferencesProvider";
 import { composeAccountId, sendDelayMs, signatureFor, withSignature } from "@/lib/prefs";
 import { Kbd } from "@/components/ui/kbd";
-import { Composer } from "./Composer";
+import { Overlay } from "@/components/ui/dialog";
+import { Composer, type ComposerPresentation } from "./Composer";
 import { clockTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import {
@@ -12,6 +13,7 @@ import {
   createAutosave,
   discardDraft,
   flushOutbox,
+  loadDraft,
   loadDraftForThread,
   newDraft,
   prepareDraft,
@@ -77,6 +79,8 @@ export function ComposerDock() {
   // The draft that was queued, kept so undo restores the text rather than an
   // empty composer.
   const recalled = useRef<Draft | null>(null);
+  // Where focus starts in the new-message overlay. See `Composer`'s `toRef`.
+  const toField = useRef<HTMLInputElement>(null);
 
   /* ---------------------------------------------------------------- saving */
 
@@ -106,10 +110,21 @@ export function ComposerDock() {
     setDraft(null);
   }, [autosave]);
 
-  // Switching conversations closes the composer and saves what was typed.
+  /*
+   * Switching conversations closes the composer and saves what was typed —
+   * unless the draft in it belongs to the conversation being switched *to*.
+   *
+   * That exception is what makes "open this draft" work from anywhere. Opening
+   * an artifact navigates and then asks for the draft, and those two arrive in
+   * whichever order React schedules them; without this the navigation would
+   * close the composer the request had just filled. Keeping a draft that
+   * already matches the thread is also simply correct on its own.
+   */
   useEffect(() => {
     autosave.flush();
-    setDraft(null);
+    setDraft((current) =>
+      current && (current.threadId ?? null) === threadId ? current : null,
+    );
   }, [threadId, autosave]);
 
   /* --------------------------------------------------------------- opening */
@@ -170,18 +185,39 @@ export function ComposerDock() {
     [ui.accountId, accounts, actions, prefs, signed],
   );
 
+  /**
+   * Resume a specific draft — the other end of the agent's "Open draft".
+   *
+   * By id, not by thread: the agent can leave two drafts on one conversation,
+   * and `loadDraftForThread` would hand back whichever was touched last rather
+   * than the one whose button was pressed.
+   */
+  const resume = useCallback(
+    (draftId: string) => {
+      void (async () => {
+        const found = await loadDraft(draftId).catch(() => null);
+        if (found) setDraft(found);
+        else actions.setStatus("That draft is gone", "error");
+      })();
+    },
+    [actions],
+  );
+
   // The reading pane's reply button lives in another unit's file, so it asks
-  // for the composer through an event rather than a prop.
+  // for the composer through an event rather than a prop. So does the agent
+  // drawer, through `actions.openArtifact`.
   useEffect(() => {
     const onRequest = (event: Event) => {
-      const detail = (event as CustomEvent<{ kind?: DraftKind; to?: string }>).detail;
+      const detail = (event as CustomEvent<{ kind?: string; to?: string; draftId?: string }>)
+        .detail;
       const kind = detail?.kind ?? "reply";
-      if (kind === "new") openNew(detail?.to);
-      else open(kind);
+      if (kind === "draft" && detail?.draftId) resume(detail.draftId);
+      else if (kind === "new") openNew(detail?.to);
+      else open(kind as DraftKind);
     };
     window.addEventListener("mach:compose", onRequest);
     return () => window.removeEventListener("mach:compose", onRequest);
-  }, [open, openNew]);
+  }, [open, openNew, resume]);
 
   useKeyBindings([
     {
@@ -419,20 +455,58 @@ export function ComposerDock() {
     );
   }
 
-  return (
+  const dismiss = () => {
+    close();
+    // Closing an untouched composer should not leave a row behind, or
+    // reopening the thread offers an empty reply for ever.
+    if (draft.body.trim() === "") void discardDraft(draft.id).catch(() => {});
+  };
+
+  const editor = (presentation: ComposerPresentation) => (
     <Composer
       draft={draft}
       busy={busy}
+      presentation={presentation}
+      toRef={toField}
       onChange={change}
       onSend={send}
-      onClose={() => {
-        close();
-        // Closing an untouched composer should not leave a row behind, or
-        // reopening the thread offers an empty reply for ever.
-        if (draft.body.trim() === "") void discardDraft(draft.id).catch(() => {});
-      }}
+      onClose={dismiss}
     />
   );
+
+  /*
+   * A new message is not part of the conversation on screen.
+   *
+   * Docking it under the open thread put the composer directly beneath
+   * somebody else's message, with that message still visible above it and the
+   * reading pane still scrolled to it — which reads as a reply, because that is
+   * exactly what the same shape means one keystroke earlier. A reply *is* about
+   * the thread above it and keeps the dock; a new message gets a surface of its
+   * own, over the window, in the manner of ⌘K.
+   *
+   * Nothing about the draft changes with the presentation: `newDraft` carries
+   * no thread, no recipients, no subject and no references, so the message
+   * genuinely has nothing to do with what is behind it.
+   */
+  if (draft.kind === "new") {
+    return (
+      <Overlay
+        open
+        onClose={dismiss}
+        align="center"
+        // A new message starts where the message does not yet have anywhere to
+        // go. The overlay's fallback is "the first field in the panel", which
+        // is the subject.
+        initialFocus={toField}
+        labelledBy="composer-subject"
+        className="max-w-[44rem]"
+      >
+        {editor("overlay")}
+      </Overlay>
+    );
+  }
+
+  return editor("dock");
 }
 
 function errorMessage(error: unknown): string {

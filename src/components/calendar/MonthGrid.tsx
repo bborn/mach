@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import type { CalendarId, EventId } from "@/types";
 import type { MergedEvent } from "@/lib/calendar-merge";
-import { toneFor, type HueIndex } from "@/lib/calendar-palette";
+import { toneFor, type CalendarColor } from "@/lib/calendar-palette";
 import { HOUR, addDays, isToday, monthShort, startOfDay, weekdayShort } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { EventChip } from "./EventBlock";
@@ -12,7 +12,7 @@ interface MonthGridProps {
   days: Date[];
   anchorMonth: number;
   events: MergedEvent[];
-  hueFor: (id: CalendarId) => HueIndex;
+  colorFor: (id: CalendarId) => CalendarColor;
   dark: boolean;
   selectedId: EventId | null;
   /**
@@ -27,7 +27,7 @@ export function MonthGrid({
   days,
   anchorMonth,
   events,
-  hueFor,
+  colorFor,
   dark,
   selectedId,
   dimIds,
@@ -134,7 +134,7 @@ export function MonthGrid({
                 <EventChip
                   key={item.event.id}
                   event={item.event}
-                  hue={hueFor(item.event.calendarId)}
+                  color={colorFor(item.event.calendarId)}
                   dark={dark}
                   tone={toneFor(item.event.rsvp)}
                   past={item.event.end < now}

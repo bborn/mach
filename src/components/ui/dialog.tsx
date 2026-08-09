@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 import { cn } from "@/lib/utils";
 
 interface OverlayProps {
@@ -7,6 +7,26 @@ interface OverlayProps {
   children: ReactNode;
   /** Distance from the top of the viewport. Palettes sit high, not centred. */
   align?: "top" | "center";
+  /**
+   * Fill the window instead of floating a panel in it.
+   *
+   * For the one surface that is not a question but a place — preferences. A
+   * settings window that has to scroll to show its sixth control is a settings
+   * window nobody reads, and the way out of that is width, not a taller modal.
+   * Everything else about the overlay is unchanged, which is the point of it
+   * being a flag rather than a second component: the focus trap, the popup
+   * exception and the restore are the parts that are hard to get right.
+   */
+  fullScreen?: boolean;
+  /**
+   * Where focus should land when this opens. Falls back to the first field.
+   *
+   * A surface with its own navigation wants focus at the top of that
+   * navigation, not in the middle of whatever section happens to be showing —
+   * and the trap's own effect runs after its children's, so a child cannot
+   * simply focus something itself.
+   */
+  initialFocus?: RefObject<HTMLElement | null>;
   labelledBy?: string;
   className?: string;
 }
@@ -23,6 +43,8 @@ export function Overlay({
   onClose,
   children,
   align = "top",
+  fullScreen = false,
+  initialFocus,
   labelledBy,
   className,
 }: OverlayProps) {
@@ -32,9 +54,11 @@ export function Overlay({
   useEffect(() => {
     if (!open) return;
     restoreTo.current = document.activeElement as HTMLElement | null;
-    const focusable = panel.current?.querySelector<HTMLElement>(
-      "input, textarea, [tabindex]:not([tabindex='-1'])",
-    );
+    const focusable =
+      initialFocus?.current ??
+      panel.current?.querySelector<HTMLElement>(
+        "input, textarea, [tabindex]:not([tabindex='-1'])",
+      );
     focusable?.focus();
 
     /*
@@ -81,10 +105,15 @@ export function Overlay({
         aria-modal="true"
         aria-labelledby={labelledBy}
         className={cn(
-          "flex max-h-[68vh] w-full max-w-[38rem] flex-col overflow-hidden",
-          "rounded-[var(--radius)] border border-border-strong bg-surface",
-          // The one shadow in the app: it says "this floats", nothing more.
-          "shadow-[0_16px_48px_-12px_rgba(0,0,0,0.35)]",
+          "flex flex-col overflow-hidden bg-surface",
+          fullScreen
+            ? "h-full w-full"
+            : [
+                "max-h-[68vh] w-full max-w-[38rem]",
+                "rounded-[var(--radius)] border border-border-strong",
+                // The one shadow in the app: it says "this floats", nothing more.
+                "shadow-[0_16px_48px_-12px_rgba(0,0,0,0.35)]",
+              ].join(" "),
           className,
         )}
       >

@@ -48,11 +48,11 @@ import {
   type ResizeEdge,
 } from "@/lib/calendar-drag";
 import type { MergedEvent } from "@/lib/calendar-merge";
-import { paintFor, toneFor, type HueIndex } from "@/lib/calendar-palette";
+import { fallbackFill, paintFor, toneFor, type CalendarColor } from "@/lib/calendar-palette";
 import { DAY, MINUTE, isToday, shortTime, startOfDay, weekdayShort } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { usePreferences } from "@/components/prefs/PreferencesProvider";
-import { EventBlock, EventChip, SELECTION_SHADOW } from "./EventBlock";
+import { EventBlock, EventChip, selectionShadow } from "./EventBlock";
 
 /** A provisional event, dragged or clicked into being but not yet saved. */
 export interface EventDraft {
@@ -71,7 +71,7 @@ export interface EventMove {
 interface TimeGridProps {
   days: Date[];
   events: MergedEvent[];
-  hueFor: (calendarId: CalendarId) => HueIndex;
+  colorFor: (calendarId: CalendarId) => CalendarColor;
   dark: boolean;
   /** Where the keyboard cursor is. Distinct from "open in the modal". */
   selectedId: EventId | null;
@@ -102,7 +102,7 @@ interface DragSession {
   edge: ResizeEdge;
   eventId: EventId;
   origin: DragOrigin;
-  hue: HueIndex;
+  color: CalendarColor;
   tone: ReturnType<typeof toneFor>;
   title: string;
   pointerId: number;
@@ -145,7 +145,7 @@ function gridTop(ts: number): number {
 export function TimeGrid({
   days,
   events,
-  hueFor,
+  colorFor,
   dark,
   selectedId,
   dimIds,
@@ -400,7 +400,7 @@ export function TimeGrid({
         edge,
         eventId: target.id,
         origin: { start: target.start, end: target.end, dayStart },
-        hue: hueFor(target.calendarId),
+        color: colorFor(target.calendarId),
         tone: toneFor(target.rsvp),
         title: target.title,
         pointerId: event.pointerId,
@@ -417,10 +417,10 @@ export function TimeGrid({
       onSelect(target.id);
       event.preventDefault();
     },
-    [days, hueFor, onSelect],
+    [days, colorFor, onSelect],
   );
 
-  const ghostPaint = dragging ? paintFor(dragging.hue, dragging.tone, { dark }) : null;
+  const ghostPaint = dragging ? paintFor(dragging.color, dragging.tone, { dark }) : null;
   const ghostColumnWidth = dragging ? dragging.contentWidth / days.length : 0;
 
   return (
@@ -498,7 +498,7 @@ export function TimeGrid({
                   <EventChip
                     key={event.id}
                     event={event}
-                    hue={hueFor(event.calendarId)}
+                    color={colorFor(event.calendarId)}
                     dark={dark}
                     tone={toneFor(event.rsvp)}
                     past={event.end < now}
@@ -567,7 +567,7 @@ export function TimeGrid({
             key={day.getTime()}
             day={day}
             events={timed}
-            hueFor={hueFor}
+            colorFor={colorFor}
             dark={dark}
             selectedId={selectedId}
             dimIds={dimIds}
@@ -613,7 +613,7 @@ export function TimeGrid({
               boxShadow: [
                 ghostPaint.border ? `inset 0 0 0 1px ${ghostPaint.border}` : undefined,
                 dragging.eventId === selectedId
-                  ? SELECTION_SHADOW
+                  ? selectionShadow(ghostPaint.selectionGap)
                   : "0 4px 16px -4px color-mix(in oklab, var(--foreground) 45%, transparent)",
               ]
                 .filter((layer): layer is string => layer !== undefined)
@@ -665,7 +665,7 @@ function dayDelta(days: Date[], from: number, to: number): number {
 interface DayColumnProps {
   day: Date;
   events: MergedEvent[];
-  hueFor: (calendarId: CalendarId) => HueIndex;
+  colorFor: (calendarId: CalendarId) => CalendarColor;
   dark: boolean;
   selectedId: EventId | null;
   dimIds?: ReadonlySet<EventId>;
@@ -714,7 +714,7 @@ function WorkingHoursWash() {
 function DayColumn({
   day,
   events,
-  hueFor,
+  colorFor,
   dark,
   selectedId,
   dimIds,
@@ -890,7 +890,7 @@ function DayColumn({
             <div key={event.id} data-event>
               <EventBlock
                 event={event}
-                hue={hueFor(event.calendarId)}
+                color={colorFor(event.calendarId)}
                 dark={dark}
                 tone={toneFor(event.rsvp)}
                 past={event.end < now}
@@ -993,6 +993,13 @@ function OverflowChips({
 }
 
 /**
+ * A block being drawn belongs to no calendar yet — the destination is chosen on
+ * save — so it takes the first slot of the fallback ramp rather than any real
+ * calendar's colour, which would be a claim about where it is going.
+ */
+const DRAFT_COLOR = fallbackFill(0);
+
+/**
  * The provisional block. Notion Calendar's signature move: the title field is
  * *in* the block, not in a modal. Enter saves, Esc discards, Tab hands it to
  * the full composer.
@@ -1015,7 +1022,7 @@ function DraftBlock({
   const [title, setTitle] = useState("");
   const input = useRef<HTMLInputElement>(null);
   const height = blockHeight(draft.end - draft.start);
-  const paint = paintFor(0, "solid", { dark });
+  const paint = paintFor(DRAFT_COLOR, "solid", { dark });
 
   useEffect(() => {
     if (editing) input.current?.focus();

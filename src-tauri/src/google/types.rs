@@ -53,6 +53,22 @@ pub struct MessageRef {
     pub thread_id: String,
 }
 
+/// `users.drafts` — an id, and the message it holds.
+///
+/// The two ids are different things and both matter: `id` addresses the draft
+/// (update it, delete it, send it), while `message.id` is the ordinary Gmail
+/// message id the sync engine will later see carrying the `DRAFT` label. Mach
+/// stores both, and it is `message.id` that lets a synced draft land on the
+/// local row Mach already wrote rather than beside it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Draft {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub message: Message,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Header {

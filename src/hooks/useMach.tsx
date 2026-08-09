@@ -73,6 +73,7 @@ import {
   type Selection,
 } from "@/lib/selection";
 import { mailboxName } from "@/lib/mailboxes";
+import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
 import { toMailboxError, useThreadStream } from "@/hooks/useThreadStream";
 import { DAY, addDays, addMonths, startOfWeek } from "@/lib/time";
@@ -413,6 +414,16 @@ export interface MachActions {
   /** Move the keyboard between the rail and the list. */
   setFocus: (focus: MailFocus) => void;
   toggleFocus: () => void;
+  /**
+   * Put the owner in front of something the agent made.
+   *
+   * The routing half of the artifact seam: the drawer knows *what* was made,
+   * this knows where that lives. A draft navigates to its conversation and
+   * asks the composer to resume it — through the same `mach:compose` event the
+   * reading pane's reply button uses, because the composer owns the draft and
+   * this hook does not.
+   */
+  openArtifact: (artifact: Artifact) => void;
   /** ⌘Z, and `z`. Takes back the last recorded action, however long ago. */
   undo: () => void;
   /** ⇧⌘Z. Re-applies the last thing undo took back. */
@@ -1158,6 +1169,29 @@ export function MachProvider({ children }: { children: ReactNode }) {
        * user does — and the status message goes back to being what it says it
        * is, a note about what just happened.
        */
+      openArtifact: (artifact) => {
+        if (artifact.kind === "event") {
+          dispatch({ type: "mode", mode: "calendar" });
+          // The grid shows a window around the anchor, so an event next month
+          // is only reachable if the anchor moves with it.
+          dispatch({ type: "anchor", anchor: artifact.startMs });
+          dispatch({ type: "event", eventId: artifact.eventId });
+          return;
+        }
+        dispatch({ type: "mode", mode: "mail" });
+        const threadId = artifact.kind === "thread" ? artifact.threadId : artifact.threadId;
+        // The conversation may not be in the list being shown — a draft on an
+        // archived thread, say. The reading pane fetches by id, so opening it
+        // does not depend on the mailbox it is filed under.
+        if (threadId != null) dispatch({ type: "thread", threadId });
+        if (artifact.kind === "draft") {
+          window.dispatchEvent(
+            new CustomEvent("mach:compose", {
+              detail: { kind: "draft", draftId: artifact.draftId },
+            }),
+          );
+        }
+      },
       undo: () => void runUndo(undoHost),
       redo: () => void runRedo(undoHost),
 

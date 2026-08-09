@@ -53,7 +53,7 @@ use super::config::AgentConfig;
 use super::context::{self, ContextItem};
 use super::error::AgentError;
 use super::gate::ToolGate;
-use super::tools::ToolContext;
+use super::tools::{Artifact, ToolContext};
 use super::wire::ModelTransport;
 
 // ===========================================================================
@@ -88,6 +88,13 @@ pub enum Entry {
         name: String,
         summary: String,
         state: ToolState,
+        /// What the call made, when it made something the owner can be put in
+        /// front of. The drawer renders it as a button; see [`Artifact`].
+        ///
+        /// Absent on every read tool and on anything that only moved labels
+        /// around, which is why it is skipped rather than sent as null.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<Artifact>,
     },
 }
 
@@ -281,15 +288,33 @@ impl SessionUi {
             name: name.to_string(),
             summary: summary.to_string(),
             state: ToolState::Running,
+            artifact: None,
         });
     }
 
     pub fn tool_finished(&self, id: &str, name: &str, state: ToolState, summary: &str) {
+        self.tool_produced(id, name, state, summary, None);
+    }
+
+    /// The same line, carrying what the call made.
+    ///
+    /// Separate from [`Self::tool_finished`] rather than a fifth argument on it
+    /// because every failure path passes `None` and reads better without one;
+    /// the gate is the only caller that has an artifact to hand over.
+    pub fn tool_produced(
+        &self,
+        id: &str,
+        name: &str,
+        state: ToolState,
+        summary: &str,
+        artifact: Option<Artifact>,
+    ) {
         self.push_entry(Entry::Tool {
             id: id.to_string(),
             name: name.to_string(),
             summary: summary.to_string(),
             state,
+            artifact,
         });
     }
 

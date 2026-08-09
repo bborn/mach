@@ -55,29 +55,17 @@ function theme(value: Preferences["theme"], title: string): Entry {
   };
 }
 
-function density(value: Preferences["density"], title: string, meta: string): Entry {
-  return {
-    id: `prefs-density-${value}`,
-    title,
-    meta,
-    keywords: `density rows list spacing compact comfortable ${value}`,
-    run: () => setPreferenceFromAnywhere({ density: value }),
-  };
-}
-
 const ENTRIES: Entry[] = [
   {
     id: "prefs-open",
     title: "Preferences…",
     meta: "⌘,",
-    keywords: "preferences settings options configure signature theme density undo sync calendar",
+    keywords: "preferences settings options configure signature theme undo sync calendar",
     run: openPreferences,
   },
   theme("dark", "Change theme: dark"),
   theme("light", "Change theme: light"),
   theme("system", "Change theme: match the system"),
-  density("compact", "List density: compact", "more rows"),
-  density("comfortable", "List density: comfortable", "default"),
 ];
 
 /**

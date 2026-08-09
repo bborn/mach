@@ -9,8 +9,8 @@ import {
 import {
   paintFor,
   type BlockPaint,
+  type CalendarColor,
   type EventTone,
-  type HueIndex,
 } from "@/lib/calendar-palette";
 import { shortTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -41,13 +41,30 @@ import { cn } from "@/lib/utils";
  *      exactly the moment you were moving something and most needed it.
  *
  * The replacement is a *luminance sandwich*, not a colour: outward from the
- * block edge, 2px of page background, then 3px of accent. The inner band is
- * the load-bearing one — it is the page's own background, so it is near-white
- * in light mode and near-black in dark, and the calendar ramp holds every fill
- * at one middling lightness (L 0.54 light, L 0.50 dark) precisely so that no
- * hue can ever approach it. There is therefore a hard lightness step between
- * the fill and the gap on every hue in both themes, and a second one between
- * the accent and the page. Desaturate the whole thing and the mark survives,
+ * block edge, 2px of a gap colour, then 3px of accent. The inner band is the
+ * load-bearing one, and what it is made of has had to change.
+ *
+ * It used to be `var(--background)` unconditionally, and that worked because
+ * the calendar ramp held every fill at one middling lightness (L 0.54 light,
+ * L 0.50 dark), so the page — near-white or near-black — could never approach a
+ * fill. Fills are now the user's own colours and span the whole range: a white
+ * gap against `#fbd75b` on a white page is a 1.4:1 step, which is not a gap,
+ * and the mark would quietly fail on exactly the pale calendars where it is
+ * hardest to see anyway.
+ *
+ * So the gap is the block's **own ink** — the black or white the text is drawn
+ * in, which `paintFor` already chose to clear 4.5:1 against the fill. The step
+ * between fill and gap is therefore guaranteed rather than assumed, on every
+ * colour, in both themes.
+ *
+ * Note what this does *not* change. In light mode the ink is white exactly when
+ * the fill is dark, which is when `var(--background)` was already white; in
+ * dark mode the ink is black exactly when the fill is light, which is when
+ * `var(--background)` was already near-black. The new rule agrees with the old
+ * one in every case where the old one worked, and differs only where it broke.
+ *
+ * Beyond the gap, the accent band still steps against the page, and the outer
+ * two steps are unchanged. Desaturate the whole thing and the mark survives,
  * which is the test that matters for a colour-blind reader.
  *
  * The structural half is the drop shadow plus a raised z-index: the selected
@@ -58,11 +75,13 @@ import { cn } from "@/lib/utils";
  * changed width — so it costs the block no geometry and arrow-stepping through
  * a day cannot make the grid twitch.
  */
-export const SELECTION_SHADOW = [
-  "0 0 0 2px var(--background)",
-  "0 0 0 5px var(--accent)",
-  "0 3px 10px -2px color-mix(in oklab, var(--foreground) 45%, transparent)",
-].join(", ");
+export function selectionShadow(gap: string): string {
+  return [
+    `0 0 0 2px ${gap}`,
+    "0 0 0 5px var(--accent)",
+    "0 3px 10px -2px color-mix(in oklab, var(--foreground) 45%, transparent)",
+  ].join(", ");
+}
 
 /**
  * The same mark, one pixel tighter, for chips.
@@ -71,15 +90,31 @@ export const SELECTION_SHADOW = [
  * halo on a 22px chip in a 4px-padded month cell loses its outer band to
  * `overflow-hidden`. Five reads identically and stays inside the box.
  */
-const SELECTION_SHADOW_CHIP = [
-  "0 0 0 2px var(--background)",
-  "0 0 0 4px var(--accent)",
-  "0 2px 8px -2px color-mix(in oklab, var(--foreground) 45%, transparent)",
-].join(", ");
+function selectionShadowChip(gap: string): string {
+  return [
+    `0 0 0 2px ${gap}`,
+    "0 0 0 4px var(--accent)",
+    "0 2px 8px -2px color-mix(in oklab, var(--foreground) 45%, transparent)",
+  ].join(", ");
+}
 
-/** Layer the block's own border (if it has one) under the selection mark. */
-function shadowFor(border: string | undefined, selected: boolean, chip: boolean): string | undefined {
-  const layers = [border, selected ? (chip ? SELECTION_SHADOW_CHIP : SELECTION_SHADOW) : undefined];
+/**
+ * Layer the block's own border (if it has one) under the selection mark.
+ *
+ * `gap` comes from the *unfaded* paint on purpose: a block mid-drag is washed
+ * towards the page, and washing the cursor's inner band with it would undo
+ * defect 3 above by another route.
+ */
+function shadowFor(
+  border: string | undefined,
+  selected: boolean,
+  chip: boolean,
+  gap: string,
+): string | undefined {
+  const layers = [
+    border,
+    selected ? (chip ? selectionShadowChip(gap) : selectionShadow(gap)) : undefined,
+  ];
   const drawn = layers.filter((layer): layer is string => layer !== undefined);
   return drawn.length > 0 ? drawn.join(", ") : undefined;
 }
@@ -90,8 +125,8 @@ function shadowFor(border: string | undefined, selected: boolean, chip: boolean)
  * `opacity` on the whole button was the obvious way to fade a block that is
  * being dragged or that a type-to-select filter has ruled out, and it faded the
  * selection ring with it. Wash the *paint* towards the page instead: the fill
- * and the text recede exactly as before, and the mark — drawn from tokens this
- * never touches — stays at full strength.
+ * and the text recede exactly as before, while the mark is drawn from the
+ * unfaded paint and stays at full strength.
  */
 function faded(paint: BlockPaint): BlockPaint {
   const wash = (color: string, keep: number) =>
@@ -107,7 +142,8 @@ function faded(paint: BlockPaint): BlockPaint {
 
 export interface EventBlockProps {
   event: CalendarEvent;
-  hue: HueIndex;
+  /** The calendar's colour — Google's hex, or the hashed fallback. */
+  color: CalendarColor;
   dark: boolean;
   tone: EventTone;
   past: boolean;
@@ -167,7 +203,7 @@ const HANDLE_MIN_HEIGHT = 24;
  */
 export function EventBlock({
   event,
-  hue,
+  color,
   dark,
   tone,
   past,
@@ -185,7 +221,7 @@ export function EventBlock({
   onPointerLeave,
 }: EventBlockProps) {
   const plan = blockPlan(height, { hasLocation: Boolean(event.location) });
-  const painted = paintFor(hue, tone, { dark, past });
+  const painted = paintFor(color, tone, { dark, past });
   const paint = dimmed ? faded(painted) : painted;
   // A half-width block cannot hold "1:30p – 2:15p" without ellipsising the one
   // part that must never ellipsise. Below ~120px, show the start only.
@@ -259,7 +295,7 @@ export function EventBlock({
         // Selection is a halo on the outside; `:focus-visible` in globals.css
         // draws its outline on the inside. Two different marks, so "the cursor
         // is here" and "the browser focus is here" never read as one thing.
-        boxShadow: shadowFor(ring, selected, false),
+        boxShadow: shadowFor(ring, selected, false, painted.selectionGap),
         // A dashed border cannot be faked with an inset shadow; tentative
         // events get a real one, inset so it does not change the geometry.
         // A sliver has no room for one either — see `sliverOutline` above.
@@ -466,7 +502,7 @@ function MergeMark({ count }: { count: number }) {
  */
 export function EventChip({
   event,
-  hue,
+  color,
   dark,
   tone,
   past,
@@ -479,7 +515,7 @@ export function EventChip({
   blockRef,
 }: {
   event: CalendarEvent;
-  hue: HueIndex;
+  color: CalendarColor;
   dark: boolean;
   tone: EventTone;
   past: boolean;
@@ -492,7 +528,7 @@ export function EventChip({
   onSelect: () => void;
   blockRef?: (node: HTMLButtonElement | null) => void;
 }) {
-  const painted = paintFor(hue, tone, { dark, past });
+  const painted = paintFor(color, tone, { dark, past });
   const paint = dimmed ? faded(painted) : painted;
 
   return (
@@ -517,6 +553,7 @@ export function EventChip({
           paint.border ? `inset 0 0 0 1px ${paint.border}` : undefined,
           selected,
           true,
+          painted.selectionGap,
         ),
         // A chip stacked against its neighbours has to cast the halo over them
         // rather than under, or the row above eats the top band of the mark.

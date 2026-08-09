@@ -38,6 +38,27 @@ export interface Mailbox {
 
 export type DraftKind = "new" | "reply" | "replyAll" | "forward";
 
+/** Where a draft stands with Gmail. Mirrors `compose::draft::RemoteState`. */
+export type RemoteState = "pending" | "synced" | "failed";
+
+/**
+ * The Gmail half of a draft.
+ *
+ * Read-only here: the editor rebuilds the draft object on every keystroke and
+ * hands it back, and Rust deliberately ignores this block when it writes. The
+ * one field the UI acts on is `state === "failed"`, which is the only thing
+ * worth telling anybody — a draft that is only on this Mac while he reads mail
+ * on his phone.
+ */
+export interface DraftRemote {
+  state: RemoteState;
+  draftId?: string | null;
+  messageId?: string | null;
+  threadId?: string | null;
+  error?: string | null;
+  syncedAt?: number;
+}
+
 export interface Draft {
   id: string;
   accountId: number;
@@ -52,6 +73,13 @@ export interface Draft {
   /** Markdown-ish source, exactly as typed. */
   body: string;
   updatedAt: number;
+  /** Absent on a draft that has never been through Rust. See `DraftRemote`. */
+  remote?: DraftRemote;
+}
+
+/** True when this draft exists here and nowhere else, and Google said why. */
+export function isLocalOnly(draft: Draft): boolean {
+  return draft.remote?.state === "failed";
 }
 
 export type OutboxState = "holding" | "sending" | "sent" | "failed";
@@ -133,6 +161,20 @@ export function newDraft(accountId: number): Draft {
 export async function loadDraftForThread(threadId: number): Promise<Draft | null> {
   if (!isTauri()) return localDrafts.get(`thread:${threadId}`) ?? null;
   const result = await call<{ draft: Draft | null }>({ op: "loadDraft", threadId });
+  return result.draft;
+}
+
+/**
+ * One draft, by its own id.
+ *
+ * The thread-keyed lookup above is what reopening a conversation uses. This is
+ * what "open the draft the agent just wrote" uses, and it has to be by id: the
+ * agent can leave two drafts on one thread, and the newest is not necessarily
+ * the one whose button was pressed.
+ */
+export async function loadDraft(draftId: string): Promise<Draft | null> {
+  if (!isTauri()) return localDrafts.get(draftId) ?? null;
+  const result = await call<{ draft: Draft | null }>({ op: "loadDraft", draftId });
   return result.draft;
 }
 

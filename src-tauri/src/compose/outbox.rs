@@ -159,6 +159,15 @@ impl Outbox {
         &self.db
     }
 
+    /// The per-account client factory this queue was built with.
+    ///
+    /// Exposed so the draft push in [`super::remote`] reaches Gmail through the
+    /// same factory the send path uses, rather than being handed a second one
+    /// that could be configured differently.
+    pub fn clients(&self) -> Arc<dyn GoogleClients> {
+        Arc::clone(&self.clients)
+    }
+
     // ----------------------------------------------------------------- queue
 
     /// Build, commit, and start the clock.

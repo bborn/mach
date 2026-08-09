@@ -8,51 +8,144 @@
  *      never by a second hue. Five accounts × several calendars is already
  *      15+ hues; spending one on "you haven't replied" turns the week into a
  *      bag of sweets.
- *   2. **Uniform lightness.** A palette looks like confetti when the colours
- *      vary in lightness, not when they vary in hue. Eight hues, evenly spaced,
- *      one lightness and one chroma for all of them.
+ *   2. **The colour belongs to the calendar's owner.** Google returns
+ *      `backgroundColor` for every calendar, and it is painted verbatim.
  *
- * The lightness was chosen the way the brief says to choose it: nudged down
- * globally until every hue clears 4.5:1 against white text. At L=0.54 C=0.13
- * the worst hue (205°, cyan) is 4.53:1. Dark mode fills sit at L=0.50 against
- * near-white text, worst hue 4.87:1.
+ * Rule 2 replaced an earlier one — "uniform lightness", every fill held at
+ * L 0.54 C 0.13 so that white text cleared 4.5:1 on all of them. That bought
+ * its guarantee by throwing away the user's colours, and `colors.ts` has the
+ * long version of why it is the wrong trade. The short version: the text is
+ * ours to choose and the fill is not, so the *text* moves. Black or white,
+ * whichever contrasts more, clears 4.5:1 on any colour in sRGB — a guarantee,
+ * not a tuning.
  *
- * These are the only literal colours in the calendar. Everything else —
- * surfaces, borders, ink, the selection ring — comes from the token layer in
- * `globals.css`, which has no eight-hue calendar ramp to borrow.
+ * Everything else — surfaces, borders, ink, the selection ring — comes from the
+ * token layer in `globals.css`, which has no calendar ramp to borrow.
  */
+
+import {
+  clampLightness,
+  contrastRatio,
+  fitLightness,
+  fromOklch,
+  isColor,
+  readableInk,
+} from "./colors";
+
+/**
+ * A calendar's colour: an sRGB hex, as Google gives it.
+ *
+ * A bare `string` rather than a branded type, because it crosses the IPC
+ * boundary as a string and every consumer here re-checks it with `isColor`
+ * anyway — a brand would only move the unchecked cast to the edge.
+ */
+export type CalendarColor = string;
+
+/**
+ * `--background` from `globals.css`, as hexes.
+ *
+ * Duplicated from the token layer, which is a cost worth naming: if those two
+ * tokens ever change, these have to change with them. The alternative is a
+ * `getComputedStyle` read per block per frame to discover a value that is a
+ * constant of the theme, which trades a maintenance hazard for a layout
+ * thrash. The test pins them against the tokens.
+ */
+export const PAGE = { light: "#ffffff", dark: "#0a0a0a" } as const;
+
+/**
+ * How far a fill may be lightened or darkened for the dark theme.
+ *
+ * The light theme does nothing at all: Google's colours were chosen against a
+ * white page and they are painted on a white page, so fidelity is free.
+ *
+ * A near-black page is a different ground, and two things go wrong on it at the
+ * ends of the range:
+ *
+ *   * **Below L 0.52 a fill stops being an object.** "Blueberry" (`#3f51b5`),
+ *     "Grape" (`#8e24aa`) and "Graphite" (`#616161`) sit at 2.98–3.39:1 against
+ *     `#0a0a0a` — under the 3:1 that WCAG 1.4.11 asks of a non-text element you
+ *     are supposed to be able to see the boundary of. L 0.52 is the lowest
+ *     lightness at which *every* hue and chroma clears 3:1 on this page; the
+ *     worst of them (a saturated violet) lands at 3.11:1.
+ *   * **Above L 0.78 a fill is a lamp.** "Banana" (`#fbd75b`) is 14:1 brighter
+ *     than the page — where the loudest thing light mode ever draws is about
+ *     5.5:1 — and in a dark room it blooms. The cap holds the brightest fill to
+ *     ~10.5:1, which is still twice light mode's maximum; going further would
+ *     start costing recognisability, which is the thing being protected.
+ *
+ * It is a clamp, not a remap. Hue and chroma are untouched; 25 of the 46
+ * colours Google offers pass through unchanged, and across the whole palette
+ * the average move is 0.026 of lightness — under three percent, which is below
+ * the threshold at which anyone would call it a different colour. Only
+ * "Banana" (0.148) and the two near-whites move enough to see. A calendar is
+ * the same colour in both themes; the handful of extreme ones are the same
+ * colour, turned down.
+ *
+ * The honest cost: two calendars whose colours differ *only* above the cap —
+ * "Banana" and a paler yellow — converge in lightness in dark mode. They keep
+ * their own hue and chroma, so they remain a yellow and a paler yellow, and it
+ * is a far smaller problem than a block you cannot find.
+ */
+const DARK_BAND = { min: 0.52, max: 0.78 } as const;
 
 /** Evenly spaced around the wheel. Eight is enough for the calendars one person actually keeps. */
 export const CALENDAR_HUES = [25, 70, 115, 160, 205, 250, 295, 340] as const;
 
-const LIGHT = { l: 0.54, c: 0.13 };
-const DARK = { l: 0.5, c: 0.13 };
+/**
+ * The fallback ramp, for calendars Google gave no colour.
+ *
+ * L 0.54 C 0.13 are the values the old uniform-lightness palette used, kept
+ * deliberately: they were tuned to sit well on a white page, they are inside
+ * `DARK_BAND` so the dark theme leaves them alone, and keeping them means a
+ * calendar with no colour looks today exactly as it looked yesterday. These are
+ * now ordinary colours going through the ordinary pipeline, not a special case.
+ */
+export const FALLBACK_FILLS: readonly CalendarColor[] = CALENDAR_HUES.map((h) =>
+  fromOklch({ l: 0.54, c: 0.13, h }),
+);
 
-/** Text on a solid fill. Not `--foreground`: it must be light in both themes. */
-const ON_FILL_LIGHT = "oklch(1 0 0)";
-const ON_FILL_DARK = "oklch(0.97 0 0)";
+/** Text on a fill must clear this. It always can — see `readableInk`. */
+export const CONTRAST_TARGET = 4.5;
 
-export type HueIndex = number;
-
-export function hueAt(index: HueIndex): number {
-  return CALENDAR_HUES[((index % CALENDAR_HUES.length) + CALENDAR_HUES.length) % CALENDAR_HUES.length];
+export function fallbackFill(index: number): CalendarColor {
+  const length = FALLBACK_FILLS.length;
+  return FALLBACK_FILLS[((index % length) + length) % length];
 }
 
-/** Solid fill for a hue index, in the given theme. */
-export function calendarFill(index: HueIndex, dark: boolean): string {
-  const { l, c } = dark ? DARK : LIGHT;
-  return `oklch(${l} ${c} ${hueAt(index)})`;
+/**
+ * The one place a calendar's colour becomes a pixel.
+ *
+ * The sidebar swatch, the month chip, the all-day bar, the event block and the
+ * modal's dot all come through here, so a calendar cannot be one colour in the
+ * rail and another in the grid.
+ */
+export function calendarFill(color: CalendarColor, dark: boolean): string {
+  if (!isColor(color)) return fallbackFill(0);
+  return dark ? clampLightness(color, DARK_BAND.min, DARK_BAND.max) : color;
 }
 
-/** The same hue as ink — used for the time and border of an unanswered invite. */
-export function calendarInk(index: HueIndex, dark: boolean): string {
-  const { c } = dark ? DARK : LIGHT;
-  const l = dark ? 0.72 : 0.48;
-  return `oklch(${l} ${c} ${hueAt(index)})`;
+/**
+ * The same colour as *ink* — the time and the 1px border of an unanswered
+ * invitation, which are drawn on the page rather than on a fill.
+ *
+ * Black-or-white is not available here: the whole point of the outlined
+ * treatment is that the calendar's colour is what identifies it. So the colour
+ * itself is moved along its own lightness axis, away from the page, until it
+ * clears 4.5:1 — the least it can move and still be readable.
+ */
+export function calendarInk(color: CalendarColor, dark: boolean): string {
+  if (!isColor(color)) return calendarInk(fallbackFill(0), dark);
+  return fitLightness(color, dark ? PAGE.dark : PAGE.light, CONTRAST_TARGET);
 }
 
-export function onFill(dark: boolean): string {
-  return dark ? ON_FILL_DARK : ON_FILL_LIGHT;
+/** The text colour for a fill, and the ratio it achieves. */
+export function inkOn(fill: string): string {
+  return readableInk(fill);
+}
+
+/** What `inkOn` actually measured — exported for the tests and for reporting. */
+export function inkContrast(fill: string): number {
+  return contrastRatio(fill, readableInk(fill)) ?? 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -79,9 +172,9 @@ export function hashString(value: string): number {
  * either. With more calendars than hues, hues repeat — which is honest, and
  * better than 15 near-identical colours.
  */
-export function assignHues(calendarIds: readonly string[]): Map<string, HueIndex> {
+export function assignHues(calendarIds: readonly string[]): Map<string, number> {
   const taken = new Set<number>();
-  const out = new Map<string, HueIndex>();
+  const out = new Map<string, number>();
   for (const id of [...calendarIds].sort()) {
     const start = hashString(id) % CALENDAR_HUES.length;
     let slot = start;
@@ -105,10 +198,11 @@ export function assignHues(calendarIds: readonly string[]): Map<string, HueIndex
 /**
  * What a block looks like, by state. Copied from Google, which gets this right:
  *
- *   accepted / own   solid fill, white text
- *   unanswered       white fill, dark title, time and 1px border in the hue
+ *   accepted / own   solid fill, text in whichever of black and white reads
+ *   unanswered       page-coloured fill, dark title, time and 1px border in the
+ *                    calendar's colour
  *   tentative        the unanswered treatment, plus a dashed border
- *   past             the same fill at 60% opacity, hue intact
+ *   past             the same fill at 60% opacity, colour intact
  *   declined         outlined, title struck through (hidden by default)
  */
 export type EventTone = "solid" | "outline" | "tentative" | "declined";
@@ -123,37 +217,68 @@ export interface BlockPaint {
   timeColor: string;
   opacity: number;
   strikethrough: boolean;
+  /**
+   * The 2px band the selection cursor draws immediately outside the block.
+   *
+   * On a solid block this is the block's own ink, which is guaranteed 4.5:1
+   * against the fill by construction — see the cursor's comment in
+   * `EventBlock.tsx` for why that guarantee is the load-bearing part.
+   */
+  selectionGap: string;
 }
 
+/**
+ * Paint is pure and the inputs are a handful of colours, so it is memoised.
+ *
+ * Every block in the week calls this on every render, and each call can run two
+ * gamut-mapping bisections. The key space is bounded by (calendars × tones × 2
+ * themes × 2), so the map cannot grow with the number of events.
+ */
+const paintCache = new Map<string, BlockPaint>();
+
 export function paintFor(
-  index: HueIndex,
+  color: CalendarColor,
   tone: EventTone,
   options: { dark: boolean; past?: boolean },
 ): BlockPaint {
   const { dark } = options;
-  const fill = calendarFill(index, dark);
-  const ink = calendarInk(index, dark);
-  const opacity = options.past ? 0.6 : 1;
+  const past = options.past ?? false;
+  const key = `${color}|${tone}|${dark ? "d" : "l"}|${past ? "p" : "n"}`;
+  const hit = paintCache.get(key);
+  if (hit) return hit;
+
+  const opacity = past ? 0.6 : 1;
+  let paint: BlockPaint;
 
   if (tone === "solid") {
-    return {
+    const fill = calendarFill(color, dark);
+    const ink = inkOn(fill);
+    paint = {
       background: fill,
-      color: onFill(dark),
-      timeColor: onFill(dark),
+      color: ink,
+      timeColor: ink,
       opacity,
       strikethrough: false,
+      selectionGap: ink,
+    };
+  } else {
+    const ink = calendarInk(color, dark);
+    paint = {
+      background: "var(--background)",
+      color: "var(--foreground)",
+      border: ink,
+      borderStyle: tone === "tentative" ? "dashed" : "solid",
+      timeColor: ink,
+      opacity: tone === "declined" ? Math.min(opacity, 0.7) : opacity,
+      strikethrough: tone === "declined",
+      // An outlined block *is* the page, so there is nothing for a gap to
+      // separate it from; the accent band does the whole job.
+      selectionGap: "var(--background)",
     };
   }
 
-  return {
-    background: "var(--background)",
-    color: "var(--foreground)",
-    border: ink,
-    borderStyle: tone === "tentative" ? "dashed" : "solid",
-    timeColor: ink,
-    opacity: tone === "declined" ? Math.min(opacity, 0.7) : opacity,
-    strikethrough: tone === "declined",
-  };
+  paintCache.set(key, paint);
+  return paint;
 }
 
 /** Map an RSVP (and whether the event has already happened) onto a tone. */

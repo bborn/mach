@@ -28,6 +28,78 @@ changes saved" are the software talking about itself. Preferences that save
 themselves should simply do so. Reserve messages for things the user must act
 on, or would otherwise not know.
 
+## Published prose has its own rule
+
+This is separate from the interface-copy rule above. It covers anything written
+for a reader outside the app: `docs/index.html` (the machmail.dev site),
+`README.md`, everything under `docs/`, and also commit messages, code comments
+and prompts, which is where these habits come from.
+
+State the fact and stop. The facts here are good enough to carry themselves;
+none of them needs a frame, a reveal, or a sentence telling the reader what to
+conclude.
+
+Never write these:
+
+| Pattern | Example that shipped |
+|---|---|
+| "X, not Y" — the contrarian reframe | "That is a decision, not a gap." |
+| Aphorisms that sound profound | "saying so is the most useful thing on this page" |
+| Meta-commentary about the page itself | "the most useful thing on this page" |
+| "deliberately", "on purpose", "by design" as a badge | "What it deliberately isn't" |
+| Em-dash as a dramatic pause before a reveal | "Opening a thread is a local read — not a request" |
+| Escalating triples | "Local first, keyboard first, fast" |
+| Sentence fragments for emphasis | "Local first. Always." |
+| Telling the reader what to conclude | "and it is not a failure" |
+
+Banned words and phrases, by name:
+
+- **"worth saying plainly"**, "worth noting", "to be clear", "let me be honest".
+  Throat-clearing in front of a sentence that should just start.
+- **"genuinely"**, as in "genuinely useful", "genuinely good". If the claim needs
+  the intensifier, the claim is weak.
+- **"load-bearing"** as a compliment about prose or design.
+- **"and here's where…"**, "here's the thing", "the interesting part is".
+  Announcing that something interesting is coming instead of saying it.
+
+The register to avoid is confident, chummy and self-satisfied. The fix is
+plainer, not more formal; do not overcorrect into corporate stiffness.
+
+Before/after, from the rewrite that produced this rule:
+
+> **Before:** It talks to the Google APIs directly and to nothing else — no
+> IMAP, no Outlook, no Fastmail. That is a decision, not a gap.
+>
+> **After:** It talks to the Gmail and Google Calendar APIs. There is no IMAP
+> and no support for other mail providers.
+
+## Look at your work before you call it done
+
+A screenshot of the fixture browser is not a screenshot of the app. `bun run
+dev` renders in a browser tab: no traffic lights, no overlay title bar, no
+native window chrome, and a different scrollbar engine. It is fine for logic and
+for most component work, and it is **not** evidence for anything that fills the
+window or sits near an edge.
+
+The preferences surface shipped with its title underneath the macOS
+close/minimise/zoom buttons. It had been screenshotted — in the browser, where
+those buttons do not exist.
+
+So: **if a change touches full-window layout, a window edge, or anything the OS
+also draws, verify it in the real app**:
+
+```sh
+MACH_QA_INSTANCE=agent scripts/qa up        # Accessory policy: never takes focus
+MACH_QA_INSTANCE=agent scripts/qa shoot after
+```
+
+The window is `titleBarStyle: "Overlay"` with `hiddenTitle`, so macOS paints the
+traffic lights over the top-left of *our* content. Anything filling the window
+owes them `pl-[5.5rem]` — `chrome/TitleBar.tsx` is the reference.
+
+And "the tests pass" is not the same claim as "it looks right". Both are
+required; neither substitutes for the other.
+
 ## Other standing rules
 
 - **Everything is keyboard navigable.** No mouse-only affordances, ever.

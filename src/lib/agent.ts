@@ -44,10 +44,52 @@ export interface ContextItem {
   detail?: string;
 }
 
+/**
+ * Something a tool made, and enough to get to it.
+ *
+ * Mirrors `agent::tools::Artifact`. It exists because the drawer used to print
+ * *"Drafted a reply…"* and leave the draft unreachable: prose is not an
+ * affordance. A tool that brings something into being carries one of these, and
+ * the drawer renders it as a button.
+ *
+ * The verb is the UI's, not Rust's — `label` is what the thing is called, and
+ * `artifactAction` below decides what pressing it is called.
+ */
+export type Artifact =
+  | {
+      kind: "draft";
+      draftId: string;
+      threadId?: number;
+      accountId: number;
+      label: string;
+    }
+  | { kind: "thread"; threadId: number; label: string }
+  | { kind: "event"; eventId: number; startMs: number; label: string };
+
+/** What the button says. Labels, not sentences. */
+export function artifactAction(artifact: Artifact): string {
+  switch (artifact.kind) {
+    case "draft":
+      return "Open draft";
+    case "thread":
+      return "Open conversation";
+    case "event":
+      return "Show event";
+  }
+}
+
 export type Entry =
   | { role: "user"; text: string }
   | { role: "agent"; text: string }
-  | { role: "tool"; id: string; name: string; summary: string; state: ToolState };
+  | {
+      role: "tool";
+      id: string;
+      name: string;
+      summary: string;
+      state: ToolState;
+      /** Absent unless the call produced something to open. */
+      artifact?: Artifact;
+    };
 
 export interface PendingApproval {
   toolUseId: string;

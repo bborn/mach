@@ -45,7 +45,9 @@ pub mod address;
 pub mod draft;
 pub mod markdown;
 pub mod mime;
+pub mod mirror;
 pub mod outbox;
+pub mod remote;
 
 use rusqlite::Connection;
 
@@ -56,8 +58,9 @@ use crate::google::GoogleError;
 pub use address::{dedupe, reply_recipients, Recipients};
 pub use draft::{
     delete_draft, load_draft, load_draft_for_thread, prepare, save_draft, Draft, DraftKind,
-    ReplyContext,
+    DraftRemote, RemoteState, ReplyContext,
 };
+pub use remote::DraftRemoteSync;
 pub use mime::{build_rfc822, Mailbox, Outgoing};
 pub use outbox::{Outbox, OutboxEntry, OutboxState, UNDO_WINDOW_MS};
 
@@ -65,13 +68,17 @@ pub use outbox::{Outbox, OutboxEntry, OutboxState, UNDO_WINDOW_MS};
 // schema
 // ---------------------------------------------------------------------------
 
-/// Local-only state with no Gmail representation: what you are still typing,
-/// and what has not left yet.
+/// What you are still typing, and what has not left yet.
 ///
 /// `compose_outbox.rfc822` holds the finished message. Storing the bytes rather
 /// than the draft fields is what makes the undo window safe: once the row is
 /// committed, sending it needs no part of the UI to still exist, so closing the
 /// window mid-window delays the send instead of losing it.
+///
+/// `compose_drafts` used to be local-only, and that was the bug: a draft the
+/// agent wrote existed in this table, in this Mac, and nowhere a person would
+/// look. It now carries the three ids that tie it to a real Gmail draft — see
+/// [`DRAFT_REMOTE_COLUMNS`] and [`remote`].
 pub const COMPOSE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS compose_drafts (
     id            TEXT    PRIMARY KEY,
@@ -115,10 +122,61 @@ CREATE TABLE IF NOT EXISTS compose_outbox (
 CREATE INDEX IF NOT EXISTS idx_compose_outbox_due ON compose_outbox (state, send_after);
 "#;
 
+/// The columns that tie a local draft to the Gmail draft it was pushed to.
+///
+/// Added here rather than as a numbered migration for the same reason the
+/// tables themselves are: this module owns them, and `db::schema` cannot create
+/// a column on a table it does not know exists. An `ALTER TABLE … ADD COLUMN`
+/// in a migration would fail outright on a store whose composer had never run.
+/// Adding them from here is idempotent in both directions — a fresh database
+/// and a database written by yesterday's build end up identical.
+///
+///  * `gmail_draft_id` — what `drafts.update` and `drafts.delete` address. Its
+///    presence is also the answer to "has this ever reached Google".
+///  * `gmail_message_id` / `gmail_thread_id` — the ordinary message and thread
+///    ids Gmail filed the draft under. These are what stop one draft becoming
+///    two: the local mirror row adopts them, so the sync pass that later sees
+///    this draft upserts *onto* Mach's row instead of inserting beside it.
+///  * `remote_state` — `pending`, `synced` or `failed`. A draft is never
+///    silently local-only; `failed` is what the composer says out loud.
+const DRAFT_REMOTE_COLUMNS: &[(&str, &str)] = &[
+    ("gmail_draft_id", "TEXT"),
+    ("gmail_message_id", "TEXT"),
+    ("gmail_thread_id", "TEXT"),
+    ("remote_state", "TEXT NOT NULL DEFAULT 'pending'"),
+    ("remote_error", "TEXT"),
+    ("remote_synced_at", "INTEGER NOT NULL DEFAULT 0"),
+];
+
 /// Idempotent. Called by every entry point into this module, so no caller has
 /// to remember it.
 pub fn ensure_compose_schema(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(COMPOSE_SCHEMA)?;
+    add_missing_columns(conn, "compose_drafts", DRAFT_REMOTE_COLUMNS)?;
+    Ok(())
+}
+
+/// `ALTER TABLE … ADD COLUMN` for whatever is not there yet.
+///
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, and a failed `ALTER` inside the
+/// caller's transaction would take the rest of the batch down with it, so the
+/// existing columns are read first.
+fn add_missing_columns(
+    conn: &Connection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> DbResult<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (name, ty) in columns {
+        if existing.iter().any(|c| c == name) {
+            continue;
+        }
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {ty};"))?;
+    }
     Ok(())
 }
 

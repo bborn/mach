@@ -1373,6 +1373,7 @@ fn the_snapshot_is_camel_case_on_the_wire() {
                 name: "send_draft".into(),
                 summary: "Send it".into(),
                 state: ToolState::Running,
+                artifact: None,
             },
         ],
         pending: None,
@@ -1398,4 +1399,99 @@ fn the_snapshot_is_camel_case_on_the_wire() {
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "delta");
     assert_eq!(json["sessionId"], "agent-1");
+}
+
+// ===========================================================================
+// What the agent made
+// ===========================================================================
+//
+// A tool that brings something into being hands back an `Artifact`, and the
+// drawer renders it as a button. Before this, `draft_reply` printed a sentence
+// and the draft was unreachable from anywhere in the app — which is how the
+// owner ended up looking at "Nothing in DRAFT" after being told a reply had
+// been drafted.
+
+#[tokio::test]
+async fn drafting_a_reply_hands_back_something_to_open() {
+    let harness = Harness::new("artifact-draft");
+    let (_account_id, thread_id) = seed(&harness.db);
+
+    let outcome = tools::execute(
+        &harness.tool_context(),
+        "draft_reply",
+        &json!({ "threadId": thread_id, "body": "Both tax items are handled." }),
+    )
+    .await
+    .expect("drafted");
+
+    let artifact = outcome.artifact.expect("a draft is a thing, not a sentence");
+    match artifact {
+        tools::Artifact::Draft {
+            draft_id,
+            thread_id: on_thread,
+            label,
+            ..
+        } => {
+            assert_eq!(
+                Some(draft_id.as_str()),
+                outcome.payload["draft"]["id"].as_str(),
+                "the button has to open the draft the tool actually wrote"
+            );
+            assert_eq!(on_thread, Some(thread_id));
+            assert!(label.starts_with("Re: "), "{label}");
+        }
+        other => panic!("expected a draft artifact, got {other:?}"),
+    }
+
+    // And the list is stale, so the Drafts mailbox repaints without a relaunch.
+    assert!(outcome.mutated);
+}
+
+#[tokio::test]
+async fn a_read_produces_no_artifact_because_it_made_nothing() {
+    let harness = Harness::new("artifact-read");
+    let (_account_id, thread_id) = seed(&harness.db);
+
+    let outcome = tools::execute(
+        &harness.tool_context(),
+        "get_thread",
+        &json!({ "threadId": thread_id }),
+    )
+    .await
+    .expect("read");
+    assert!(outcome.artifact.is_none());
+}
+
+/// The seam is not a special case for drafts: a created event carries one too,
+/// with the instant the grid has to be scrolled to.
+#[test]
+fn an_artifact_survives_the_wire_with_its_ids_intact() {
+    let entry = Entry::Tool {
+        id: "tu-9".into(),
+        name: "createEvent".into(),
+        summary: "Created “Coffee”".into(),
+        state: ToolState::Ok,
+        artifact: Some(tools::Artifact::Event {
+            event_id: 42,
+            start_ms: 1_775_000_000_000,
+            label: "Coffee".into(),
+        }),
+    };
+    let json = serde_json::to_value(&entry).unwrap();
+    assert_eq!(json["artifact"]["kind"], "event");
+    assert_eq!(json["artifact"]["eventId"], 42);
+    assert_eq!(json["artifact"]["startMs"], 1_775_000_000_000i64);
+    assert_eq!(json["artifact"]["label"], "Coffee");
+
+    // A tool line that made nothing does not carry the key at all, rather than
+    // carrying a null the frontend would have to test for.
+    let plain = serde_json::to_value(Entry::Tool {
+        id: "tu-1".into(),
+        name: "archive".into(),
+        summary: "Archived 3 conversations".into(),
+        state: ToolState::Ok,
+        artifact: None,
+    })
+    .unwrap();
+    assert!(plain.get("artifact").is_none());
 }

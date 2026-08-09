@@ -13,6 +13,7 @@ import {
   requestAsk,
   subscribeAsk,
   UNKNOWN_BACKEND,
+  artifactAction,
   loadBackendStatus,
   type AgentEvent,
   type AgentSession,
@@ -348,5 +349,65 @@ describe("the backend status", () => {
   it("carries the label a session is tagged with", () => {
     const s = session({ backend: "Claude Code" });
     expect(s.backend).toBe("Claude Code");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* what the agent made                                                         */
+/* -------------------------------------------------------------------------- */
+
+describe("artifacts", () => {
+  it("keeps what a tool made when the line is updated in place", () => {
+    // The running line has no artifact — the tool has not finished. The
+    // completed line replaces it, and the thing it made has to survive that,
+    // because the running line is the one already on screen.
+    let s = session();
+    s = reduceSession(s, {
+      type: "entry",
+      sessionId: s.id,
+      entry: { role: "tool", id: "tu-1", name: "draft_reply", summary: "Writing a reply…", state: "running" },
+    });
+    s = reduceSession(s, {
+      type: "entry",
+      sessionId: s.id,
+      entry: {
+        role: "tool",
+        id: "tu-1",
+        name: "draft_reply",
+        summary: "Drafted “Re: Bookkeeper”",
+        state: "ok",
+        artifact: {
+          kind: "draft",
+          draftId: "draft-19fe",
+          threadId: 41774,
+          accountId: 1,
+          label: "Re: Bookkeeper",
+        },
+      },
+    });
+
+    expect(s.entries).toHaveLength(2);
+    const tool = s.entries[1];
+    expect(tool.role).toBe("tool");
+    if (tool.role !== "tool") throw new Error("unreachable");
+    expect(tool.artifact).toEqual({
+      kind: "draft",
+      draftId: "draft-19fe",
+      threadId: 41774,
+      accountId: 1,
+      label: "Re: Bookkeeper",
+    });
+  });
+
+  it("names the action after the thing, not after the tool", () => {
+    expect(
+      artifactAction({ kind: "draft", draftId: "d", accountId: 1, label: "Re: x" }),
+    ).toBe("Open draft");
+    expect(artifactAction({ kind: "thread", threadId: 2, label: "x" })).toBe(
+      "Open conversation",
+    );
+    expect(artifactAction({ kind: "event", eventId: 3, startMs: 0, label: "x" })).toBe(
+      "Show event",
+    );
   });
 });

@@ -116,15 +116,36 @@ pub async fn dispatch(
             Ok(json!({ "draft": found }))
         }
 
+        // Three writes, in the order the invariant demands: the draft row, the
+        // mirror that puts it in the Drafts mailbox, and only then Gmail —
+        // which is spawned, not awaited, so this call costs SQLite and nothing
+        // else. See `compose::mirror` and `compose::remote`.
         "saveDraft" => {
             let parsed = parse_draft(&payload)?;
             let saved = draft::save_draft(db, &parsed, now)?;
+            let thread_id = engine::mirror::mirror(db, &saved, now)?;
+            // A draft started from nothing now has a conversation to live in,
+            // and the row has to know which — otherwise reopening it from the
+            // Drafts mailbox would find no draft on that thread.
+            let saved = if saved.thread_id.is_none() {
+                draft::save_draft(
+                    db,
+                    &Draft {
+                        thread_id: Some(thread_id),
+                        ..saved
+                    },
+                    now,
+                )?
+            } else {
+                saved
+            };
+            engine::remote::spawn_push(db.clone(), outbox.clients(), saved.id.clone(), now);
             Ok(json!({ "draft": saved }))
         }
 
         "discardDraft" => {
             let id = required_str(&payload, "draftId")?;
-            draft::delete_draft(db, &id)?;
+            forget_draft(db, outbox, &id)?;
             Ok(json!({ "ok": true }))
         }
 
@@ -158,8 +179,9 @@ pub async fn dispatch(
                 .unwrap_or(now + UNDO_WINDOW_MS);
             let entry = outbox.queue(&built, now, send_after)?;
             // The draft has become a message; keeping it would re-open an empty
-            // composer on the thread that now contains the reply.
-            draft::delete_draft(db, &parsed.id)?;
+            // composer on the thread that now contains the reply — and leave a
+            // copy of the unsent text in his Drafts on every device.
+            forget_draft(db, outbox, &parsed.id)?;
             Ok(json!({
                 "entry": entry,
                 "undoUntil": send_after,
@@ -174,11 +196,22 @@ pub async fn dispatch(
         }
 
         "flush" => {
+            // Drafts written while the network was down are pushed here too.
+            // The frontend flushes on mount, so "the app was offline yesterday"
+            // resolves itself at launch rather than staying local for ever.
+            let pushed = engine::remote::DraftRemoteSync::new(db.clone(), outbox.clients())
+                .push_pending(now)
+                .await
+                .unwrap_or(0);
             let outcomes = outbox.flush_due(now).await?;
             // A day is long enough for "sent" to have been seen and short
             // enough that the table does not become a mail archive.
             let _ = outbox.forget_sent(now - 86_400_000);
-            Ok(json!({ "outcomes": outcomes, "pending": outbox.pending()? }))
+            Ok(json!({
+                "outcomes": outcomes,
+                "pending": outbox.pending()?,
+                "draftsPushed": pushed,
+            }))
         }
 
         "outbox" => Ok(json!({ "pending": outbox.pending()?, "all": outbox.list()? })),
@@ -197,6 +230,36 @@ pub async fn dispatch(
             "unknown compose operation {other:?}"
         ))),
     }
+}
+
+/// Forget a draft everywhere it exists: the row, the mirror in the mailbox, and
+/// Gmail.
+///
+/// The three have to go together. Leaving the mirror leaves a phantom in the
+/// Drafts list with nothing behind it; leaving the Gmail draft leaves the copy
+/// on his phone, which is the same bug as the original one seen from the other
+/// end — the app and the mailbox disagreeing about what exists.
+fn forget_draft(
+    db: &crate::db::Db,
+    outbox: &Outbox,
+    draft_id: &str,
+) -> Result<(), ComposeError> {
+    let existing = draft::load_draft(db, draft_id)?;
+    if let Some(draft) = &existing {
+        engine::mirror::unmirror(db, draft)?;
+    }
+    draft::delete_draft(db, draft_id)?;
+    if let Some(draft) = existing {
+        if let Some(remote_id) = draft.remote.draft_id {
+            engine::remote::spawn_delete(
+                db.clone(),
+                outbox.clients(),
+                remote_id,
+                draft.account_id,
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

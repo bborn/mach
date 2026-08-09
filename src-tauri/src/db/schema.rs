@@ -46,7 +46,33 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 7,
         sql: M7_EVENT_DETAIL,
     },
+    Migration {
+        version: 8,
+        sql: M8_DRAFT_LOOKUP,
+    },
 ];
+
+/// Migration 8 — find a conversation by the draft in it.
+///
+/// The Drafts mailbox used to be "threads carrying Gmail's `DRAFT` label", read
+/// out of `thread_labels`, and that turned out to be a set the app cannot keep.
+/// `sync_queries::recompute_thread` rebuilds every derived field on `threads`
+/// from the per-message label union on each pass — which is exactly what makes
+/// a replayed history batch converge — so a `DRAFT` row written locally for a
+/// draft Google has not told us about yet is dropped by the next sync. The
+/// draft was in the mailbox, and then quietly was not.
+///
+/// So the Drafts mailbox reads `messages.is_draft` as well (see
+/// `queries::list_threads`), which is the same fact from the side that is
+/// durable: it is set locally when Mach mirrors a draft, and set by
+/// `sync::convert` from Gmail's own `DRAFT` label on the way in. This is the
+/// index that makes that second test a seek rather than a scan.
+///
+/// Partial, because drafts are a handful of rows in a table with tens of
+/// thousands: the index holds only the threads that actually have one.
+const M8_DRAFT_LOOKUP: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_messages_draft ON messages (thread_id) WHERE is_draft = 1;
+"#;
 
 /// Migration 7 — what makes an event a meeting rather than a block of colour.
 ///

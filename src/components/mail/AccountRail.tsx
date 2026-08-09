@@ -1,169 +1,109 @@
-import {
-  Archive,
-  Bookmark,
-  Clock,
-  FileText,
-  Inbox,
-  Mail,
-  Plus,
-  Send,
-  Star,
-  Tag,
-  Trash2,
-  TriangleAlert,
-  X,
-  type LucideIcon,
-} from "lucide-react";
-import { Fragment, useEffect, useMemo, useRef } from "react";
-import type { AccountId } from "@/types";
+import { ChevronDown, ChevronRight, X } from "lucide-react";
+import { useEffect, useMemo, useRef } from "react";
+import type { ThreadId } from "@/types";
 import { useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
-import { ACCOUNT_BG } from "@/lib/colors";
-import { favoriteKey } from "@/lib/favorites";
+import { useUiSession } from "@/components/prefs/PreferencesProvider";
 import { railMailboxes } from "@/lib/mailboxes";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
-
-const SYSTEM_ICONS: Record<string, LucideIcon> = {
-  INBOX: Inbox,
-  STARRED: Star,
-  SNOOZED: Clock,
-  DRAFT: FileText,
-  SENT: Send,
-  ARCHIVE: Archive,
-  SPAM: TriangleAlert,
-  TRASH: Trash2,
-};
-
-interface RailItem {
-  key: string;
-  /** Heading rendered immediately above this row, if it opens a section. */
-  section?: string;
-  active: boolean;
-  activate: () => void;
-  leading: React.ReactNode;
-  label: string;
-  count?: number;
-  title?: string;
-  onRemove?: () => void;
-  removeTitle?: string;
-}
+import { railItems, railStep, type RailItem, type RailSection } from "./rail-model";
+import { useInboxUnread } from "./use-inbox-unread";
 
 /**
- * The rail is a list, and lists are navigable.
+ * The rail is a tree, and trees are navigable.
  *
  * Every row here is reachable with the keyboard: Tab moves the keyboard into
- * the rail, `j`/`k` walk it, Enter picks a mailbox and hands the keyboard back
- * to the list, Escape hands it back without changing anything. ⌘K still jumps
- * to any mailbox by name — this is the path for the times you know where the
- * row is on screen and do not want to open a dialog to reach it.
+ * the rail, `j`/`k` walk it, `←`/`→` fold and unfold the sections and step
+ * between a heading and its children, Enter picks a mailbox and hands the
+ * keyboard back to the list, Escape hands it back without changing anything.
+ * ⌘K still jumps to any mailbox by name, and ⌃1–5 still filters to an account
+ * without leaving the mailbox you are in — the rail's account rows are the
+ * other gesture, "that account's inbox", which is what nesting them promises.
  *
- * The rows are built as data first so the keyboard and the pointer walk exactly
- * the same list, in exactly the same order, including favorites and anything
- * below the fold.
+ * The rows themselves are built in `rail-model.tsx`; this is the wiring.
  */
 export function AccountRail() {
-  const { accounts, labels, allThreads, ui, favorites, dispatch, actions, isUnread } = useMach();
+  const { accounts, labels, ui, favorites, dispatch, actions } = useMach();
   const scroller = useRef<HTMLDivElement>(null);
 
-  const unreadByAccount = useMemo(() => {
-    const counts = new Map<AccountId, number>();
-    for (const thread of allThreads) {
-      if (!isUnread(thread) || !thread.labelIds.includes("INBOX")) continue;
-      counts.set(thread.accountId, (counts.get(thread.accountId) ?? 0) + 1);
-    }
-    return counts;
-  }, [allThreads, isUnread]);
+  /*
+   * Which sections are folded — remembered across launches.
+   *
+   * Session state, not a setting: nobody would look for it in ⌘,, and the app
+   * simply ought to be where you left it. The calendar sidebar already keeps
+   * its folded groups here; this is the same mechanism, not a second one.
+   */
+  const { session, remember } = useUiSession();
+  const collapsed = session.collapsedRailSections ?? [];
+  const toggleSection = (section: RailSection) =>
+    remember({
+      collapsedRailSections: collapsed.includes(section)
+        ? collapsed.filter((id) => id !== section)
+        : [...collapsed, section],
+    });
 
-  const totalUnread = useMemo(
-    () => [...unreadByAccount.values()].reduce((sum, n) => sum + n, 0),
-    [unreadByAccount],
+  /*
+   * Anything the UI has already taken out of the inbox or marked read, but that
+   * the backend has not confirmed yet. The badge has to fall with the rows, not
+   * a round trip later — an archive-everything gesture that empties the list
+   * while the rail still claims fifty unread is the exact lie this guards.
+   */
+  const suppressed = useMemo<ReadonlySet<ThreadId>>(
+    () => new Set<ThreadId>([...ui.archived, ...ui.readExtra]),
+    [ui.archived, ui.readExtra],
   );
+  const unread = useInboxUnread(suppressed);
 
   // The rail carries the mailboxes you navigate to, not every label Gmail has.
-  // Labels live in ⌘K, and the ones worth a permanent row you favorite.
-  const mailboxes = useMemo(() => railMailboxes(labels), [labels]);
+  // Labels live in ⌘K, and the ones worth a permanent row you favorite. Inbox
+  // is not among them any more: it is the section these sit under.
+  const mailboxes = useMemo(
+    () => railMailboxes(labels).filter((label) => label.id !== "INBOX"),
+    [labels],
+  );
 
-  const items = useMemo<RailItem[]>(() => {
-    const rows: RailItem[] = [
-      {
-        key: "account:all",
-        section: "Accounts",
-        active: ui.accountId === null,
-        activate: () => dispatch({ type: "account", accountId: null }),
-        leading: <span className="h-1.5 w-1.5 rounded-full bg-foreground" />,
-        label: "All accounts",
-        count: totalUnread,
-      },
-      ...accounts.map((account) => ({
-        key: `account:${account.id}`,
-        active: ui.accountId === account.id,
-        activate: () => dispatch({ type: "account", accountId: account.id }),
-        leading: (
-          <span className={cn("h-1.5 w-1.5 rounded-full", ACCOUNT_BG[account.colorIndex])} />
-        ),
-        // The full address, not the local part. With five accounts the bit
-        // before the @ is often identical across them, which makes the rail
-        // ambiguous exactly when it matters most.
-        label: account.email,
-        count: unreadByAccount.get(account.id) ?? 0,
-        title: account.email,
-      })),
-      ...favorites.map((favorite, index) => {
-        const key = favoriteKey(favorite);
-        return {
-          key: `favorite:${key}`,
-          section: index === 0 ? "Favorites" : undefined,
-          active:
-            favorite.kind === "mailbox"
-              ? ui.labelId === favorite.labelId && ui.accountId === favorite.accountId
-              : ui.threadId === favorite.threadId,
-          activate: () => actions.openFavorite(favorite),
-          leading:
-            favorite.kind === "thread" ? (
-              <Mail size={13} strokeWidth={1.75} className="text-faint-foreground" />
-            ) : (
-              <Bookmark size={13} strokeWidth={1.75} className="text-faint-foreground" />
-            ),
-          label: favorite.name,
-          title: favorite.name,
-          onRemove: () => actions.unfavorite(key),
-          removeTitle: `Remove ${favorite.name} from favorites`,
-        };
-      }),
-      ...mailboxes.map((label, index) => {
-        const Icon = SYSTEM_ICONS[label.id] ?? Tag;
-        return {
-          key: `mailbox:${label.id}`,
-          section: index === 0 ? "Mailboxes" : undefined,
-          active: ui.labelId === label.id,
-          activate: () => dispatch({ type: "label", labelId: label.id }),
-          leading: <Icon size={13} strokeWidth={1.75} className="text-faint-foreground" />,
-          label: label.name,
-        };
-      }),
-      {
-        key: "add-account",
-        section: "Account",
-        active: false,
-        activate: () => dispatch({ type: "addAccount", open: true }),
-        leading: <Plus size={13} strokeWidth={1.75} className="text-faint-foreground" />,
-        label: "Add account",
-      },
-    ];
-    return rows;
-  }, [
-    accounts,
-    favorites,
-    mailboxes,
-    totalUnread,
-    unreadByAccount,
-    ui.accountId,
-    ui.labelId,
-    ui.threadId,
-    dispatch,
-    actions,
-  ]);
+  const items = useMemo<RailItem[]>(
+    () =>
+      railItems(
+        {
+          accounts,
+          mailboxes,
+          favorites,
+          accountId: ui.accountId,
+          labelId: ui.labelId,
+          threadId: ui.threadId,
+          unread,
+          collapsed,
+        },
+        {
+          open: (accountId, labelId) => {
+            dispatch({ type: "account", accountId });
+            dispatch({ type: "label", labelId });
+          },
+          openLabel: (labelId) => dispatch({ type: "label", labelId }),
+          openCalendar: () => actions.setMode("calendar"),
+          openFavorite: (favorite) => actions.openFavorite(favorite),
+          unfavorite: (key) => actions.unfavorite(key),
+          toggle: toggleSection,
+        },
+      ),
+    // `toggleSection` is rebuilt every render but closes over nothing except
+    // `collapsed` and the store's own setter, so `collapsed` is the dependency
+    // that actually decides both which rows exist and what folding one does.
+    [
+      accounts,
+      mailboxes,
+      favorites,
+      unread,
+      collapsed,
+      ui.accountId,
+      ui.labelId,
+      ui.threadId,
+      dispatch,
+      actions,
+    ],
+  );
 
   const railActive = ui.mode === "mail" && !ui.paletteOpen && ui.focus === "rail";
 
@@ -207,6 +147,14 @@ export function AccountRail() {
     dispatch({ type: "railIndex", index: next });
   };
 
+  const step = (direction: "in" | "out") => {
+    const outcome = railStep(items, focusedIndex, direction);
+    if (outcome.kind === "toggle") toggleSection(outcome.section);
+    else if (outcome.kind === "move") dispatch({ type: "railIndex", index: outcome.index });
+  };
+
+  const focused = items[focusedIndex];
+
   useKeyBindings([
     {
       keys: "j",
@@ -225,12 +173,46 @@ export function AccountRail() {
     { keys: "down", when: () => railActive, handler: () => move(1) },
     { keys: "up", when: () => railActive, handler: () => move(-1) },
     {
+      keys: "left",
+      group: "Sidebar",
+      description: "Fold the section, or step out to it",
+      when: () => railActive,
+      handler: () => step("out"),
+    },
+    {
+      keys: "right",
+      group: "Sidebar",
+      description: "Unfold the section, or step into it",
+      when: () => railActive,
+      handler: () => step("in"),
+    },
+    {
+      // Space is the platform's "operate the thing under the cursor" and costs
+      // nothing here: the rail is not a text surface and does not scroll by page.
+      // Declined on a row with nothing to fold, so it falls through rather than
+      // being swallowed.
+      keys: "space",
+      when: () => railActive,
+      handler: () => {
+        if (!focused?.section) return false;
+        toggleSection(focused.section);
+      },
+    },
+    {
       keys: "enter",
       group: "Sidebar",
       description: "Open, and hand the keyboard back to the list",
       when: () => railActive,
       handler: () => {
-        items[focusedIndex]?.activate();
+        // A heading that only folds has nowhere to send you, so Enter folds it
+        // and the keyboard stays where it is rather than being handed to a list
+        // that did not change.
+        if (!focused) return;
+        if (!focused.activate) {
+          if (focused.section) toggleSection(focused.section);
+          return;
+        }
+        focused.activate();
         actions.setFocus("list");
       },
     },
@@ -249,80 +231,123 @@ export function AccountRail() {
   return (
     <ScrollArea
       ref={scroller}
-      role="listbox"
+      role="tree"
       aria-label="Mailboxes"
-      className="w-rail flex-none border-r border-border bg-surface"
+      className="w-rail flex-none border-r border-border bg-surface py-1"
     >
-      {items.map((item, index) => (
-        <Fragment key={item.key}>
-          {item.section && (
-            <SectionLabel className={index === 0 ? undefined : "mt-3"}>
-              {item.section}
-            </SectionLabel>
-          )}
-          <RailRow item={item} index={index} focused={index === focusedIndex} />
-        </Fragment>
-      ))}
+      {items.map((item, index) => {
+        const section = item.section;
+        return (
+          <RailRow
+            key={item.key}
+            item={item}
+            index={index}
+            focused={index === focusedIndex}
+            onToggle={section ? () => toggleSection(section) : undefined}
+          />
+        );
+      })}
       <div className="h-3" />
     </ScrollArea>
   );
 }
 
-function SectionLabel({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <div
-      className={cn(
-        "px-3 pb-1 pt-2 text-micro font-medium uppercase tracking-[0.06em] text-faint-foreground",
-        className,
-      )}
-    >
-      {children}
-    </div>
-  );
-}
-
-function RailRow({
+export function RailRow({
   item,
   index,
   focused,
+  onToggle,
 }: {
   item: RailItem;
   index: number;
   focused: boolean;
+  onToggle?: () => void;
 }) {
-  const { active, label, count, title, leading, onRemove, removeTitle } = item;
+  const { active, label, count, countSuffix, title, leading, onRemove, removeTitle } = item;
+  const surface = item.surface === true;
   return (
     // The row is a button, so the unpin control cannot be nested inside it —
-    // it sits alongside, and the group hover is what ties them together.
+    // it sits alongside, and the group hover is what ties them together. The
+    // disclosure is a third button for the same reason, and because folding a
+    // section and navigating into it are different intents.
     <div
-      className={cn(
-        "group relative flex h-7 w-full items-center",
-        active ? "bg-surface-raised" : "hover:bg-row-hover",
-        // Focused and active are different facts — where the keyboard is, and
-        // which mailbox you are in — so they get different marks: an outline
-        // for the one, a fill and an edge for the other.
-        focused && "ring-1 ring-inset ring-accent",
-      )}
+      className={cn("group relative flex h-7 w-full items-center px-1", item.spaced && "mt-2")}
     >
-      {active && <span className="absolute inset-y-0 left-0 w-[2px] bg-accent" />}
+      <div
+        className={cn(
+          // Edge to edge, not an inset pill: the rail is a column of places and
+          // the selected one is the whole width of the column. Selected and
+          // focused are different facts — which mailbox you are in, and where
+          // the keyboard is — so they get different marks.
+          "pointer-events-none absolute inset-0",
+          active && "bg-row-selected",
+          focused && "ring-1 ring-inset ring-accent",
+        )}
+      />
+      {onToggle ? (
+        <button
+          type="button"
+          // Not in the tab order and not a rail index: `←`/`→` operate it, and a
+          // second stop per section would double the length of the walk.
+          tabIndex={-1}
+          aria-label={`${item.expanded ? "Collapse" : "Expand"} ${label}`}
+          onClick={onToggle}
+          className="z-10 flex h-full w-3.5 shrink-0 items-center justify-center text-muted-foreground hover:text-foreground"
+        >
+          {item.expanded ? (
+            <ChevronDown size={11} strokeWidth={2} />
+          ) : (
+            <ChevronRight size={11} strokeWidth={2} />
+          )}
+        </button>
+      ) : (
+        <span className="w-3.5 shrink-0" />
+      )}
       <button
         type="button"
         data-rail-index={index}
-        role="option"
+        data-rail-key={item.key}
+        role="treeitem"
+        aria-level={item.level}
         aria-selected={active}
+        aria-expanded={item.section ? item.expanded : undefined}
         tabIndex={focused ? 0 : -1}
-        onClick={item.activate}
+        onClick={item.activate ?? onToggle}
         title={title}
         className={cn(
-          "flex h-full min-w-0 flex-1 items-center gap-2 pl-3 pr-2 text-list outline-none",
-          active ? "text-foreground" : "text-muted-foreground group-hover:text-foreground",
+          // Every row is a row, including the ones that head a section. A
+          // section heading drawn as a tiny uppercase label reads as a caption,
+          // and a *folded* one reads as a caption with nothing under it — which
+          // looks broken rather than folded. Weight carries the distinction
+          // instead: surfaces heavy, groupings quiet.
+          "z-10 flex h-full min-w-0 flex-1 items-center gap-1.5 pl-1 pr-1 text-left text-list outline-none",
+          item.level === 2 && "pl-3.5",
+          active || surface
+            ? "font-medium text-foreground"
+            : "text-muted-foreground group-hover:text-foreground",
+          // An unread count is the reason to look at the row, so the row leans
+          // into it the way Gmail's mailbox list does.
+          !active && count ? "font-medium text-foreground" : undefined,
         )}
       >
-        <span className="flex w-3.5 shrink-0 justify-center">{leading}</span>
-        <span className="min-w-0 flex-1 truncate text-left">{label}</span>
+        <span
+          className={cn(
+            "flex w-3.5 shrink-0 items-center justify-center",
+            active ? "text-accent" : surface ? "text-muted-foreground" : undefined,
+          )}
+        >
+          {leading}
+        </span>
+        <span className="min-w-0 flex-1 truncate">{label}</span>
         {count ? (
-          <span className="shrink-0 font-mono text-micro tabular-nums text-faint-foreground">
+          <span
+            className={cn(
+              "shrink-0 font-mono text-micro tabular-nums",
+              active ? "text-foreground" : "text-muted-foreground",
+            )}
+          >
             {count}
+            {countSuffix}
           </span>
         ) : null}
       </button>
@@ -333,7 +358,7 @@ function RailRow({
           title={removeTitle}
           aria-label={removeTitle}
           tabIndex={-1}
-          className="mr-1.5 hidden h-4 w-4 shrink-0 items-center justify-center rounded-[var(--radius)] text-faint-foreground hover:text-foreground group-hover:flex"
+          className="z-10 mr-1 hidden h-4 w-4 shrink-0 items-center justify-center rounded-[var(--radius)] text-faint-foreground hover:text-foreground group-hover:flex"
         >
           <X size={11} strokeWidth={2} />
         </button>

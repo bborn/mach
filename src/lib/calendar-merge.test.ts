@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CalendarEvent } from "@/types";
 import { mergeDuplicates, mergeKey, normaliseTitle } from "./calendar-merge";
 import { assignHues, CALENDAR_HUES, hashString, paintFor, toneFor } from "./calendar-palette";
+import { oklchHue } from "./colors";
 
 const START = new Date(2026, 7, 3, 10, 0, 0, 0).getTime();
 const END = START + 3_600_000;
@@ -136,24 +137,26 @@ describe("the calendar palette", () => {
   });
 
   it("encodes status as fill treatment, never as a second hue", () => {
-    const accepted = paintFor(0, toneFor("accepted"), { dark: false });
-    const pending = paintFor(0, toneFor("needsAction"), { dark: false });
-    expect(accepted.background).toBe(pending.timeColor.replace(/0\.48/, "0.54"));
-    // White fill, dark title, hue kept for the time and the border (§6).
+    const accepted = paintFor("#16a765", toneFor("accepted"), { dark: false });
+    const pending = paintFor("#16a765", toneFor("needsAction"), { dark: false });
+    // The unanswered block is the same hue as the accepted one, moved only in
+    // lightness so it can be read as ink on the page rather than as a ground.
+    expect(oklchHue(pending.timeColor)).toBeCloseTo(oklchHue(accepted.background)!, 0);
+    // Page-coloured fill, dark title, hue kept for the time and the border (§6).
     expect(pending.background).toBe("var(--background)");
     expect(pending.color).toBe("var(--foreground)");
     expect(pending.border).toBeDefined();
   });
 
   it("pushes a past event back with opacity, keeping its hue", () => {
-    const past = paintFor(3, "solid", { dark: false, past: true });
-    const now = paintFor(3, "solid", { dark: false });
+    const past = paintFor("#4986e7", "solid", { dark: false, past: true });
+    const now = paintFor("#4986e7", "solid", { dark: false });
     expect(past.opacity).toBe(0.6);
     expect(past.background).toBe(now.background);
   });
 
   it("strikes a declined event through rather than recolouring it", () => {
-    const declined = paintFor(2, toneFor("declined"), { dark: false });
+    const declined = paintFor("#8e24aa", toneFor("declined"), { dark: false });
     expect(declined.strikethrough).toBe(true);
     expect(declined.background).toBe("var(--background)");
   });

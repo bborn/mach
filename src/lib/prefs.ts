@@ -31,7 +31,6 @@
  *   | preference | who reads it |
  *   |---|---|
  *   | `theme` | `useMach` — mirrors it into `ui.theme`, which paints `.dark` |
- *   | `density` | `PreferencesProvider` → `data-density` → `globals.css` |
  *   | `defaultAccountId` | `ComposerDock`, when `c` has no account to infer |
  *   | `signatures` | `ComposerDock`, on every draft it opens |
  *   | `undoWindowSeconds` | `useMach` — how long the undo affordance lingers |
@@ -69,7 +68,6 @@ import { isTauri } from "./ipc";
 /* The model                                                                   */
 /* -------------------------------------------------------------------------- */
 
-export type Density = "comfortable" | "compact";
 export type Theme = "system" | "light" | "dark";
 
 /**
@@ -106,7 +104,6 @@ export interface Preferences {
   defaultAccountId: number | null;
   /** Account id (as a string key) to plain-text signature. */
   signatures: Record<string, string>;
-  density: Density;
   theme: Theme;
   syncIntervalSeconds: number;
   /**
@@ -166,7 +163,6 @@ export interface Preferences {
 export const DEFAULT_PREFERENCES: Preferences = {
   defaultAccountId: null,
   signatures: {},
-  density: "comfortable",
   theme: "system",
   syncIntervalSeconds: 60,
   undoWindowSeconds: 20,
@@ -202,7 +198,6 @@ export const SEND_DELAY_BOUNDS: Bounds = { min: 0, max: 300 };
 /* -------------------------------------------------------------------------- */
 
 const AGENT_BACKENDS = new Set<string>(["auto", "claudeCli", "anthropicApi", "command"]);
-const DENSITIES = new Set<string>(["comfortable", "compact"]);
 const THEMES = new Set<string>(["system", "light", "dark"]);
 const WEEK_STARTS = new Set<number>([0, 1, 6]);
 
@@ -280,6 +275,10 @@ function flag(value: unknown, fallback: boolean): boolean {
 /**
  * Whatever the store handed back, as a `Preferences` that is definitely a
  * `Preferences`. Unknown keys are ignored; missing and malformed ones default.
+ *
+ * Ignoring unknown keys is also what retires a preference: `density` was a row
+ * in this table until the app settled on one display, and the stores that still
+ * have that row need no migration — nothing reads it, so nothing sees it.
  */
 export function parsePreferences(raw: unknown): Preferences {
   const source = isRecord(raw) ? raw : {};
@@ -293,9 +292,6 @@ export function parsePreferences(raw: unknown): Preferences {
         ? accountId
         : null,
     signatures: signatures(source.signatures),
-    density: typeof source.density === "string" && DENSITIES.has(source.density)
-      ? (source.density as Density)
-      : d.density,
     theme: typeof source.theme === "string" && THEMES.has(source.theme)
       ? (source.theme as Theme)
       : d.theme,
@@ -581,6 +577,8 @@ export interface UiSession {
   listWidth: number;
   /** Account ids whose calendar group is folded up in the sidebar. */
   collapsedCalendarAccounts: number[];
+  /** Mail rail sections folded up — `"inbox"`, `"folders"`, `"favorites"`. */
+  collapsedRailSections: string[];
 }
 
 /** The key the session blob lives under. Alphanumeric, like every other key. */
@@ -629,6 +627,14 @@ export function parseSession(raw: unknown): Partial<UiSession> {
   if (Array.isArray(raw.collapsedCalendarAccounts)) {
     out.collapsedCalendarAccounts = raw.collapsedCalendarAccounts.filter(
       (id): id is number => typeof id === "number" && Number.isInteger(id),
+    );
+  }
+  // Section ids are not validated against the rail's own list on purpose: a
+  // section that no longer exists is inert, and dropping unknown ids here would
+  // silently forget a section belonging to a newer build the user also runs.
+  if (Array.isArray(raw.collapsedRailSections)) {
+    out.collapsedRailSections = raw.collapsedRailSections.filter(
+      (id): id is string => typeof id === "string" && id.length > 0,
     );
   }
 

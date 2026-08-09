@@ -11,10 +11,12 @@ import {
 import { useEffect, useRef, useState } from "react";
 import {
   approve,
+  artifactAction,
   deny,
   removeContext,
   sendMessage,
   type AgentSession,
+  type Artifact,
   type ContextItem,
   type Entry,
 } from "@/lib/agent";
@@ -36,7 +38,10 @@ import { Kbd } from "@/components/ui/kbd";
  *   it feel like talking about the screen; showing it is what stops the agent
  *   silently working from the wrong thing;
  * - **the conversation**, with each tool call as its own line so "what is it
- *   doing" never needs a guess;
+ *   doing" never needs a guess — and, where the call *made* something, a button
+ *   that opens it. The agent used to say it had drafted a reply and leave the
+ *   draft unreachable from anywhere in the app; a sentence is not an
+ *   affordance, and this is the row that fixes it;
  * - **the approval bar**, when an outbound action is waiting. It names the
  *   consequence — who, and when — because approving a sentence you cannot read
  *   is not approving anything.
@@ -45,10 +50,13 @@ export function AgentDrawer({
   session,
   onMinimise,
   onClose,
+  onOpenArtifact,
 }: {
   session: AgentSession;
   onMinimise: () => void;
   onClose: () => void;
+  /** Put the owner in front of something a tool made. See `Artifact`. */
+  onOpenArtifact: (artifact: Artifact) => void;
 }) {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -106,7 +114,11 @@ export function AgentDrawer({
 
       <div ref={scroller} className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
         {session.entries.map((entry, index) => (
-          <EntryRow key={rowKey(entry, index)} entry={entry} />
+          <EntryRow
+            key={rowKey(entry, index)}
+            entry={entry}
+            onOpenArtifact={onOpenArtifact}
+          />
         ))}
         {session.streaming && (
           <p className="whitespace-pre-wrap py-1 text-list text-foreground">
@@ -222,7 +234,13 @@ function ContextChip({ sessionId, item }: { sessionId: string; item: ContextItem
   );
 }
 
-function EntryRow({ entry }: { entry: Entry }) {
+function EntryRow({
+  entry,
+  onOpenArtifact,
+}: {
+  entry: Entry;
+  onOpenArtifact: (artifact: Artifact) => void;
+}) {
   if (entry.role === "user") {
     return (
       <p className="border-l-2 border-accent py-1 pl-2 text-list text-muted-foreground">
@@ -248,6 +266,19 @@ function EntryRow({ entry }: { entry: Entry }) {
         <Wrench size={10} strokeWidth={2} className="shrink-0" />
       )}
       <span className="truncate">{entry.summary}</span>
+      {entry.artifact && (
+        <button
+          type="button"
+          onClick={() => onOpenArtifact(entry.artifact!)}
+          className={cn(
+            "shrink-0 rounded-[var(--radius)] border border-border px-1.5 font-sans",
+            "text-accent hover:border-border-strong hover:brightness-110",
+            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent",
+          )}
+        >
+          {artifactAction(entry.artifact)}
+        </button>
+      )}
       <span className="shrink-0 text-faint-foreground opacity-60">{entry.name}</span>
     </p>
   );
