@@ -1,10 +1,12 @@
 /**
  * The undo toast, tested as three claims and some markup.
  *
- * The claims are the ones the surface exists to make. That it lives exactly as
- * long as the preference says — the toast is the undo *offer*, and an offer
- * that outlasts or undershoots the window the user chose is a different
- * feature. That a run of archives is one card and not a wall of them. And that
+ * The claims are the ones the surface exists to make. That it goes away on its
+ * own, and quickly — the preference caps it downward but cannot stretch it,
+ * because "how long undo is available" and "how long a card covers the corner
+ * of the window" turned out to be different questions with one answer, and
+ * twenty seconds is only a sane answer to the first. That a run of archives is
+ * one card and not a wall of them. And that
  * a failure is told apart from a confirmation by something other than its
  * wording, because the wording is the one thing a screen reader user cannot
  * see.
@@ -17,7 +19,12 @@
 
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ERROR_HOLD, statusLifetime, type StatusMessage } from "@/hooks/useMach";
+import {
+  ERROR_HOLD,
+  TOAST_MAX_MS,
+  statusLifetime,
+  type StatusMessage,
+} from "@/hooks/useMach";
 import { DEFAULT_PREFERENCES, undoWindowMs } from "@/lib/prefs";
 import { ToastLayer, collapse, noToast, offerFor, type ToastAction } from "./Toast";
 
@@ -57,25 +64,30 @@ function render(props: Partial<Parameters<typeof ToastLayer>[0]> = {}): string {
 }
 
 describe("how long a toast lives", () => {
-  it("is the undo window, and nothing else", () => {
+  it("is capped, so the default undo window does not park a card for 20s", () => {
+    // The two were the same number and the card read as stuck. Undo stays
+    // offered for as long as the preference says; the *card* does not.
     const window = undoWindowMs(DEFAULT_PREFERENCES);
-    expect(statusLifetime(status(), window)).toBe(window);
+    expect(window).toBeGreaterThan(TOAST_MAX_MS);
+    expect(statusLifetime(status(), window)).toBe(TOAST_MAX_MS);
   });
 
-  it("follows the preference when the preference moves", () => {
-    // The point of reading it rather than hardcoding: a person who sets the
-    // window to five seconds is saying how long they want to be offered the
-    // button, and the button is on the toast.
-    const short = undoWindowMs({ ...DEFAULT_PREFERENCES, undoWindowSeconds: 5 });
-    const long = undoWindowMs({ ...DEFAULT_PREFERENCES, undoWindowSeconds: 45 });
-    expect(statusLifetime(status(), short)).toBe(5_000);
-    expect(statusLifetime(status(), long)).toBe(45_000);
+  it("follows the preference when the preference is shorter than the cap", () => {
+    // Someone who sets a three-second window has said something about how long
+    // they want to be interrupted, and the toast must not outlive the offer.
+    const short = undoWindowMs({ ...DEFAULT_PREFERENCES, undoWindowSeconds: 3 });
+    expect(statusLifetime(status(), short)).toBe(3_000);
+  });
+
+  it("does not grow past the cap however large the window is", () => {
+    const long = undoWindowMs({ ...DEFAULT_PREFERENCES, undoWindowSeconds: 300 });
+    expect(statusLifetime(status(), long)).toBe(TOAST_MAX_MS);
   });
 
   it("holds a failure longer than a confirmation, off the same number", () => {
     const window = undoWindowMs(DEFAULT_PREFERENCES);
     const failure = statusLifetime(status({ tone: "error" }), window);
-    expect(failure).toBe(window * ERROR_HOLD);
+    expect(failure).toBe(TOAST_MAX_MS * ERROR_HOLD);
     expect(failure).toBeGreaterThan(statusLifetime(status(), window));
   });
 });

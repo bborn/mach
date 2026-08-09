@@ -137,8 +137,28 @@ export interface StatusMessage {
  */
 export const ERROR_HOLD = 2;
 
+/**
+ * The longest a toast sits on screen, however long undo stays offered.
+ *
+ * These were the same number, and that was wrong. "How long is undo available"
+ * and "how long should a card cover the corner of the window" are different
+ * questions that happen to have been answered by one preference, and the
+ * default of twenty seconds is a reasonable answer to the first and an absurd
+ * one to the second — long enough that the toast reads as stuck rather than
+ * transient.
+ *
+ * Capping rather than replacing keeps the preference meaningful in the
+ * direction it can still be right: someone who sets a *three second* undo
+ * window has said something about how long they want to be interrupted, and
+ * the toast should not outlive the offer it is making. Nothing is lost when it
+ * goes — the stack never expires, ⌘Z keeps working, and the status bar goes on
+ * naming what it would undo.
+ */
+export const TOAST_MAX_MS = 6_000;
+
 export function statusLifetime(status: StatusMessage, undoWindow: number): number {
-  return status.tone === "error" ? undoWindow * ERROR_HOLD : undoWindow;
+  const base = Math.min(undoWindow, TOAST_MAX_MS);
+  return status.tone === "error" ? base * ERROR_HOLD : base;
 }
 
 interface UiState {
