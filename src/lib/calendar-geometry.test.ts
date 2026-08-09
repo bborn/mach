@@ -177,10 +177,10 @@ describe("visibleColumns", () => {
 
   /*
    * The old rule was "how many 40px columns fit", which capped a 156px column at
-   * three events and then rendered those three at 52px each — the unreadable
-   * cluster the dogfood pass measured. A cascade asks a different question: how
-   * many 18px strips fit beside something worth reading. Same width, five
-   * events on the grid instead of three, and the one on top is legible.
+   * three events and rendered those three at 52px each: the unreadable cluster
+   * the dogfood pass measured. The rule now counts 18px strips beside something
+   * worth reading, so the same width carries five events and the top one is
+   * legible.
    */
   it("counts cascade strips, not columns", () => {
     expect(visibleColumns(5, 156)).toBe(5);
