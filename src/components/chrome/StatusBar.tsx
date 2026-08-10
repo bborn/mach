@@ -24,10 +24,9 @@ import { SyncIndicator } from "./SyncIndicator";
  * announced by furniture any more.
  *
  * What is left passes the same test: every item is a fact about the current
- * view that nothing else on screen states. The count of conversations, the
- * count selected, the pending `g …`, the fixture warning, and the sync
- * indicator — which renders nothing at all unless a sync is running or has
- * failed.
+ * view that nothing else on screen states. The count selected, the pending
+ * `g …`, the fixture warning, and the sync indicator — which renders nothing
+ * at all unless a sync is running or has failed.
  *
  * # The keymap is not one of those facts
  *
@@ -42,9 +41,17 @@ import { SyncIndicator } from "./SyncIndicator";
  *
  * `?` opens the reference card. That is where a legend belongs, and the sheet
  * is one key away rather than buried in settings. Bindings are untouched.
+ *
+ * # Neither was the count
+ *
+ * The rail also carried `${n} conversations` in mail mode and `${view} view`
+ * in calendar mode. Both failed the same test: the mail list header already
+ * shows `Inbox · All accounts · 48` above the column being counted, and the
+ * calendar header already highlights the active view in its Day/Week/Month
+ * control. Both were a second copy of a number already on screen.
  */
 export function StatusBar() {
-  const { ui, visibleThreads, hasMore, live } = useMach();
+  const { ui, live } = useMach();
   const pending = usePendingSequence();
   const selected = ui.mode === "mail" ? ui.selection.ids.length : 0;
 
@@ -61,12 +68,6 @@ export function StatusBar() {
           {selected} selected
         </span>
       )}
-
-      <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-faint-foreground">
-        {ui.mode === "mail"
-          ? `${visibleThreads.length}${hasMore ? "+" : ""} conversations`
-          : `${ui.calendarView} view`}
-      </span>
 
       {pending && (
         <span className="shrink-0 whitespace-nowrap font-mono text-micro text-accent">
