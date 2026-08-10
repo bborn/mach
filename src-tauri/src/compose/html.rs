@@ -41,6 +41,7 @@
 //! or arrive from another client, and neither goes through the editor at all.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 /// Tags that may appear in an outgoing message.
 ///
@@ -150,6 +151,84 @@ pub fn sanitize(html: &str) -> String {
     } else {
         cleaned
     }
+}
+
+// ---------------------------------------------------------------------------
+// somebody else's HTML, reproduced inside ours
+// ---------------------------------------------------------------------------
+
+/// Every `cid:` an HTML body addresses, in document order, without repeats.
+///
+/// Parsed rather than matched: attribute order, quoting and spacing are the
+/// sending client's to choose, and an expression that agreed with Gmail's
+/// output would come apart on Outlook's. `src` alone is read — a `cid:` in an
+/// `href` is a link to a part, which no client resolves and nothing here would
+/// carry.
+pub fn cid_references(html: &str) -> Vec<String> {
+    let found: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let collector = Arc::clone(&found);
+    let mut builder = ammonia::Builder::default();
+    builder
+        .add_url_schemes(["cid"])
+        .add_tag_attributes("img", ["src"])
+        .attribute_filter(move |_element, attribute, value| {
+            if attribute == "src" {
+                if let Some(id) = content_id_of(value) {
+                    let mut seen = collector.lock().unwrap_or_else(|e| e.into_inner());
+                    if !seen.iter().any(|existing| existing == &id) {
+                        seen.push(id);
+                    }
+                }
+            }
+            Some(value.into())
+        });
+    // The output is thrown away; the walk is the point.
+    let _ = builder.clean(html).to_string();
+    let out = found.lock().unwrap_or_else(|e| e.into_inner());
+    out.clone()
+}
+
+/// Somebody else's HTML, cleaned for reproduction inside a message of ours,
+/// keeping only the `cid:` references whose parts travel with it.
+///
+/// **The set is what makes the body and the parts agree.** A forward reproduces
+/// the original's HTML whole, and that HTML addresses the pictures in it by
+/// `cid:` — references that resolve only against parts of the *same* message.
+/// Carry the parts and the reference is right; drop the parts and the recipient
+/// gets a broken image where the picture was. So a reference whose part is not
+/// on this draft loses its `src` here, which is what every client already does
+/// with an attribute it cannot use: the `alt` text stays and nothing pretends
+/// there is a picture.
+///
+/// It is also how removal works. Take the chip off in the composer and the
+/// inline row goes; the next build finds no part with that id and the reference
+/// goes with it.
+pub fn quoted(html: &str, carried: &HashSet<String>) -> String {
+    let carried: Arc<HashSet<String>> = Arc::new(carried.clone());
+    let mut builder = ammonia::Builder::default();
+    builder
+        .add_url_schemes(["cid"])
+        .add_tag_attributes("img", ["src"])
+        .attribute_filter(move |_element, attribute, value| {
+            match (attribute, content_id_of(value)) {
+                ("src", Some(id)) if !carried.contains(&id) => None,
+                _ => Some(value.into()),
+            }
+        });
+    builder.clean(html).to_string()
+}
+
+/// The bare Content-ID a `cid:` URL addresses, if that is what this value is.
+fn content_id_of(value: &str) -> Option<String> {
+    let value = value.trim();
+    // The scheme is case-insensitive (RFC 3986 §3.1); the id after it is not.
+    let (scheme, rest) = value.split_at_checked(4)?;
+    if !scheme.eq_ignore_ascii_case("cid:") {
+        return None;
+    }
+    // RFC 2392 addresses a part by its id; a percent-encoded one is legal and
+    // rare, and is left exactly as written so it compares equal to the header.
+    (!rest.is_empty()).then(|| rest.to_string())
 }
 
 /// Keep only the declarations on [`STYLE_PROPERTIES`] whose values survive

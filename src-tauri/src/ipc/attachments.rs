@@ -335,12 +335,13 @@ async fn materialise(state: &AppState, attachment_id: i64) -> Result<AttachmentF
 
     // A part with no attachment id had its bytes inlined in the sync response,
     // so there is no handle to fetch by and the part has to be found in the
-    // message. It still gets a stable key: the part id if Gmail gave one, the
-    // filename and size otherwise, which is the most identity such a part has.
-    let part_id = row
-        .gmail_attachment_id
-        .clone()
-        .unwrap_or_else(|| format!("inline:{}:{}", row.size_bytes, row.filename));
+    // message. It still gets a stable key — see [`store::file_part_id`], which
+    // the composer reads with when a forward asks for the same bytes.
+    let part_id = store::file_part_id(
+        row.gmail_attachment_id.as_deref(),
+        row.size_bytes,
+        &row.filename,
+    );
     let key = store::cache_key(
         row.account_id,
         &row.gmail_message_id,

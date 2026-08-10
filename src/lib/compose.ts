@@ -204,10 +204,77 @@ async function call<T>(payload: Record<string, unknown>): Promise<T> {
   return invoke<T>("send_message", { draft: payload });
 }
 
-export async function prepareDraft(threadId: number, kind: DraftKind): Promise<Draft> {
-  if (!isTauri()) return localPrepare(threadId, kind);
-  const result = await call<{ draft: Draft }>({ op: "prepare", threadId, kind });
-  return result.draft;
+/**
+ * A file a forward is going to carry, before its bytes are here.
+ *
+ * It has no id because it has no row yet — the row is written when the bytes
+ * land. Until then the composer draws it from this, so the chips are on screen
+ * naming real files at the instant the draft opens rather than a second later.
+ */
+export interface ArrivingFile {
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+}
+
+/**
+ * A prepared draft, and what forwarding it will take with it.
+ *
+ * `carrying` and `refused` are empty for every kind but `forward`: a reply
+ * quotes the original and carries none of its files, which is what every mail
+ * client does and what anyone pressing `r` expects.
+ */
+export interface PreparedDraft {
+  draft: Draft;
+  /**
+   * Whether there is anything to fetch at all.
+   *
+   * Not the same question as `carrying.length > 0`: an inline picture has no
+   * attachment row and so no name or size to show, and a message whose only
+   * baggage is the logo in its signature would otherwise look like a message
+   * with nothing to carry.
+   */
+  carries: boolean;
+  carrying: ArrivingFile[];
+  /** One sentence per file that will not be on the message, naming it. */
+  refused: string[];
+}
+
+export async function prepareDraft(
+  threadId: number,
+  kind: DraftKind,
+): Promise<PreparedDraft> {
+  if (!isTauri()) {
+    return { draft: localPrepare(threadId, kind), carries: false, carrying: [], refused: [] };
+  }
+  const result = await call<Partial<PreparedDraft> & { draft: Draft }>({
+    op: "prepare",
+    threadId,
+    kind,
+  });
+  return {
+    draft: result.draft,
+    carries: result.carries ?? false,
+    carrying: result.carrying ?? [],
+    refused: result.refused ?? [],
+  };
+}
+
+/**
+ * Fetch the original's files onto a forward.
+ *
+ * Separate from `prepareDraft` because this is the half that can reach Gmail,
+ * and the composer is already on screen before it is called. Bytes already in
+ * the local attachment cache never leave the machine; the rest are downloaded
+ * once and re-uploaded, because Gmail has no way to be told "send the file that
+ * is already on message X".
+ */
+export async function carryForward(
+  draftId: string,
+  messageId: number,
+): Promise<AttachResult> {
+  if (!isTauri()) return { attachments: localAttachments(draftId), added: [], refused: [] };
+  return call<AttachResult>({ op: "carryForward", draftId, messageId });
 }
 
 /**

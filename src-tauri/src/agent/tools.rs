@@ -924,7 +924,70 @@ async fn draft_reply(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Ag
 
     let saved = compose_dispatch(&ctx.db, &ctx.outbox, json!({ "op": "saveDraft", "draft": draft }))
         .await?;
-    Ok(drafted(saved))
+
+    // A forward takes the original's files with it here for the same reason it
+    // does in the composer: forwarding "here's the invoice" without the invoice
+    // is the message not arriving. The composer splits this off so the window
+    // opens first; the agent has no window to open, so it waits.
+    let saved = match kind {
+        "forward" => carry_forward_onto(ctx, &saved).await?,
+        _ => saved,
+    };
+
+    // A file that could not ride reaches the model, so it can say so rather
+    // than report a forward that quietly went without it.
+    let refused: Vec<String> = saved
+        .get("refused")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut outcome = drafted(saved);
+    if !refused.is_empty() {
+        outcome.summary = format!("{} — {}", outcome.summary, refused.join(" · "));
+        outcome.payload["refused"] = json!(refused);
+    }
+    Ok(outcome)
+}
+
+/// Put the forwarded message's attachments on the draft that was just written.
+///
+/// Whatever will not fit is refused by name, and the draft keeps everything that
+/// does — the same contract the composer has, because it is the same call. The
+/// draft comes back re-read so the model sees what it is actually carrying
+/// rather than the empty list `saveDraft` answered with.
+async fn carry_forward_onto(ctx: &ToolContext, saved: &Value) -> Result<Value, AgentError> {
+    let draft = saved.get("draft").cloned().unwrap_or(Value::Null);
+    let (Some(draft_id), Some(message_id)) = (
+        draft.get("id").and_then(Value::as_str),
+        draft.get("replyToId").and_then(Value::as_i64),
+    ) else {
+        return Ok(saved.clone());
+    };
+
+    let carried = compose_dispatch(
+        &ctx.db,
+        &ctx.outbox,
+        json!({ "op": "carryForward", "draftId": draft_id, "messageId": message_id }),
+    )
+    .await?;
+
+    let mut saved = saved.clone();
+    if let Some(attachments) = carried.get("attachments") {
+        saved["draft"]["attachments"] = attachments.clone();
+    }
+    // Not fatal, and not silent. A file that could not ride is named in the
+    // answer the model reads, so it can say so rather than claim it sent one.
+    if let Some(refused) = carried.get("refused") {
+        saved["refused"] = refused.clone();
+    }
+    Ok(saved)
 }
 
 /// A message to somebody, on no conversation at all.

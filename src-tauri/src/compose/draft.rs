@@ -16,6 +16,8 @@
 //! scrolling past a screen of somebody else's mail, and the quote has to be
 //! built the same way whether a human or the agent produced the body.
 
+use std::collections::HashSet;
+
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
@@ -481,6 +483,21 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
 
     let (body_text, body_html) = body_parts(draft);
 
+    // The bytes, not the metadata: this is the one moment they are needed, and
+    // the one place they are read. A draft object handed round the UI carries
+    // filenames and sizes only.
+    //
+    // Read before the body is assembled rather than after, because a forward's
+    // body depends on it: the original's HTML addresses its pictures by `cid:`,
+    // and only a reference whose part is actually on this draft may survive.
+    // See [`super::html::quoted`].
+    let attachments = super::attach::list_with_bytes(db, &draft.id)?;
+    let carried_cids: HashSet<String> = attachments
+        .iter()
+        .filter(|(meta, _)| meta.inline)
+        .map(|(meta, _)| meta.content_id.clone())
+        .collect();
+
     // `Adopted` is absent from both arms on purpose: its body already contains
     // whatever the client that wrote it quoted, and quoting the parent a second
     // time here is how one save would turn his phone's text into two copies of
@@ -492,7 +509,7 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
         ),
         (Some(p), DraftKind::Forward) => (
             format!("{}\n\n{}", body_text.trim_end(), forward_text(p)),
-            format!("{body_html}{}", forward_html(p)),
+            format!("{body_html}{}", forward_html(p, &carried_cids)),
         ),
         _ => (body_text, body_html),
     };
@@ -509,10 +526,7 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
         None => None,
     };
 
-    // The bytes, not the metadata: this is the one moment they are needed, and
-    // the one place they are read. A draft object handed round the UI carries
-    // filenames and sizes only.
-    let attachments = super::attach::list_with_bytes(db, &draft.id)?
+    let attachments = attachments
         .into_iter()
         .map(|(meta, bytes)| OutgoingAttachment {
             filename: meta.filename,
@@ -690,15 +704,37 @@ pub fn forward_text(message: &Message) -> String {
     out
 }
 
-pub fn forward_html(message: &Message) -> String {
+/// The original reproduced whole, with the pictures in it still resolvable.
+///
+/// `carried` is every `Content-ID` this draft is actually carrying as an inline
+/// part. A forward is the one place a reproduced body may keep a `cid:`: the
+/// parts travel with it, so the reference resolves in the recipient's client
+/// exactly as it did in the sender's. A reference to a part that did not make
+/// it — too large, refused, or taken off by hand before sending — loses its
+/// `src` instead of becoming a broken image. See [`super::html::quoted`].
+pub fn forward_html(message: &Message, carried: &HashSet<String>) -> String {
     let mut headers = String::new();
     markdown::escape_into(&mut headers, &forward_header_block(message));
     format!(
         "<div class=\"gmail_quote\">\
          <div dir=\"ltr\" class=\"gmail_attr\">{}</div><br>{}</div>",
         headers.replace('\n', "<br>"),
-        original_html(message)
+        forwarded_html(message, carried)
     )
+}
+
+/// The original's own HTML, cleaned, keeping the `cid:` references it is
+/// shipping the parts for. Its text when it has no HTML, exactly as a quote.
+fn forwarded_html(message: &Message, carried: &HashSet<String>) -> String {
+    match message
+        .body_html
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
+        Some(html) => super::html::quoted(html, carried),
+        None => original_html(message),
+    }
 }
 
 fn forward_header_block(message: &Message) -> String {

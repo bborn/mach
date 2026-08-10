@@ -44,6 +44,7 @@
 pub mod address;
 pub mod attach;
 pub mod draft;
+pub mod forward;
 pub mod html;
 pub mod markdown;
 pub mod mime;
