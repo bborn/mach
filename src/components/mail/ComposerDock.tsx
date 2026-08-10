@@ -1028,21 +1028,18 @@ export function ComposerDock() {
      * keystroke. The consequence is that while a draft exists, `r`, `a` and
      * `f` all do the same thing: they reopen it. Offering three labels for one
      * behaviour is the same fault as drawing one control twice, so the strip
-     * collapses to the two things that remain true: a new message, and the
-     * draft.
+     * collapses to the one thing that remains true: the draft.
+     *
+     * A new message used to sit here too, ahead of everything else. It is the
+     * one action in this strip that does not answer the conversation above
+     * it — `c` still opens it from anywhere, but a chip among reply/forward
+     * controls implied it belonged to this thread, and it does not.
      */
     return (
       <>
         {strip}
         <div className="shrink-0 border-t border-border">
           <div className="mx-auto flex max-w-[72ch] items-center gap-3 px-5 py-2 text-micro text-faint-foreground">
-            <button
-              type="button"
-              onClick={() => openNew()}
-              className="inline-flex items-center gap-1.5 hover:text-foreground"
-            >
-              <Kbd keys={COMPOSER_KEYS.compose} /> new
-            </button>
             {threadDraft ? (
               <>
                 <button
