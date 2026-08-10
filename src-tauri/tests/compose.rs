@@ -51,6 +51,14 @@ struct FakeTransport {
     responses: Mutex<VecDeque<Result<HttpResponse, TransportError>>>,
     default: Mutex<Result<HttpResponse, TransportError>>,
     requests: Mutex<Vec<HttpRequest>>,
+    /// Runs as a request goes out, before its response is handed back.
+    ///
+    /// Some races can only be set up from here. A push holds a `Draft` it
+    /// loaded before the request; whether the row still exists when the
+    /// response lands is the whole question, and there is no other seam
+    /// between those two moments.
+    #[allow(clippy::type_complexity)]
+    on_request: Mutex<Option<Box<dyn Fn(&HttpRequest) + Send>>>,
 }
 
 impl FakeTransport {
@@ -62,6 +70,7 @@ impl FakeTransport {
                 r#"{"id":"sent-1","threadId":"t-1"}"#,
             ))),
             requests: Mutex::new(Vec::new()),
+            on_request: Mutex::new(None),
         })
     }
 
@@ -70,6 +79,7 @@ impl FakeTransport {
             responses: Mutex::new(VecDeque::new()),
             default: Mutex::new(Ok(HttpResponse::json(status, body.to_string()))),
             requests: Mutex::new(Vec::new()),
+            on_request: Mutex::new(None),
         })
     }
 
@@ -81,6 +91,7 @@ impl FakeTransport {
                 r#"{"id":"sent-1","threadId":"t-1"}"#,
             ))),
             requests: Mutex::new(Vec::new()),
+            on_request: Mutex::new(None),
         })
     }
 
@@ -130,6 +141,9 @@ impl HttpTransport for FakeTransport {
         &'a self,
         request: HttpRequest,
     ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+        if let Some(hook) = self.on_request.lock().unwrap().as_ref() {
+            hook(&request);
+        }
         self.requests.lock().unwrap().push(request);
         let next = self.responses.lock().unwrap().pop_front();
         let out = next.unwrap_or_else(|| self.default.lock().unwrap().clone());
@@ -3140,4 +3154,181 @@ async fn saving_a_discarded_draft_id_again_does_not_bring_it_back() {
         "a discarded draft stays discarded, whatever order the writes arrived in"
     );
     assert!(draft::load_draft(&db, &draft.id).unwrap().is_none());
+}
+
+/// The bug the owner hit within the hour, twice: every draft-backed send came
+/// back "google resource not found" and nothing was delivered.
+///
+/// `⌘⏎` deletes the `compose_drafts` row and tombstones it, then the outbox
+/// waits out the undo window. A push that was already in flight lands during
+/// that wait, sees a retired draft, and — before this — deleted the Gmail draft
+/// on the grounds that nothing would ever address it again. Something was:
+/// `drafts.send`, ten seconds later, at an id that no longer existed. Both of
+/// the owner's Gmail drafts were gone from `drafts.list` when it was checked.
+///
+/// The delete lands *during* the create, from the transport hook, because that
+/// is where it lands in life: `push` reads the row, goes out, and the row is
+/// taken from under it while the request is in flight.
+#[tokio::test]
+async fn a_push_landing_after_send_leaves_the_draft_for_the_outbox() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let saved = pushed_draft(&db, &out, &transport, thread, "Sending this one.").await;
+    let draft_id = saved["id"].as_str().unwrap().to_string();
+
+    // Queue the send. This is what takes the row out and puts the Gmail id on
+    // the outbox row.
+    snapshot_draft_row(&db, &draft_id);
+    dispatch(&db, &out, json!({ "op": "send", "draft": saved.clone(), "now": NOW + 1 }))
+        .await
+        .unwrap();
+
+    let held = out.list().unwrap().into_iter().next().unwrap();
+    assert_eq!(
+        held.draft_id.as_deref(),
+        Some(draft_id.as_str()),
+        "the outbox row has to name the draft, or nothing can tell a send from a discard"
+    );
+    assert!(held.gmail_draft_id.is_some(), "and carry its Gmail id");
+
+    // Now replay a push that was in flight across that moment: the draft row
+    // is restored just long enough for `push` to load it, and the hook removes
+    // it again as the request goes out.
+    restore_draft_row(&db, &draft_id);
+    let gone = {
+        let db = db.clone();
+        let id = draft_id.clone();
+        move |_: &HttpRequest| delete_draft_row(&db, &id)
+    };
+    *transport.on_request.lock().unwrap() = Some(Box::new(gone));
+    *transport.default.lock().unwrap() = Ok(HttpResponse::json(
+        200,
+        r#"{"id":"r-draft-2","message":{"id":"gmsg-draft-2","threadId":"gthread-1"}}"#,
+    ));
+
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+    let _ = sync.push(&draft_id, NOW + 2).await;
+    *transport.on_request.lock().unwrap() = None;
+
+    assert!(
+        !transport.requests().iter().any(|r| r.method.as_str() == "DELETE"),
+        "the outbox is holding this draft in order to send it; deleting it is the 404"
+    );
+
+    *transport.default.lock().unwrap() = Ok(HttpResponse::json(
+        200,
+        r#"{"id":"gmsg-sent-1","threadId":"gthread-1"}"#,
+    ));
+    out.flush_due(NOW + UNDO_WINDOW_MS + 3).await.unwrap();
+
+    let sends: Vec<_> = transport
+        .requests()
+        .into_iter()
+        .filter(|r| r.url.contains("/drafts/send") || r.url.contains("/messages/send"))
+        .collect();
+    assert_eq!(sends.len(), 1, "{sends:?}");
+    let body: serde_json::Value =
+        serde_json::from_slice(sends[0].body.as_deref().unwrap_or_default()).unwrap();
+    assert_eq!(
+        body["id"].as_str(),
+        Some("r-draft-2"),
+        "it sends the draft that exists, not the id captured before the push landed"
+    );
+
+    let entry = out.list().unwrap().into_iter().next().unwrap();
+    assert_eq!(
+        entry.state,
+        compose::outbox::OutboxState::Sent,
+        "{:?}",
+        entry.last_error
+    );
+}
+
+/// The other half, so the fix above cannot be "never delete anything": a
+/// discard leaves no outbox row, and the draft the push just made is litter.
+#[tokio::test]
+async fn a_push_landing_after_discard_still_deletes_the_gmail_draft() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let saved = pushed_draft(&db, &out, &transport, thread, "Discarding this one.").await;
+    let draft_id = saved["id"].as_str().unwrap().to_string();
+
+    snapshot_draft_row(&db, &draft_id);
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "discardDraft", "draftId": draft_id, "now": NOW + 1 }),
+    )
+    .await
+    .unwrap();
+
+    restore_draft_row(&db, &draft_id);
+    let gone = {
+        let db = db.clone();
+        let id = draft_id.clone();
+        move |_: &HttpRequest| delete_draft_row(&db, &id)
+    };
+    *transport.on_request.lock().unwrap() = Some(Box::new(gone));
+    *transport.default.lock().unwrap() = Ok(HttpResponse::json(
+        200,
+        r#"{"id":"r-draft-2","message":{"id":"gmsg-draft-2","threadId":"gthread-1"}}"#,
+    ));
+
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+    let _ = sync.push(&draft_id, NOW + 2).await;
+    *transport.on_request.lock().unwrap() = None;
+
+    assert!(
+        transport
+            .requests()
+            .iter()
+            .any(|r| r.method.as_str() == "DELETE" && r.url.contains("r-draft-2")),
+        "nothing is holding this draft, so the one the push just made has to go"
+    );
+}
+
+// -------------------------------------------------- in-flight race helpers
+//
+// A push loads its `Draft`, goes out, and reads the world again when the
+// response lands. Reproducing what the owner hit means taking the row away
+// between those two reads, which no public API does — a send removes it before
+// any push could start. So the row is copied aside, put back for the load, and
+// removed again from the transport hook.
+
+/// Copy a draft row aside before something deletes it.
+fn snapshot_draft_row(db: &Db, id: &str) {
+    db.write(|conn| {
+        conn.execute("DROP TABLE IF EXISTS zz_draft_snapshot", [])?;
+        conn.execute(
+            "CREATE TABLE zz_draft_snapshot AS SELECT * FROM compose_drafts WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Put it back, so `push` can load it the way it did before the send.
+fn restore_draft_row(db: &Db, id: &str) {
+    db.write(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO compose_drafts SELECT * FROM zz_draft_snapshot WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Take it away again, from inside the request.
+fn delete_draft_row(db: &Db, id: &str) {
+    db.write(|conn| {
+        conn.execute("DELETE FROM compose_drafts WHERE id = ?1", [id])?;
+        Ok(())
+    })
+    .unwrap();
 }

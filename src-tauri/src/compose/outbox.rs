@@ -387,6 +387,57 @@ impl Outbox {
         })?)
     }
 
+    /// The row still waiting to leave that was written as `draft_id`, if any.
+    ///
+    /// This is what separates a draft that was *sent* from one that was
+    /// *discarded*. Both delete the `compose_drafts` row and both write a
+    /// tombstone, so from `compose::remote`'s side they are the same event —
+    /// and it used to treat them the same, deleting the Gmail draft behind
+    /// both. For a discard that is right. For a send it destroys the very
+    /// draft the outbox is about to call `drafts.send` on, and the send comes
+    /// back 404 ten seconds later with the message never delivered.
+    ///
+    /// A live row here means the outbox owns that Gmail draft until it leaves.
+    pub fn owner_of_draft(db: &Db, draft_id: &str) -> Result<Option<OutboxEntry>> {
+        Ok(db.read(|conn| {
+            Ok(conn
+                .query_row(
+                    &format!(
+                        "SELECT {ENTRY_COLUMNS} FROM compose_outbox \
+                         WHERE draft_id = ?1 AND state IN ('holding', 'sending') \
+                         ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    [draft_id],
+                    map_entry,
+                )
+                .optional()?)
+        })?)
+    }
+
+    /// Point a waiting row at the Gmail draft that actually exists now.
+    ///
+    /// A push that was in flight when the message was queued can come back
+    /// having *created* a draft rather than updated one, and its id is then
+    /// not the id the outbox captured. Sending the captured one would 404 just
+    /// as surely, so the newer id replaces it.
+    pub fn repoint_draft(
+        db: &Db,
+        id: &str,
+        gmail_draft_id: &str,
+        gmail_draft_message_id: Option<&str>,
+    ) -> Result<()> {
+        db.write(|conn| {
+            conn.execute(
+                "UPDATE compose_outbox \
+                 SET gmail_draft_id = ?2, gmail_draft_message_id = ?3 \
+                 WHERE id = ?1 AND state IN ('holding', 'sending')",
+                rusqlite::params![id, gmail_draft_id, gmail_draft_message_id],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     /// Forget a delivered message. Purely housekeeping — sent rows are kept
     /// only so the UI can say "sent" for a moment.
     pub fn forget_sent(&self, before_ms: i64) -> Result<usize> {

@@ -36,6 +36,7 @@ use crate::db::Db;
 
 use super::draft::{self, Draft, DraftRemote, RemoteState};
 use super::mime::build_rfc822;
+use super::outbox::Outbox;
 use super::{mirror, Result};
 
 /// The Gmail side of the composer's drafts.
@@ -117,6 +118,26 @@ impl DraftRemoteSync {
                 // message that was already sent, which is the duplicate the
                 // owner found. It goes back now, while its id is still in hand.
                 if draft::is_retired(&self.db, &draft.id)? {
+                    // ...unless it was retired by ⌘⏎ rather than by discard.
+                    // Both take the row out and both tombstone it, so they are
+                    // indistinguishable here — but a queued message is about
+                    // to call `drafts.send` on this exact Gmail draft, and
+                    // deleting it makes that a 404 with nothing delivered.
+                    //
+                    // The id can also have moved: a push in flight at queue
+                    // time can come back having created a draft rather than
+                    // updated one, and the outbox is holding the older id. So
+                    // the row is pointed at what exists rather than left to
+                    // send at what does not.
+                    if let Some(owner) = Outbox::owner_of_draft(&self.db, &draft.id)? {
+                        Outbox::repoint_draft(
+                            &self.db,
+                            &owner.id,
+                            &remote.id,
+                            non_empty(&remote.message.id).as_deref(),
+                        )?;
+                        return Ok(RemoteState::Pending);
+                    }
                     let _ = self.delete(&remote.id, draft.account_id).await;
                     return Ok(RemoteState::Pending);
                 }
