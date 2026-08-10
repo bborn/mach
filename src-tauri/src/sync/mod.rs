@@ -99,6 +99,15 @@ pub struct SyncConfig {
     /// Fetched messages written per transaction. This is a *write* batch, not a
     /// fetch batch: the backfill no longer waits for a batch to be written
     /// before asking for more.
+    ///
+    /// It is also the length of the longest wait a user command can inherit
+    /// from the sync loop, which is what sets it. A background writer stands
+    /// aside for a queued command at its next batch boundary, so a command
+    /// waits for at most one batch in progress — and against the owner's
+    /// mailbox a batch of 25 messages measured p99 111 ms, versus 27 ms at 10.
+    /// The cost is 14% fewer messages a second written locally, which buys
+    /// nothing: the backfill is bounded by Gmail's quota at roughly 40 messages
+    /// a second, and this writes over a thousand.
     pub message_batch_size: usize,
     /// `maxResults` for `messages.list` during the backfill.
     pub list_page_size: u32,
@@ -141,7 +150,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             backfill_window_days: 365,
-            message_batch_size: 25,
+            message_batch_size: 10,
             list_page_size: 500,
             history_page_size: 500,
             account_concurrency: 5,
@@ -348,7 +357,7 @@ impl SyncEngine {
         clients: Arc<dyn ClientFactory>,
         config: SyncConfig,
     ) -> Result<Self, SyncError> {
-        db.write(sync_queries::ensure_schema)?;
+        db.write_background(sync_queries::ensure_schema)?;
         let request_concurrency = config.request_concurrency.max(1);
         let poll_interval_ms = AtomicU64::new(config.poll_interval.as_millis() as u64);
         Ok(Self {
@@ -472,6 +481,7 @@ async fn run_loop(inner: Arc<Inner>) {
         if inner.cancel.is_cancelled() {
             break;
         }
+        checkpoint(&inner.db);
         tokio::select! {
             biased;
             () = inner.cancel.cancelled() => break,
@@ -480,6 +490,37 @@ async fn run_loop(inner: Arc<Inner>) {
         }
     }
     inner.status.set_running(false);
+}
+
+/// How large the write-ahead log is allowed to get before the sync loop stops
+/// to fold it back into the database file.
+///
+/// The automatic checkpoint cannot be relied on to do this. It is passive, so
+/// it abandons the attempt whenever a reader is using the log, and this app's
+/// reader pool answers the UI continuously; measured against a generated store
+/// of the owner's shape with the pool busy, the log grew linearly to 139 MB
+/// over 3,200 messages written and never once fell. The owner's had reached
+/// 814 MB, about a third of his store's footprint on disk.
+///
+/// 32 MB is the size at which truncating costs about 15 ms — small enough to
+/// happen inside a sync pass without a user noticing, and small enough that the
+/// log stops being a meaningful share of the disk.
+const WAL_CHECKPOINT_OVER_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Fold the log back in, if it has grown enough to be worth the stall.
+///
+/// Called between passes, and from the backfill writer between batches: a
+/// backfill is a single pass that runs for hours, so waiting for the end of one
+/// would be waiting for the end of the only thing that fills the log.
+///
+/// Synchronous, on whichever task calls it. Under the threshold it is one
+/// `stat`; over it, it is tens of milliseconds of SQLite — which is the same
+/// kind of call, on the same thread, as the transactions this loop already
+/// commits, so there is nothing to hand to a blocking pool. A failure is not
+/// worth reporting: the log is a little longer and there is another gap in a
+/// minute.
+pub(crate) fn checkpoint(db: &Db) {
+    let _ = db.checkpoint_if_large(WAL_CHECKPOINT_OVER_BYTES);
 }
 
 /// One pass over every account. Accounts run concurrently and independently;

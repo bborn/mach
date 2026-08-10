@@ -106,7 +106,7 @@ impl CalendarSync {
             .filter(|row| !row.deleted)
             .map(|row| row.calendar_id.clone())
             .collect();
-        self.db.write(move |conn| {
+        self.db.write_background(move |conn| {
             for row in &rows {
                 queries::upsert_calendar(conn, row)?;
             }
@@ -133,7 +133,7 @@ impl CalendarSync {
                     Ok(sweep) => sweep,
                     Err(e) if e.requires_full_resync() => {
                         // Expected. Forget the token and re-list the window.
-                        self.db.write(|conn| {
+                        self.db.write_background(|conn| {
                             sync_queries::set_calendar_sync_token(
                                 conn,
                                 account_id,
@@ -181,7 +181,7 @@ impl CalendarSync {
         sweep: EventsSweep,
     ) -> Result<u64, SyncError> {
         let account_id = self.account_id;
-        let written = self.db.write(|conn| {
+        let written = self.db.write_background(|conn| {
             let mut written = 0u64;
             for event in &sweep.events {
                 let Some(id) = event.id.as_deref().filter(|s| !s.is_empty()) else {

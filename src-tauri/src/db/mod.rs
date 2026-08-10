@@ -20,6 +20,29 @@
 //!    writer per database anyway, so the mutex costs nothing we were not already
 //!    going to pay, and it makes "one writer" a type-level fact rather than a
 //!    convention. The sync loop holds it; commands take it briefly.
+//!
+//! # Why the writer is not just a mutex
+//!
+//! It was, and that was the lag. A sync batch holds the write connection for a
+//! median of 13 ms against the owner's mailbox, which is nothing; but the sync
+//! loop releases the lock and immediately asks for it again, and `Mutex` makes
+//! no fairness promise. On macOS the thread that just unlocked reliably wins the
+//! relock against a thread that was already waiting. So a keystroke did not wait
+//! for *a* batch, it waited for however many batches happened before it got
+//! lucky. Measured on a generated store of the owner's shape: p50 34 ms, p95
+//! 1.6 s, worst case 4.5 s, for a write whose own work is 0.4 ms.
+//!
+//! [`Db::write_background`] is the fix, and it is a scheduling change rather
+//! than a SQLite one. Every caller that is not the sync engine keeps
+//! [`Db::write`], which registers itself as waiting before it queues on the
+//! mutex; a background writer parks before *each* batch for as long as any
+//! interactive writer is registered. A user command therefore waits for at most
+//! one batch already in progress, which is the shortest wait that does not
+//! involve aborting work the sync loop has already done.
+//!
+//! The standoff has a timeout ([`BACKGROUND_STANDOFF`]) so that a user holding
+//! the keyboard down cannot stop mail syncing altogether; on expiry the sync
+//! loop simply queues for the mutex as it used to.
 //!  * **Readers** — a lazily grown, bounded pool of connections opened with
 //!    `PRAGMA query_only = ON`. Checkout is a `Vec::pop` under a very short
 //!    mutex, never held for the duration of a query. Read-only is enforced by
@@ -43,7 +66,8 @@ pub mod sync_queries;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -51,6 +75,17 @@ use rusqlite::{Connection, OpenFlags};
 /// reading pane, one search box — four idle readers is more than the UI can use
 /// at once, and each costs only a file handle plus a page cache.
 const MAX_IDLE_READERS: usize = 4;
+
+/// The longest a background writer stands off for interactive writes before
+/// queueing for the connection anyway.
+///
+/// Without it, a burst of commands arriving faster than they are served would
+/// stop mail syncing for as long as the burst lasted. With it the sync loop
+/// falls back to the ordinary queue, so the worst this bound can cost a user
+/// command is the same wait it had before — and reaching it takes a command
+/// pending continuously for a quarter of a second, which a keyboard does not
+/// produce.
+const BACKGROUND_STANDOFF: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------
 // errors
@@ -91,6 +126,15 @@ struct Inner {
     uri: String,
     writer: Mutex<Connection>,
     idle_readers: Mutex<Vec<Connection>>,
+    /// How many interactive writers are queued for `writer` but have not yet
+    /// taken it. Background writers wait for this to reach zero.
+    ///
+    /// A count under its own mutex rather than an atomic, because a background
+    /// writer sleeps on it and a `Condvar` needs a mutex to make "check, then
+    /// sleep" atomic against "decrement, then wake".
+    interactive_waiting: Mutex<usize>,
+    /// Where a background writer sleeps while `interactive_waiting` is non-zero.
+    quiet: Condvar,
 }
 
 impl Db {
@@ -131,21 +175,63 @@ impl Db {
                 uri,
                 writer: Mutex::new(writer),
                 idle_readers: Mutex::new(Vec::new()),
+                interactive_waiting: Mutex::new(0),
+                quiet: Condvar::new(),
             }),
         })
     }
 
-    /// The single write connection. Held for the duration of the guard, so keep
-    /// the critical section to one logical unit of work.
+    /// The single write connection, for work a person is waiting on. Held for
+    /// the duration of the guard, so keep the critical section to one logical
+    /// unit of work.
+    ///
+    /// Registers itself as waiting before it queues, which is what makes the
+    /// sync loop stand aside at its next batch boundary rather than relocking
+    /// ahead of it. See the module doc.
     ///
     /// A poisoned mutex is recovered rather than propagated: a panic in one
     /// command must not take the whole store offline, and SQLite's own
     /// transaction rollback has already restored consistency.
     pub fn writer(&self) -> MutexGuard<'_, Connection> {
-        self.inner
-            .writer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        *lock(&self.inner.interactive_waiting) += 1;
+        let conn = lock(&self.inner.writer);
+        // Deregister on *acquisition*, not on release. The point of the count is
+        // to stop a background writer starting a new batch while somebody is
+        // queued; once we hold the connection it is the mutex that keeps it out,
+        // and holding the count any longer would delay the sync loop for no
+        // further benefit.
+        let mut waiting = lock(&self.inner.interactive_waiting);
+        *waiting -= 1;
+        if *waiting == 0 {
+            self.inner.quiet.notify_all();
+        }
+        drop(waiting);
+        conn
+    }
+
+    /// The single write connection, for work nobody is waiting on.
+    ///
+    /// Waits for every queued interactive writer first, so a sync batch cannot
+    /// start while a keystroke is pending. The wait is bounded by
+    /// [`BACKGROUND_STANDOFF`]; after that this queues like any other writer.
+    pub fn background_writer(&self) -> MutexGuard<'_, Connection> {
+        let mut waiting = lock(&self.inner.interactive_waiting);
+        let mut left = BACKGROUND_STANDOFF;
+        while *waiting > 0 && !left.is_zero() {
+            let started = std::time::Instant::now();
+            let (guard, timeout) = self
+                .inner
+                .quiet
+                .wait_timeout(waiting, left)
+                .unwrap_or_else(|p| p.into_inner());
+            waiting = guard;
+            if timeout.timed_out() {
+                break;
+            }
+            left = left.saturating_sub(started.elapsed());
+        }
+        drop(waiting);
+        lock(&self.inner.writer)
     }
 
     /// A read-only connection from the pool. Never blocks on the writer.
@@ -178,6 +264,9 @@ impl Db {
 
     /// Convenience: run a closure inside a write transaction, committing on
     /// `Ok` and rolling back on `Err`.
+    ///
+    /// Interactive. Use [`Db::write_background`] for anything the sync engine
+    /// does on its own schedule.
     pub fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let mut conn = self.writer();
         let tx = conn.transaction()?;
@@ -185,6 +274,81 @@ impl Db {
         tx.commit()?;
         Ok(out)
     }
+
+    /// The same, for work nobody is waiting on.
+    ///
+    /// Identical transaction semantics — same isolation, same durability, same
+    /// rollback on `Err`. The only difference is when it is allowed to start.
+    pub fn write_background<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let mut conn = self.background_writer();
+        let tx = conn.transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Fold the write-ahead log back into the database file and truncate it,
+    /// but only once it is worth the stall, and only if nothing is reading.
+    ///
+    /// # Why this is not left to SQLite
+    ///
+    /// The automatic checkpoint runs after a commit that leaves the log over
+    /// `wal_autocheckpoint` pages, and it runs in `PASSIVE` mode: it copies what
+    /// it can and gives up the moment a reader is using the log, without
+    /// resetting the file. That is the right default for a process that goes
+    /// quiet between writes. This one does not — the reader pool answers the UI
+    /// continuously while the sync loop writes — so on a busy mailbox the
+    /// passive checkpoint never once completes and the log only ever grows.
+    /// Measured on a generated store of the owner's shape, with four readers
+    /// busy: 139 MB of log after 3,200 messages written, rising linearly, and
+    /// never falling. His own log had reached 814 MB, about a third of the
+    /// store's total footprint on disk.
+    ///
+    /// So the checkpoint is asked for explicitly: from the gap between sync
+    /// passes, and from the backfill writer between batches, which are the two
+    /// moments with no transaction of their own to interrupt. It goes through
+    /// [`Db::background_writer`], so like any other background write it cannot
+    /// start while a user command is queued.
+    ///
+    /// `TRUNCATE` rather than `PASSIVE` because shrinking the file is the whole
+    /// point, and rather than `FULL` because `FULL` leaves the pages in place.
+    /// It blocks writers for its duration and waits for readers to finish; on a
+    /// 139 MB log that measured 61 ms, and it scales with the log, so the first
+    /// run against a very large one costs a few hundred milliseconds once.
+    /// A checkpoint that cannot get in returns `SQLITE_BUSY`, which is reported
+    /// as `Ok(false)` — there is another gap in a minute.
+    ///
+    /// Nothing here risks data: a checkpoint moves committed pages from one file
+    /// to the other and is exactly as crash-safe as the commits that produced
+    /// them.
+    pub fn checkpoint_if_large(&self, over_bytes: u64) -> Result<bool> {
+        let wal = format!("{}-wal", self.inner.uri);
+        match std::fs::metadata(&wal) {
+            Ok(meta) if meta.len() >= over_bytes => {}
+            // No log, or one that is not costing anything yet. In-memory
+            // databases have no file and land here too.
+            _ => return Ok(false),
+        }
+        let conn = self.background_writer();
+        // A busy checkpoint is not an error; it is "later".
+        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(busy) => Ok(busy == 0),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Take a mutex, recovering rather than propagating poison. A panic in one
+/// command must not take the whole store offline.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// A pooled read-only connection. Returns itself to the pool on drop.
@@ -248,6 +412,16 @@ fn open_connection(uri: &str, read_only: bool) -> Result<Connection> {
 ///    `ON DELETE CASCADE`, and measurement showed it is not — SQLite fires
 ///    those triggers either way. `cascading_a_thread_delete_also_clears_the_index`
 ///    pins that behaviour by asking `messages_fts` directly.)
+///  * `wal_autocheckpoint` — raised far above its default of 1000 pages, and
+///    replaced in practice by [`Db::checkpoint_if_large`]. The automatic
+///    checkpoint runs **inside the commit** of whichever transaction pushed the
+///    log past the threshold, so with the default it lands on one sync batch in
+///    seven and turns a 11 ms batch into a 350 ms one — a stall that a user
+///    command then waits behind. Moving it out of the commit path is what takes
+///    the worst case from 346 ms to under a batch. It is raised rather than
+///    disabled so that a build which somehow never calls the explicit
+///    checkpoint still has a backstop, instead of growing the log until the
+///    disk fills.
 ///  * `busy_timeout` — a second writer (or a checkpointer) should wait, not
 ///    fail. Five seconds is far longer than any write here takes.
 ///  * `query_only` on pool readers — the engine, not code review, enforces that
@@ -257,6 +431,7 @@ fn apply_pragmas(conn: &Connection, read_only: bool) -> Result<()> {
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
+         PRAGMA wal_autocheckpoint = 65536;
          PRAGMA busy_timeout = 5000;
          PRAGMA temp_store = MEMORY;
          PRAGMA cache_size = -16000;",

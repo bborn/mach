@@ -525,6 +525,18 @@ fn pragmas_are_configured_for_a_desktop_app() {
 
     let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
     assert_eq!(sync, 1, "synchronous = NORMAL (1) is the WAL sweet spot");
+
+    // The automatic checkpoint runs inside the commit that crosses its
+    // threshold, so at the default of 1000 pages it lands on one sync batch in
+    // seven and turns an 11 ms batch into a 350 ms one. Checkpointing is
+    // `Db::checkpoint_if_large`'s job now; this is only a backstop.
+    let autockpt: i64 = conn
+        .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        autockpt >= 65536,
+        "the automatic checkpoint must not be in the commit path: {autockpt}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,4 +1294,201 @@ fn readers_cannot_write() {
         [],
     );
     assert!(err.is_err(), "pool readers must be query_only");
+}
+
+
+// ---------------------------------------------------------------------------
+// the sync loop must not hold the door shut
+// ---------------------------------------------------------------------------
+
+/// One batch of work of the shape the sync loop commits, against `threads`.
+fn batch(db: &Db, tag: &str, rows: usize) {
+    db.write_background(|conn| {
+        for i in 0..rows {
+            conn.execute(
+                "UPDATE threads SET snippet = ?2 WHERE gmail_thread_id = ?1",
+                rusqlite::params![format!("t{i}"), format!("{tag} {i}")],
+            )?;
+        }
+        Ok(())
+    })
+    .expect("sync batch");
+}
+
+/// A user write completes promptly while a sync batch is in flight.
+///
+/// This is the property the store exists to provide, and until
+/// `write_background` it did not hold. The sync loop's batches are short — a
+/// median of 13 ms against the owner's mailbox — but it released the write
+/// connection and immediately asked for it back, and `Mutex` hands the lock to
+/// whoever asks, not to whoever has waited longest. On macOS the relocking
+/// thread wins nearly every time, so a user command waited not for one batch
+/// but for however many happened before it got lucky: measured against a
+/// generated store of the owner's shape, p95 1.6 s and a worst case of 4.5 s
+/// for a write whose own work is under a millisecond.
+///
+/// So the test reproduces that shape rather than describing it: a background
+/// writer running batches back to back with no gap, and user writes going in
+/// while they run. The assertion is a bound on the **worst** one, because a
+/// median that passes while the tail is seconds long is exactly the bug.
+#[test]
+fn a_user_write_does_not_queue_behind_the_sync_loop() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const ROWS: usize = 400;
+
+    let t = TempDb::new("writer-priority");
+    let account_id = account(&t, "sync@example.com", 0);
+
+    // Enough rows that a batch is real work rather than a no-op.
+    {
+        let conn = t.writer();
+        for i in 0..ROWS {
+            q::upsert_thread(
+                &conn,
+                &NewThread {
+                    account_id,
+                    gmail_thread_id: format!("t{i}"),
+                    participants: vec![Participant::new("a@b.c")],
+                    subject: format!("subject {i}"),
+                    snippet: "x".repeat(200),
+                    last_message_at: i as i64,
+                    is_unread: false,
+                    message_count: 1,
+                    has_attachments: false,
+                    label_ids: vec!["INBOX".into()],
+                },
+            )
+            .expect("seed");
+        }
+    }
+
+    // What one batch costs on this machine, so the budget is expressed in
+    // batches rather than in a wall-clock number that would mean something
+    // different on other hardware.
+    let batch_ms = {
+        let t0 = Instant::now();
+        batch(&t.db, "calibrate", ROWS);
+        t0.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let sync_db = t.db.clone();
+    let sync_stop = Arc::clone(&stop);
+    let sync = std::thread::spawn(move || {
+        let mut batches = 0u64;
+        while !sync_stop.load(Ordering::Relaxed) {
+            batch(&sync_db, "sync", ROWS);
+            batches += 1;
+        }
+        batches
+    });
+
+    let mut worst: f64 = 0.0;
+    for i in 0..40 {
+        let t0 = Instant::now();
+        t.db.write(|conn| {
+            conn.execute(
+                "UPDATE threads SET is_unread = 1 WHERE gmail_thread_id = ?1",
+                [format!("t{i}")],
+            )?;
+            Ok(())
+        })
+        .expect("user write");
+        worst = worst.max(t0.elapsed().as_secs_f64() * 1000.0);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let batches = sync.join().unwrap();
+    assert!(
+        batches > 5,
+        "the sync loop has to have actually been running: {batches} batches"
+    );
+
+    // One batch already in progress is the irreducible wait. Three is slack for
+    // a loaded machine; without the standoff this ran to tens of batches.
+    let budget = (batch_ms * 3.0).max(50.0);
+    assert!(
+        worst < budget,
+        "a user write waited {worst:.0}ms while the sync loop ran \
+         (one batch is {batch_ms:.1}ms, budget {budget:.0}ms, {batches} batches ran)"
+    );
+}
+
+/// The log is folded back into the database file rather than growing forever.
+///
+/// `wal_autocheckpoint` is supposed to do this and cannot: it is passive, so it
+/// gives up whenever a reader is using the log, and this app's reader pool is
+/// answering the UI continuously. Measured on a generated store with four
+/// readers busy, the log grew linearly to 139 MB over 3,200 messages written and
+/// never fell; the owner's had reached 814 MB.
+#[test]
+fn a_checkpoint_shrinks_the_write_ahead_log() {
+    let t = TempDb::new("checkpoint");
+    let account_id = account(&t, "wal@example.com", 0);
+
+    let wal_len = || {
+        let mut p = t.path.clone().into_os_string();
+        p.push("-wal");
+        std::fs::metadata(PathBuf::from(p))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+
+    // Hold a reader open across the writes, which is what stops the automatic
+    // checkpoint from ever completing.
+    let pinned = t.reader();
+    for round in 0..40 {
+        t.db.write_background(|conn| {
+            for i in 0..200 {
+                q::upsert_thread(
+                    conn,
+                    &NewThread {
+                        account_id,
+                        gmail_thread_id: format!("t{round}-{i}"),
+                        participants: vec![Participant::new("a@b.c")],
+                        subject: "s".repeat(400),
+                        snippet: "x".repeat(400),
+                        last_message_at: i,
+                        is_unread: false,
+                        message_count: 1,
+                        has_attachments: false,
+                        label_ids: vec!["INBOX".into()],
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .expect("write");
+        let _ = q::list_threads(&pinned, &ThreadQuery::default());
+    }
+    let grown = wal_len();
+    drop(pinned);
+
+    // Below the threshold nothing happens, so a small log never costs a stall.
+    assert!(
+        !t.db.checkpoint_if_large(grown + 1).expect("checkpoint"),
+        "a log under the threshold must be left alone"
+    );
+    assert_eq!(wal_len(), grown, "and left at its size");
+
+    assert!(
+        t.db.checkpoint_if_large(1).expect("checkpoint"),
+        "a log over the threshold must be checkpointed"
+    );
+    assert!(
+        wal_len() < grown,
+        "the log should have shrunk: {grown} -> {}",
+        wal_len()
+    );
+
+    // And the rows are all still there afterwards.
+    let conn = t.reader();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM threads", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(n, 40 * 200);
 }

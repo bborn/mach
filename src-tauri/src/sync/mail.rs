@@ -96,6 +96,22 @@ const WRITE_QUEUE_DEPTH: usize = 2;
 /// keyset read of a few hundred rows costs about as much as one of ten.
 const LEASE_AHEAD: usize = 4;
 
+/// How often the backfill writer asks whether the write-ahead log needs folding
+/// back into the database file.
+///
+/// A batch of 25 messages is roughly 600 KB of log, so this is a check every
+/// 20 MB or so of writing — often enough that the 32 MB threshold is never much
+/// overshot, and rare enough that the check itself is nothing.
+const BATCHES_BETWEEN_CHECKPOINTS: usize = 32;
+
+/// History records applied per transaction.
+///
+/// Chosen so that one transaction's write lock is short enough for a user
+/// command to wait behind it without noticing — a backfill batch of 25 whole
+/// messages measures 13 ms at the median against a 46,000-thread store, and a
+/// history record is a smaller unit of work than a message.
+const HISTORY_APPLY_CHUNK: usize = 50;
+
 /// Whether the messages a history replay stores are allowed to say anything.
 ///
 /// The distinction is not cosmetic — see the module doc. It is an enum rather
@@ -159,7 +175,7 @@ impl MailSync {
                 Err(SyncError::Google(e)) if e.requires_full_resync() => {
                     // Expected, not exceptional: the watermark aged out of
                     // Gmail's retention window. Throw it away and rebuild.
-                    self.db.write(|conn| {
+                    self.db.write_background(|conn| {
                         queries::set_history_id(conn, self.account_id, None)?;
                         sync_queries::clear_backfill(conn, self.account_id)
                     })?;
@@ -177,7 +193,7 @@ impl MailSync {
         self.report.phase(SyncPhase::Labels);
         let labels = self.gmail.labels_list("me").await?;
         let account_id = self.account_id;
-        self.db.write(|conn| {
+        self.db.write_background(|conn| {
             for label in &labels {
                 if label.id.is_empty() {
                     continue;
@@ -248,7 +264,7 @@ impl MailSync {
             .collect();
 
         let account_id = self.account_id;
-        self.db.write(|conn| {
+        self.db.write_background(|conn| {
             for (gmail_message_id, gmail_draft_id) in &pairs {
                 queries::set_message_draft_id(conn, account_id, gmail_message_id, gmail_draft_id)?;
             }
@@ -306,7 +322,7 @@ impl MailSync {
                 // Read the watermark BEFORE the first messages.list call.
                 let profile = self.gmail.get_profile("me").await?;
                 let window_start_ms = self.window_start_ms();
-                self.db.write(|conn| {
+                self.db.write_background(|conn| {
                     sync_queries::begin_backfill(
                         conn,
                         account_id,
@@ -328,7 +344,9 @@ impl MailSync {
         // Promote the pre-backfill watermark and drop the checkpoint together,
         // so there is no instant in which the account looks synced without one.
         self.db
-            .write(|conn| sync_queries::finish_backfill(conn, account_id, &start_history_id))?;
+            .write_background(|conn| {
+                sync_queries::finish_backfill(conn, account_id, &start_history_id)
+            })?;
 
         // Everything that arrived *during* the backfill is now replayed. Silent:
         // a first sync can run for hours, and the mail that landed while it did
@@ -339,7 +357,7 @@ impl MailSync {
                 // The backfill outlived Gmail's history retention. Drop the
                 // watermark; the next pass rebuilds. Do not recurse.
                 self.db
-                    .write(|conn| queries::set_history_id(conn, account_id, None))?;
+                    .write_background(|conn| queries::set_history_id(conn, account_id, None))?;
                 0
             }
             Err(e) => return Err(e),
@@ -377,7 +395,7 @@ impl MailSync {
                 .collect();
             let next = page.next_page_token.clone();
 
-            self.db.write(|conn| {
+            self.db.write_background(|conn| {
                 sync_queries::enqueue_backfill(conn, account_id, &refs)?;
                 sync_queries::set_backfill_cursor(
                     conn,
@@ -635,8 +653,13 @@ impl MailSync {
             .cloned()
             .collect();
 
+        // Sized by how many requests may be in flight, not by how many rows a
+        // transaction writes — this chunk is a *fetch* batch, and every id in it
+        // goes on the wire at once. It used to borrow `message_batch_size`,
+        // which is now the write batch and much smaller; sharing the two would
+        // have quietly cut how fast a history sweep can pull message bodies.
         let mut fetched: HashMap<String, g::Message> = HashMap::new();
-        for chunk in to_fetch.chunks(self.config.message_batch_size.max(1)) {
+        for chunk in to_fetch.chunks(self.fetch_width()) {
             self.cancel.check()?;
             for (id, message) in self.fetch_messages(chunk).await? {
                 if let Some(message) = message {
@@ -649,70 +672,108 @@ impl MailSync {
 
         let records = sweep.records;
         let watermark = sweep.history_id.clone();
-        let (written, arrived) = self.db.write(|conn| {
-            let mut touched: HashSet<i64> = HashSet::new();
-            let mut stored = 0u64;
-            // The ids this sweep genuinely added, in the order Gmail reported
-            // them. Collected even when the voice is silent — it costs a `Vec`
-            // of strings the caller drops — so that the two paths through this
-            // function stay one path.
-            let mut arrived: Vec<String> = Vec::new();
 
-            for record in &records {
-                for added in &record.messages_added {
-                    if let Some(message) = fetched.get(&added.message.id) {
-                        touched.insert(store_message(conn, account_id, message)?);
-                        stored += 1;
-                        arrived.push(added.message.id.clone());
-                    }
-                }
-                for change in &record.labels_added {
-                    if let Some(thread_id) = apply_label_change(
-                        conn,
-                        account_id,
-                        &change.message.id,
-                        &change.label_ids,
-                        true,
-                        &fetched,
-                    )? {
-                        touched.insert(thread_id);
-                    }
-                }
-                for change in &record.labels_removed {
-                    if let Some(thread_id) = apply_label_change(
-                        conn,
-                        account_id,
-                        &change.message.id,
-                        &change.label_ids,
-                        false,
-                        &fetched,
-                    )? {
-                        touched.insert(thread_id);
-                    }
-                }
-                for gone in &record.messages_deleted {
-                    if let Some(thread_id) = sync_queries::delete_message_by_gmail_id(
-                        conn,
-                        account_id,
-                        &gone.message.id,
-                    )? {
-                        touched.insert(thread_id);
-                    }
-                }
-            }
+        // One transaction per `HISTORY_APPLY_CHUNK` records rather than one for
+        // the whole sweep.
+        //
+        // The sweep is unbounded: it is everything that happened since the
+        // watermark, so an app that was closed over a weekend replays tens of
+        // thousands of records, and as a single transaction that is a write lock
+        // held for as long as it takes — which is the one case where "a user
+        // command waits at most one batch" would have meant nothing.
+        //
+        // Chunking does not weaken either property this function owns.
+        // Re-applying a record is a no-op by construction (per-message label
+        // sets are sets, `store_message` upserts, `delete_message_by_gmail_id`
+        // deletes a row that is already gone), so a crash mid-sweep replays from
+        // the *old* watermark and converges. And the watermark still moves in
+        // the same transaction as the last of the changes it accounts for, which
+        // is what stops it from ever running ahead of them.
+        //
+        // What it does change: a sweep is now visible to the UI as it lands
+        // rather than all at once. For a mail client that is the better of the
+        // two — new mail appearing in pieces beats the window standing still.
+        let mut written = 0u64;
+        let mut arrived: Vec<String> = Vec::new();
+        let chunks: Vec<&[g::HistoryRecord]> = if records.is_empty() {
+            vec![&[]]
+        } else {
+            records.chunks(HISTORY_APPLY_CHUNK).collect()
+        };
+        let last = chunks.len() - 1;
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            self.cancel.check()?;
+            let fetched = &fetched;
+            let watermark = &watermark;
+            let (stored, mut chunk_arrived) = self.db.write_background(move |conn| {
+                let mut touched: HashSet<i64> = HashSet::new();
+                let mut stored = 0u64;
+                // The ids this sweep genuinely added, in the order Gmail
+                // reported them. Collected even when the voice is silent — it
+                // costs a `Vec` of strings the caller drops — so that the two
+                // paths through this function stay one path.
+                let mut arrived: Vec<String> = Vec::new();
 
-            for thread_id in touched {
-                sync_queries::recompute_thread(conn, thread_id)?;
-            }
+                for record in chunk {
+                    for added in &record.messages_added {
+                        if let Some(message) = fetched.get(&added.message.id) {
+                            touched.insert(store_message(conn, account_id, message)?);
+                            stored += 1;
+                            arrived.push(added.message.id.clone());
+                        }
+                    }
+                    for change in &record.labels_added {
+                        if let Some(thread_id) = apply_label_change(
+                            conn,
+                            account_id,
+                            &change.message.id,
+                            &change.label_ids,
+                            true,
+                            fetched,
+                        )? {
+                            touched.insert(thread_id);
+                        }
+                    }
+                    for change in &record.labels_removed {
+                        if let Some(thread_id) = apply_label_change(
+                            conn,
+                            account_id,
+                            &change.message.id,
+                            &change.label_ids,
+                            false,
+                            fetched,
+                        )? {
+                            touched.insert(thread_id);
+                        }
+                    }
+                    for gone in &record.messages_deleted {
+                        if let Some(thread_id) = sync_queries::delete_message_by_gmail_id(
+                            conn,
+                            account_id,
+                            &gone.message.id,
+                        )? {
+                            touched.insert(thread_id);
+                        }
+                    }
+                }
 
-            // The watermark moves last, inside the same transaction as the
-            // changes it accounts for. A crash one statement earlier replays
-            // the batch; replaying is idempotent.
-            if let Some(watermark) = &watermark {
-                queries::set_history_id(conn, account_id, Some(watermark))?;
-            }
-            Ok((stored, arrived))
-        })?;
+                for thread_id in touched {
+                    sync_queries::recompute_thread(conn, thread_id)?;
+                }
+
+                // The watermark moves last, inside the same transaction as the
+                // changes it accounts for. A crash one statement earlier
+                // replays the batch; replaying is idempotent.
+                if i == last {
+                    if let Some(watermark) = watermark {
+                        queries::set_history_id(conn, account_id, Some(watermark))?;
+                    }
+                }
+                Ok((stored, arrived))
+            })?;
+            written += stored;
+            arrived.append(&mut chunk_arrived);
+        }
 
         // After the commit, never inside it: nothing is announced that a crash
         // could take back, and `announce` opens its own short transaction to
@@ -837,9 +898,10 @@ fn spawn_backfill_writer(
 ) -> JoinHandle<Result<u64, DbError>> {
     tokio::spawn(async move {
         let mut written = 0u64;
+        let mut since_checkpoint = 0usize;
         while let Some(batch) = rx.recv().await {
             let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
-            let (stored, done, total) = db.write(|conn| {
+            let (stored, done, total) = db.write_background(|conn| {
                 let mut touched: HashSet<i64> = HashSet::new();
                 let mut stored = 0u64;
                 for (_, message) in &batch {
@@ -863,6 +925,19 @@ fn spawn_backfill_writer(
             written += stored;
             report.add_messages(stored as i64);
             report.backfill_progress(done, total);
+
+            // Between batches, never inside one. A backfill is a single sync
+            // pass that runs for hours and writes a megabyte a second, so the
+            // gap between passes — where the loop's own checkpoint lives — does
+            // not come round until long after the log has become the largest
+            // file this app owns. Checked rather than performed every time:
+            // `checkpoint_if_large` is a `stat` unless the log has actually
+            // grown past the threshold.
+            since_checkpoint += 1;
+            if since_checkpoint >= BATCHES_BETWEEN_CHECKPOINTS {
+                since_checkpoint = 0;
+                super::checkpoint(&db);
+            }
         }
         Ok(written)
     })
