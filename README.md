@@ -43,8 +43,8 @@ Working, and in daily use by its author:
 - New-mail notifications and a Dock badge, under a narrow rule: unread, in the
   inbox, not from you, and either in Gmail's Personal category or continuing a
   thread you have written to.
-- Preferences for theme, density, default account, per-account signatures, undo
-  window, send delay, week start, working hours and sync interval.
+- Preferences for theme, default account, per-account signatures, undo window,
+  send delay, week start, working hours and sync interval.
 - An in-app agent that runs on the Claude Code CLI by default and needs no API
   key. See [`docs/agent-backends.md`](docs/agent-backends.md).
 - A sandboxed plugin runtime. See [`PLUGINS.md`](PLUGINS.md).

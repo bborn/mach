@@ -709,8 +709,9 @@ a reusable package. **Treat cal.com as look-don't-touch.**
 These are genuine taste calls, not researchable facts:
 
 1. **Density.** 48px/hour is Google's number and shows ~16 hours on a 13" laptop. A
-   40px option would show all 24 with no scrolling but makes a 15-min event 10px. Ship
-   48 fixed, or expose a compact/comfortable toggle?
+   40px option would show all 24 with no scrolling but makes a 15-min event 10px.
+   **Settled: 48 fixed.** Mach has one display and no density setting — the thread list
+   had a compact/comfortable pair and it was removed rather than extended.
 
 2. **Weekend columns.** Full-width equal columns for all 7 days, or narrow Sat/Sun to
    ~60% width to buy space for the working week? Notion Calendar hides weekends entirely

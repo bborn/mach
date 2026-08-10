@@ -54,7 +54,27 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: M9_MESSAGE_DRAFT_ID,
     },
+    Migration {
+        version: 10,
+        sql: M10_DROP_DENSITY,
+    },
 ];
+
+/// Migration 10 — delete the retired `density` preference.
+///
+/// `density` chose between a compact and a comfortable thread row. The app has
+/// one row now, and nothing reads the key.
+///
+/// Migration 4's note says a removed preference "leaves a row nobody reads
+/// instead of a column nobody can drop". That covers a downgrade, where a build
+/// that still wants the key has to find it. `density` will not come back, and
+/// `get_preferences` returns every row, so leaving it means handing the
+/// frontend a setting with no meaning on every launch for the lifetime of the
+/// store. One `DELETE` ends it.
+///
+/// A store that never held the key is unaffected — `DELETE` of no rows is not
+/// an error.
+const M10_DROP_DENSITY: &str = "DELETE FROM preferences WHERE key = 'density';";
 
 /// Migration 9 — which Gmail draft a message *is*.
 ///

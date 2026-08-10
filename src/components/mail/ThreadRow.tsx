@@ -159,7 +159,26 @@ export const ThreadRow = memo(function ThreadRow({
         )}
       />
 
-      <div className="flex min-w-0 flex-1 flex-col gap-px">
+      {/*
+        4px between the three lines. It was 1px, and the row read "a little
+        tight" in a report from inside the app.
+
+        The three lines sat 1px apart inside a row that kept ~8.75px clear above
+        the sender and below the preview. The space around the group was nine
+        times the space within it, which by proximity makes the group one
+        paragraph: sender, subject and preview fused into a single block, and
+        the type ramp was left carrying the hierarchy alone. 4px puts the two
+        figures within about 2:1 of each other, and the three lines separate.
+
+        The leading was left alone. Each of these is a single truncated line, so
+        `leading-tight` only sets how much symmetric padding the line box
+        carries — it would be this same gap under another name, spelled where
+        nobody reading the row's rhythm would look for it.
+
+        Adding up the line boxes: 16.25 + 4 + 17.5 + 4 + 13.75 = 55.5px, which
+        is what `--spacing-row` is sized against.
+      */}
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
         <div className="flex items-center gap-1">
           <span
             className={cn(
@@ -207,9 +226,8 @@ export const ThreadRow = memo(function ThreadRow({
           the preview sits one step down at `text-micro`. That puts three pixels
           between the line you scan for and the line you glance at.
 
-          It costs no height: 14px and 11px at `leading-tight` come to the same
-          49px the three 13px lines did, `--spacing-row` is untouched, and the
-          list shows as many conversations as it did.
+          It cost no height: 14px and 11px at `leading-tight` come to the same
+          47.5px the three 13px lines did.
 
           The preview goes darker as it goes smaller, `muted` rather than
           `faint`. The size is already carrying the demotion, and 11px at the

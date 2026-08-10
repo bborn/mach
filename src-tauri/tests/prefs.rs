@@ -73,7 +73,7 @@ fn a_written_preference_reads_back_unchanged() {
 fn every_json_shape_survives_the_round_trip() {
     let db = db();
     db.write(|conn| {
-        prefs::set(conn, "density", &json!("compact"), 1)?;
+        prefs::set(conn, "theme", &json!("dark"), 1)?;
         prefs::set(conn, "weekStartsOn", &json!(0), 1)?;
         prefs::set(conn, "defaultAccountId", &json!(null), 1)?;
         prefs::set(conn, "workingHours", &json!({ "start": 8, "end": 18 }), 1)?;
@@ -82,7 +82,7 @@ fn every_json_shape_survives_the_round_trip() {
     .expect("write a mixed batch");
 
     let all = db.read(prefs::all).expect("read all");
-    assert_eq!(all.get("density"), Some(&json!("compact")));
+    assert_eq!(all.get("theme"), Some(&json!("dark")));
     assert_eq!(all.get("weekStartsOn"), Some(&json!(0)));
     assert_eq!(all.get("defaultAccountId"), Some(&json!(null)));
     assert_eq!(
@@ -127,7 +127,7 @@ fn a_corrupt_row_is_skipped_rather_than_fatal() {
     // downgrade. One bad row must not cost the other eight.
     db.write(|conn| {
         Ok(conn.execute(
-            "INSERT INTO preferences (key, value, updated_at) VALUES ('density', '{not json', 1)",
+            "INSERT INTO preferences (key, value, updated_at) VALUES ('workingHours', '{not json', 1)",
             [],
         )?)
     })
@@ -135,7 +135,10 @@ fn a_corrupt_row_is_skipped_rather_than_fatal() {
 
     let all = db.read(prefs::all).expect("read all");
     assert_eq!(all.get("theme"), Some(&json!("dark")));
-    assert!(!all.contains_key("density"), "the unparsable row is dropped");
+    assert!(
+        !all.contains_key("workingHours"),
+        "the unparsable row is dropped"
+    );
 }
 
 #[test]
@@ -158,7 +161,6 @@ fn keys_this_build_has_never_heard_of_come_back_anyway() {
 fn key_validation_accepts_the_names_the_ui_actually_writes() {
     for key in [
         "theme",
-        "density",
         "weekStartsOn",
         "defaultAccountId",
         "undoWindowSeconds",

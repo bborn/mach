@@ -7,7 +7,7 @@
 //!
 //! # Rust holds the bytes; TypeScript holds the meaning
 //!
-//! Nothing here knows that `density` is one of two words or that
+//! Nothing here knows that `theme` is one of three words or that
 //! `undoWindowSeconds` is a number with a floor. That belongs in `src/lib/prefs.ts`,
 //! which has to do the defaulting and clamping anyway — the store can hand back
 //! a key written by a newer build, or by a hand-edited database, and the UI must

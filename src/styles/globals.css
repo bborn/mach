@@ -193,8 +193,21 @@
    * padding that keeps them off the divider. Written here as a literal because
    * there is exactly one row height — see `ThreadRow.tsx` for why the row is
    * three lines and why its height is fixed rather than grown from content.
+   *
+   * 76px, from 68. The three lines carry 47.5px of line box and the two gaps
+   * between them another 8, so 76 leaves 9.75px above the sender and below the
+   * preview. That is a little over twice the 4px within the group, which is the
+   * ratio that makes the row read as one thing with three parts. At 68 the
+   * outer figure was 8.75px against a 1px gap, and nine to one reads as a
+   * paragraph — see `ThreadRow.tsx`.
+   *
+   * The row height grew rather than the padding shrinking, because 4px gaps
+   * inside a 68px row would have left 5.75px at the edges and moved the
+   * crowding to the divider.
+   *
+   * It costs a conversation on screen. A 900px window showed 10 and shows 9.
    */
-  --spacing-row: 4.25rem;
+  --spacing-row: 4.75rem;
   --spacing-rail: var(--rail-width);
   --spacing-list: var(--list-width);
 
@@ -216,11 +229,11 @@
    *   title    17  one per view, and only one: the calendar's day number, the
    *                open conversation's subject
    *
-   * Density pays nothing for this. The three sizes that carry most of the
-   * pixels (micro, list, body) are unchanged, and the step above them is spent
-   * on two elements per surface. The thread row is still three lines in the
-   * same 4.25rem: the subject going 13→14 is paid for by the preview going
-   * 13→11.
+   * Height paid nothing for this. The three sizes that carry most of the pixels
+   * (micro, list, body) are unchanged, and the step above them is spent on two
+   * elements per surface. The thread row stayed at 4.25rem across the change:
+   * the subject going 13→14 was paid for by the preview going 13→11. The row is
+   * 4.75rem now, and that is the line spacing above, not the ramp.
    *
    * The event grid keeps its own 12px, set in `calendar-geometry.ts` rather than
    * here: it is a density figure measured off Google Calendar, not a step of

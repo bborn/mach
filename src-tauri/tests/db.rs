@@ -197,6 +197,50 @@ fn migrations_are_idempotent() {
 }
 
 #[test]
+fn upgrading_deletes_the_retired_density_preference_and_leaves_the_rest() {
+    // The upgrade path for a store written before the app settled on one thread
+    // row. `density` has to go; every other setting in the same table has to
+    // still be there afterwards.
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    let before_density_was_retired = schema::MIGRATIONS
+        .iter()
+        .map(|m| m.version)
+        .filter(|v| *v < schema::LATEST_VERSION)
+        .max()
+        .expect("a version before the newest");
+
+    for migration in schema::MIGRATIONS
+        .iter()
+        .filter(|m| m.version <= before_density_was_retired)
+    {
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(migration.sql).unwrap();
+        tx.pragma_update(None, "user_version", migration.version)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    conn.execute(
+        "INSERT INTO preferences (key, value, updated_at) VALUES
+            ('density', '\"compact\"', 1),
+            ('theme', '\"dark\"', 1)",
+        [],
+    )
+    .unwrap();
+
+    assert_eq!(schema::migrate(&mut conn).unwrap(), schema::LATEST_VERSION);
+
+    let keys: Vec<String> = conn
+        .prepare("SELECT key FROM preferences ORDER BY key")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(keys, vec!["theme".to_string()]);
+}
+
+#[test]
 fn an_older_database_gains_the_new_event_columns_without_losing_its_events() {
     // The upgrade path, not the fresh-install path: `ALTER TABLE` runs against a
     // populated `events`, and every new column has to read back as "we were
