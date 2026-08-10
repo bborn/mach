@@ -1,6 +1,5 @@
 import { Search } from "lucide-react";
 import { useMach } from "@/hooks/useMach";
-import { ACCOUNT_BG } from "@/lib/colors";
 import { cn } from "@/lib/utils";
 import { Kbd } from "@/components/ui/kbd";
 
@@ -9,12 +8,12 @@ import { Kbd } from "@/components/ui/kbd";
  *
  * It has moved into the rail, where Inbox and Calendar sit as peers — which is
  * where an app states what its surfaces are. The title bar is now what it
- * should have been: the window's identity, its search, and who is signed in.
+ * should have been: the window's identity and its search.
  * ⌘1/⌘2 and `g m`/`g c` are unchanged, and the calendar's own header carries a
  * Mail button so the trip back is not keyboard-only.
  */
 export function TitleBar() {
-  const { actions, accounts } = useMach();
+  const { actions } = useMach();
 
   return (
     <header
@@ -38,16 +37,6 @@ export function TitleBar() {
         <span className="min-w-0 flex-1 truncate text-left">Search</span>
         <Kbd keys="mod+k" className="border-none bg-transparent px-0" />
       </button>
-
-      <div className="ml-auto flex shrink-0 items-center gap-1" title="Accounts">
-        {accounts.map((account) => (
-          <span
-            key={account.id}
-            title={account.email}
-            className={cn("h-1.5 w-1.5 rounded-full", ACCOUNT_BG[account.colorIndex])}
-          />
-        ))}
-      </div>
     </header>
   );
 }
