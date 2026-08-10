@@ -60,9 +60,10 @@
 //!
 //! # What is never evicted
 //!
-//! [`retention_reason`] is the whole guard, and it is the only guard. The SQL in
+//! [`plan`] is the whole guard, and it is the only guard. The SQL in
 //! [`candidates`] narrows the scan; it does not decide. Every candidate goes
-//! through this function and only a `None` is written.
+//! through this function and only a [`Plan::Evict`] or [`Plan::Derive`] is
+//! written.
 //!
 //!  * **Anything Gmail cannot give back.** A local draft, an outbox message, any
 //!    row whose `gmail_message_id` is one of Mach's own placeholders, and the
@@ -76,26 +77,56 @@
 //!  * **Trash and spam.** The message still exists at Gmail *today*; in thirty
 //!    days it is purged and the request would 404 forever. Evicting there trades
 //!    a recoverable body for an unrecoverable one at a date nobody is watching.
-//!  * **Anything with no plain text.** The read path renders `body_text` while
-//!    the request is in flight. A message that has HTML and no text part would
-//!    fall through to its snippet — one line — and would be a visibly worse
-//!    message for as long as it took to fetch, or forever if the fetch failed.
-//!    Deriving text from the HTML first was considered and rejected: it would
-//!    write `body_text`, and `body_text` is what `messages_fts` indexes.
+//!  * **Anything with no plain text, and none derivable.** The read path renders
+//!    `body_text` while the request is in flight. A message with HTML and no
+//!    text part would fall through to its snippet — one line — and would be a
+//!    visibly worse message for as long as the fetch took, or forever if it
+//!    failed. See [the section below](#html-only-mail) for what happens first.
 //!  * **Anything already gone.** `body_html IS NULL` is not a candidate; there
 //!    is nothing to free and a stamp would make a plain-text message look
 //!    refetchable.
 //!  * **Small bodies.** Under [`EvictionPolicy::min_bytes`] the page is not
 //!    freed anyway — a short body shares a page with its neighbours — and the
 //!    open would still cost a round trip. 2 KB is the floor.
+//!  * **Bodies that are mostly text already.** A body whose derived text is
+//!    within [`EvictionPolicy::min_bytes`] of the HTML it came from frees
+//!    nothing and costs a round trip. Same floor, applied to the difference.
 //!
-//! `body_text` is never written by anything in this module. Neither is
-//! `subject`. Those two are the whole of `messages_fts`, so the index is not
-//! merely intact after a sweep: nothing an eviction writes is indexed at all,
-//! and a search finds an evicted message by a phrase in its body exactly as it
-//! did before. (The `messages_fts_au` trigger still fires on the UPDATE and
-//! re-writes the same terms, which costs index churn and no correctness; see
-//! [`sweep`].)
+//! # HTML-only mail
+//!
+//! The first version of this module refused every message with no `body_text`
+//! and left it there, on the grounds that deriving text would write `body_text`
+//! and `body_text` is what `messages_fts` indexes. On the owner's store that
+//! rule refused 12 481 of 12 494 candidates and the first sweep freed nothing.
+//!
+//! The reasoning was backwards on this data. Plenty of senders ship HTML with no
+//! `text/plain` alternative, and Mach stores what arrived; those messages have
+//! *no* indexed body at all and are findable by subject alone. Writing a derived
+//! `body_text` cannot cost search anything, because there was nothing there to
+//! lose — it is the only way those bodies become searchable.
+//!
+//! So the sweep derives the text — [`crate::render::text::from_html`], which
+//! sanitizes first, so no stylesheet or script ever becomes a term — and writes
+//! it in **the same UPDATE that drops the HTML**:
+//!
+//! ```sql
+//! UPDATE messages SET body_text = ?, body_html = NULL, … WHERE id = ?
+//! ```
+//!
+//! One statement, so the ordering is not a convention that a later edit can
+//! reverse. There is no instant, and no crash, in which a row has lost its HTML
+//! and not yet gained its text: either the row is written or it is not. A
+//! derivation that produces nothing legible means the statement is never issued
+//! and the HTML stays where it is.
+//!
+//! `subject` is still never written, and neither is a `body_text` that already
+//! holds something — the derived write carries `AND (body_text IS NULL OR
+//! trim(body_text) = '')`, so a sender's own text can never be replaced by a
+//! machine's reading of their markup, not even by a sweep racing a sync.
+//!
+//! Derived text is marked as derived, in `body_text_derived_at` (migration 13).
+//! Nothing reads it to change what the reader sees; it exists so the rows this
+//! module invented text for can be found again if the extractor improves.
 //!
 //! # Getting the space back
 //!
@@ -172,8 +203,13 @@ pub enum Keep {
     Draft,
     /// Trashed or spam: Gmail purges it, and then the re-fetch is a 404.
     Deleted,
-    /// No plain-text body to render while the re-fetch is in flight.
+    /// No plain-text body to render while the re-fetch is in flight, and none
+    /// could be read out of the HTML either — a body that is one image with no
+    /// `alt`, or markup with no prose in it at all.
     NoText,
+    /// The text derived from this body is nearly as large as the body. Dropping
+    /// the HTML would free nothing and cost a round trip.
+    NoGain,
     /// There is no HTML here to drop.
     NotResident,
     /// Too small for the round trip to be worth the pages.
@@ -192,6 +228,7 @@ impl Keep {
             Keep::Draft => "draft",
             Keep::Deleted => "deleted",
             Keep::NoText => "noText",
+            Keep::NoGain => "noGain",
             Keep::NotResident => "notResident",
             Keep::TooSmall => "tooSmall",
             Keep::TooRecent => "tooRecent",
@@ -221,46 +258,103 @@ pub struct MessageFacts {
     pub html_restored_at: Option<i64>,
 }
 
-/// The guard. `None` means this row's HTML may be dropped.
+/// What the sweep will do with one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// Drop the HTML. The message already has text to render in its place.
+    Evict,
+    /// Read the text out of the HTML and drop the HTML, in one statement. The
+    /// message has no `body_text`, which on this store is most of them.
+    Derive,
+    /// Leave it alone, for this reason.
+    Keep(Keep),
+}
+
+impl Plan {
+    /// The reason this row is being left alone, if it is.
+    pub fn kept(self) -> Option<Keep> {
+        match self {
+            Plan::Keep(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// The guard.
 ///
 /// The order is deliberate: everything unrecoverable is refused before anything
 /// merely uneconomic is, so a test that asks "why was this kept" gets the answer
 /// that matters rather than "it was small".
-pub fn retention_reason(
-    facts: &MessageFacts,
-    now_ms: i64,
-    policy: &EvictionPolicy,
-) -> Option<Keep> {
+///
+/// Missing text is no longer a refusal — it is [`Plan::Derive`], which is a
+/// refusal until the derivation succeeds. It sits where the old check sat, after
+/// everything unrecoverable and before every economic test, so nothing that
+/// could not be fetched back is ever offered for derivation.
+pub fn plan(facts: &MessageFacts, now_ms: i64, policy: &EvictionPolicy) -> Plan {
     // Not Google's id: a draft Mach minted, an outbox entry, or a row with no
     // id at all. There is nothing at the other end to ask.
     if is_local_message_id(&facts.gmail_message_id) {
-        return Some(Keep::Unrecoverable);
+        return Plan::Keep(Keep::Unrecoverable);
     }
     if facts.is_draft {
-        return Some(Keep::Draft);
+        return Plan::Keep(Keep::Draft);
     }
     if facts.deleted {
-        return Some(Keep::Deleted);
-    }
-    if !facts.has_text {
-        return Some(Keep::NoText);
+        return Plan::Keep(Keep::Deleted);
     }
 
     let Some(bytes) = facts.html_bytes else {
-        return Some(Keep::NotResident);
+        return Plan::Keep(Keep::NotResident);
     };
     if bytes < policy.min_bytes {
-        return Some(Keep::TooSmall);
+        return Plan::Keep(Keep::TooSmall);
     }
     if facts.internal_date >= now_ms.saturating_sub(policy.older_than_ms) {
-        return Some(Keep::TooRecent);
+        return Plan::Keep(Keep::TooRecent);
     }
     if let Some(restored) = facts.html_restored_at {
         if restored >= now_ms.saturating_sub(policy.keep_restored_for_ms) {
-            return Some(Keep::RecentlyRestored);
+            return Plan::Keep(Keep::RecentlyRestored);
         }
     }
-    None
+
+    if facts.has_text {
+        Plan::Evict
+    } else {
+        Plan::Derive
+    }
+}
+
+/// The guard, for a caller that only wants to know whether the row is being left
+/// alone. A row that needs its text derived first is not being kept — see
+/// [`plan`].
+pub fn retention_reason(facts: &MessageFacts, now_ms: i64, policy: &EvictionPolicy) -> Option<Keep> {
+    plan(facts, now_ms, policy).kept()
+}
+
+/// The largest derived body the sweep will store.
+///
+/// Derived text is written back into the store the sweep is trying to shrink, so
+/// it needs a ceiling that does not depend on the sender's markup being sane. A
+/// quarter of a megabyte is far more prose than any mail body — the owner's
+/// entire `body_text` column is 140 MB across 66 000 messages, about 2 KB each —
+/// and it bounds the pathological case where stripping the tags off a very large
+/// document yields a very large document.
+pub const MAX_DERIVED_BYTES: usize = 256 * 1024;
+
+/// The text this HTML would be indexed and read by, or `None` if there is none.
+///
+/// Sanitizing happens inside [`crate::render::text::from_html`], which is what
+/// keeps a `<style>` block from arriving in the index as three kilobytes of CSS
+/// selectors.
+pub fn derive_text(html: &str) -> Option<String> {
+    let text = crate::render::text::from_html(html);
+    let bounded = crate::render::text::truncate(&text, MAX_DERIVED_BYTES);
+    if bounded.trim().is_empty() {
+        None
+    } else {
+        Some(bounded.into_owned())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,8 +368,14 @@ pub struct EvictionReport {
     pub examined: u64,
     /// Rows whose HTML was dropped.
     pub evicted: u64,
-    /// Bytes of `body_html` no longer stored. Not bytes returned to the
-    /// filesystem — see [`reclaim`] for that.
+    /// Of those, rows that had no `body_text` until this sweep wrote one.
+    pub derived: u64,
+    /// Bytes of derived text written back, which is the cost of those rows.
+    pub bytes_written: u64,
+    /// Bytes of `body_html` no longer stored, **less** `bytes_written`. Net,
+    /// because a sweep that drops 80 KB of markup and stores 3 KB of text has
+    /// freed 77 KB and saying 80 would be wrong. Not bytes returned to the
+    /// filesystem either — see [`reclaim`] for that.
     pub bytes_freed: u64,
     /// Rows the guard refused, and why. Kept because "the sweep found 40 000
     /// candidates and evicted none" is a sentence somebody has to be able to
@@ -302,6 +402,8 @@ impl EvictionReport {
     fn absorb(&mut self, other: EvictionReport) {
         self.examined += other.examined;
         self.evicted += other.evicted;
+        self.derived += other.derived;
+        self.bytes_written += other.bytes_written;
         self.bytes_freed += other.bytes_freed;
         for (reason, n) in other.kept {
             match self.kept.iter_mut().find(|(r, _)| *r == reason) {
@@ -314,7 +416,7 @@ impl EvictionReport {
 
 /// The rows the sweep will consider, cheapest-first.
 ///
-/// Every clause here is also in [`retention_reason`], which is the point: this
+/// Every clause here is also in [`plan`], which is the point: this
 /// is a pre-filter that keeps the sweep from reading 66 000 rows to reject
 /// 63 000 of them, and the guard is what actually decides. The one clause that
 /// cannot be expressed twice is the local-id test — `gmail_message_id = ''` is
@@ -372,6 +474,57 @@ fn candidates(
     Ok(rows)
 }
 
+/// One row the sweep has decided to evict, and the text it will carry with it.
+struct Doomed {
+    id: i64,
+    /// Bytes of `body_html` about to go.
+    html_bytes: i64,
+    /// The text derived from that HTML, for a row that had none. `None` means
+    /// the row already has a body the reader can fall back to.
+    derived: Option<String>,
+}
+
+/// The HTML of one row, read back so its text can be derived from it.
+///
+/// A separate single-row read rather than a column on [`candidates`], because
+/// the batch is 500 rows and a batch of 500 bodies is 40 MB held to decide
+/// something that only needs one at a time.
+fn resident_html(db: &Db, id: i64) -> Result<Option<String>> {
+    db.read(|conn| {
+        use rusqlite::OptionalExtension;
+        Ok(conn
+            .query_row("SELECT body_html FROM messages WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
+    })
+}
+
+/// The text that will stand in for this row's HTML, or why it will not.
+///
+/// The two economic refusals that can only be made once the derivation has been
+/// tried. Both leave the HTML exactly where it is, which is what makes trying
+/// safe: nothing has been written by the time either is returned.
+fn derived_body(
+    db: &Db,
+    facts: &MessageFacts,
+    policy: &EvictionPolicy,
+) -> Result<std::result::Result<String, Keep>> {
+    let derived = resident_html(db, facts.id)?.as_deref().and_then(derive_text);
+    // Markup with no prose in it — one image and no `alt`, a body that is all
+    // layout. Nothing to fall back to and nothing to index.
+    let Some(text) = derived else {
+        return Ok(Err(Keep::NoText));
+    };
+    // Storing the text would cost most of what dropping the HTML saves, and the
+    // next open would still be a round trip.
+    if facts.html_bytes.unwrap_or(0) - (text.len() as i64) < policy.min_bytes {
+        return Ok(Err(Keep::NoGain));
+    }
+    Ok(Ok(text))
+}
+
 /// Drop the HTML of everything the policy and the guard agree on.
 ///
 /// One write transaction per [`EvictionPolicy::batch`], because the alternative
@@ -379,11 +532,37 @@ fn candidates(
 /// the whole sweep and puts every sync write behind it. Between batches the lock
 /// is released, so the sync loop interleaves normally.
 ///
-/// The `UPDATE` fires `messages_fts_au`, which deletes and re-inserts this row's
-/// terms. The terms are `subject` and `body_text` and neither is being changed,
-/// so the net effect on the index is nothing; the cost is real, and it is why
-/// [`reclaim`] runs `optimize` before the `VACUUM` rather than leaving the index
-/// carrying a delete and an insert for every evicted row.
+/// # Where the derivation happens
+///
+/// Before the transaction opens, not inside it. Sanitizing a body costs on the
+/// order of a millisecond and a batch of 500 would be most of a second of it;
+/// spending that under the single writer lock is exactly the contention this
+/// module exists to avoid. So the text is derived from a pooled read, which
+/// blocks nobody, and the write is only the UPDATEs.
+///
+/// That leaves a gap in which sync could have replaced `body_html` — and it is
+/// closed by the statement rather than by the ordering. `body_html IS NOT NULL`
+/// means a row re-fetched in between is not stamped as evicted while holding a
+/// body, and `body_text IS NULL OR trim(body_text) = ''` means a row that gained
+/// a real text part in between keeps it. A message body at Gmail does not change
+/// under a message id, so the derivation cannot be reading different bytes from
+/// the ones being dropped; these two clauses are what makes that not need to be
+/// true.
+///
+/// # The one statement
+///
+/// The derived write sets `body_text` and NULLs `body_html` in a single UPDATE.
+/// Not two statements in a transaction, which would be equally durable and would
+/// leave the ordering as a line of code somebody could move. There is no
+/// sequence of interruptions that loses both, because there is no intermediate
+/// row state to be interrupted in.
+///
+/// The `UPDATE` fires `messages_fts_au`, which deletes this row's old terms and
+/// inserts its new ones. For a row that is only losing HTML the terms are
+/// unchanged and the churn buys nothing, which is why [`reclaim`] runs
+/// `optimize` before the `VACUUM`. For a row that is gaining derived text, that
+/// trigger is the entire point: `subject` was all `messages_fts` had of it, and
+/// after the sweep it has the body.
 pub fn sweep(db: &Db, now_ms: i64, policy: &EvictionPolicy) -> Result<EvictionReport> {
     let mut total = EvictionReport::default();
     let mut cursor = 0i64;
@@ -404,32 +583,64 @@ pub fn sweep(db: &Db, now_ms: i64, policy: &EvictionPolicy) -> Result<EvictionRe
         cursor = batch.last().map(|f| f.id).unwrap_or(cursor);
 
         let mut report = EvictionReport::default();
-        let mut doomed: Vec<(i64, i64)> = Vec::with_capacity(batch.len());
+        let mut doomed: Vec<Doomed> = Vec::with_capacity(batch.len());
         for facts in &batch {
             report.examined += 1;
-            match retention_reason(facts, now_ms, policy) {
-                Some(reason) => report.keep(reason),
-                None => doomed.push((facts.id, facts.html_bytes.unwrap_or(0))),
+            let html_bytes = facts.html_bytes.unwrap_or(0);
+            match plan(facts, now_ms, policy) {
+                Plan::Keep(reason) => report.keep(reason),
+                Plan::Evict => doomed.push(Doomed {
+                    id: facts.id,
+                    html_bytes,
+                    derived: None,
+                }),
+                Plan::Derive => match derived_body(db, facts, policy)? {
+                    Err(reason) => report.keep(reason),
+                    Ok(text) => doomed.push(Doomed {
+                        id: facts.id,
+                        html_bytes,
+                        derived: Some(text),
+                    }),
+                },
             }
         }
 
         if !doomed.is_empty() {
             db.write(|conn| {
-                let mut stmt = conn.prepare(
-                    // `body_html IS NOT NULL` in the WHERE so a row sync
-                    // re-fetched between the read and this write is not stamped
-                    // as evicted while holding a body.
+                let mut evict = conn.prepare(
                     "UPDATE messages
                         SET body_html        = NULL,
                             html_evicted_at  = ?2,
                             html_restored_at = NULL
                       WHERE id = ?1 AND body_html IS NOT NULL",
                 )?;
-                for (id, bytes) in &doomed {
-                    if stmt.execute(params![id, now_ms])? > 0 {
-                        report.evicted += 1;
-                        report.bytes_freed += *bytes as u64;
+                // Text and eviction in one statement. See the function doc.
+                let mut derive = conn.prepare(
+                    "UPDATE messages
+                        SET body_text            = ?3,
+                            body_text_derived_at = ?2,
+                            body_html            = NULL,
+                            html_evicted_at      = ?2,
+                            html_restored_at     = NULL
+                      WHERE id = ?1
+                        AND body_html IS NOT NULL
+                        AND (body_text IS NULL OR trim(body_text) = '')",
+                )?;
+                for row in &doomed {
+                    let wrote = match &row.derived {
+                        None => evict.execute(params![row.id, now_ms])?,
+                        Some(text) => derive.execute(params![row.id, now_ms, text])?,
+                    };
+                    if wrote == 0 {
+                        continue;
                     }
+                    report.evicted += 1;
+                    let written = row.derived.as_ref().map(|t| t.len() as u64).unwrap_or(0);
+                    if written > 0 {
+                        report.derived += 1;
+                        report.bytes_written += written;
+                    }
+                    report.bytes_freed += (row.html_bytes as u64).saturating_sub(written);
                 }
                 Ok(())
             })?;

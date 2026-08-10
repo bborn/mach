@@ -1532,3 +1532,138 @@ fn declared_size_is_read_from_the_declaration_that_actually_renders() {
     let r = allow(r#"<img src="https://t.test/a.png" style="color:red;margin:0;width:2px">"#);
     assert_eq!(r.blocked_trackers, 1, "{}", r.html);
 }
+
+// ---------------------------------------------------------------------------
+// HTML → text
+// ---------------------------------------------------------------------------
+//
+// `render::text` is what the eviction sweep derives `body_text` from for the
+// large fraction of mail that arrives as HTML with no `text/plain` part. So it
+// is held to two standards at once: legible enough to read while the HTML is
+// being re-fetched, and clean enough that what goes into `messages_fts` is
+// words a person would search for.
+
+use mach_lib::render::text;
+
+#[test]
+fn a_stylesheet_never_becomes_searchable_text() {
+    // The reason the extractor sanitizes first. A body with a `<style>` block —
+    // which is most marketing mail — would otherwise contribute a few kilobytes
+    // of selectors and property names to the index.
+    let derived = text::from_html(
+        "<html><head><style>.hero { color: #ff0000; font-family: Helvetica; }</style></head>\
+         <body><script>var tracking = 'pixel';</script><p>The invoice is attached.</p></body></html>",
+    );
+
+    assert_eq!(derived, "The invoice is attached.");
+    for leak in ["color", "Helvetica", "#ff0000", "tracking", "pixel", "var"] {
+        assert!(
+            !derived.contains(leak),
+            "{leak:?} leaked into the text: {derived}"
+        );
+    }
+}
+
+#[test]
+fn table_cells_do_not_run_into_each_other() {
+    // Mail is laid out in tables. Without a separator "Total" and "$42" become
+    // one token, findable by neither word.
+    let derived = text::from_html(
+        "<table><tr><td>Total</td><td>$42.00</td></tr>\
+         <tr><td>Shipping</td><td>Free</td></tr></table>",
+    );
+
+    assert_eq!(derived, "Total $42.00\nShipping Free");
+}
+
+#[test]
+fn alt_text_is_kept_and_a_bare_link_keeps_its_url() {
+    // A message that is entirely images has its prose in `alt`, and a button
+    // that is one image with no `alt` would otherwise be nothing at all.
+    let derived = text::from_html(
+        r#"<p><img src="https://cdn.test/hero.png" alt="Spring sale: 40% off"></p>
+           <p><a href="https://shop.test/sale">Shop now</a></p>
+           <p><a href="https://shop.test/terms"><img src="https://cdn.test/b.png"></a></p>"#,
+    );
+
+    assert!(derived.contains("Spring sale: 40% off"), "{derived}");
+    assert!(derived.contains("Shop now"), "{derived}");
+    assert!(
+        derived.contains("https://shop.test/terms"),
+        "a link with no text keeps its URL: {derived}"
+    );
+    // And a link that *did* have text is not also spelled out as a URL, which
+    // would put a tracking URL beside every word in the index.
+    assert!(!derived.contains("https://shop.test/sale"), "{derived}");
+}
+
+#[test]
+fn entities_are_decoded_once() {
+    // Decoding twice takes `&amp;lt;` all the way to `<`, which is how a
+    // sanitized body turns back into markup. Attribute values are pushed still
+    // escaped for exactly this reason.
+    let derived = text::from_html(
+        r#"<p>Tom &amp; Jerry &mdash; &amp;lt;not a tag&amp;gt;</p>
+           <p><img src="https://cdn.test/a.png" alt="Ben &amp; Jerry&#39;s"></p>"#,
+    );
+
+    assert!(
+        derived.contains("Tom & Jerry — &lt;not a tag&gt;"),
+        "{derived}"
+    );
+    assert!(derived.contains("Ben & Jerry's"), "{derived}");
+}
+
+#[test]
+fn whitespace_comes_out_readable() {
+    // Two hundred spacer rows and a pretty-printed body should not produce two
+    // hundred blank lines and a screenful of indentation.
+    let derived = text::from_html(
+        "<div>\n    <p>   First     paragraph.   </p>\n\n\n\
+         <div style=\"padding:0\">&nbsp;</div>\
+         <div style=\"padding:0\">&nbsp;</div>\
+         <div style=\"padding:0\">&nbsp;</div>\
+         <p>Second\n   paragraph.</p>\n</div>",
+    );
+
+    assert_eq!(derived, "First paragraph.\nSecond paragraph.");
+}
+
+#[test]
+fn markup_with_no_prose_comes_out_empty() {
+    // What tells the sweep there is nothing to fall back to, so the HTML has to
+    // stay. Asserted here as well as in `evict.rs`, because it is this
+    // function's answer that decides it.
+    for body in [
+        r#"<img src="https://cdn.test/a.png">"#,
+        "<style>.a { color: red }</style>",
+        "<div><span>   </span><br><br></div>",
+        "",
+    ] {
+        assert!(
+            text::from_html(body).trim().is_empty(),
+            "{body:?} produced text: {:?}",
+            text::from_html(body)
+        );
+    }
+}
+
+#[test]
+fn a_body_truncated_mid_tag_does_not_leak_the_tag() {
+    // The sanitizer's input cap can cut a body anywhere. Everything after an
+    // unterminated `<` is markup that cannot be read, so it is not text either.
+    assert_eq!(
+        text::from_sanitized("<p>Readable.</p><div style=\"color:re"),
+        "Readable."
+    );
+}
+
+#[test]
+fn an_attribute_name_is_matched_at_its_boundary() {
+    // `data-mach-blocked-src` and `src` both end in the shorter name, and the
+    // sanitizer emits the first of those on every remote image.
+    let derived = text::from_sanitized(
+        r#"<a data-href="https://decoy.test/" href="https://real.test/"><img alt=""></a>"#,
+    );
+    assert_eq!(derived, "https://real.test/");
+}

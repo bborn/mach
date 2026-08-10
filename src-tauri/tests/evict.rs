@@ -10,15 +10,18 @@
 //! So the properties under test are:
 //!
 //!  1. **Nothing unrecoverable is evicted.** Every id Mach minted, every draft,
-//!     everything in Trash or Spam, and everything with no plain text to render
-//!     in the meantime, survives a sweep that is otherwise evicting everything.
-//!  2. **`body_text` and the index are untouched.** A search that found a
-//!     message by a phrase in its body finds it after the sweep, by the same
-//!     phrase.
-//!  3. **The read path never waits.** An evicted message renders its text with
+//!     and everything in Trash or Spam survives a sweep that is otherwise
+//!     evicting everything.
+//!  2. **Nothing is ever left with neither a body nor its text.** A message with
+//!     no `body_text` has one derived from its HTML in the same statement that
+//!     drops the HTML, and a derivation that fails leaves the HTML alone.
+//!  3. **A sender's own text is never overwritten, and the index only gains.** A
+//!     search that found a message by a phrase in its body finds it after the
+//!     sweep; a message that had no indexed body at all becomes findable by one.
+//!  4. **The read path never waits.** An evicted message renders its text with
 //!     no request, and the request that upgrades it is a second call the reader
 //!     is not blocked on.
-//!  4. **A failed fetch is loud and lossless.** The text stays and the reason is
+//!  5. **A failed fetch is loud and lossless.** The text stays and the reason is
 //!     returned rather than swallowed.
 
 use std::path::PathBuf;
@@ -30,7 +33,7 @@ use mach_lib::db::models::*;
 use mach_lib::db::queries as q;
 use mach_lib::db::Db;
 use mach_lib::evict::{
-    self, restore_html, EvictionPolicy, Keep, MessageFacts, RestoreError, Restored,
+    self, restore_html, EvictionPolicy, Keep, MessageFacts, Plan, RestoreError, Restored,
 };
 use mach_lib::google::calendar::CalendarClient;
 use mach_lib::google::gmail::GmailClient;
@@ -396,18 +399,76 @@ fn trash_and_spam_are_never_evicted() {
 }
 
 #[test]
-fn a_message_with_no_plain_text_is_never_evicted() {
-    // There would be nothing to render while the request was in flight, and
-    // nothing at all if it failed. The whole read path rests on `body_text`
-    // being there.
+fn a_message_with_no_plain_text_has_its_text_derived_first() {
+    // The read path rests on `body_text` being there, and for most of the mail
+    // on this store it is not — HTML-only is what the majority of senders ship.
+    // So the plan for those rows is to write one, from the HTML, before the HTML
+    // goes. It is not a refusal and it is not an unguarded eviction.
     let facts = MessageFacts {
         has_text: false,
         ..evictable()
     };
+    assert_eq!(evict::plan(&facts, NOW, &policy()), Plan::Derive);
     assert_eq!(
         evict::retention_reason(&facts, NOW, &policy()),
-        Some(Keep::NoText)
+        None,
+        "a row waiting on a derivation is not being kept"
     );
+}
+
+#[test]
+fn deriving_text_never_reaches_a_message_that_could_not_be_fetched_back() {
+    // The order in `plan`: every unrecoverable reason is answered before the
+    // question of text is asked. Otherwise a draft with no text part would be
+    // offered for derivation, and the only thing standing between that and an
+    // evicted draft would be the derivation failing.
+    for (label, facts) in [
+        (
+            "a local id",
+            MessageFacts {
+                gmail_message_id: format!("{OUTBOX_ID_PREFIX}4"),
+                has_text: false,
+                ..evictable()
+            },
+        ),
+        (
+            "a draft",
+            MessageFacts {
+                is_draft: true,
+                has_text: false,
+                ..evictable()
+            },
+        ),
+        (
+            "a trashed message",
+            MessageFacts {
+                deleted: true,
+                has_text: false,
+                ..evictable()
+            },
+        ),
+        (
+            "a recent message",
+            MessageFacts {
+                internal_date: NOW - 3 * DAY_MS,
+                has_text: false,
+                ..evictable()
+            },
+        ),
+        (
+            "a small body",
+            MessageFacts {
+                html_bytes: Some(400),
+                has_text: false,
+                ..evictable()
+            },
+        ),
+    ] {
+        assert!(
+            matches!(evict::plan(&facts, NOW, &policy()), Plan::Keep(_)),
+            "{label} with no text must be kept, not derived"
+        );
+    }
 }
 
 #[test]
@@ -491,7 +552,11 @@ fn an_old_message_loses_its_html_and_keeps_its_text() {
     assert_eq!(
         text_of(&db, id).as_deref(),
         Some("The quarterly numbers are attached."),
-        "body_text is never touched"
+        "a body the sender wrote is left exactly as it was"
+    );
+    assert_eq!(
+        report.derived, 0,
+        "and nothing was derived, because nothing needed to be"
     );
 }
 
@@ -553,14 +618,6 @@ fn the_sweep_leaves_everything_unrecoverable_where_it_is() {
             ..Default::default()
         },
     );
-    let no_text = store(
-        &db,
-        account_id,
-        &Sample {
-            text: None,
-            ..Default::default()
-        },
-    );
     let recent = store(
         &db,
         account_id,
@@ -589,7 +646,6 @@ fn the_sweep_leaves_everything_unrecoverable_where_it_is() {
         ("a Gmail-side draft", gmail_draft),
         ("a trashed message", trashed),
         ("a spam message", spam),
-        ("a message with no plain text", no_text),
         ("a recent message", recent),
         ("a tiny body", tiny),
     ] {
@@ -602,10 +658,13 @@ fn the_sweep_leaves_everything_unrecoverable_where_it_is() {
 }
 
 #[test]
-fn a_sweep_never_writes_body_text_or_subject() {
-    // The two columns `messages_fts` indexes. Asserted as a property of the
-    // whole store rather than of one row, so a future clause that "fixes up" a
-    // body while it is there has to fail this.
+fn a_sweep_never_rewrites_a_body_the_sender_wrote() {
+    // `body_text` and `subject` are the whole of `messages_fts`. The sweep
+    // writes `body_text` now, and only ever into a row that has none — a
+    // sender's own text is never replaced by a machine's reading of their
+    // markup. Asserted as a property of the whole store rather than of one row,
+    // so a future clause that "fixes up" a body while it is there has to fail
+    // this.
     let db = TempDb::new("columns");
     let account_id = account(&db);
     for n in 0..5 {
@@ -642,12 +701,307 @@ fn a_sweep_never_writes_body_text_or_subject() {
     assert_eq!(before, after);
 }
 
+// ===========================================================================
+// HTML-only mail
+// ===========================================================================
+//
+// The rows the first version of this module refused, which on the owner's store
+// was 12 481 of 12 494 candidates. They have no `body_text`, so there was
+// nothing to render while a re-fetch was in flight — and, separately, nothing in
+// `messages_fts` either: those messages were findable by subject alone.
+
+/// A body with prose in it and no `text/plain` part, which is what most HTML
+/// mail is: a table of spacer cells with some words somewhere inside.
+fn html_only(prose: &str) -> Sample {
+    Sample {
+        html: Some(format!(
+            "<html><head><style>.x {{ color: #ff0000 }}</style></head><body>\
+             <table><tr><td><p>{prose}</p></td></tr></table>{}</body></html>",
+            "<div style=\"padding:0\">&nbsp;</div>".repeat(200)
+        )),
+        text: None,
+        ..Default::default()
+    }
+}
+
+fn derived_at_of(db: &Db, message_id: i64) -> Option<i64> {
+    db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT body_text_derived_at FROM messages WHERE id = ?1",
+                [message_id],
+                |r| r.get(0),
+            )
+            .expect("row"))
+    })
+    .expect("read")
+}
+
+#[test]
+fn an_html_only_message_gains_text_and_then_loses_its_html() {
+    let db = TempDb::new("derive");
+    let account_id = account(&db);
+    let id = store(
+        &db,
+        account_id,
+        &html_only("The pangolin invoice is overdue."),
+    );
+    assert_eq!(text_of(&db, id), None, "it starts with no text at all");
+    let html_bytes = html_of(&db, id).expect("resident").len() as u64;
+
+    let report = evict::sweep(&db, NOW, &policy()).expect("sweep");
+
+    assert_eq!(report.evicted, 1);
+    assert_eq!(report.derived, 1);
+    assert_eq!(html_of(&db, id), None, "the HTML is gone");
+    assert_eq!(
+        text_of(&db, id).as_deref(),
+        Some("The pangolin invoice is overdue."),
+        "and the text it never had is there"
+    );
+    assert_eq!(
+        derived_at_of(&db, id),
+        Some(NOW),
+        "marked as text Mach wrote, not text the sender sent"
+    );
+
+    // The stylesheet was in the body and is not in the text.
+    assert!(!text_of(&db, id).unwrap().contains("color"));
+
+    // Net, because storing the text costs some of what dropping the HTML saved.
+    // Reporting the gross is how a sweep that writes back nearly as much as it
+    // drops would still look like a win.
+    assert_eq!(report.bytes_written, text_of(&db, id).unwrap().len() as u64);
+    assert_eq!(
+        report.bytes_freed + report.bytes_written,
+        html_bytes,
+        "bytes_freed is the difference, not the gross"
+    );
+}
+
+#[test]
+fn a_derivation_that_produces_nothing_leaves_the_html_alone() {
+    // The failure case, and the reason the write is conditional rather than
+    // ordered: a body that is one image with no `alt` has no text in it, so
+    // there is nothing to fall back to and the HTML has to stay.
+    let db = TempDb::new("underivable");
+    let account_id = account(&db);
+    let id = store(
+        &db,
+        account_id,
+        &Sample {
+            html: Some(format!(
+                "<html><body>{}</body></html>",
+                "<img src=\"https://cdn.test/pixel.png\">".repeat(200)
+            )),
+            text: None,
+            ..Default::default()
+        },
+    );
+
+    let report = evict::sweep(&db, NOW, &policy()).expect("sweep");
+
+    assert_eq!(report.evicted, 0);
+    assert_eq!(report.kept_count(Keep::NoText), 1);
+    assert!(
+        html_of(&db, id).is_some(),
+        "the body is still there to be read"
+    );
+    assert_eq!(text_of(&db, id), None);
+    assert_eq!(derived_at_of(&db, id), None);
+}
+
+#[test]
+fn a_body_that_is_almost_all_text_is_not_worth_evicting() {
+    // Dropping 3 KB of markup to store 2.9 KB of text frees nothing and costs a
+    // round trip on the next open.
+    let db = TempDb::new("nogain");
+    let account_id = account(&db);
+    let id = store(
+        &db,
+        account_id,
+        &Sample {
+            html: Some(format!("<p>{}</p>", "prose ".repeat(700))),
+            text: None,
+            ..Default::default()
+        },
+    );
+
+    let report = evict::sweep(&db, NOW, &policy()).expect("sweep");
+
+    assert_eq!(report.evicted, 0);
+    assert_eq!(report.kept_count(Keep::NoGain), 1);
+    assert!(html_of(&db, id).is_some());
+    assert_eq!(text_of(&db, id), None, "and nothing was written either");
+}
+
+#[test]
+fn a_derived_body_has_a_ceiling() {
+    // Derived text is written back into the store the sweep is shrinking, so it
+    // cannot be allowed to depend on the sender's markup being sane.
+    let huge = format!("<p>{}</p>", "pangolin ".repeat(200_000));
+    let derived = evict::derive_text(&huge).expect("there is prose in it");
+
+    assert!(
+        derived.len() <= evict::MAX_DERIVED_BYTES,
+        "{} bytes",
+        derived.len()
+    );
+    assert!(derived.starts_with("pangolin pangolin"));
+}
+
+#[test]
+fn no_message_is_ever_left_with_neither_a_body_nor_its_text() {
+    // The ordering guarantee, enforced by SQLite rather than asserted after the
+    // fact. This trigger fires once per UPDATE *statement*, inside the sweep's
+    // own transaction, so it sees every intermediate state a crash could freeze
+    // — and aborts on the one state that must never exist. Deriving in a second
+    // statement after the eviction would trip it; so would evicting a row whose
+    // derivation came back empty.
+    let db = TempDb::new("atomic");
+    let account_id = account(&db);
+    {
+        let conn = db.writer();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER bodyless AFTER UPDATE ON messages
+             WHEN new.body_html IS NULL
+              AND new.html_evicted_at IS NOT NULL
+              AND (new.body_text IS NULL OR trim(new.body_text) = '')
+             BEGIN
+               SELECT RAISE(ABORT, 'a message was left with neither its HTML nor any text');
+             END;",
+        )
+        .expect("trigger");
+    }
+
+    let with_text = store(&db, account_id, &Sample::default());
+    let derived = store(&db, account_id, &html_only("Quarterly numbers attached."));
+    let underivable = store(
+        &db,
+        account_id,
+        &Sample {
+            html: Some(format!(
+                "<html><body>{}</body></html>",
+                "<img src=\"https://cdn.test/pixel.png\">".repeat(200)
+            )),
+            text: None,
+            ..Default::default()
+        },
+    );
+
+    let report = evict::sweep(&db, NOW, &policy()).expect("the sweep must not abort");
+
+    assert_eq!(report.evicted, 2);
+    assert_eq!(html_of(&db, with_text), None);
+    assert_eq!(html_of(&db, derived), None);
+    assert!(text_of(&db, derived).is_some());
+    assert!(
+        html_of(&db, underivable).is_some(),
+        "the one that could not be derived kept its body"
+    );
+}
+
+#[test]
+fn a_sender_who_sends_text_later_is_not_overwritten() {
+    // The write's own `body_text IS NULL OR trim(body_text) = ''`, which is what
+    // makes the derivation safe to do outside the transaction: a sync that fills
+    // in a real text part between the read and the write keeps it, and the row
+    // is simply not evicted this time round.
+    let db = TempDb::new("race");
+    let account_id = account(&db);
+    let id = store(&db, account_id, &html_only("Derived words."));
+
+    // Stand in for the sync that landed in between.
+    db.write(|conn| {
+        conn.execute(
+            "UPDATE messages SET body_text = 'The sender said this' WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    })
+    .expect("sync write");
+
+    evict::sweep(&db, NOW, &policy()).expect("sweep");
+
+    assert_eq!(
+        text_of(&db, id).as_deref(),
+        Some("The sender said this"),
+        "the sender's own text survived"
+    );
+}
+
+#[test]
+fn search_finds_a_message_by_text_derived_from_its_html() {
+    // The second half of the fix, and the part that is not about disk. These
+    // messages were in `messages_fts` under their subject and nothing else;
+    // `body_text` is the only body column the index has ever had, and they had
+    // none. Deriving one is the only way the phrase becomes findable.
+    let db = TempDb::new("derived-search");
+    let account_id = account(&db);
+    let id = store(
+        &db,
+        account_id,
+        &Sample {
+            subject: "Weekly digest".into(),
+            ..html_only("The pangolin invoice is overdue.")
+        },
+    );
+
+    let before = db
+        .read(|conn| q::search_thread_summaries(conn, "pangolin", 10))
+        .expect("search");
+    assert!(
+        before.is_empty(),
+        "the phrase is in the HTML, and the HTML was never indexed"
+    );
+
+    evict::sweep(&db, NOW, &policy()).expect("sweep");
+
+    let after = db
+        .read(|conn| q::search_thread_summaries(conn, "pangolin", 10))
+        .expect("search");
+    assert_eq!(after.len(), 1, "and now it is findable");
+    assert_eq!(html_of(&db, id), None, "having also freed the markup");
+}
+
+#[test]
+fn derived_text_renders_while_the_html_is_being_fetched_back() {
+    let db = TempDb::new("derived-read");
+    let account_id = account(&db);
+    let id = store(&db, account_id, &html_only("Quarterly numbers attached."));
+    evict::sweep(&db, NOW, &policy()).expect("sweep");
+
+    let rendered = render_message(&db, id, false).expect("render");
+
+    assert_eq!(rendered.format, BodyFormat::Text);
+    assert!(
+        rendered.body.html.contains("Quarterly numbers attached."),
+        "{}",
+        rendered.body.html
+    );
+    assert!(rendered.html_evicted, "and the upgrade is still offered");
+}
+
+#[test]
+fn a_second_sweep_does_not_re_derive_what_it_already_wrote() {
+    let db = TempDb::new("derive-twice");
+    let account_id = account(&db);
+    let id = store(&db, account_id, &html_only("Once only."));
+
+    assert_eq!(evict::sweep(&db, NOW, &policy()).expect("first").derived, 1);
+    let second = evict::sweep(&db, NOW, &policy()).expect("second");
+
+    assert_eq!(second.examined, 0);
+    assert_eq!(second.derived, 0);
+    assert_eq!(text_of(&db, id).as_deref(), Some("Once only."));
+}
+
 #[test]
 fn search_still_finds_an_evicted_message_by_its_body() {
-    // `messages_fts` is external-content over (subject, body_text). Eviction
-    // writes neither, so this is a check that the trigger's delete-and-reinsert
-    // on the UPDATE leaves the index able to answer, not a check that HTML was
-    // ever searchable — it never was.
+    // `messages_fts` is external-content over (subject, body_text). For a
+    // message that came with its own text, eviction writes neither, so this is a
+    // check that the trigger's delete-and-reinsert on the UPDATE leaves the
+    // index able to answer.
     let db = TempDb::new("search");
     let account_id = account(&db);
     let id = store(

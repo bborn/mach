@@ -182,10 +182,16 @@ pub fn run() {
                 evict::FIRST_SWEEP_DELAY,
                 evict::DEFAULT_SWEEP_INTERVAL,
                 |report| {
+                    // Net megabytes, and the derived count beside it: the first
+                    // sweep on a real store evicted nine bodies and reported
+                    // 0 MB, and the number that would have explained it — how
+                    // many candidates had no text to fall back on — was not in
+                    // the line.
                     eprintln!(
-                        "evicted {} message bodies ({} MB of HTML)",
+                        "evicted {} message bodies ({} MB freed, {} had their text derived first)",
                         report.evicted,
-                        report.bytes_freed / 1_000_000
+                        report.bytes_freed / 1_000_000,
+                        report.derived
                     )
                 },
             ));

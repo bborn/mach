@@ -155,7 +155,7 @@ fn body_of(message: &crate::db::models::Message) -> String {
     match (&message.body_text, &message.body_html) {
         (Some(text), _) if !text.trim().is_empty() => crate::render::quotes::split_text(text).new,
         (_, Some(html)) if !html.trim().is_empty() => {
-            super::tools::html_to_text(&crate::render::render_html(html).html)
+            crate::render::text::from_sanitized(&crate::render::render_html(html).html)
         }
         _ => message.snippet.clone(),
     }

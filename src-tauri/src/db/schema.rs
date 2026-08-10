@@ -66,7 +66,42 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 12,
         sql: M12_HTML_EVICTION,
     },
+    Migration {
+        version: 13,
+        sql: M13_DERIVED_TEXT,
+    },
 ];
+
+/// Migration 13 — when Mach wrote this row's `body_text` itself.
+///
+/// A great deal of mail arrives as HTML with no `text/plain` alternative. On the
+/// owner's store that is 12 481 of the 12 494 messages the eviction sweep would
+/// otherwise have been able to touch, and it is the reason the first sweep freed
+/// nothing: [`crate::evict`] refuses to drop HTML from a message that has no
+/// text to render in its place. The same rows are also unfindable by their
+/// bodies, because `messages_fts` indexes `body_text` and there is none.
+///
+/// So the sweep derives one from the HTML before dropping it. This column is
+/// where that fact is recorded — non-NULL means the text in `body_text` was
+/// produced here, by [`crate::render::text`], rather than sent by whoever wrote
+/// the message.
+///
+/// It is worth a column because the alternative is that the two are
+/// indistinguishable, and they are not the same thing:
+///
+///  * A derivation is a decision that can be revisited. Improving the extractor
+///    is only useful if the rows it already wrote can be found and redone, and
+///    without this the query for "text Mach invented" does not exist.
+///  * `html_evicted_at` does not answer it. A message can have derived text and
+///    a resident body — sync's upsert writes `body_html` back without touching
+///    either date — and a message can be evicted with the sender's own text.
+///
+/// Nothing reads it to change what the reader sees. Derived text is rendered
+/// exactly like any other plain-text body, because it is the same claim: this is
+/// what the message says.
+const M13_DERIVED_TEXT: &str = r#"
+ALTER TABLE messages ADD COLUMN body_text_derived_at INTEGER;
+"#;
 
 /// Migration 12 — two dates that say what happened to a message's HTML.
 ///
@@ -76,7 +111,8 @@ pub const MIGRATIONS: &[Migration] = &[
 /// `gmail_message_id`, so dropping it locally costs a request rather than the
 /// message. `body_text` is not that — it is small, it is what `messages_fts`
 /// indexes, and it is what an evicted message renders from while the request is
-/// in flight — so it is never touched. See [`crate::evict`].
+/// in flight. The sweep writes it only into a row that has none, and only in the
+/// statement that drops the HTML; see migration 13 and [`crate::evict`].
 ///
 /// Both columns are about the *cache*, not the message, which is why neither is
 /// on `NewMessage` and neither is written by sync's upsert:

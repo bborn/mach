@@ -38,6 +38,7 @@ pub mod entities;
 pub mod flowed;
 pub mod quotes;
 pub mod sanitize;
+pub mod text;
 
 use serde::Serialize;
 

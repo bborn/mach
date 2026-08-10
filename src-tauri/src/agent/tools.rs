@@ -652,7 +652,7 @@ fn message_text(message: &crate::db::models::Message) -> String {
         // security boundary, and the sanitizer has already thrown away scripts,
         // styles and everything else that would otherwise become "text".
         (_, Some(html)) if !html.trim().is_empty() => {
-            html_to_text(&crate::render::render_html(html).html)
+            crate::render::text::from_sanitized(&crate::render::render_html(html).html)
         }
         _ => message.snippet.clone(),
     };
@@ -662,55 +662,6 @@ fn message_text(message: &crate::db::models::Message) -> String {
     }
     let head: String = trimmed.chars().take(BODY_CHARS).collect();
     format!("{head}\n… [truncated]")
-}
-
-/// Sanitized HTML → something a model can read.
-///
-/// Block-level tags become newlines so paragraphs survive; everything else is
-/// dropped. Deliberately small — the goal is legible prose, not fidelity.
-pub fn html_to_text(html: &str) -> String {
-    let mut out = String::with_capacity(html.len() / 2);
-    let mut chars = html.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '<' {
-            out.push(ch);
-            continue;
-        }
-        let mut tag = String::new();
-        for c in chars.by_ref() {
-            if c == '>' {
-                break;
-            }
-            tag.push(c);
-        }
-        let name: String = tag
-            .trim_start_matches('/')
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric())
-            .collect::<String>()
-            .to_ascii_lowercase();
-        if matches!(
-            name.as_str(),
-            "p" | "br" | "div" | "tr" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "blockquote"
-        ) {
-            out.push('\n');
-        }
-    }
-
-    // Was a chain of `.replace()` calls, which decoded `&amp;lt;` all the way
-    // to `<` by re-reading its own output. See `render::entities`.
-    let decoded = crate::render::entities::decode(&out);
-
-    // Collapse the runs of blank lines that stripping a table leaves behind.
-    let mut lines: Vec<&str> = Vec::new();
-    for line in decoded.lines() {
-        let line = line.trim();
-        if line.is_empty() && lines.last().map(|l: &&str| l.is_empty()).unwrap_or(true) {
-            continue;
-        }
-        lines.push(line);
-    }
-    lines.join("\n").trim().to_string()
 }
 
 fn list_events(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
