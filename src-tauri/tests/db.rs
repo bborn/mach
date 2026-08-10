@@ -1492,20 +1492,3 @@ fn a_checkpoint_shrinks_the_write_ahead_log() {
         .expect("count");
     assert_eq!(n, 40 * 200);
 }
-
-/// The attachment cache is a sibling of `mach.db`, and two places derive its
-/// directory: the reader, from `config.database_path`, and the composer, from
-/// the open store. A forward reuses a file the reader already downloaded only
-/// while those two agree, so this is the answer they agree on.
-#[test]
-fn an_on_disk_store_names_the_directory_its_attachment_cache_sits_in() {
-    let t = TempDb::new("directory");
-    assert_eq!(t.db.directory().as_deref(), t.path.parent());
-}
-
-/// And an in-memory store names none, rather than naming the working directory
-/// — which would have a test write a cache wherever it happened to be run.
-#[test]
-fn an_in_memory_store_has_no_directory_to_cache_into() {
-    assert!(Db::open_in_memory().unwrap().directory().is_none());
-}

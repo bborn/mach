@@ -144,27 +144,6 @@ pub fn cache_key(
     hex::encode(hasher.finalize())
 }
 
-/// The part id a *file* is cached under.
-///
-/// A part with no Gmail attachment id had its bytes inlined in the sync
-/// response, so there is no handle to fetch by; the filename and size are the
-/// most identity such a part has, and they still give it a stable key.
-///
-/// Shared rather than derived twice: the reader caches under this key when it
-/// downloads a file, and the composer looks under it when a forward asks
-/// whether the bytes are already here. Two spellings of the same key would mean
-/// every forward re-downloaded a file the owner had just opened.
-pub fn file_part_id(
-    gmail_attachment_id: Option<&str>,
-    size_bytes: i64,
-    filename: &str,
-) -> String {
-    match gmail_attachment_id.filter(|id| !id.is_empty()) {
-        Some(id) => id.to_string(),
-        None => format!("inline:{size_bytes}:{filename}"),
-    }
-}
-
 /// One cached file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedFile {

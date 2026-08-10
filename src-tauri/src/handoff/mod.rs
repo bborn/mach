@@ -12,13 +12,14 @@
 //! name  OfferLab
 //! dir   ~/Projects/offerlab
 //! run   claude "{{prompt}}"
-//! mode  terminal | inline
+//! mode  terminal | inline | session
 //! ```
 //!
-//! `terminal` opens a live session he takes over; `inline` runs the command,
-//! captures its output and shows it once. The same machinery therefore covers
-//! "open a Claude session here", "run something headless" and "queue a task",
-//! as *configuration* rather than as three code paths.
+//! `terminal` opens a live session he takes over in Terminal.app; `inline` runs
+//! the command, captures its output and shows it once; `session` runs it on a
+//! pty inside the window and gives him the pane. The same machinery therefore
+//! covers "open a Claude session here", "run something headless" and "queue a
+//! task", as *configuration* rather than as three code paths.
 //!
 //! # The two security properties, and where each one is enforced
 //!
@@ -57,6 +58,7 @@
 //! | [`template`] | tokenizing `run`, and substitution that cannot escape a token |
 //! | [`context`] | a thread or an event as fenced, untrusted text |
 //! | [`plan`] | argv + environment + files, and the two ways to launch |
+//! | [`session`] | the same plan on a pty Mach owns, and how it is reaped |
 //! | [`terminal`] | which terminal application the terminal path opens |
 //!
 //! Everything that decides anything is a plain function over plain data, so
@@ -64,12 +66,14 @@
 
 pub mod context;
 pub mod plan;
+pub mod session;
 pub mod target;
 pub mod template;
 pub mod terminal;
 
 pub use context::{HandoffContext, HandoffSource};
 pub use plan::{LaunchPlan, Launched};
+pub use session::Sessions;
 pub use target::{HandoffMode, HandoffTarget};
 pub use terminal::Terminal;
 

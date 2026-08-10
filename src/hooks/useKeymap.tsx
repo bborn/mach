@@ -114,6 +114,7 @@ export function useKeyBindings(bindings: KeyBinding[]): void {
         priority: binding.priority,
         allowInInput: binding.allowInInput,
         preventDefault: binding.preventDefault,
+        passthrough: binding.passthrough,
         when: () => latest.current[index]?.when?.() ?? true,
         handler: (event) => latest.current[index]?.handler(event),
       }),

@@ -64,7 +64,7 @@ pub mod schema;
 pub mod sync_queries;
 
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -179,24 +179,6 @@ impl Db {
                 quiet: Condvar::new(),
             }),
         })
-    }
-
-    /// The directory this store lives in, when it lives anywhere.
-    ///
-    /// `None` for an in-memory database, which is what every test opens. That
-    /// distinction is the whole reason this returns an `Option`: the attachment
-    /// cache is a sibling of `mach.db`, and answering with a *relative*
-    /// directory for a store that has none would have a test write a cache into
-    /// whatever the working directory happened to be.
-    pub fn directory(&self) -> Option<PathBuf> {
-        let uri = &self.inner.uri;
-        if uri.starts_with("file:") && uri.contains("mode=memory") {
-            return None;
-        }
-        Path::new(uri)
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map(Path::to_path_buf)
     }
 
     /// The single write connection, for work a person is waiting on. Held for

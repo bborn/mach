@@ -29,10 +29,9 @@ use serde_json::{json, Value};
 
 use mach_lib::commands::{AccountClients, Command, CommandDispatcher, GoogleClients};
 use mach_lib::db::models::{
-    LabelType, NewAccount, NewAttachment, NewLabel, NewMessage, NewThread, Participant, RsvpStatus,
+    LabelType, NewAccount, NewLabel, NewMessage, NewThread, Participant, RsvpStatus,
 };
 use mach_lib::db::{queries, Db};
-use mach_lib::google::types::encode_base64url;
 use mach_lib::google::{
     BoxFuture, HttpRequest, HttpResponse, HttpTransport, StaticTokenProvider, TransportError,
 };
@@ -224,28 +223,17 @@ impl SessionEmitter for Recorder {
 /// Answers every Gmail call with 200 `{}` and remembers the requests.
 struct FakeGoogle {
     requests: Mutex<Vec<HttpRequest>>,
-    /// Answers chosen by what the URL contains. Only the endpoints a test cares
-    /// about need one; everything else gets the `{"id":"sent-1"}` default.
-    routes: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeGoogle {
     fn new() -> Arc<Self> {
         Arc::new(FakeGoogle {
             requests: Mutex::new(Vec::new()),
-            routes: Mutex::new(Vec::new()),
         })
     }
 
     fn requests(&self) -> Vec<HttpRequest> {
         self.requests.lock().unwrap().clone()
-    }
-
-    fn route(&self, needle: &str, body: Value) {
-        self.routes
-            .lock()
-            .unwrap()
-            .push((needle.to_string(), body.to_string()));
     }
 }
 
@@ -254,20 +242,8 @@ impl HttpTransport for FakeGoogle {
         &'a self,
         request: HttpRequest,
     ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
-        let routed = self
-            .routes
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(needle, _)| request.url.contains(needle.as_str()))
-            .map(|(_, body)| body.clone());
         self.requests.lock().unwrap().push(request);
-        Box::pin(async move {
-            Ok(HttpResponse::json(
-                200,
-                routed.unwrap_or_else(|| "{\"id\":\"sent-1\"}".to_string()),
-            ))
-        })
+        Box::pin(async { Ok(HttpResponse::json(200, "{\"id\":\"sent-1\"}")) })
     }
 }
 
@@ -1505,76 +1481,6 @@ async fn drafting_a_reply_hands_back_something_to_open() {
 
     // And the list is stale, so the Drafts mailbox repaints without a relaunch.
     assert!(outcome.mutated);
-}
-
-/// The agent forwards through the same composer the window does, so a forward
-/// it writes carries the original's files. Forwarding "here's the invoice"
-/// without the invoice is the message not arriving, whoever asked for it.
-#[tokio::test]
-async fn a_forward_the_agent_writes_carries_the_originals_files() {
-    let harness = Harness::new("forward-files");
-    let (_account_id, thread_id) = seed(&harness.db);
-
-    let message_id = harness
-        .db
-        .read(|conn| queries::messages_for_thread(conn, thread_id))
-        .expect("messages")[0]
-        .id;
-    harness
-        .db
-        .write(|conn| {
-            queries::upsert_attachment(
-                conn,
-                &NewAttachment {
-                    message_id,
-                    gmail_attachment_id: Some("att-1".into()),
-                    filename: "data room.pdf".into(),
-                    mime_type: "application/pdf".into(),
-                    size_bytes: 9,
-                    local_path: None,
-                },
-            )
-        })
-        .expect("attachment");
-
-    harness.google.route(
-        "/attachments/att-1",
-        json!({ "size": 9, "data": encode_base64url(b"%PDF-1.7\n") }),
-    );
-
-    let outcome = tools::execute(
-        &harness.tool_context(),
-        "draft_reply",
-        &json!({
-            "threadId": thread_id,
-            "kind": "forward",
-            "to": ["kim@investor.example"],
-            "body": "Passing this on.",
-        }),
-    )
-    .await
-    .expect("drafted");
-
-    let attachments = outcome.payload["draft"]["attachments"]
-        .as_array()
-        .expect("the draft says what it is carrying");
-    assert_eq!(attachments.len(), 1, "{attachments:?}");
-    assert_eq!(attachments[0]["filename"], "data room.pdf");
-    assert_eq!(attachments[0]["sizeBytes"], 9);
-
-    // A reply of the same conversation still carries none of it.
-    let replied = tools::execute(
-        &harness.tool_context(),
-        "draft_reply",
-        &json!({ "threadId": thread_id, "body": "On it." }),
-    )
-    .await
-    .expect("drafted");
-    let carried = replied.payload["draft"]["attachments"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert!(carried.is_empty(), "a reply carries nothing: {carried:?}");
 }
 
 #[tokio::test]

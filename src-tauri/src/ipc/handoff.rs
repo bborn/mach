@@ -8,6 +8,15 @@
 //! | `handoff_terminals` | — | [`Terminals`] — what is installed, and any override |
 //! | `handoff_preview` | `targetId?`, `note`, `source` | [`HandoffPreview`] |
 //! | `handoff_run` | `targetId`, `note`, `source` | [`Launched`] |
+//! | `handoff_session_open` | `targetId`, `note`, `source`, `cols`, `rows` | [`SessionStarted`] |
+//! | `handoff_session_current` | — | [`SessionStarted`]`?` — what a reloaded window adopts |
+//! | `handoff_session_write` | `sessionId`, `data` | — |
+//! | `handoff_session_resize` | `sessionId`, `cols`, `rows` | — |
+//! | `handoff_session_close` | `sessionId` | — |
+//!
+//! The last four are the pane. Output goes the other way, on the
+//! [`HANDOFF_SESSION_EVENT`] Tauri event — push, never poll, like every other
+//! stream in the app.
 //!
 //! The engine is `src-tauri/src/handoff/`, declared below with `#[path]` rather
 //! than in `lib.rs` — the same arrangement [`super::compose`] and
@@ -27,13 +36,16 @@
 #[path = "../handoff/mod.rs"]
 pub mod engine;
 
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use engine::context::{AttachmentRef, EventSource, HandoffSource, MailMessage, MailSource};
 use engine::plan::{self, LaunchPlan, Launched};
+use engine::session::{SessionSink, Sessions};
 use engine::target::{self, HandoffTarget};
 use engine::terminal::{self, Terminal};
 use engine::{context, HandoffError};
@@ -99,6 +111,97 @@ pub struct HandoffPreview {
 pub struct Terminals {
     pub installed: Vec<Terminal>,
     pub forced: Option<String>,
+}
+
+/// What the pane is handed when a session starts.
+///
+/// `prompt` is on the wire so the pane can keep showing what was handed over
+/// for as long as the session is up. The confirmation sheet has already shown
+/// it once — see `HandoffDialog` — and this is the copy that stays on screen,
+/// because "what did I actually send that thing" is a question with an answer
+/// and the answer should not be a temp file path.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStarted {
+    pub session_id: String,
+    pub target_name: String,
+    pub command: String,
+    pub dir: String,
+    pub prompt: String,
+    pub context_file: String,
+}
+
+// ===========================================================================
+// The session pane's end of the pipe
+// ===========================================================================
+
+/// The one channel every session pane speaks on.
+pub const HANDOFF_SESSION_EVENT: &str = "handoff-session";
+
+/// One thing that happened to the running session.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum SessionEvent {
+    /// Terminal output. Base64 because it is *bytes* — a pty carries escape
+    /// sequences, and a chunk boundary lands in the middle of a UTF-8 sequence
+    /// often enough that decoding here would corrupt the stream. The pane
+    /// decodes to a `Uint8Array` and hands that to the emulator, which is the
+    /// only thing in the system that knows where a character ends.
+    #[serde(rename_all = "camelCase")]
+    Output {
+        session_id: String,
+        base64: String,
+        /// Bytes dropped in front of this chunk because the process outran the
+        /// pane. Zero in every ordinary session.
+        dropped: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    Exited {
+        session_id: String,
+        status: Option<i32>,
+    },
+}
+
+/// Sends what the pty produced to the webview.
+struct TauriSessionSink {
+    app: AppHandle,
+}
+
+impl SessionSink for TauriSessionSink {
+    fn output(&self, session_id: &str, bytes: Vec<u8>, dropped: u64) {
+        // A failed emit means the window is gone, which is not something a
+        // running session should die for — `close_all` on exit is what ends it.
+        let _ = self.app.emit(
+            HANDOFF_SESSION_EVENT,
+            SessionEvent::Output {
+                session_id: session_id.to_string(),
+                base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                dropped,
+            },
+        );
+    }
+
+    fn exited(&self, session_id: &str, status: Option<i32>) {
+        let _ = self.app.emit(
+            HANDOFF_SESSION_EVENT,
+            SessionEvent::Exited {
+                session_id: session_id.to_string(),
+                status,
+            },
+        );
+    }
+}
+
+/// The process-wide registry.
+///
+/// A static rather than managed state because `lib.rs` has to reach it from the
+/// `RunEvent::Exit` callback, where there is an `AppHandle` but no `State`, and
+/// because there is exactly one of it for the life of the process either way.
+/// `Sessions` itself knows nothing about Tauri, which is what lets
+/// `tests/handoff_session.rs` drive a real pty without an application.
+pub fn sessions() -> &'static Arc<Sessions> {
+    static SESSIONS: OnceLock<Arc<Sessions>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Arc::new(Sessions::new()))
 }
 
 // ===========================================================================
@@ -208,6 +311,13 @@ pub async fn handoff_run(
     let (target, plan) = prepare(&state.db, &target_id, &note, source.as_ref())?;
 
     let launched = match target.mode {
+        // A session is not a throw, so it does not come through here: it has a
+        // pane that outlives the call, and `handoff_session_open` is the door.
+        target::HandoffMode::Session => {
+            return Err(IpcError::internal(
+                "that target opens a session — use the session pane".to_string(),
+            ))
+        }
         target::HandoffMode::Inline => plan::run_inline(&plan).await?,
         target::HandoffMode::Terminal => {
             let app = terminal_app(&state.db)?;
@@ -232,6 +342,100 @@ pub async fn handoff_run(
     })?;
 
     Ok(launched)
+}
+
+// ===========================================================================
+// The session pane
+// ===========================================================================
+
+/// Start the target's command on a pty and hand the pane its id.
+///
+/// The plan is built by the same [`prepare`] every other mode goes through, so
+/// the argv, the directory, the environment and the prompt are resolved once —
+/// and the confirmation sheet the frontend showed before calling this was built
+/// from `handoff_preview`, which is the same function again.
+#[tauri::command(async)]
+pub async fn handoff_session_open(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    target_id: String,
+    note: String,
+    source: Option<SourceRef>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> Result<SessionStarted, IpcError> {
+    let (target, plan) = prepare(&state.db, &target_id, &note, source.as_ref())?;
+    if target.mode != target::HandoffMode::Session {
+        return Err(IpcError::internal(format!(
+            "{} is not a session target",
+            target.name
+        )));
+    }
+
+    let started = sessions().open(
+        &plan,
+        cols.unwrap_or(engine::session::DEFAULT_COLS),
+        rows.unwrap_or(engine::session::DEFAULT_ROWS),
+        Arc::new(TauriSessionSink { app }),
+    )?;
+
+    let now = now_ms();
+    let id = target.id.clone();
+    state.db.write(move |conn| {
+        let mut targets = target::load(conn)?;
+        if let Some(stored) = targets.iter_mut().find(|t| t.id == id) {
+            stored.last_run_at = Some(now);
+        }
+        target::save(conn, &targets, now)
+    })?;
+
+    Ok(SessionStarted {
+        session_id: started.session_id,
+        target_name: started.target_name,
+        command: started.command,
+        dir: started.dir,
+        prompt: started.prompt,
+        context_file: started.context_file,
+    })
+}
+
+/// The session that is running, for a webview that has just loaded.
+///
+/// A reload — hot module replacement, a renderer that crashed — leaves the
+/// process running with nothing on screen pointing at it. This is how the pane
+/// finds it again. What was printed before the reload is gone: the scrollback
+/// lived in the emulator that went away with the page, and keeping a copy of it
+/// on this side would mean holding a session's entire output in memory for a
+/// case that is already rare.
+#[tauri::command]
+pub fn handoff_session_current() -> Option<SessionStarted> {
+    sessions().current().map(|started| SessionStarted {
+        session_id: started.session_id,
+        target_name: started.target_name,
+        command: started.command,
+        dir: started.dir,
+        prompt: started.prompt,
+        context_file: started.context_file,
+    })
+}
+
+/// Keystrokes, exactly as the emulator encoded them.
+#[tauri::command]
+pub fn handoff_session_write(session_id: String, data: String) -> Result<(), IpcError> {
+    Ok(sessions().write(&session_id, data.as_bytes())?)
+}
+
+/// The pane's new size in cells.
+#[tauri::command]
+pub fn handoff_session_resize(session_id: String, cols: u16, rows: u16) -> Result<(), IpcError> {
+    Ok(sessions().resize(&session_id, cols, rows)?)
+}
+
+/// End it. Never fails: a pane closing a session that has already exited is the
+/// ordinary case, not an error to report.
+#[tauri::command]
+pub fn handoff_session_close(session_id: String) {
+    sessions().close(&session_id);
 }
 
 // ===========================================================================

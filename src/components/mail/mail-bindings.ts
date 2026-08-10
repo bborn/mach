@@ -18,29 +18,15 @@
  * reads them back.
  */
 
-import type { MachActions } from "@/hooks/useMach";
 import type { KeyBinding } from "@/lib/keymap";
 import { OVERLAY_KEY_FLOOR } from "@/lib/keymap";
-import type { LabelId } from "@/types";
-import { mailboxOffers, putBackLabel } from "./selection-actions";
 
-/** The scopes the mail keys are gated on. See `MailMode` for what they mean. */
+/** The two scopes the mail keys are gated on. See `MailMode` for what they mean. */
 export interface MailGates {
   /** Mail mode is on screen and no dialog has the keyboard. */
   mail: () => boolean;
   /** …and the keyboard is in the thread list. */
   active: () => boolean;
-  /**
-   * Which mailbox the list is showing.
-   *
-   * A third gate rather than a third boolean, because the action keys are no
-   * longer the same everywhere: `#` discards in Drafts and trashes elsewhere,
-   * ⇧E only means something in a mailbox you can be put back out of. The
-   * mailbox decides, and `selection-actions.ts` holds the table it decides
-   * from — so a key is live in exactly the mailboxes whose selection bar
-   * offers the button for it.
-   */
-  mailbox: () => LabelId;
 }
 
 export interface MailActionHandlers {
@@ -54,72 +40,23 @@ export interface MailActionHandlers {
    */
   openSnooze: () => void;
   star: () => void;
-  markRead: () => void;
-  markUnread: () => void;
   trash: () => void;
-  /** Discard the selected drafts. Asks once; see `discardSelected`. */
-  discard: () => void;
-  /** Out of Trash, out of Spam, back to the inbox — whichever applies. */
-  putBack: () => void;
   favorite: () => void;
   undo: () => void;
-}
-
-/**
- * The one place a key and a button are wired to the same command.
- *
- * Both `MailMode`, which registers the keys, and `SelectionBar`, which draws
- * the buttons, build their handlers here. Neither assembles a command of its
- * own, so "the button does what the key does" is not a thing to keep in step —
- * there is one function per verb and two things calling it.
- */
-export function mailActionHandlers(actions: MachActions): MailActionHandlers {
-  return {
-    archive: () => actions.archiveSelected(),
-    openSnooze: () => actions.setSnooze(true),
-    star: () => actions.starSelected(),
-    markRead: () => actions.markReadSelected(true),
-    markUnread: () => actions.markReadSelected(false),
-    trash: () => actions.trashSelected(),
-    discard: () => actions.discardSelected(),
-    putBack: () => actions.putBackSelected(),
-    favorite: () => actions.toggleFavoriteFocused(),
-    undo: () => actions.undo(),
-  };
 }
 
 export function mailActionBindings(
   gates: MailGates,
   on: MailActionHandlers,
 ): KeyBinding[] {
-  const { active, mail, mailbox } = gates;
-  /** Live only where the selection bar draws the matching button. */
-  const offers = (id: Parameters<typeof mailboxOffers>[1]) => () =>
-    active() && mailboxOffers(mailbox(), id);
+  const { active, mail } = gates;
   return [
     {
       keys: "e",
       group: "Actions",
       description: "Archive",
-      when: offers("archive"),
+      when: active,
       handler: on.archive,
-    },
-    {
-      /*
-       * ⇧E — the way back out of wherever `e` and `#` put something.
-       *
-       * One key for three commands, because it is one idea: Restore from
-       * Trash, Not spam, Move to inbox. Which one it is depends on the
-       * mailbox, `useMach` picks it, and the description follows so the help
-       * sheet names the command that is actually live rather than a generic
-       * one covering all three. Gmail has no key here, so nothing is being
-       * diverged from.
-       */
-      keys: "shift+e",
-      group: "Actions",
-      description: putBackLabel(mailbox()) ?? "Move back",
-      when: offers("putBack"),
-      handler: on.putBack,
     },
     {
       // Gmail's snooze key. Mach shipped `h` — a Superhuman habit — and `b` is
@@ -127,75 +64,29 @@ export function mailActionBindings(
       keys: "b",
       group: "Actions",
       description: "Snooze",
-      when: offers("snooze"),
+      when: active,
       handler: on.openSnooze,
     },
     {
       // The old key, kept and undocumented. Nothing else wants `h`, and taking
       // a working key out from under someone mid-week buys nothing.
       keys: "h",
-      when: offers("snooze"),
+      when: active,
       handler: on.openSnooze,
     },
     {
       keys: "s",
       group: "Actions",
       description: "Star",
-      when: offers("star"),
+      when: active,
       handler: on.star,
-    },
-    {
-      // Gmail's two, and the pair `u` already sits between: `u` goes back to
-      // the list, ⇧I and ⇧U say what has been read. Both are registered
-      // whenever either is offered — the bar draws the one that applies to
-      // what is selected, and the other still works.
-      keys: "shift+i",
-      group: "Actions",
-      description: "Mark read",
-      when: offers("read"),
-      handler: on.markRead,
-    },
-    {
-      keys: "shift+u",
-      group: "Actions",
-      description: "Mark unread",
-      when: offers("read"),
-      handler: on.markUnread,
     },
     {
       keys: "#",
       group: "Actions",
       description: "Trash",
-      when: offers("trash"),
+      when: active,
       handler: on.trash,
-    },
-    {
-      /*
-       * `#` in Drafts throws the drafts away instead.
-       *
-       * Not a second meaning bolted onto Gmail's trash key — the same meaning,
-       * which is "get rid of these", spelled the way the mailbox can honour
-       * it. Trashing a draft is very nearly a no-op here: `list_threads`
-       * matches Drafts on `messages.is_draft` as well as on the `DRAFT` label
-       * (see `db/queries.rs`), so a trashed draft thread stays in the list it
-       * was trashed from. Gmail's own Drafts toolbar makes the same
-       * substitution and calls its bin "Discard drafts".
-       *
-       * The two bindings are mutually exclusive on the mailbox, so the
-       * registry sees no tie — the same arrangement as the two Escapes in
-       * `MailMode`.
-       *
-       * ⌘⌫ is deliberately *not* aliased onto this. It already means "throw
-       * away the draft in the conversation I am looking at" — `ComposerDock`
-       * registers it at priority 5 — and one key that discards one draft or
-       * six depending on what is selected behind a reading pane is a worse
-       * offer than one that always means the same thing.
-       */
-      keys: "#",
-      group: "Actions",
-      description: "Discard drafts",
-      when: offers("discard"),
-      handler: on.discard,
     },
     {
       /*
@@ -228,14 +119,9 @@ export function mailActionBindings(
        * No confirmation, deliberately. Undo is the safety net, exactly as it is
        * for archive: `trash` has an exact inverse (`untrash`, restoring the
        * labels the thread actually had) and it goes on the same stack ⌘Z reads.
-       *
-       * Off in Drafts, where the key above it is off for the same reason:
-       * trashing a draft leaves it in Drafts. ⌘⌫ there goes on meaning what
-       * `ComposerDock` registers it for — discard the draft in this
-       * conversation.
        */
       keys: "mod+backspace",
-      when: offers("trash"),
+      when: active,
       handler: on.trash,
     },
     {

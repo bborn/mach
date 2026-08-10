@@ -8,6 +8,7 @@ import {
   handoffRequest,
   handoffResolver,
   loadTargets,
+  openSession,
   previewHandoff,
   runHandoff,
   subscribeHandoff,
@@ -97,10 +98,18 @@ export function HandoffDialog() {
   }, [ui.mode, ui.threadId, ui.eventId]);
 
   const launch = useCallback(
-    async (targetId: string, note: string) => {
+    async (targetId: string, note: string, mode?: HandoffPreview["mode"]) => {
       setPhase("running");
       setFailure(null);
       try {
+        if (mode === "session") {
+          // The pane takes it from here. Nothing more is shown: a window full
+          // of the process's own output has already said that it started.
+          await openSession({ targetId, note, source, cols: 100, rows: 30 });
+          closeHandoff();
+          setPhase("idle");
+          return;
+        }
         const done = await runHandoff({ targetId, note, source });
         setReceipt(done);
         // Terminal mode has already shown itself — a window opened. Anything
@@ -148,18 +157,29 @@ export function HandoffDialog() {
     setFailure(null);
 
     const target = targetSnapshot().find((t) => t.id === targetId);
-    if (target && target.lastRunAt) {
-      void launch(targetId, note);
+    if (target && target.lastRunAt && target.mode !== "session") {
+      void launch(targetId, note, target.mode);
       return;
     }
 
-    // Never run, or the list is stale: ask, showing what would actually happen.
+    /*
+     * Never run, or the list is stale, or it opens a session: ask, showing what
+     * would actually happen.
+     *
+     * A session target asks *every* time, and the reason is the prompt rather
+     * than the command. The other two modes throw a sentence at something and
+     * forget it; this one puts a stranger's words in front of a running agent
+     * with tools, in a pane, for as long as it takes. Prompt injection is not
+     * solvable here and pretending otherwise would be worse than useless — but
+     * a prompt he has read before it is sent is a different thing from one he
+     * has not, and the whole prompt is on screen below.
+     */
     setPhase("preparing");
     void previewHandoff({ targetId, note, source })
       .then((plan) => {
         if (ticket !== pending.current) return;
-        if (!plan.unproven) {
-          void launch(targetId, note);
+        if (!plan.unproven && plan.mode !== "session") {
+          void launch(targetId, note, plan.mode);
           return;
         }
         setPreview(plan);
@@ -213,7 +233,9 @@ export function HandoffDialog() {
       priority: 312,
       when: () => open && phase === "confirming" && preview !== null,
       handler: () => {
-        if (request?.kind === "run" && preview) void launch(preview.targetId, request.note);
+        if (request?.kind === "run" && preview) {
+          void launch(preview.targetId, request.note, preview.mode);
+        }
       },
     },
   ]);
@@ -236,7 +258,7 @@ export function HandoffDialog() {
                 ? receipt.targetName
                 : "Hand off"}
         </span>
-        {phase === "confirming" && (
+        {phase === "confirming" && preview?.unproven && (
           <span className="truncate text-micro text-faint-foreground">first run of this target</span>
         )}
       </header>
@@ -270,10 +292,12 @@ export function HandoffDialog() {
               size="sm"
               variant="default"
               onClick={() => {
-                if (request?.kind === "run") void launch(preview.targetId, request.note);
+                if (request?.kind === "run") {
+                  void launch(preview.targetId, request.note, preview.mode);
+                }
               }}
             >
-              Hand off
+              {preview.mode === "session" ? "Start session" : "Hand off"}
             </Button>
           </span>
         ) : (
@@ -292,12 +316,23 @@ function Confirm({ preview }: { preview: HandoffPreview }) {
     <div className="flex flex-col gap-2">
       <dl className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-micro">
         <dt className="text-faint-foreground">Runs</dt>
-        <dd className="break-all font-mono text-muted-foreground">{preview.command}</dd>
+        {/* argv joined, so for `claude "{{prompt}}"` this line *is* the prompt
+            again — thousands of characters of somebody else's mail, above the
+            block that shows the same text with a label on it. Bounded here so
+            the row stays a row: the readable copy is below, and this one keeps
+            saying exactly what will be executed for anyone who scrolls it. */}
+        <dd className="max-h-16 overflow-auto break-all font-mono text-muted-foreground">
+          {preview.command}
+        </dd>
         <dt className="text-faint-foreground">In</dt>
         <dd className="break-all font-mono text-muted-foreground">{preview.dir}</dd>
         <dt className="text-faint-foreground">Mode</dt>
         <dd className="text-muted-foreground">
-          {preview.mode === "terminal" ? "Terminal session" : "Inline, output shown here"}
+          {preview.mode === "terminal"
+            ? "Terminal session"
+            : preview.mode === "session"
+              ? "Session in a pane"
+              : "Inline, output shown here"}
         </dd>
         {preview.contextLabel && (
           <>
@@ -307,6 +342,10 @@ function Confirm({ preview }: { preview: HandoffPreview }) {
         )}
       </dl>
 
+      {/* The block below is the argument the command is about to receive, and
+          most of it was written by whoever sent the mail. Naming it is the
+          difference between a prompt he read and one he did not. */}
+      <span className="text-micro text-faint-foreground">Prompt</span>
       <pre
         aria-label="What will be sent"
         tabIndex={0}

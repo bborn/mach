@@ -10,8 +10,7 @@
 //!
 //! | `op` | argument | returns |
 //! |---|---|---|
-//! | `prepare` | `threadId`, `kind` | `{ draft, carrying, refused }` |
-//! | `carryForward` | `draftId`, `messageId` | `{ attachments, added, refused }` |
+//! | `prepare` | `threadId`, `kind` | `{ draft }` |
 //! | `loadDraft` | `draftId`, `messageId` or `threadId` | `{ draft \| null }` |
 //! | `saveDraft` | `draft` | `{ draft }` |
 //! | `discardDraft` | `draftId` | `{ ok, remote }` |
@@ -55,13 +54,8 @@ use engine::mime::build_rfc822;
 use engine::outbox::{Outbox, UNDO_WINDOW_MS};
 use engine::ComposeError;
 
-use super::attachments::store::{self, AttachmentCache};
 use super::error::IpcError;
 use super::state::AppState;
-
-/// Gmail addresses the authorised account as `me`, the same way the rest of
-/// this layer does.
-const USER_ID: &str = "me";
 
 // ---------------------------------------------------------------------------
 // the handler
@@ -175,25 +169,9 @@ async fn open_panel(app: &tauri::AppHandle) -> Result<Vec<String>, IpcError> {
 /// The router, as a plain function over `&Db` — a `#[tauri::command]` cannot be
 /// called without an application, so it is not allowed to hold a decision.
 /// `tests/compose.rs` drives this.
-///
-/// The attachment cache is found from the store's own directory, which is where
-/// [`super::attachments`] puts it. A test opens an in-memory store and gets
-/// `None`, which means "nothing is cached here" and not "cache into the working
-/// directory"; a test that wants to *observe* the cache calls [`dispatch_in`]
-/// with one of its own.
 pub async fn dispatch(
     db: &crate::db::Db,
     outbox: &Outbox,
-    payload: Value,
-) -> Result<Value, ComposeError> {
-    let cache = db.directory().map(AttachmentCache::new);
-    dispatch_in(db, outbox, cache.as_ref(), payload).await
-}
-
-pub async fn dispatch_in(
-    db: &crate::db::Db,
-    outbox: &Outbox,
-    cache: Option<&AttachmentCache>,
     payload: Value,
 ) -> Result<Value, ComposeError> {
     let op = payload
@@ -220,55 +198,7 @@ pub async fn dispatch_in(
                 .map(str::to_string)
                 .unwrap_or_else(|| new_draft_id(now));
             let prepared = draft::prepare(db, thread_id, kind, id)?;
-            // What a forward will take with it, decided here so the composer
-            // can draw a chip per file the instant it opens — and say which
-            // file is too large before a single byte is fetched. A local read;
-            // see `compose::forward`. Every other kind carries nothing, so
-            // `plan` is not even asked.
-            let plan = match (kind, prepared.reply_to_id) {
-                (DraftKind::Forward, Some(message_id)) => {
-                    engine::forward::plan(db, message_id)?
-                }
-                _ => engine::forward::Plan::default(),
-            };
-            Ok(json!({
-                "draft": prepared,
-                // Whether the fetch below is worth making at all. A message
-                // with no files and no pictures answers `false`, and pressing
-                // `f` on it costs exactly what it always did.
-                "carries": !plan.is_empty(),
-                "carrying": plan
-                    .files
-                    .iter()
-                    .map(|file| json!({
-                        "filename": file.filename,
-                        "mimeType": file.mime_type,
-                        "sizeBytes": file.size_bytes,
-                    }))
-                    .collect::<Vec<Value>>(),
-                "refused": plan.refused,
-            }))
-        }
-
-        // Go and get what the plan said this forward would carry.
-        //
-        // Its own operation rather than part of `prepare` because it is the
-        // only half that can touch the network, and the composer must be on
-        // screen before it starts. `prepare` answers from SQLite in a
-        // millisecond; this resolves whenever Gmail does, and the chips fill in
-        // when it lands.
-        "carryForward" => {
-            let draft_id = required_str(&payload, "draftId")?;
-            let message_id = required_i64(&payload, "messageId")?;
-            carry_forward(
-                db,
-                outbox.clients(),
-                cache,
-                &draft_id,
-                message_id,
-                now,
-            )
-            .await
+            Ok(json!({ "draft": prepared }))
         }
 
         // Three keys, narrowest first. `messageId` is the reading pane's: it
@@ -578,311 +508,6 @@ pub async fn dispatch_in(
         other => Err(ComposeError::invalid(format!(
             "unknown compose operation {other:?}"
         ))),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// what a forward carries
-// ---------------------------------------------------------------------------
-
-/// Put the original's files and pictures on the forward.
-///
-/// # Where the bytes come from, in order of preference
-///
-/// 1. **The local attachment cache**, if the owner has already opened or saved
-///    this file. Same directory, same key — see [`store::file_part_id`] — so a
-///    file read a minute ago is not downloaded a second time to be re-sent.
-/// 2. **Gmail**, by `attachmentId` where there is one, and otherwise out of a
-///    `messages.get`, which is the only way to reach a part whose bytes were
-///    inlined in the sync response. Whatever is fetched is written into the
-///    cache on the way past, so the reader gets the same saving in reverse.
-///
-/// There is no third option. Gmail has no call that would let a send reference
-/// a part of another message: `drafts.create` and `messages.send` take a
-/// complete RFC822 message in `raw` and nothing else, and `attachmentId` is a
-/// handle for downloading. So the bytes make the round trip. See the doc on
-/// [`engine::forward`].
-///
-/// # Nothing here is fatal
-///
-/// One file that cannot be fetched must not cost the other three, and must not
-/// be silent either — every failure becomes a sentence naming the file, which
-/// the composer says out loud. That is the same contract `attachAdd` has.
-async fn carry_forward(
-    db: &crate::db::Db,
-    clients: Arc<dyn crate::commands::GoogleClients>,
-    cache: Option<&AttachmentCache>,
-    draft_id: &str,
-    message_id: i64,
-    now: i64,
-) -> Result<Value, ComposeError> {
-    let plan = engine::forward::plan(db, message_id)?;
-    let mut refused = plan.refused.clone();
-    let mut added: Vec<engine::attach::Attachment> = Vec::new();
-
-    if plan.is_empty() {
-        return Ok(json!({
-            "attachments": engine::attach::list(db, draft_id)?,
-            "added": added,
-            "refused": refused,
-        }));
-    }
-
-    let gmail = match clients.gmail(plan.account_id) {
-        Ok(client) => Some(client),
-        // Not a reason to stop: anything already cached still rides, and the
-        // files that needed the network are named below rather than here, so
-        // the owner reads which ones he has lost and not only why.
-        Err(error) => {
-            refused.push(error.to_string());
-            None
-        }
-    };
-    // One `messages.get` for the whole forward, however many parts need it.
-    let mut fetched: Option<crate::google::types::Message> = None;
-
-    // The pictures first. They have no row and so no known size, and a body
-    // with a hole where a picture was is worse than a file that says it did not
-    // fit. `added_at` is nudged per file so the chips keep the order the
-    // message had rather than the order two ids happened to sort in.
-    let mut clock = now;
-    for content_id in &plan.inline_cids {
-        clock += 1;
-        let key = store::cache_key(
-            plan.account_id,
-            &plan.gmail_message_id,
-            store::PartKind::Inline,
-            content_id,
-        );
-        let known = cache.and_then(|cache| cache.find(&key)).and_then(|hit| {
-            std::fs::read(&hit.path).ok()
-        });
-
-        let (bytes, name, declared) = match known {
-            Some(bytes) => (bytes, String::new(), None),
-            None => {
-                let Some(gmail) = gmail.as_ref() else { continue };
-                let message = match full_message(gmail, &plan.gmail_message_id, &mut fetched).await
-                {
-                    Ok(message) => message,
-                    Err(error) => {
-                        refused.push(error);
-                        break;
-                    }
-                };
-                let body = message.extract_body();
-                let Some(part) = body
-                    .attachments
-                    .iter()
-                    .find(|part| matches_content_id(part, content_id))
-                else {
-                    // A `cid:` the message does not answer to. Nothing to
-                    // carry and nothing to say: the reference is dropped from
-                    // the forwarded body at build time, which is what a
-                    // recipient of the *original* already sees.
-                    continue;
-                };
-                let name = part.filename.clone();
-                let declared = Some(part.mime_type.clone());
-                match part_bytes(gmail, &plan.gmail_message_id, part).await {
-                    Ok(bytes) => (bytes, name, declared),
-                    Err(error) => {
-                        refused.push(error);
-                        continue;
-                    }
-                }
-            }
-        };
-
-        // Sniffed, not taken on the sender's word — the same rule the reading
-        // pane applies before it draws one. A part that is not an image cannot
-        // be drawn where it sits by anybody, so it rides as a file and the
-        // reference to it is dropped rather than left broken.
-        let sniffed = store::names::sniff_raster_image(&bytes);
-        let mime = sniffed.map(str::to_string).or(declared);
-        match engine::attach::add_incoming(
-            db,
-            draft_id,
-            engine::attach::Incoming {
-                filename: &name,
-                mime_type: mime.as_deref(),
-                inline: sniffed.is_some(),
-                content_id: Some(content_id),
-            },
-            &bytes,
-            clock,
-        ) {
-            Ok(attachment) => {
-                if let Some(cache) = cache {
-                    let _ = cache.store(&key, &attachment.filename, &bytes);
-                }
-                added.push(attachment);
-            }
-            Err(error) => refused.push(error.to_string()),
-        }
-    }
-
-    for file in &plan.files {
-        clock += 1;
-        let key = store::cache_key(
-            plan.account_id,
-            &plan.gmail_message_id,
-            store::PartKind::File,
-            &store::file_part_id(
-                file.gmail_attachment_id.as_deref(),
-                file.size_bytes,
-                &file.filename,
-            ),
-        );
-        let cached = cache
-            .and_then(|cache| cache.find(&key))
-            .and_then(|hit| std::fs::read(&hit.path).ok());
-
-        let bytes = match cached {
-            Some(bytes) => bytes,
-            None => {
-                let Some(gmail) = gmail.as_ref() else {
-                    // No way to reach Gmail, and these bytes are not here. The
-                    // reason is already in `refused`; this is the file it cost.
-                    refused.push(format!("{} could not be fetched", file.filename));
-                    continue;
-                };
-                match file_bytes(gmail, &plan, file, &mut fetched).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        refused.push(error);
-                        continue;
-                    }
-                }
-            }
-        };
-
-        match engine::attach::add_incoming(
-            db,
-            draft_id,
-            engine::attach::Incoming {
-                filename: &file.filename,
-                mime_type: Some(&file.mime_type),
-                inline: false,
-                content_id: None,
-            },
-            &bytes,
-            clock,
-        ) {
-            Ok(attachment) => {
-                if let Some(cache) = cache {
-                    let _ = cache.store(&key, &attachment.filename, &bytes);
-                }
-                added.push(attachment);
-            }
-            Err(error) => refused.push(error.to_string()),
-        }
-    }
-
-    Ok(json!({
-        "attachments": engine::attach::list(db, draft_id)?,
-        "added": added,
-        "refused": refused,
-    }))
-}
-
-/// The whole message, fetched at most once per forward.
-async fn full_message<'a>(
-    gmail: &crate::google::gmail::GmailClient,
-    gmail_message_id: &str,
-    held: &'a mut Option<crate::google::types::Message>,
-) -> Result<&'a crate::google::types::Message, String> {
-    if held.is_none() {
-        let message = gmail
-            .messages_get(
-                USER_ID,
-                gmail_message_id,
-                crate::google::gmail::MessageFormat::Full,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        *held = Some(message);
-    }
-    Ok(held.as_ref().expect("just filled"))
-}
-
-/// One file's bytes: by attachment id when Gmail gave one, and out of the
-/// message when it did not — the same two roads [`super::attachments`] takes,
-/// for the same reason.
-async fn file_bytes(
-    gmail: &crate::google::gmail::GmailClient,
-    plan: &engine::forward::Plan,
-    file: &engine::forward::PlannedFile,
-    held: &mut Option<crate::google::types::Message>,
-) -> Result<Vec<u8>, String> {
-    if let Some(id) = file.gmail_attachment_id.as_deref() {
-        return gmail
-            .attachment_get_capped(
-                USER_ID,
-                &plan.gmail_message_id,
-                id,
-                engine::attach::MAX_ATTACHMENT_BYTES as usize,
-            )
-            .await
-            .map_err(|error| format!("{}: {error}", file.filename));
-    }
-    let message = full_message(gmail, &plan.gmail_message_id, held).await?;
-    let body = message.extract_body();
-    let part = body
-        .attachments
-        .iter()
-        .find(|part| part.filename == file.filename && part.size == file.size_bytes)
-        .or_else(|| {
-            body.attachments
-                .iter()
-                .find(|part| part.filename == file.filename)
-        })
-        .ok_or_else(|| {
-            format!(
-                "{} is no longer part of that message on Gmail",
-                file.filename
-            )
-        })?;
-    part_bytes(gmail, &plan.gmail_message_id, part).await
-}
-
-/// The bytes behind one MIME part, whichever way Gmail chose to deliver them.
-async fn part_bytes(
-    gmail: &crate::google::gmail::GmailClient,
-    gmail_message_id: &str,
-    part: &crate::google::types::AttachmentMeta,
-) -> Result<Vec<u8>, String> {
-    if let Some(data) = &part.data {
-        return Ok(data.clone());
-    }
-    let id = part.attachment_id.as_deref().ok_or_else(|| {
-        format!(
-            "{} carries no bytes and no way to fetch them",
-            if part.filename.is_empty() {
-                "that part of the message"
-            } else {
-                &part.filename
-            }
-        )
-    })?;
-    gmail
-        .attachment_get_capped(
-            USER_ID,
-            gmail_message_id,
-            id,
-            engine::attach::MAX_ATTACHMENT_BYTES as usize,
-        )
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// Does this part answer to `content_id`? Exact first, because a Content-ID is
-/// a case-sensitive addr-spec; case-insensitively second, because plenty of
-/// mailers do not know that.
-fn matches_content_id(part: &crate::google::types::AttachmentMeta, content_id: &str) -> bool {
-    match part.content_id.as_deref() {
-        Some(id) => id == content_id || id.eq_ignore_ascii_case(content_id),
-        None => false,
     }
 }
 

@@ -17,6 +17,7 @@ import { ShortcutSheet } from "@/components/chrome/ShortcutSheet";
 import { AddAccountDialog } from "@/components/accounts/AddAccountDialog";
 import { FeedbackDialog } from "@/components/feedback/FeedbackDialog";
 import { HandoffDialog } from "@/components/handoff/HandoffDialog";
+import { SessionPane } from "@/components/handoff/SessionPane";
 import { AgentDock } from "@/components/agent/AgentDock";
 import { PluginProvider } from "@/hooks/usePlugins";
 import { PluginAskDialog } from "@/components/plugins/PluginAskDialog";
@@ -296,6 +297,9 @@ function Shell() {
         what you drag.
       */}
       <div className="flex shrink-0 flex-col border-t border-border">
+        {/* A handoff that stayed in the window. Renders nothing until one is
+            running, and takes the top edge when it is. */}
+        <SessionPane />
         <AgentDock />
         <StatusBar />
       </div>

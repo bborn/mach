@@ -85,7 +85,6 @@ import {
   type Selection,
 } from "@/lib/selection";
 import { mailboxName } from "@/lib/mailboxes";
-import { discardThreadDrafts } from "@/lib/compose";
 import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
 import { toMailboxError, useThreadStream } from "@/hooks/useThreadStream";
@@ -245,20 +244,6 @@ interface UiState {
    * agreeing with one retires it; the reducer here only stores what it is told.
    */
   guesses: Guesses;
-  /**
-   * Whether the next `discardSelected` will actually discard.
-   *
-   * The one action in the selection bar that asks before it acts, and the flag
-   * has to live here rather than inside the bar because two surfaces raise the
-   * question and either may answer it: `#` in Drafts, and the button `#` is
-   * drawn beside. A `useState` in the bar could not be armed by a keystroke the
-   * registry routed somewhere else.
-   *
-   * Disarmed by anything that changes what "these drafts" means — a different
-   * selection, a different mailbox — so a question asked about six rows can
-   * never be answered about seven. See `discardSelected`.
-   */
-  confirmDiscard: boolean;
   status: StatusMessage | null;
 }
 
@@ -287,8 +272,6 @@ type UiAction =
   | { type: "project"; guesses: Guesses }
   /** Drop guesses — the list agrees now, or the write was refused. */
   | { type: "forget"; threadIds: ThreadId[] }
-  /** Ask, or stop asking, whether the selected drafts should be thrown away. */
-  | { type: "confirmDiscard"; armed: boolean }
   | { type: "status"; status: UiState["status"] };
 
 export const initialUi: UiState = {
@@ -311,7 +294,6 @@ export const initialUi: UiState = {
   hiddenCalendars: [],
   theme: "system",
   guesses: {},
-  confirmDiscard: false,
   status: null,
 };
 
@@ -330,16 +312,9 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
         accountId: action.accountId,
         threadId: null,
         selection: emptySelection,
-        confirmDiscard: false,
       };
     case "label":
-      return {
-        ...state,
-        labelId: action.labelId,
-        threadId: null,
-        selection: emptySelection,
-        confirmDiscard: false,
-      };
+      return { ...state, labelId: action.labelId, threadId: null, selection: emptySelection };
     case "thread":
       return {
         ...state,
@@ -359,10 +334,8 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
             ? state.selection
             : reanchor(state.selection, action.threadId),
       };
-    // A question asked about six drafts must never be answered about seven, so
-    // any change to what is selected takes the question back.
     case "selection":
-      return { ...state, selection: action.selection, confirmDiscard: false };
+      return { ...state, selection: action.selection };
     case "focus":
       return {
         ...state,
@@ -415,8 +388,6 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
       for (const id of action.threadIds) delete next[id];
       return { ...state, guesses: next };
     }
-    case "confirmDiscard":
-      return { ...state, confirmDiscard: action.armed };
     case "status":
       return { ...state, status: action.status };
   }
@@ -506,28 +477,6 @@ export interface MachActions {
   archiveSelected: () => void;
   trashSelected: () => void;
   starSelected: () => void;
-  /** ⇧I and ⇧U. Marks the whole selection, not each row by its own state. */
-  markReadSelected: (read: boolean) => void;
-  /**
-   * ⇧E: the way back out of the mailbox on screen.
-   *
-   * One action, three commands. Which one depends on where you are, and the
-   * mailbox is the only thing that can answer it — `untrash` out of Trash,
-   * `label SPAM off` out of Spam, `unarchive` back to the inbox. It goes
-   * through `bulk` like everything else, so ⌘Z gets the inverse the command
-   * layer minted.
-   */
-  putBackSelected: () => void;
-  /**
-   * Throw away the drafts on the selected conversations. Asks first.
-   *
-   * The one destructive action here that is not a `Command`, and cannot be:
-   * see `discardThreadDrafts`. Because there is no inverse for ⌘Z to run, the
-   * first call arms the question and the second answers it — the same "one
-   * keystroke to ask, a second to mean it" the single-draft discard has used
-   * since it was written.
-   */
-  discardSelected: () => void;
   /**
    * Snooze to a named instant.
    *
@@ -1452,90 +1401,6 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
       archiveSelected: () => bulk({ kind: "archive", threadIds: commandTargetIds }),
       trashSelected: () => bulk({ kind: "trash", threadIds: commandTargetIds }),
-      markReadSelected: (read) =>
-        bulk({ kind: "markRead", threadIds: commandTargetIds, read }),
-
-      putBackSelected: () => {
-        const threadIds = commandTargetIds;
-        if (threadIds.length === 0) return;
-        if (ui.labelId === "TRASH") {
-          bulk({ kind: "untrash", threadIds });
-          return;
-        }
-        if (ui.labelId === "SPAM") {
-          /*
-           * Gmail's own "Not spam" also files the conversation back into the
-           * inbox. This only takes the label off, which is one command with an
-           * exact inverse (`label SPAM on`) rather than two commands and two
-           * ⌘Z presses to get back to where you were. The conversation leaves
-           * Spam and stays in All Mail, which is where a false positive
-           * belongs; there is no `Command` that can express both halves at
-           * once without the UI minting a `ThreadLabelState`, and building one
-           * of those here is exactly what `ThreadLabelState` says not to do.
-           */
-          bulk(
-            { kind: "label", threadIds, labelId: "SPAM", add: false },
-            `Marked ${threadIds.length} ${threadIds.length === 1 ? "conversation" : "conversations"} as not spam`,
-          );
-          return;
-        }
-        bulk({ kind: "unarchive", threadIds });
-      },
-
-      discardSelected: () => {
-        const threadIds = commandTargetIds;
-        if (threadIds.length === 0) return;
-        // First press asks. The bar turns into the question; `#` again, or the
-        // button in it, comes back here with the flag set.
-        if (!ui.confirmDiscard) {
-          dispatch({ type: "confirmDiscard", armed: true });
-          return;
-        }
-        // Clearing the selection also disarms — see the reducer — so the rows
-        // and the question go together.
-        dispatch({ type: "selection", selection: clearSelection(ui.selection) });
-        void discardThreadDrafts(threadIds)
-          .then(({ discarded, missing, remoteFailed }) => {
-            // No `undo` on any of these: there is nothing to put back, and a
-            // toast offering ⌘Z for something ⌘Z cannot do is worse than no
-            // toast. `run` is not involved, so nothing reaches the stack.
-            if (remoteFailed > 0) {
-              dispatch({
-                type: "status",
-                status: {
-                  message: `Gmail still has ${remoteFailed === 1 ? "one of those drafts" : `${remoteFailed} of those drafts`} — they may come back`,
-                  tone: "error",
-                },
-              });
-            } else if (discarded === 0) {
-              dispatch({
-                type: "status",
-                status: { message: "There were no drafts left to throw away", tone: "error" },
-              });
-            } else {
-              dispatch({
-                type: "status",
-                status: {
-                  message: `Discarded ${discarded} ${discarded === 1 ? "draft" : "drafts"}${
-                    missing > 0 ? ` — ${missing} had none left` : ""
-                  }`,
-                  tone: "info",
-                },
-              });
-            }
-            // The rows are gone from Gmail and from the store; the list on
-            // screen is the only thing that does not know yet.
-            setReloadKey((k) => k + 1);
-            streamRef.current.refresh();
-          })
-          .catch((caught: unknown) =>
-            dispatch({
-              type: "status",
-              status: { message: toMailboxError(caught).message, tone: "error" },
-            }),
-          );
-      },
-
       snoozeSelected: (until) =>
         bulk(
           { kind: "snooze", threadIds: commandTargetIds, until },
@@ -1680,10 +1545,6 @@ export function MachProvider({ children }: { children: ReactNode }) {
     ui.theme,
     ui.selection,
     ui.focus,
-    // `putBackSelected` reads the mailbox to pick its command, and
-    // `discardSelected` reads whether the question has already been asked.
-    ui.labelId,
-    ui.confirmDiscard,
     selectedIndex,
     visibleThreads,
     listIds,

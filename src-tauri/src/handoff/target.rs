@@ -45,6 +45,9 @@ pub enum HandoffMode {
     /// Run it, capture what it printed, show that once. For commands that
     /// return — `ty task create …` — not for watching work happen.
     Inline,
+    /// Run it on a pty inside the window and talk to it there. The same live
+    /// session `Terminal` gives, without leaving the app. See [`super::session`].
+    Session,
 }
 
 impl HandoffMode {
@@ -52,6 +55,7 @@ impl HandoffMode {
         match self {
             HandoffMode::Terminal => "terminal",
             HandoffMode::Inline => "inline",
+            HandoffMode::Session => "session",
         }
     }
 }

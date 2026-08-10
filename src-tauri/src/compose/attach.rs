@@ -121,32 +121,6 @@ pub fn is_image_mime(mime_type: &str) -> bool {
     base.starts_with("image/") && base != "image/svg+xml"
 }
 
-/// A file arriving from somewhere that is not the owner's disk.
-///
-/// The owner's own files need none of this: a path carries a name, the name
-/// carries an extension, and the extension is the type. A part taken out of
-/// somebody else's message has all three of those separately, and two of them
-/// can be missing — an inline image is routinely a nameless `image/png` whose
-/// only identity is its `Content-ID`.
-#[derive(Debug, Clone, Default)]
-pub struct Incoming<'a> {
-    /// The sender's name for it. May be empty, and is sanitized here.
-    pub filename: &'a str,
-    /// The type to send it under. `None` derives one from the extension, which
-    /// is what a file chosen off disk gets.
-    pub mime_type: Option<&'a str>,
-    /// A request, exactly as on [`add_bytes`].
-    pub inline: bool,
-    /// The `Content-ID` to keep, bare.
-    ///
-    /// Set only when the body that travels with this part already addresses it
-    /// by that id — a forward reproduces the original's HTML, `cid:` and all,
-    /// so minting a new id here would leave the reference pointing at nothing.
-    /// A malformed one is refused and a fresh id used instead, which costs the
-    /// reference and not the file.
-    pub content_id: Option<&'a str>,
-}
-
 /// Attach a file already read into memory.
 ///
 /// Reading is the caller's job so that this function is testable without a
@@ -164,60 +138,30 @@ pub fn add_bytes(
     inline: bool,
     now_ms: i64,
 ) -> Result<Attachment> {
-    add_incoming(
-        db,
-        draft_id,
-        Incoming {
-            filename: raw_name,
-            inline,
-            ..Incoming::default()
-        },
-        bytes,
-        now_ms,
-    )
-}
-
-/// [`add_bytes`], for a file that came out of a message rather than off a disk.
-///
-/// The same table, the same caps and the same refusals — which is the point.
-/// A file a forward carries is a chip in the composer like any other, removable
-/// by the same keystroke, because it is the same row.
-pub fn add_incoming(
-    db: &Db,
-    draft_id: &str,
-    file: Incoming<'_>,
-    bytes: &[u8],
-    now_ms: i64,
-) -> Result<Attachment> {
     db.write(ensure_compose_schema)?;
 
     let size = bytes.len() as u64;
-    let mime_type = file
-        .mime_type
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_ascii_lowercase);
-    let filename = named(file.filename, mime_type.as_deref());
-    let mime_type = mime_type.unwrap_or_else(|| mime_for(&filename));
+    let filename = names::safe_filename(raw_name);
     if size > MAX_ATTACHMENT_BYTES {
-        return Err(ComposeError::invalid(refusal_too_large(
-            &filename,
-            size as i64,
+        return Err(ComposeError::invalid(format!(
+            "{filename} is {} — larger than the {} MB Gmail will send",
+            human_size(size as i64),
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
         )));
     }
     let already = total_bytes(db, draft_id)? as u64;
     if already + size > MAX_TOTAL_ATTACHMENT_BYTES {
-        return Err(ComposeError::invalid(refusal_past_total(&filename)));
+        return Err(ComposeError::invalid(format!(
+            "{filename} would take this message past the {} MB Gmail will send",
+            MAX_TOTAL_ATTACHMENT_BYTES / (1024 * 1024)
+        )));
     }
 
+    let mime_type = mime_for(&filename);
     let id = format!("att-{now_ms:x}-{:x}", entropy(now_ms));
     let attachment = Attachment {
-        content_id: file
-            .content_id
-            .filter(|cid| names::is_valid_content_id(cid))
-            .map(str::to_string)
-            .unwrap_or_else(|| content_id_for(&id)),
-        inline: file.inline && can_be_inline(&mime_type, size),
+        content_id: content_id_for(&id),
+        inline: inline && can_be_inline(&mime_type, size),
         id: id.clone(),
         draft_id: draft_id.to_string(),
         filename,
@@ -305,43 +249,6 @@ pub fn bytes_of(db: &Db, attachment_id: &str) -> Result<Option<(Attachment, Vec<
             )
             .optional()?)
     })?)
-}
-
-/// The two refusals a file can meet, worded once.
-///
-/// The wording is shared because the *condition* is shared: a forward's files
-/// are planned against these limits before anything is downloaded, and then
-/// pass through [`add_incoming`], which enforces them again. One sentence per
-/// condition, wherever the owner meets it.
-pub fn refusal_too_large(filename: &str, size_bytes: i64) -> String {
-    format!(
-        "{filename} is {} — larger than the {} MB Gmail will send",
-        human_size(size_bytes),
-        MAX_ATTACHMENT_BYTES / (1024 * 1024)
-    )
-}
-
-pub fn refusal_past_total(filename: &str) -> String {
-    format!(
-        "{filename} would take this message past the {} MB Gmail will send",
-        MAX_TOTAL_ATTACHMENT_BYTES / (1024 * 1024)
-    )
-}
-
-/// The name a file is stored and shown under.
-///
-/// A part with no `filename` at all is the common shape of an inline image, and
-/// `safe_filename` would answer `attachment` for it — a chip reading
-/// "attachment" beside a picture, and a recipient offered a nameless download.
-/// The type is the only thing left to name it from, so it does.
-fn named(raw: &str, mime_type: Option<&str>) -> String {
-    if !raw.trim().is_empty() {
-        return names::safe_filename(raw);
-    }
-    match mime_type.filter(|t| is_image_mime(t)) {
-        Some(mime) => format!("image.{}", names::raster_extension(mime)),
-        None => names::safe_filename(raw),
-    }
 }
 
 /// A `Content-ID` for a new attachment.

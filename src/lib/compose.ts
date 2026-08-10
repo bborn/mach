@@ -307,51 +307,6 @@ export async function discardDraft(draftId: string): Promise<DiscardResult> {
   return { ok: result.ok ?? true, remote: result.remote ?? "none", error: result.error };
 }
 
-/** What became of a selection's worth of drafts. */
-export interface BulkDiscardResult {
-  /** Drafts that are gone here, whatever Gmail did about it. */
-  discarded: number;
-  /** Threads that turned out to hold no draft at all. */
-  missing: number;
-  /** Discarded here and still on Gmail — the sync pass will bring them back. */
-  remoteFailed: number;
-}
-
-/**
- * Throw away the drafts on several conversations.
- *
- * The bulk half of the thing `ComposerDock` does for one, and it goes through
- * the same two calls — resolve the thread's draft, then delete it — because
- * those are the only calls that exist for a draft. There is no `Command` for
- * discarding one, and there cannot be a useful one: a discard ends at
- * `drafts.delete`, Gmail does not hand the id back, and an "undo" could only
- * mean creating a *different* draft containing the same words. So this is not a
- * second command path around `run`; it is the one draft path, reached from the
- * list instead of from a composer.
- *
- * A thread with no draft is counted rather than raised. The Drafts mailbox
- * matches on `messages.is_draft` as well as on the label, and a row can lose
- * its draft between the list being fetched and the key being pressed — a send
- * on the phone, another window. Six selected and five discarded is a fact worth
- * reporting, not a failure.
- */
-export async function discardThreadDrafts(
-  threadIds: readonly number[],
-): Promise<BulkDiscardResult> {
-  const found = await Promise.all(
-    threadIds.map((threadId) => loadDraftForThread(threadId).catch(() => null)),
-  );
-  const ids = found.filter((draft): draft is Draft => draft !== null).map((d) => d.id);
-  const results = await Promise.all(
-    ids.map((id) => discardDraft(id).catch((): DiscardResult => ({ ok: false, remote: "failed" }))),
-  );
-  return {
-    discarded: results.length,
-    missing: threadIds.length - ids.length,
-    remoteFailed: results.filter((r) => r.remote === "failed").length,
-  };
-}
-
 /* -------------------------------------------------------------------------- */
 /* Attachments                                                                 */
 /* -------------------------------------------------------------------------- */

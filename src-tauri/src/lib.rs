@@ -229,6 +229,11 @@ pub fn run() {
             ipc::handoff::handoff_terminals,
             ipc::handoff::handoff_preview,
             ipc::handoff::handoff_run,
+            ipc::handoff::handoff_session_open,
+            ipc::handoff::handoff_session_current,
+            ipc::handoff::handoff_session_write,
+            ipc::handoff::handoff_session_resize,
+            ipc::handoff::handoff_session_close,
             ipc::render::render_message_body,
             ipc::render::open_external,
             evict::command::restore_message_body,
@@ -271,6 +276,26 @@ pub fn run() {
             // process.
             if let tauri::RunEvent::Reopen { .. } = event {
                 shell::reopen(app);
+            }
+            /*
+             * The handoff session pane's process does not outlive the app.
+             *
+             * `ExitRequested` fires while there is still a process to signal
+             * from, which `Exit` — the last thing before the runtime tears
+             * down — does not reliably leave time for. Both are handled
+             * because `close_all` is idempotent and the cost of the second
+             * call is a lock and a `None`.
+             *
+             * This is guarantee 2 of three; see `handoff::session`. The one
+             * that matters when this code never runs at all is the third: the
+             * master descriptor dies with the process, and the tty hangs the
+             * session up on its own.
+             */
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                ipc::handoff::sessions().close_all();
             }
         });
 }

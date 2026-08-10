@@ -24,17 +24,9 @@ import { SyncIndicator } from "./SyncIndicator";
  * announced by furniture any more.
  *
  * What is left passes the same test: every item is a fact about the current
- * view that nothing else on screen states. The pending `g …`, the fixture
- * warning, and the sync indicator — which renders nothing at all unless a sync
- * is running or has failed.
- *
- * # Nor was the selection
- *
- * The rail counted the selection too, and stopped when the count acquired a
- * job. `mail/SelectionBar.tsx` says what the ticked rows can be done with, and
- * a count of them belongs beside the verbs that act on it rather than in the
- * opposite corner of the window from the checkboxes it describes. Two copies of
- * "6 selected" was already one too many before either of them meant anything.
+ * view that nothing else on screen states. The count selected, the pending
+ * `g …`, the fixture warning, and the sync indicator — which renders nothing
+ * at all unless a sync is running or has failed.
  *
  * # The keymap is not one of those facts
  *
@@ -59,13 +51,24 @@ import { SyncIndicator } from "./SyncIndicator";
  * control. Both were a second copy of a number already on screen.
  */
 export function StatusBar() {
-  const { live } = useMach();
+  const { ui, live } = useMach();
   const pending = usePendingSequence();
+  const selected = ui.mode === "mail" ? ui.selection.ids.length : 0;
 
   return (
     // No border of its own: the container in `App.tsx` draws the one edge the
     // bottom of the window needs, whichever of these strips is topmost.
     <footer className="flex h-6 shrink-0 items-center gap-3 overflow-hidden bg-surface px-3">
+      {/* How many rows the next keystroke will act on. It sits *beside* the
+          status message rather than inside it: the message is transient, and
+          the count has to survive it or the number the user is acting on
+          disappears for six seconds after every ⌘A. */}
+      {selected > 0 && (
+        <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-accent">
+          {selected} selected
+        </span>
+      )}
+
       {pending && (
         <span className="shrink-0 whitespace-nowrap font-mono text-micro text-accent">
           {formatBinding(pending)} …
