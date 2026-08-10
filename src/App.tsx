@@ -7,6 +7,7 @@ import { MachProvider, useMach } from "@/hooks/useMach";
 import { cn } from "@/lib/utils";
 import { StatusBar } from "@/components/chrome/StatusBar";
 import { Toast } from "@/components/chrome/Toast";
+import { HeldUpdate } from "@/components/chrome/HeldUpdate";
 import { TitleBar } from "@/components/chrome/TitleBar";
 import { CalendarMode } from "@/components/calendar/CalendarMode";
 import { LinkFailures } from "@/components/mail/LinkFailures";
@@ -295,7 +296,17 @@ function Shell() {
         Renders nothing until there is a message. See the file for why it is
         the status message rather than a second one.
       */}
-      <Toast />
+      <Toast>
+        {/*
+          The held-update offer, in the same layer and above the message.
+
+          `import.meta.env.DEV` is the literal `false` after Vite substitutes
+          it, so the whole expression folds away in a production build and the
+          import with it — same claim as the QA bridge above. A shipped build
+          has no dev server behind it and so has nothing to be told about.
+        */}
+        {import.meta.env.DEV && <HeldUpdate />}
+      </Toast>
       {/* Renders nothing. A link that could not be opened is known about in
           Rust, at the navigation layer, where there is no component to tell —
           this is what carries that back to the toast. */}

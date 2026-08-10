@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && tsc -p tsconfig.node.json --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

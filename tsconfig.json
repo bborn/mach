@@ -29,6 +29,12 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "plugins"],
-  "references": [{ "path": "./tsconfig.node.json" }]
+  /*
+   * `tsconfig.node.json` covers the Vite config and is checked separately —
+   * `bun run build` runs both. It used to be a project *reference*, which
+   * stopped working the moment the config started importing a file out of
+   * `src`: a referenced project claims the files it lists, and this one then
+   * wants a built `.d.ts` for a source file it can already see.
+   */
+  "include": ["src", "plugins"]
 }

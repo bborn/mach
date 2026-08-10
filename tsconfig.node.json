@@ -1,10 +1,13 @@
 {
   "compilerOptions": {
-    "composite": true,
+    "noEmit": true,
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true
   },
-  "include": ["vite.config.ts"]
+  // `hmr-hold.ts` is the one file both halves share: the dev server's plugin
+  // lives in the config, the window's card lives in `src`, and they have to
+  // agree on what is held and what the two of them call it.
+  "include": ["vite.config.ts", "src/lib/hmr-hold.ts"]
 }

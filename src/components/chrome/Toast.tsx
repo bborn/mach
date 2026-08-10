@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { TriangleAlert, X } from "lucide-react";
 import { useMach, type StatusMessage } from "@/hooks/useMach";
 import { describeRedo, describeUndo, peekRedo, peekUndo } from "@/lib/undo-stack";
@@ -121,9 +121,11 @@ export interface ToastAction {
   run: () => void;
 }
 
-export interface ToastLayerProps {
-  status: StatusMessage | null;
-  repeat: number;
+export interface ToastCardProps {
+  message: string;
+  tone: StatusMessage["tone"];
+  /** Rendered as `×n` from 2 up. */
+  repeat?: number;
   action: ToastAction | null;
   onDismiss: () => void;
   /** Called with `true` while a pointer or the focus is inside the card. */
@@ -131,22 +133,25 @@ export interface ToastLayerProps {
 }
 
 /**
- * The fixed layer and its two live regions.
+ * One card: a line, an optional keyboard-bound button, a dismiss.
  *
- * Two, not one, because an error has to interrupt and a confirmation must not:
- * a screen reader hearing "Archived 3 conversations" over the top of whatever
- * it was reading would make the app unusable, and one that waits politely to
- * mention a failure has hidden it. Both regions are mounted for the life of the
- * window whether or not anything is in them — a live region added to the page
- * at the same moment as its content is not reliably announced.
- *
- * Split out from `Toast` below so it can be rendered and asserted on without a
- * provider or a DOM. Everything here is props.
+ * Split out from the layer because it is now worn by two things. `ui.status`
+ * fills it for everything the app did, and — in a development build only —
+ * `chrome/HeldUpdate.tsx` fills it to offer the frontend code that arrived
+ * while he was reading. A second surface for that would have been a second
+ * thing to learn; the button and its binding are the shape he already knows.
  */
-export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastLayerProps) {
-  const error = status?.tone === "error";
+export function ToastCard({
+  message,
+  tone,
+  repeat = 1,
+  action,
+  onDismiss,
+  onHold,
+}: ToastCardProps) {
+  const error = tone === "error";
 
-  const card = status && (
+  return (
     <div
       // Only the card takes the pointer. The layer around it does not, so the
       // rows underneath stay clickable right up to the toast's own edges.
@@ -186,7 +191,7 @@ export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastL
       )}
 
       <span className={cn("min-w-0 text-list leading-snug", error ? "text-danger" : "text-foreground")}>
-        {status.message}
+        {message}
       </span>
 
       {/* The collapsed run, said out loud rather than left as three messages
@@ -230,6 +235,59 @@ export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastL
       </button>
     </div>
   );
+}
+
+export interface ToastLayerProps {
+  status: StatusMessage | null;
+  repeat: number;
+  action: ToastAction | null;
+  onDismiss: () => void;
+  /** Called with `true` while a pointer or the focus is inside the card. */
+  onHold?: (holding: boolean) => void;
+  /**
+   * Cards that are not `ui.status`, stacked above it and outliving it.
+   *
+   * One thing uses this and only in development: the held-update offer. It
+   * cannot be a status message because a status message is timed out by
+   * `useMach` in a few seconds and replaced by the next thing he does, and an
+   * offer he has not answered yet must still be there when he looks up.
+   */
+  children?: ReactNode;
+}
+
+/**
+ * The fixed layer and its two live regions.
+ *
+ * Two, not one, because an error has to interrupt and a confirmation must not:
+ * a screen reader hearing "Archived 3 conversations" over the top of whatever
+ * it was reading would make the app unusable, and one that waits politely to
+ * mention a failure has hidden it. Both regions are mounted for the life of the
+ * window whether or not anything is in them — a live region added to the page
+ * at the same moment as its content is not reliably announced.
+ *
+ * Split out from `Toast` below so it can be rendered and asserted on without a
+ * provider or a DOM. Everything here is props.
+ */
+export function ToastLayer({
+  status,
+  repeat,
+  action,
+  onDismiss,
+  onHold,
+  children,
+}: ToastLayerProps) {
+  const error = status?.tone === "error";
+
+  const card = status && (
+    <ToastCard
+      message={status.message}
+      tone={status.tone}
+      repeat={repeat}
+      action={action}
+      onDismiss={onDismiss}
+      onHold={onHold}
+    />
+  );
 
   return (
     <div
@@ -248,6 +306,8 @@ export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastL
        */
       className="pointer-events-none fixed bottom-9 left-[calc(var(--rail-width)+0.75rem)] z-30 flex flex-col items-start gap-1"
     >
+      {/* Above the status card, because it is the one that stays. */}
+      {children}
       <div role="status" aria-live="polite" aria-atomic="true">
         {error ? null : card}
       </div>
@@ -261,7 +321,7 @@ export function ToastLayer({ status, repeat, action, onDismiss, onHold }: ToastL
 /**
  * The wired toast. One per window; `App` mounts it beside the status bar.
  */
-export function Toast() {
+export function Toast({ children }: { children?: ReactNode }) {
   const { ui, undoState, actions, dispatch } = useMach();
   const [run, setRun] = useState<ToastRun>(noToast);
 
@@ -333,6 +393,8 @@ export function Toast() {
         setRun(noToast);
         dispatch({ type: "status", status: null });
       }}
-    />
+    >
+      {children}
+    </ToastLayer>
   );
 }
