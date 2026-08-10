@@ -82,6 +82,14 @@ set -euo pipefail
 # and calendars without doing its own backfill or spending API quota. It
 # refuses to overwrite an existing seeded store unless you pass --force.
 #
+# It copies mail, not credentials. Refresh tokens are in the Keychain, and a
+# non-main instance addresses its own service — com.mach.mail.oauth.qa-<name>
+# rather than com.mach.mail.oauth — so it cannot read or write the owner's.
+# A seeded instance therefore starts with accounts and no credentials: every
+# address reports "needs reauthorization" and nothing reaches Google. That is
+# the intended state, and it is what stops a QA instance putting a Keychain
+# password dialog on the owner's screen. See `auth::tokens::keychain_service`.
+#
 # Every command targets one instance's pid, so two instances can run at once
 # and `shoot` never captures the wrong window.
 #
@@ -103,10 +111,17 @@ REAL_DB="$HOME/Library/Application Support/com.mach.mail/mach.sqlite3"
 
 # The owner's instance uses the OS app-data dir; every other instance is
 # self-contained under .qa/<name>/data.
+#
+# The Keychain is the one thing that is global to the machine, so it is
+# namespaced the same way: `auth::tokens::keychain_service` derives the service
+# from MACH_DATA_DIR, and the value below is the same derivation so this script
+# can say which namespace an instance is using. Only `main` names
+# com.mach.mail.oauth, which is where the owner's refresh tokens are.
 if [ "$INSTANCE" = "main" ]; then
   DATA_DIR=""
   DB="$REAL_DB"
   CONTROL=""
+  KEYCHAIN_SERVICE="com.mach.mail.oauth"
 else
   DATA_DIR="$QA_DIR/data"
   DB="$DATA_DIR/mach.sqlite3"
@@ -114,6 +129,9 @@ else
   # instance has no MACH_DATA_DIR, so it never opens a port and there is
   # nothing here to read.
   CONTROL="$DATA_DIR/qa-control.json"
+  SLUG="$(printf '%s' "$INSTANCE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/^-*//; s/-*$//')"
+  [ -n "$SLUG" ] || SLUG="unnamed"
+  KEYCHAIN_SERVICE="com.mach.mail.oauth.qa-$SLUG"
 fi
 
 mkdir -p "$QA_DIR"
@@ -175,9 +193,11 @@ cmd_seed() {
   echo "seeded $DB from the real store"
   sqlite3 "$DB" "SELECT (SELECT count(*) FROM threads)||' threads, '||(SELECT count(*) FROM messages)||' messages, '||(SELECT count(*) FROM events)||' events';"
   echo
-  echo "NOTE: tokens live in the Keychain, not the database, so this instance"
-  echo "      will sync as the same accounts. If you do not want it touching"
-  echo "      Google at all, keep it offline or do not add accounts to it."
+  echo "NOTE: credentials do not come with it. Tokens live in the Keychain, and"
+  echo "      this instance addresses its own service ($KEYCHAIN_SERVICE),"
+  echo "      which is empty. Every account above will report \"needs"
+  echo "      reauthorization\" and no sync pass will reach Google. That is the"
+  echo "      intended state: mail and calendars to look at, no credentials."
 }
 
 cmd_up() {
@@ -316,6 +336,7 @@ cmd_state() {
   echo "process : ${pid:+running (pid $pid)}${pid:-NOT RUNNING}"
   echo "vite    : $(curl -sf -o /dev/null http://localhost:1420 && echo up || echo down)"
   echo "store   : $DB"
+  echo "keychain: $KEYCHAIN_SERVICE"
   local rect; rect="$(window_rect 2>/dev/null)" || rect=""
   echo "window  : ${rect:-<none>}"
   [ -f "$DB" ] || { echo "db      : <none yet>"; return 0; }

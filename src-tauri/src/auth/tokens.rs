@@ -1,12 +1,16 @@
 //! Token lifetime and storage.
 //!
-//! Refresh tokens go in the macOS Keychain, keyed by account email. Access
-//! tokens stay in memory and are refreshed transparently inside a safety margin.
+//! Refresh tokens go in the macOS Keychain, keyed by account email, under a
+//! service name that belongs to the instance rather than to the app — see
+//! [`keychain_service`], which is what keeps a QA instance off the owner's
+//! credentials. Access tokens stay in memory and are refreshed transparently
+//! inside a safety margin.
 //! Every type in here that holds secret material implements `Debug` by hand so
 //! it cannot leak through a stray `{:?}`; `tests/auth.rs` asserts that.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Component, Path};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
@@ -19,9 +23,97 @@ use super::{AuthError, ClientConfig};
 /// request never leaves with a token that dies in flight.
 pub const REFRESH_MARGIN_SECONDS: i64 = 60;
 
-/// Keychain service name. Every account is an entry under this service, with the
-/// account's email address as the entry's username.
+/// The owner's Keychain service name. Every account is an entry under this
+/// service, with the account's email address as the entry's username.
+///
+/// Only the owner's instance may name it. Call [`keychain_service`] rather than
+/// this constant anywhere a store is being built.
 pub const KEYCHAIN_SERVICE: &str = "com.mach.mail.oauth";
+
+/// Prefix for every instance that is not the owner's.
+pub const QA_KEYCHAIN_PREFIX: &str = "com.mach.mail.oauth.qa-";
+
+/// What a QA instance is called when its data directory yields nothing usable.
+const UNNAMED_QA_INSTANCE: &str = "unnamed";
+
+/// The Keychain service this process is allowed to use.
+///
+/// # Why this is not a constant
+///
+/// `scripts/qa` gives a QA instance its own SQLite store under
+/// `.qa/<instance>/data`, its own plugin directory and its own attachment
+/// cache, so nothing it does can reach the mailbox the owner is reading. The
+/// Keychain is the one thing left that is global to the machine, and the
+/// service name was a constant — so a QA instance asking for
+/// `com.mach.mail.oauth` / `<owner's address>` was asking for the owner's real
+/// refresh token.
+///
+/// macOS answers that request with a modal panel — *"mach wants to access key
+/// com.mach.mail.oauth in your keychain"* — because a rebuilt debug binary has
+/// a different code signature from the one that created the item, so the item's
+/// ACL no longer matches. That panel takes the owner's focus and blocks the
+/// reading thread until somebody answers it, which is precisely what a QA
+/// instance must never be able to cause.
+///
+/// Giving each instance its own service closes the route structurally: a QA
+/// process cannot *name* the owner's entries, so there is nothing for macOS to
+/// ask about. It finds no item, gets `errSecItemNotFound`, and returns.
+///
+/// [`crate::shell::is_qa_instance`] is the signal — `MACH_DATA_DIR` — because
+/// it is already the thing that makes an instance separate. One signal, not two
+/// that can disagree.
+pub fn keychain_service() -> String {
+    if !crate::shell::is_qa_instance() {
+        return KEYCHAIN_SERVICE.to_string();
+    }
+    // `is_qa_instance` is `MACH_DATA_DIR` being set, so this is present; the
+    // default is unreachable and would name the instance `unnamed` anyway.
+    let data_dir = std::env::var_os("MACH_DATA_DIR").unwrap_or_default();
+    format!("{QA_KEYCHAIN_PREFIX}{}", instance_name(Path::new(&data_dir)))
+}
+
+/// The instance name embedded in a QA data directory.
+///
+/// `scripts/qa` lays instances out as `<repo>/.qa/<instance>/data`, so the name
+/// is the directory *holding* the store rather than the store directory itself.
+/// Anything else — a hand-set `MACH_DATA_DIR` pointing somewhere arbitrary —
+/// falls back to the last component, and then to [`UNNAMED_QA_INSTANCE`]. The
+/// result only has to be stable and distinct from the owner's service; it is
+/// slugged so it stays readable in Keychain Access, where the owner is the one
+/// who has to recognise it.
+fn instance_name(data_dir: &Path) -> String {
+    let mut parts: Vec<&str> = data_dir
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect();
+    if parts.last() == Some(&"data") {
+        parts.pop();
+    }
+
+    let slug: String = parts
+        .last()
+        .copied()
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        UNNAMED_QA_INSTANCE.to_string()
+    } else {
+        slug.to_string()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Secret
@@ -177,6 +269,9 @@ pub trait TokenStore: Send + Sync {
 }
 
 /// The real store: the macOS Keychain, via the `keyring` crate.
+///
+/// The service name comes from [`keychain_service`], so a QA instance reads and
+/// writes its own namespace and the owner's entries are not addressable from it.
 #[derive(Debug, Clone)]
 pub struct KeychainTokenStore {
     service: String,
@@ -185,7 +280,7 @@ pub struct KeychainTokenStore {
 impl Default for KeychainTokenStore {
     fn default() -> Self {
         Self {
-            service: KEYCHAIN_SERVICE.to_string(),
+            service: keychain_service(),
         }
     }
 }
@@ -201,6 +296,11 @@ impl KeychainTokenStore {
         Self {
             service: service.into(),
         }
+    }
+
+    /// The Keychain service this store addresses.
+    pub fn service(&self) -> &str {
+        &self.service
     }
 
     fn entry(&self, account_email: &str) -> Result<keyring::Entry, AuthError> {
@@ -483,5 +583,103 @@ impl<H, S> fmt::Debug for TokenManager<H, S> {
             .field("config", &self.config)
             .field("cached_accounts", &accounts)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The owner's service name is the one thing here that must not move: every
+    /// refresh token he has is filed under it, and changing it would silently
+    /// log all five accounts out.
+    ///
+    /// `MACH_DATA_DIR` is process-wide, so this shares `shell::ENV_LOCK` with
+    /// the tests in `shell` and `qa` that mutate the same variable.
+    #[test]
+    fn the_owners_instance_keeps_the_service_name_it_has_always_had() {
+        let _guard = crate::shell::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        std::env::remove_var("MACH_DATA_DIR");
+        assert_eq!(keychain_service(), "com.mach.mail.oauth");
+        assert_eq!(
+            KeychainTokenStore::default().service(),
+            "com.mach.mail.oauth",
+            "the store the owner's app builds must address the owner's entries"
+        );
+    }
+
+    /// The defect this exists for: a QA instance asking for the owner's key.
+    #[test]
+    fn a_qa_instance_cannot_name_the_owners_entries() {
+        let _guard = crate::shell::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        std::env::set_var("MACH_DATA_DIR", "/Users/owner/mach/.qa/agent/data");
+        let service = keychain_service();
+        assert_eq!(service, "com.mach.mail.oauth.qa-agent");
+        assert_ne!(service, KEYCHAIN_SERVICE);
+        assert_eq!(KeychainTokenStore::default().service(), service);
+
+        // A second instance is a third namespace, not a shared one.
+        std::env::set_var("MACH_DATA_DIR", "/Users/owner/mach/.qa/review/data");
+        assert_eq!(keychain_service(), "com.mach.mail.oauth.qa-review");
+
+        std::env::remove_var("MACH_DATA_DIR");
+        assert_eq!(
+            keychain_service(),
+            KEYCHAIN_SERVICE,
+            "unsetting the variable must restore the owner's namespace"
+        );
+    }
+
+    #[test]
+    fn an_instance_is_named_by_the_directory_holding_its_store() {
+        assert_eq!(instance_name(Path::new(".qa/agent/data")), "agent");
+        assert_eq!(instance_name(Path::new("/repo/.qa/agent/data/")), "agent");
+        // A hand-set MACH_DATA_DIR that is not laid out like `scripts/qa`.
+        assert_eq!(instance_name(Path::new("/tmp/mach-qa")), "mach-qa");
+        // Anything that is not a name still has to produce one, because the
+        // alternative is falling back to the owner's service.
+        assert_eq!(instance_name(Path::new("/")), UNNAMED_QA_INSTANCE);
+        assert_eq!(instance_name(Path::new("data")), UNNAMED_QA_INSTANCE);
+        assert_eq!(instance_name(Path::new("/x/Feature Branch!/data")), "feature-branch");
+    }
+
+    /// Whatever the data directory is called, the result is never the owner's
+    /// service and is always a well-formed name under the QA prefix.
+    #[test]
+    fn no_data_directory_can_produce_the_owners_service() {
+        for dir in [
+            "/",
+            "data",
+            "com.mach.mail/data",
+            "com.mach.mail.oauth",
+            "../../Library/Application Support/com.mach.mail",
+            "",
+        ] {
+            let service = format!("{QA_KEYCHAIN_PREFIX}{}", instance_name(Path::new(dir)));
+            assert_ne!(service, KEYCHAIN_SERVICE, "{dir} reached the owner's service");
+            assert!(service.starts_with(QA_KEYCHAIN_PREFIX), "{dir} -> {service}");
+            assert!(service.len() > QA_KEYCHAIN_PREFIX.len(), "{dir} -> {service}");
+        }
+    }
+
+    /// A QA instance with no credentials of its own must answer, not wait.
+    ///
+    /// The store double is what a Keychain lookup for a service with no items
+    /// does: `errSecItemNotFound`, which `keyring` reports as `NoEntry` and
+    /// [`KeychainTokenStore::load_refresh_token`] turns into `Ok(None)`. There
+    /// is no dialog on that path because there is no item to authorize.
+    #[test]
+    fn an_empty_store_answers_immediately() {
+        let store = MemoryTokenStore::default();
+        let started = std::time::Instant::now();
+        let answer = store.load_refresh_token("someone@example.com");
+        assert!(matches!(answer, Ok(None)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

@@ -1120,6 +1120,38 @@ fn restoring_an_empty_store_asks_for_nothing() {
     assert!(needs.is_empty());
 }
 
+/// What a seeded QA instance is: accounts from the owner's database, and a
+/// Keychain namespace of its own that holds nothing.
+///
+/// Every address has to come back as needing reauthorization, and the whole
+/// check has to *return* — this is the call `restore_accounts_into` makes on a
+/// background thread at launch, and the two incidents it is written against
+/// were both a Keychain read that never came back.
+#[test]
+fn a_seeded_store_reports_every_account_as_needing_credentials_and_returns() {
+    let db = TempDb::new("restore-seeded");
+    for (index, email) in ["one@example.com", "two@example.com", "three@example.com"]
+        .into_iter()
+        .enumerate()
+    {
+        account(&db, email, index as i64);
+    }
+
+    let started = std::time::Instant::now();
+    let mut needs = restore_accounts(&db, &MemoryTokenStore::default()).expect("restore accounts");
+    needs.sort();
+
+    assert_eq!(
+        needs,
+        vec![
+            "one@example.com".to_string(),
+            "three@example.com".to_string(),
+            "two@example.com".to_string(),
+        ]
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
 // ---------------------------------------------------------------------------
 // the wire sample
 // ---------------------------------------------------------------------------

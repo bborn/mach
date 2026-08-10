@@ -355,7 +355,8 @@ Most of this is mechanical: prose in doc comments, test fixture strings, and the
 | `package.json` | 2, 6 | `"name": "mach"`, repo URL `bborn/mach` |
 | `index.html` | 7 | `<title>Mach</title>` |
 | `src-tauri/src/config.rs` | 32 | `DATABASE_FILE_NAME = "mach.sqlite3"` |
-| `src-tauri/src/auth/tokens.rs` | 24 | `KEYCHAIN_SERVICE = "com.mach.mail.oauth"` |
+| `src-tauri/src/auth/tokens.rs` | 28 | `KEYCHAIN_SERVICE = "com.mach.mail.oauth"` |
+| `src-tauri/src/auth/tokens.rs` | 31 | `QA_KEYCHAIN_PREFIX = "com.mach.mail.oauth.qa-"` |
 
 Environment variables in use, all of which would want a new prefix:
 `MACH_GOOGLE_CLIENT_ID` (19 references), `MACH_GOOGLE_CLIENT_SECRET` (10),
@@ -403,6 +404,10 @@ is `"com.mach.mail.oauth"` and every account's refresh token is a keychain entry
 under it. Change that constant and every account must be re-authorized — which
 means walking the **"Google hasn't verified this app" → Advanced → Go to …
 (unsafe)** interstitial once per account again.
+
+`QA_KEYCHAIN_PREFIX` is the same string with `.qa-` and the instance name
+appended, and it is what every non-`main` instance uses. It holds nothing the
+owner would miss, so a rename can leave it wherever it lands.
 
 Three options, cheapest first:
 

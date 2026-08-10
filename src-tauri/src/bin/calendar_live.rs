@@ -26,6 +26,23 @@
 //! database he is reading. The Google side is real either way — that is the
 //! entire point — but the blast radius stops at one throwaway event.
 //!
+//! # It needs credentials of its own
+//!
+//! Setting `MACH_DATA_DIR` also moves this process into its own Keychain
+//! namespace — see [`mach_lib::auth::tokens::keychain_service`], which is what
+//! stops a QA instance putting a password dialog on the owner's screen. So this
+//! does not borrow the owner's refresh tokens, and against a freshly seeded
+//! store it stops at:
+//!
+//! ```text
+//! no credentials for you@example.com; the account must be authorized first
+//! ```
+//!
+//! Authorize the account once *in that instance* — `MACH_QA_INSTANCE=agent
+//! scripts/qa up`, then add the account — and the token lands in the same
+//! namespace this binary reads. There is deliberately no flag that points it at
+//! the owner's entries instead.
+//!
 //! # What it does
 //!
 //! Creates one event an hour long, tomorrow, titled so it is unmistakable in

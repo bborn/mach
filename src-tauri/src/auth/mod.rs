@@ -46,6 +46,11 @@
 //! Access tokens live only in memory. Nothing in this module writes a token to
 //! disk or to a log; every type that holds one implements `Debug` by hand so a
 //! stray `{:?}` cannot leak it. There are tests for that.
+//!
+//! The Keychain is global to the machine, so the service name is not. It comes
+//! from [`tokens::keychain_service`]: the owner's instance uses
+//! [`tokens::KEYCHAIN_SERVICE`], and every QA instance gets a namespace of its
+//! own and cannot address his entries at all.
 
 pub mod flow;
 pub mod http;

@@ -726,6 +726,41 @@ async fn a_missing_refresh_token_asks_for_reauthorization_rather_than_panicking(
     );
 }
 
+/// The QA cold start, on the runtime flavour the app actually uses.
+///
+/// A QA instance addresses its own Keychain service, which holds no items, so
+/// every account it inherited from a seeded store looks like this: the store
+/// says `Ok(None)` and `access_token` has to *return* `NotAuthorized`. The
+/// multi-thread flavour is the one that takes the `block_in_place` branch of
+/// `load_refresh_token_unblocking`, which is where the two previous hangs were,
+/// and the timeout is the assertion — a task blocked inside its own poll never
+/// completes, so finishing at all is the evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_qa_instance_with_no_credentials_returns_rather_than_blocking() {
+    let manager = TokenManager::new(
+        test_config(),
+        FakeHttp::new(vec![]),
+        MemoryTokenStore::default(),
+    );
+
+    for email in ["one@example.com", "two@example.com"] {
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.access_token(email),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{email} never came back — the read blocked"));
+
+        match answer {
+            Err(AuthError::NotAuthorized(who)) => assert_eq!(who, email),
+            other => panic!("expected NotAuthorized, got {other:?}"),
+        }
+    }
+
+    // Nothing was sent to Google either: there was no credential to send.
+    assert_eq!(manager.http().call_count(), 0);
+}
+
 #[tokio::test]
 async fn a_token_endpoint_error_is_surfaced_not_swallowed() {
     let http = FakeHttp::new(vec![oauth::HttpResponse {

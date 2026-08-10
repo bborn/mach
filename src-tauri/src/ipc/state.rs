@@ -24,6 +24,13 @@
 //! entry (the user deleted it, or the app is running on a different machine)
 //! makes that account appear in `needsReauthorization` — it is not an error and
 //! it does not stop the other four from syncing.
+//!
+//! A QA instance is the same case for every row at once. It addresses its own
+//! Keychain namespace (see [`crate::auth::tokens::keychain_service`]), so a
+//! store copied from the owner by `scripts/qa seed` arrives with accounts and
+//! without credentials: every address lands in `needsReauthorization`, the
+//! mailbox renders from SQLite as it always does, and each sync pass records
+//! "no credentials for …" against that account rather than retrying forever.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use crate::auth::flow::{self, AuthorizedAccount, PendingAuthorization};
 use crate::auth::http::GoogleTokenHttp;
 use crate::auth::oauth;
-use crate::auth::tokens::{KeychainTokenStore, TokenManager, TokenStore, KEYCHAIN_SERVICE};
+use crate::auth::tokens::{keychain_service, KeychainTokenStore, TokenManager, TokenStore};
 use crate::auth::ClientConfig;
 use crate::commands::{CommandDispatcher, CommandError, GoogleClients};
 use crate::config::AppConfig;
@@ -394,6 +401,14 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
 ///
 /// This is the app's own invariant applied to the login keychain rather than to
 /// Google: the UI never waits on anything it does not already have locally.
+///
+/// # On a QA instance
+///
+/// The store here is namespaced to the instance, so the lookup is for a service
+/// that holds no items at all: `errSecItemNotFound` on every account, returned
+/// without a dialog because there is no item whose ACL macOS would need to ask
+/// about. Every address is reported as needing reauthorization, which is the
+/// honest answer — a seeded database carries mail, not credentials.
 pub fn restore_accounts_into(state: &AppState) {
     match restore_accounts(&state.db, &KeychainTokenStore::default()) {
         Ok(emails) => {
@@ -482,8 +497,12 @@ pub fn persist_account(db: &Db, email: &str) -> Result<Account, IpcError> {
                 email: email.to_string(),
                 display_name: existing.as_ref().and_then(|a| a.display_name.clone()),
                 // The Keychain service, not the credential: tokens never touch
-                // SQLite.
-                token_ref: KEYCHAIN_SERVICE.to_string(),
+                // SQLite. Written from `keychain_service()` rather than the
+                // constant so the row records where this instance actually put
+                // the token — a QA instance has its own namespace, and a seeded
+                // store's inherited rows naming the owner's service are exactly
+                // the credentials it does not have.
+                token_ref: keychain_service(),
                 colour_index,
             },
         )
