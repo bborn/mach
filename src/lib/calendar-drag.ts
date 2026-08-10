@@ -225,6 +225,22 @@ export function crossesDay(outcome: DragOutcome, dayStart: number): boolean {
   return startOfDay(outcome.start).getTime() !== dayStart;
 }
 
+/**
+ * Is this drag making a copy rather than moving the original?
+ *
+ * Alt held during a move is the gesture every file manager and most calendars
+ * use for "leave that one where it is". A *resize* with alt held is not: there
+ * is no second event a stretched edge could describe, so the modifier is
+ * ignored there rather than doing something surprising with it.
+ *
+ * The answer is recomputed from every event that carries a modifier state, not
+ * latched at pointer-down: alt is a thing you reach for once the drag is
+ * already under way and you can see where it is going.
+ */
+export function isCopyDrag(kind: DragKind, altKey: boolean): boolean {
+  return kind === "move" && altKey;
+}
+
 /** Has the pointer moved far enough to count as a drag rather than a click? */
 export function isDrag(dx: number, dy: number, threshold = DRAG_THRESHOLD_PX): boolean {
   return Math.abs(dx) >= threshold || Math.abs(dy) >= threshold;

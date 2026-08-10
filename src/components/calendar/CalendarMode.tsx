@@ -27,6 +27,7 @@ import { parseEventText, type ParsedEvent } from "@/lib/calendar-nlp";
 import { nudge, type DragOutcome } from "@/lib/calendar-drag";
 import {
   canEditEvent,
+  copyDraft,
   duplicateDraft,
   formDraft,
   formPatch,
@@ -519,11 +520,25 @@ export function CalendarMode() {
     [run, allEvents, guardEdit],
   );
 
+  /**
+   * A block was dropped.
+   *
+   * With alt held it is a copy: the original stays where it was and a new event
+   * is created at the time the ghost landed on, on the same calendar. That is a
+   * create, not a move, so it takes the create path whole — including the
+   * refusal that comes back when the calendar is one you can only read.
+   */
   const onGridMove = useCallback(
     (move: EventMove) => {
+      if (move.copy) {
+        const source = allEvents.find((e) => e.id === move.eventId);
+        if (!source) return;
+        void create(copyDraft(source, { start: move.start, end: move.end }), source.calendarId);
+        return;
+      }
       applyMove(move.eventId, { start: move.start, end: move.end }, false);
     },
-    [applyMove],
+    [applyMove, allEvents, create],
   );
 
   /**

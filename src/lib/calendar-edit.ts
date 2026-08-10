@@ -662,6 +662,31 @@ export function duplicateDraft(event: CalendarEvent): EventDraft {
 }
 
 /**
+ * The draft that copies an event to times that have already been chosen — by an
+ * alt-drag on the grid, or by a paste that worked out where the day starts.
+ *
+ * The title is carried across unchanged. `duplicateDraft` marks its copy
+ * "(copy)" because it lands exactly on top of the original and there would
+ * otherwise be nothing to tell the two apart; a copy that arrives somewhere
+ * else is already told apart by the thing that put it there.
+ */
+export function copyDraft(
+  event: CalendarEvent,
+  at: { start: number; end: number },
+): EventDraft {
+  return {
+    title: event.title === "(no title)" ? "" : event.title,
+    description: event.description,
+    location: event.location,
+    startTs: at.start,
+    endTs: at.end,
+    isAllDay: event.allDay,
+    attendees: event.attendees,
+    recurrence: [],
+  };
+}
+
+/**
  * The draft that pastes a copied event into a day.
  *
  * The time of day survives, the date does not — pasting is "this meeting, but
@@ -676,16 +701,7 @@ export function pasteDraft(event: CalendarEvent, targetDay: number): EventDraft 
         new Date(targetDay).getDate(),
       )
     : startOfDay(targetDay).getTime() + (event.start - startOfDay(event.start).getTime());
-  return {
-    title: event.title === "(no title)" ? "" : event.title,
-    description: event.description,
-    location: event.location,
-    startTs: start,
-    endTs: start + duration,
-    isAllDay: event.allDay,
-    attendees: event.attendees,
-    recurrence: [],
-  };
+  return copyDraft(event, { start, end: start + duration });
 }
 
 /* -------------------------------------------------------------------------- */

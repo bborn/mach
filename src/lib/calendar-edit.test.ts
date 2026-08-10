@@ -10,6 +10,7 @@ import {
   reminderChoiceId,
   reminderMinutesOf,
   requiresSeriesScope,
+  copyDraft,
   dateField,
   duplicateDraft,
   emptyForm,
@@ -303,6 +304,17 @@ describe("drafts", () => {
     expect(draft.title).toBe("Standup (copy)");
     expect(draft.startTs).toBe(event.start);
     expect(draft.location).toBe("Room 2");
+  });
+
+  it("copies to a dragged time without renaming it", () => {
+    const at = { start: event.start + 2 * 60 * 60 * 1000, end: event.end + 2 * 60 * 60 * 1000 };
+    const draft = copyDraft(event, at);
+    expect(draft.title).toBe("Standup");
+    expect(draft.startTs).toBe(at.start);
+    expect(draft.endTs).toBe(at.end);
+    expect(draft.location).toBe("Room 2");
+    // A copy is one event, whatever the original repeated.
+    expect(draft.recurrence).toEqual([]);
   });
 
   it("pastes onto another day at the same time of day", () => {
