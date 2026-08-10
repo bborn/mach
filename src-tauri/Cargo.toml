@@ -29,6 +29,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+# `tests/bundle.rs` measures the shipped icons' opaque area, which needs their
+# alpha channel and nothing else. Already in the lock as a transitive
+# dependency, so this costs no download.
+png = "0.17"
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
