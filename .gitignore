@@ -44,3 +44,6 @@ client_secret*.json
 
 # Scratch directory for assets/logo/build.py.
 target-icons/
+
+# Another tool's session state. Nothing here is about Mach.
+.omo/

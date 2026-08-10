@@ -250,6 +250,7 @@ fn running_summary(name: &str) -> String {
         "list_events" => "Checking the calendar…".to_string(),
         "list_labels" | "list_accounts" => "Looking things up…".to_string(),
         tools::DRAFT_TOOL => "Writing a reply…".to_string(),
+        tools::NEW_DRAFT_TOOL => "Writing a message…".to_string(),
         tools::SEND_TOOL => "Ready to send…".to_string(),
         other => format!("{other}…"),
     }

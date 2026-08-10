@@ -563,7 +563,9 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn new_draft_id(now: i64) -> String {
+/// The router's own draft id, exposed so `agent::tools` mints ids in the same
+/// grammar rather than inventing a second one.
+pub fn new_draft_id(now: i64) -> String {
     format!("draft-{now:x}-{:x}", entropy(now))
 }
 

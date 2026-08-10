@@ -559,6 +559,7 @@ fn the_mcp_surface_is_exactly_the_command_layer_and_nothing_more() {
         "list_labels",
         "list_accounts",
         tools::DRAFT_TOOL,
+        tools::NEW_DRAFT_TOOL,
         tools::SEND_TOOL,
     ];
     for name in &names {

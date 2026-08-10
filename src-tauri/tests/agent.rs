@@ -559,6 +559,7 @@ fn reads_and_compose_sit_beside_the_commands() {
         "list_labels",
         "list_accounts",
         "draft_reply",
+        "draft_message",
         "send_draft",
         "archive",
         "snooze",
@@ -566,6 +567,38 @@ fn reads_and_compose_sit_beside_the_commands() {
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
+}
+
+/// The declaration is the whole contract with the model, so it is pinned.
+///
+/// `to`, `subject` and `body` are required and there is **no** `threadId`:
+/// nothing about this tool can be answered by an existing conversation, which
+/// is the point of it existing beside `draft_reply`.
+#[test]
+fn the_compose_tool_asks_for_what_a_new_message_needs_and_nothing_else() {
+    let tool = tools::find("draft_message").expect("draft_message");
+    let schema = &tool.definition.input_schema;
+
+    assert_eq!(schema["required"], json!(["to", "subject", "body"]));
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert!(
+        schema["properties"].get("threadId").is_none(),
+        "a new message has no thread: {schema}"
+    );
+    for optional in ["cc", "bcc", "accountId"] {
+        assert!(
+            schema["properties"].get(optional).is_some(),
+            "missing {optional}"
+        );
+    }
+    assert_eq!(schema["properties"]["to"]["minItems"], json!(1));
+    // And the description tells the model which of the two drafting tools this
+    // is, because picking the wrong one is the original defect.
+    assert!(
+        tool.definition.description.contains("draft_reply"),
+        "{}",
+        tool.definition.description
+    );
 }
 
 #[test]
@@ -579,7 +612,10 @@ fn only_what_touches_another_human_needs_approval() {
         "trash",
         "snooze",
         "label",
+        // Both drafting tools are free. A draft is a row in the Drafts mailbox
+        // that nobody has been told about; `send_draft` below is the gate.
         "draft_reply",
+        "draft_message",
     ] {
         assert_eq!(tools::policy_for(auto), ToolPolicy::Auto, "{auto}");
     }
@@ -1494,4 +1530,287 @@ fn an_artifact_survives_the_wire_with_its_ids_intact() {
     })
     .unwrap();
     assert!(plain.get("artifact").is_none());
+}
+
+// ===========================================================================
+// Writing to somebody, rather than answering them
+// ===========================================================================
+//
+// The agent could only compose off an existing thread, so asked to write to
+// Molly it replied to a month-old Venmo request and reported that the draft
+// had inherited the subject "Re: Molly Swenson requests $288.00". Sending that
+// reads as a mistake to the person receiving it. These pin the other half: a
+// draft on no conversation, with the subject it was given.
+
+/// A second account, so "which account" is a real question.
+fn add_account(db: &Db, email: &str) -> i64 {
+    db.write(|conn| {
+        queries::upsert_account(
+            conn,
+            &NewAccount {
+                email: email.into(),
+                display_name: None,
+                token_ref: "keychain".into(),
+                colour_index: 1,
+            },
+        )
+    })
+    .expect("account")
+}
+
+/// How many rows the composer holds — what a refused call must not change.
+fn draft_count(db: &Db) -> i64 {
+    db.read(|conn| Ok(conn.query_row("SELECT count(*) FROM compose_drafts", [], |row| row.get(0))?))
+        .expect("count")
+}
+
+/// A complete `draft_message` call, with the fields under test overridden.
+fn compose(overrides: Value) -> Value {
+    let mut base = json!({
+        "to": ["molly.swenson@example.com"],
+        "subject": "Thursday",
+        "body": "does 4 work?",
+    });
+    for (key, value) in overrides.as_object().expect("an object") {
+        base[key] = value.clone();
+    }
+    base
+}
+
+#[tokio::test]
+async fn a_new_message_keeps_the_subject_it_was_given_and_joins_no_conversation() {
+    let harness = Harness::new("compose-new");
+    let (account_id, thread_id) = seed(&harness.db);
+
+    let outcome = tools::execute(
+        &harness.tool_context(),
+        "draft_message",
+        &json!({
+            "to": ["Molly Swenson <molly.swenson@example.com>"],
+            "cc": ["sam@example.com"],
+            "subject": "Thursday, and the roof quote",
+            "body": "quote came in at 4.2 — happy to walk you through it thursday.",
+        }),
+    )
+    .await
+    .expect("drafted");
+
+    let draft = &outcome.payload["draft"];
+
+    // The whole point: verbatim, with nothing prefixed to it.
+    assert_eq!(draft["subject"], "Thursday, and the roof quote");
+    assert_eq!(draft["kind"], "new");
+
+    // Addressed as given, display name and all.
+    assert_eq!(draft["to"][0]["email"], "molly.swenson@example.com");
+    assert_eq!(draft["to"][0]["name"], "Molly Swenson");
+    assert_eq!(draft["cc"][0]["email"], "sam@example.com");
+    assert_eq!(draft["accountId"], account_id);
+
+    // Not on Tawny's thread, and Tawny's thread has not acquired a draft.
+    assert_ne!(draft["threadId"], json!(thread_id));
+    assert!(
+        mach_lib::ipc::compose::engine::draft::load_draft_for_thread(&harness.db.db, thread_id)
+            .unwrap()
+            .is_none(),
+        "the existing conversation was left alone"
+    );
+
+    // The conversation it was given instead is its own, titled with the same
+    // subject and filed under DRAFT — which is the row in the Drafts mailbox.
+    let own_thread = draft["threadId"].as_i64().expect("a conversation of its own");
+    let summary = harness
+        .db
+        .read(|conn| queries::thread_summary(conn, own_thread))
+        .unwrap()
+        .expect("the draft is listed");
+    assert_eq!(summary.subject, "Thursday, and the roof quote");
+    assert!(summary.label_ids.iter().any(|l| l == "DRAFT"), "{summary:?}");
+
+    // And the message it would build carries that subject and no threading
+    // headers, which is the version of "no thread" the recipient sees.
+    let preview = mach_lib::ipc::compose::dispatch(
+        &harness.db.db,
+        &harness.outbox,
+        json!({ "op": "preview", "draft": draft }),
+    )
+    .await
+    .expect("previewed");
+    let headers = preview["headers"].as_str().unwrap();
+    assert!(
+        headers.contains("Subject: Thursday, and the roof quote"),
+        "{headers}"
+    );
+    assert!(!headers.contains("In-Reply-To"), "{headers}");
+    assert!(!headers.contains("References"), "{headers}");
+    assert!(preview["gmailThreadId"].is_null(), "{preview}");
+
+    assert!(outcome.mutated);
+}
+
+/// The result has to be openable, the way `draft_reply`'s is: the drawer shows
+/// "Open draft" beside it, and pressing it resumes *that* draft by id.
+#[tokio::test]
+async fn a_new_message_hands_back_a_draft_the_drawer_can_open() {
+    let harness = Harness::new("compose-artifact");
+    let (account_id, _thread_id) = seed(&harness.db);
+
+    let outcome = tools::execute(
+        &harness.tool_context(),
+        "draft_message",
+        &compose(json!({ "subject": "Coffee?" })),
+    )
+    .await
+    .expect("drafted");
+
+    match outcome.artifact.expect("a draft is a thing, not a sentence") {
+        tools::Artifact::Draft {
+            draft_id,
+            thread_id,
+            account_id: on_account,
+            label,
+        } => {
+            assert_eq!(
+                Some(draft_id.as_str()),
+                outcome.payload["draft"]["id"].as_str(),
+                "the button has to open the draft the tool actually wrote"
+            );
+            assert_eq!(label, "Coffee?", "the button is named for the message");
+            assert_eq!(on_account, account_id);
+            // The draft has a conversation of its own — the mirror gives it one
+            // so it is in the Drafts mailbox — and the button navigates there
+            // before resuming it.
+            assert!(thread_id.is_some());
+
+            // What "Open draft" does: load by id.
+            let resumed =
+                mach_lib::ipc::compose::engine::draft::load_draft(&harness.db.db, &draft_id)
+                    .unwrap()
+                    .expect("the draft is in the store");
+            assert_eq!(resumed.subject, "Coffee?");
+            assert_eq!(resumed.to[0].email, "molly.swenson@example.com");
+        }
+        other => panic!("expected a draft artifact, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_account_is_the_default_preference_unless_the_call_names_one() {
+    let harness = Harness::new("compose-account");
+    let (first, _thread_id) = seed(&harness.db);
+    let second = add_account(&harness.db, "alex@work.example");
+
+    let account_of = |overrides: Value| async {
+        tools::execute(
+            &harness.tool_context(),
+            "draft_message",
+            &compose(overrides),
+        )
+        .await
+        .map(|outcome| outcome.payload["draft"]["accountId"].as_i64().unwrap())
+    };
+
+    let set_default = |value: Value| {
+        harness
+            .db
+            .write(|conn| {
+                mach_lib::ipc::prefs::set(
+                    conn,
+                    mach_lib::ipc::prefs::DEFAULT_ACCOUNT_KEY,
+                    &value,
+                    0,
+                )
+            })
+            .expect("preference written");
+    };
+
+    // Nothing chosen: the first account, which is the order the sidebar uses.
+    assert_eq!(account_of(json!({})).await.unwrap(), first);
+
+    // The preference, once there is one. This is the case a new message has —
+    // no thread, no list scope, nothing else to go on.
+    set_default(json!(second));
+    assert_eq!(account_of(json!({})).await.unwrap(), second);
+
+    // A caller that knows better wins over it.
+    assert_eq!(
+        account_of(json!({ "accountId": first })).await.unwrap(),
+        first
+    );
+
+    // A preference left pointing at a removed account is not fatal: it falls
+    // back rather than refusing to write.
+    set_default(json!(9_999));
+    assert_eq!(account_of(json!({})).await.unwrap(), first);
+
+    // But an account the *call* named and that does not exist is an error.
+    // Sending from a different address than the one asked for is the silent
+    // substitution this tool exists to avoid.
+    let error = account_of(json!({ "accountId": 9_999 }))
+        .await
+        .expect_err("no such account");
+    let message = error.to_string();
+    assert!(message.contains("9999"), "{message}");
+    assert!(message.contains("alex@example.com"), "{message}");
+    assert!(error.is_recoverable_by_model());
+}
+
+#[tokio::test]
+async fn a_malformed_address_fails_visibly_and_writes_nothing() {
+    let harness = Harness::new("compose-address");
+    seed(&harness.db);
+
+    // One good draft first, so the count below means something.
+    tools::execute(
+        &harness.tool_context(),
+        "draft_message",
+        &compose(json!({})),
+    )
+    .await
+    .expect("drafted");
+    assert_eq!(draft_count(&harness.db), 1);
+
+    for bad in [
+        json!(["Molly"]),
+        json!(["molly at example.com"]),
+        json!(["molly@example"]),
+        json!(["molly@example..com"]),
+        json!([""]),
+        json!([]),
+        json!([7]),
+    ] {
+        let error = tools::execute(
+            &harness.tool_context(),
+            "draft_message",
+            &compose(json!({ "to": bad })),
+        )
+        .await
+        .expect_err(&format!("{bad} addresses nobody"));
+        assert!(matches!(error, AgentError::Invalid(_)), "{bad}: {error:?}");
+        // Reported to the model rather than killing the session, so it can go
+        // and find the real address.
+        assert!(error.is_recoverable_by_model(), "{bad}");
+    }
+
+    // The offender is named, because "invalid recipients" is not a fix.
+    let error = tools::execute(
+        &harness.tool_context(),
+        "draft_message",
+        &compose(json!({ "to": ["Molly"] })),
+    )
+    .await
+    .expect_err("not an address");
+    assert!(error.to_string().contains("Molly"), "{error}");
+
+    // A cc nobody can deliver to is refused the same way as a to.
+    tools::execute(
+        &harness.tool_context(),
+        "draft_message",
+        &compose(json!({ "cc": ["sam@"] })),
+    )
+    .await
+    .expect_err("not an address");
+
+    // Nothing was written by any of it.
+    assert_eq!(draft_count(&harness.db), 1);
 }

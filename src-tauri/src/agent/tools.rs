@@ -27,10 +27,17 @@
 //!
 //! # Compose
 //!
-//! `draft_reply` and `send_draft` go through the composer's own router
-//! ([`crate::ipc::compose::dispatch`]) rather than reimplementing threading and
-//! MIME. Drafting is local and free; sending is the one thing that reaches
-//! another human, so it is [`ToolPolicy::Approve`].
+//! `draft_reply`, `draft_message` and `send_draft` go through the composer's own
+//! router ([`crate::ipc::compose::dispatch`]) rather than reimplementing
+//! threading and MIME. Drafting is local and free; sending is the one thing that
+//! reaches another human, so it is [`ToolPolicy::Approve`].
+//!
+//! `draft_reply` answers a conversation and takes its recipients, its subject
+//! and its threading headers from that conversation. `draft_message` is the
+//! other half, and it exists because the agent had only the first: asked to
+//! write to somebody, it replied to an unrelated month-old thread and reported
+//! that the draft had inherited the subject "Re: Molly Swenson requests
+//! $288.00". `draft_message` writes the subject it was given, on no thread.
 
 use std::sync::Arc;
 
@@ -98,6 +105,8 @@ pub const APPROVAL_COMMANDS: &[&str] = &[
 /// The tool that actually puts a message in the outbox.
 pub const SEND_TOOL: &str = "send_draft";
 pub const DRAFT_TOOL: &str = "draft_reply";
+/// A message to somebody, from nothing — the agent's `c`.
+pub const NEW_DRAFT_TOOL: &str = "draft_message";
 
 // ===========================================================================
 // Definitions
@@ -389,6 +398,40 @@ fn compose_tools() -> Vec<Tool> {
                 "additionalProperties": false,
             }),
         ),
+        // Auto, exactly like `draft_reply`. Writing a draft tells nobody: it is
+        // a row in the Drafts mailbox, editable and discardable, and
+        // `send_draft` is still the approval that stands between it and another
+        // human. Asking twice for one message would teach the owner to click
+        // yes without reading, which costs the approval that matters.
+        Tool::auto(
+            NEW_DRAFT_TOOL,
+            "Write a new message and save it as a draft. Use this whenever the message \
+             is not an answer to an existing conversation: it starts a conversation of \
+             its own, and the subject is the one you give here. draft_reply is for \
+             answering a thread, and inherits that thread's subject. Nothing is sent. \
+             Returns a draftId for send_draft.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Email addresses. \u{201c}Molly <molly@example.com>\u{201d} is accepted too.",
+                    },
+                    "cc": { "type": "array", "items": { "type": "string" } },
+                    "bcc": { "type": "array", "items": { "type": "string" } },
+                    "subject": { "type": "string", "description": "Used exactly as written." },
+                    "body": { "type": "string", "description": "The message text. Markdown-ish: *bold*, _italic_, - bullets." },
+                    "accountId": {
+                        "type": "integer",
+                        "description": "Send from this account. Omit to use the default account.",
+                    },
+                },
+                "required": ["to", "subject", "body"],
+                "additionalProperties": false,
+            }),
+        ),
         Tool {
             definition: ToolDefinition {
                 name: SEND_TOOL.to_string(),
@@ -500,6 +543,7 @@ pub async fn execute(ctx: &ToolContext, name: &str, input: &Value) -> Result<Too
         "list_labels" => list_labels(ctx, input),
         "list_accounts" => list_accounts(ctx),
         DRAFT_TOOL => draft_reply(ctx, input).await,
+        NEW_DRAFT_TOOL => draft_message(ctx, input).await,
         SEND_TOOL => send_draft(ctx, input).await,
         other if super::plugin_tools::is_plugin_tool(other) => run_plugin(ctx, other, input).await,
         _ => run_command(ctx, name, input).await,
@@ -760,11 +804,70 @@ async fn draft_reply(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Ag
 
     let saved = compose_dispatch(&ctx.db, &ctx.outbox, json!({ "op": "saveDraft", "draft": draft }))
         .await?;
+    Ok(drafted(saved))
+}
+
+/// A message to somebody, on no conversation at all.
+///
+/// The composer's `c` builds a blank draft in the window and lets the first
+/// autosave write the row; this builds the same object and hands it straight to
+/// `saveDraft`, which is the same write — the row, the mirror that puts it in
+/// the Drafts mailbox, and the push to Gmail. There is no second way to make a
+/// draft, and in particular no `prepare`: `prepare` exists to read a *thread*,
+/// and a message being started has none.
+///
+/// The subject goes in as written. Nothing here derives one, and `kind: new`
+/// is what keeps [`crate::ipc::compose::engine::draft::build`] from threading
+/// the message onto anything at send.
+async fn draft_message(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+    let to = mailboxes(input, "to")?;
+    if to.is_empty() {
+        return Err(AgentError::invalid(
+            "draft_message needs at least one address in to",
+        ));
+    }
+    let cc = mailboxes(input, "cc")?;
+    let bcc = mailboxes(input, "bcc")?;
+    let subject = input
+        .get("subject")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AgentError::invalid("draft_message needs a subject"))?;
+    let body = input
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AgentError::invalid("draft_message needs a body"))?;
+    let account_id = compose_account(ctx, input)?;
+
+    // Only the fields the model owns. Everything else — `bodyFormat`, the
+    // Gmail half, the attachments — takes the `Draft` struct's own default,
+    // which is the same thing that happens to a draft arriving from the editor
+    // without them.
+    let draft = json!({
+        "id": crate::ipc::compose::new_draft_id(now_ms()),
+        "accountId": account_id,
+        "threadId": Value::Null,
+        "replyToId": Value::Null,
+        "kind": "new",
+        "to": to,
+        "cc": cc,
+        "bcc": bcc,
+        "subject": subject,
+        "body": body,
+    });
+
+    let saved = compose_dispatch(&ctx.db, &ctx.outbox, json!({ "op": "saveDraft", "draft": draft }))
+        .await?;
+    Ok(drafted(saved))
+}
+
+/// What `saveDraft` came back with, as a tool result the drawer can open.
+fn drafted(saved: Value) -> ToolOutcome {
     let draft = saved.get("draft").cloned().unwrap_or(Value::Null);
 
     let subject = draft
         .get("subject")
         .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
         .unwrap_or("(no subject)")
         .to_string();
     // The one line this whole change exists for: the drawer gets something to
@@ -779,14 +882,136 @@ async fn draft_reply(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Ag
             label: subject.clone(),
         });
 
-    Ok(ToolOutcome {
+    ToolOutcome {
         summary: format!("Drafted \u{201c}{subject}\u{201d}"),
         payload: json!({ "draft": draft }),
         // The draft is now a row in the Drafts mailbox, so the list is stale —
         // this is what makes it appear without a relaunch.
         mutated: true,
         artifact,
-    })
+    }
+}
+
+/// Which account a message with nothing behind it is sent from.
+///
+/// The same three-step rule the composer follows in `composeAccountId`
+/// (`src/lib/prefs.ts`), with the tool's own argument standing in for "the
+/// mailbox the list is filtered to": what the caller named, then the stored
+/// default if it still names an account that exists, then the first account,
+/// which is the order the sidebar shows them in.
+///
+/// A named account that does not exist is an error rather than a fall-through.
+/// The model asked to send from a particular address; quietly sending from a
+/// different one is the class of mistake this whole tool exists to stop.
+fn compose_account(ctx: &ToolContext, input: &Value) -> Result<i64, AgentError> {
+    let accounts = ctx.db.read(crate::db::queries::list_accounts)?;
+    if accounts.is_empty() {
+        return Err(AgentError::invalid(
+            "there is no account to send from — add one in Mach first",
+        ));
+    }
+
+    if let Some(named) = input.get("accountId").and_then(Value::as_i64) {
+        return accounts
+            .iter()
+            .find(|a| a.id == named)
+            .map(|a| a.id)
+            .ok_or_else(|| {
+                let known: Vec<String> = accounts
+                    .iter()
+                    .map(|a| format!("{} (accountId {})", a.email, a.id))
+                    .collect();
+                AgentError::invalid(format!(
+                    "there is no account with id {named}. The accounts are: {}",
+                    known.join(", ")
+                ))
+            });
+    }
+
+    let preferred = ctx.db.read(crate::ipc::prefs::default_account_id)?;
+    if let Some(id) = preferred.filter(|id| accounts.iter().any(|a| a.id == *id)) {
+        return Ok(id);
+    }
+    Ok(accounts[0].id)
+}
+
+/// The addresses in one field, parsed and then actually checked.
+///
+/// [`parse_list`] is the composer's own grammar, so `"Molly <molly@x.com>"` and
+/// a bare address both work, and it is deliberately forgiving — a typed field
+/// must not refuse a keystroke. Nothing here is typed, though, and a draft
+/// addressed to `molly` would sit in the Drafts mailbox looking finished and
+/// fail at send. So a malformed address fails the tool call instead: the drawer
+/// shows it in red and the model is told what was wrong with it.
+///
+/// [`parse_list`]: crate::ipc::compose::engine::address::parse_list
+fn mailboxes(input: &Value, field: &str) -> Result<Vec<Value>, AgentError> {
+    use crate::ipc::compose::engine::address;
+
+    let entries: Vec<String> = match input.get(field) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(one)) => vec![one.clone()],
+        Some(Value::Array(list)) => list
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    AgentError::invalid(format!("{field} takes email addresses, as strings"))
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(AgentError::invalid(format!(
+                "{field} takes an array of email addresses"
+            )))
+        }
+    };
+
+    let mut parsed = Vec::new();
+    for entry in &entries {
+        parsed.extend(address::parse_list(entry));
+    }
+    let parsed = address::dedupe(parsed);
+
+    let bad: Vec<String> = parsed
+        .iter()
+        .map(|mailbox| mailbox.email.clone())
+        .filter(|email| !is_address(email))
+        .collect();
+    if !bad.is_empty() {
+        return Err(AgentError::invalid(format!(
+            "{} in {field} {} not an email address. Use the address itself, \
+             e.g. molly@example.com — search the mail for it rather than guessing.",
+            bad.join(", "),
+            if bad.len() == 1 { "is" } else { "are" },
+        )));
+    }
+
+    Ok(parsed
+        .iter()
+        .map(|mailbox| serde_json::to_value(mailbox).unwrap_or(Value::Null))
+        .collect())
+}
+
+/// Whether a string is shaped like an email address.
+///
+/// A shape check and nothing more — no mailbox on the other end is being
+/// claimed. It rejects what the model actually gets wrong: a bare name, a
+/// display name that lost its address, two addresses run together, a domain
+/// with no dot in it.
+fn is_address(email: &str) -> bool {
+    let mut parts = email.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && !email
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "<>,;\"".contains(c))
 }
 
 async fn send_draft(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {

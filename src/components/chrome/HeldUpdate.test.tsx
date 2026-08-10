@@ -9,6 +9,7 @@
 
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { formatBinding } from "@/lib/keymap";
 import { ToastLayer } from "./Toast";
 import { TAKE_KEYS, UpdateOffer } from "./HeldUpdate";
 
@@ -30,8 +31,13 @@ describe("the offer", () => {
   it("prints the binding on the button, the way Undo prints ⌘Z", () => {
     // ⌘R rather than a new letter: reloading is a gesture every window on the
     // machine already has, and the toast is where it is learned.
+    //
+    // Asserted through `formatBinding` rather than against a literal "⌘R":
+    // `mod` is ⌘ on macOS and ⌃ everywhere else, and CI runs on Linux. The
+    // literal passed here and failed there, which is a test about the platform
+    // rather than about the button.
     expect(TAKE_KEYS).toBe("mod+r");
-    expect(offer()).toContain("⌘R");
+    expect(offer()).toContain(formatBinding(TAKE_KEYS));
   });
 
   it("can be put away, since not now is an answer", () => {

@@ -19,13 +19,18 @@
 //! turn the settings table into a blob store. Both are shape checks, not
 //! meaning checks.
 //!
-//! # The one exception
+//! # The two exceptions
 //!
 //! [`SYNC_INTERVAL_KEY`] is read on this side, because the thing it controls is
 //! on this side: the background loop's gap between passes. Writing it applies to
 //! the running engine immediately (see [`SyncEngine::set_poll_interval`]), and
 //! `bootstrap` reads it back at launch, so the setting survives a restart
 //! without the frontend having to replay it.
+//!
+//! [`DEFAULT_ACCOUNT_KEY`] is read here for the same reason: the agent composes
+//! a new message in Rust, with no window and no thread to infer an account
+//! from, so the answer the composer would have got from `composeAccountId` in
+//! `src/lib/prefs.ts` has to be available on this side too.
 //!
 //! [`SyncEngine::set_poll_interval`]: crate::sync::SyncEngine::set_poll_interval
 
@@ -43,6 +48,11 @@ use super::state::AppState;
 
 /// The gap between background sync passes, in seconds. Read by `bootstrap`.
 pub const SYNC_INTERVAL_KEY: &str = "syncIntervalSeconds";
+
+/// The account used when there is nothing to infer one from. Written by the
+/// preferences dialog, read by the composer in the window and by the agent's
+/// compose tool here.
+pub const DEFAULT_ACCOUNT_KEY: &str = "defaultAccountId";
 
 /// Long enough for any name the UI would choose, short enough that a key is
 /// obviously a key and not a payload somebody put in the wrong column.
@@ -132,6 +142,17 @@ pub fn set(conn: &Connection, key: &str, value: &Value, now_ms: i64) -> DbResult
         rusqlite::params![key, value.to_string(), now_ms],
     )?;
     Ok(())
+}
+
+/// The chosen default account, or `None` when none has been chosen.
+///
+/// A JSON number and nothing else, for the same reason [`sync_interval`] is
+/// strict: the dialog writes a number or `null`, so anything else in this row
+/// was not written by the dialog. Whether the id still names an account is the
+/// caller's question — an account can be removed after the preference was set,
+/// and this layer holds bytes rather than meaning.
+pub fn default_account_id(conn: &Connection) -> DbResult<Option<i64>> {
+    Ok(get(conn, DEFAULT_ACCOUNT_KEY)?.as_ref().and_then(Value::as_i64))
 }
 
 /// The stored sync interval, clamped, or `None` to leave [`SyncConfig`]'s own

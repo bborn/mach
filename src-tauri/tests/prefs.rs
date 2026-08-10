@@ -242,3 +242,25 @@ fn a_sync_interval_stored_as_a_string_is_ignored() {
 
     assert_eq!(db.read(prefs::sync_interval).expect("read"), None);
 }
+
+/// The account a new message goes out from when there is nothing to infer one
+/// from. Read on this side because the agent composes without a window.
+#[test]
+fn the_default_account_reads_back_as_a_number_or_not_at_all() {
+    let db = db();
+    assert_eq!(db.read(prefs::default_account_id).expect("read"), None);
+
+    db.write(|conn| prefs::set(conn, prefs::DEFAULT_ACCOUNT_KEY, &json!(4), 1))
+        .expect("write");
+    assert_eq!(db.read(prefs::default_account_id).expect("read"), Some(4));
+
+    // "No default" is how the dialog spells the unset choice, and it means the
+    // caller falls back rather than sending from account null.
+    db.write(|conn| prefs::set(conn, prefs::DEFAULT_ACCOUNT_KEY, &json!(null), 2))
+        .expect("write");
+    assert_eq!(db.read(prefs::default_account_id).expect("read"), None);
+
+    db.write(|conn| prefs::set(conn, prefs::DEFAULT_ACCOUNT_KEY, &json!("4"), 3))
+        .expect("write");
+    assert_eq!(db.read(prefs::default_account_id).expect("read"), None);
+}
