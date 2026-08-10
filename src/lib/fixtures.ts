@@ -173,6 +173,7 @@ const THREAD_SEEDS: ThreadSeed[] = [
   ["a2", "marcus@lumen.example", "Renewal terms — Paperbark", "They want annual with quarterly outs, which is not a thing. Countering with annual, 30-day termination for", 268.0, false, false, ["INBOX", "L_CUSTOMERS"]],
   ["a1", "tawny@northloop.example", "Term sheet — redline attached", "Two changes from what we discussed: the option pool is pre-money and the board seat converts at Series B", 292.0, false, true, ["INBOX", "L_INVESTORS"]],
   ["a4", "deb@feldmanlegal.example", "Re: Property tax assessment appeal", "Filed. Hearing is scheduled for Oct 14 at 9am, and you do not need to attend unless they contest the comps", 316.0, false, false, ["INBOX", "L_FAMILY"]],
+  ["a5", "books@whinynil.example", "Bookkeeping digest — Monday 10 August", "Three things need you; the rest is filed. Invoice #51 is drafted and waiting for you to send — OfferLab, 64.0", 9.5, true, false, ["INBOX", "L_RECEIPTS"]],
 ];
 
 const BODY_PARAGRAPHS = [
@@ -310,6 +311,56 @@ function attachDraft(): void {
   thread.messageCount = messages.length;
 }
 attachDraft();
+
+/**
+ * One conversation is machine-generated mail, hard-wrapped at 72 columns.
+ *
+ * Nearly every generator wraps its `text/plain` at 72 or 78, and the wrap is
+ * baked into the body as real newlines — so what the reading pane does with a
+ * column it did not choose is visible in `bun run dev` rather than only in real
+ * mail. It carries the three shapes that a naive un-wrapper would destroy: a
+ * numbered list, a hanging indent, and an indented copy-paste block.
+ */
+const DIGEST_THREAD_ID = THREAD_SEEDS.length;
+const DIGEST_BODY = [
+  "Good morning. Bookkeeping digest for Monday, 10 August 2026. Three things need you;",
+  "the rest is filed.",
+  "",
+  "  1. Invoice #51 is drafted and waiting for you to send — OfferLab, 7/26-8/10, 64.0 hours",
+  "    at $125/hr = $8,000.00. The PDF is already in your inbox from this morning, and also at",
+  "    ~/Dropbox/Whiny Nil/2026/invoices/offerlab/Invoice_51_2026-08-10.pdf (the hours detail",
+  "    is next to it as 08-10-26-hours.csv). Copy-paste block:",
+  "",
+  "       Invoice 51",
+  "       OfferLab, 7/26 - 8/10",
+  "       64.0 hours @ $125.00/hr",
+  "       Total due: $8,000.00",
+  "",
+  "  2. Two receipts could not be matched to a transaction: Anthropic ($1,284.30, Jul 31)",
+  "    and Google Cloud ($412.66, Aug 1). Both are sitting in the review queue until you",
+  "    say which project they belong to.",
+  "",
+  "  3. The quarterly estimated payment is due 15 September. On last quarter's numbers",
+  "    that is roughly $9,400 federal and $2,150 state; I will refine it once August",
+  "    closes.",
+  "",
+  "Everything else reconciled cleanly — 41 transactions categorised, 3 rules fired, and",
+  "no duplicates were found in the August ledger.",
+  "",
+  "-- ",
+  "Whiny Nil bookkeeping, automated. Reply to this message and a human will read it.",
+].join("\n");
+
+function attachDigest(): void {
+  const messages = built.messages.get(DIGEST_THREAD_ID);
+  const first = messages?.[0];
+  if (!messages || !first) return;
+  messages.length = 1;
+  first.bodyText = DIGEST_BODY;
+  const thread = built.threads.find((t) => t.id === DIGEST_THREAD_ID);
+  if (thread) thread.messageCount = 1;
+}
+attachDigest();
 
 export const threads: Thread[] = built.threads;
 export const messagesByThread: Map<number, Message[]> = built.messages;

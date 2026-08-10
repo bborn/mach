@@ -185,6 +185,32 @@ fn nested_multipart_yields_text_html_and_attachments() {
     assert_eq!(inline[0].part_id.as_deref(), Some("0.1"));
 }
 
+/// `format=flowed` lives in the part's `Content-Type` parameters and nowhere
+/// else: `mimeType` is Gmail's normalized type and has none. This walks a
+/// `multipart/alternative` so the declaration has to be read off the plain part
+/// that won the body slot rather than off the message or the HTML alternative.
+#[test]
+fn a_flowed_plain_part_reports_its_content_type_parameters() {
+    let msg: Message = serde_json::from_str(&fixture("message_text_flowed.json")).unwrap();
+    let body = msg.extract_body();
+    assert!(body.text_flowed, "{body:#?}");
+    assert!(body.text_delsp, "{body:#?}");
+    assert!(body.text.as_deref().unwrap().contains("waiting \n"));
+    // The HTML alternative is still taken, and says nothing about flowing.
+    assert!(body.html.is_some(), "{body:#?}");
+}
+
+/// The overwhelmingly common case, and the one the reported message is in.
+#[test]
+fn a_plain_part_that_says_nothing_is_not_flowed() {
+    for name in ["message_text_only.json", "message_nested_multipart.json"] {
+        let msg: Message = serde_json::from_str(&fixture(name)).unwrap();
+        let body = msg.extract_body();
+        assert!(!body.text_flowed, "{name}: {body:#?}");
+        assert!(!body.text_delsp, "{name}: {body:#?}");
+    }
+}
+
 #[test]
 fn headers_are_readable_case_insensitively() {
     let msg: Message = serde_json::from_str(&fixture("message_nested_multipart.json")).unwrap();

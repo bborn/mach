@@ -281,6 +281,61 @@ export function frameGround(format: BodyFormat): FrameGround {
   return format === "html" ? "light" : "theme";
 }
 
+/* -------------------------------------------------------------------------- */
+/* Measure                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The column a `text/plain` body is rendered in.
+ *
+ * # Why plain text needs one and HTML does not
+ *
+ * A `text/plain` body arrives with its column already chosen. The sender's
+ * generator wrapped it — 72, 76, 78 or 80 characters, and RFC 5322 asks for no
+ * more than 78 — and those wraps are real newlines in the body, which
+ * [`text_to_html`] preserves. So the message is not text to be laid out; it is
+ * text that has already been laid out, and the only question left is how wide a
+ * box to put it in.
+ *
+ * Get that box **wider** than the sender's column and every line lands intact.
+ * The right edge is ragged, because the sender's breaks are not the box's
+ * breaks, and that is what plain mail has looked like since before there were
+ * windows to show it in.
+ *
+ * Get it **narrower** and each line spills its last word or two onto a line of
+ * its own, at column zero, and it does that on every line in the message. That
+ * is what the reader reported: an automated bookkeeping digest, wrapped at
+ * about ninety columns, alternating a full line with a one-word orphan.
+ *
+ * Narrowing cannot fix that — it only changes which word is orphaned. The box
+ * has to be at least as wide as the column the sender used.
+ *
+ * # The number
+ *
+ * 40rem is 640px, which in the frame's own font is about ninety characters of
+ * ordinary mail and sixty-nine of the widest case, all digits. That holds the
+ * 78 columns RFC 5322 recommends with room to spare, and it holds the
+ * ninety-column digests that real bookkeeping software emits.
+ *
+ * It is also a ceiling: a reading pane dragged out to fill a wide window would
+ * otherwise stretch a body wrapped at 72 columns across the whole of it, which
+ * puts the sender's breaks nowhere near the box's and makes the ragged edge far
+ * more obvious than it needs to be.
+ *
+ * `ReadingPane` sizes its column from this, so the frame can actually reach it;
+ * `message-body.measure.test.ts` holds the two together.
+ */
+export const TEXT_MEASURE = "40rem";
+
+/** The horizontal padding `ReadingPane` puts around the message column. */
+export const MESSAGE_COLUMN_PADDING = "2.5rem";
+
+/**
+ * What `ReadingPane`'s message column is capped at: the measure, plus its own
+ * padding, so the body inside lands on exactly [`TEXT_MEASURE`].
+ */
+export const MESSAGE_COLUMN_MAX = `calc(${TEXT_MEASURE} + ${MESSAGE_COLUMN_PADDING})`;
+
 /**
  * The light theme's own values, as literals.
  *
@@ -371,7 +426,8 @@ function tokenBlock(tokens: FrameTokens): string {
  * that URL. Where it leaves a table genuinely too wide, [`containWideContent`]
  * gives that table its own scroller, which is the behaviour we want anyway.
  */
-function frameStyles(tokens: FrameTokens, ground: FrameGround): string {
+function frameStyles(tokens: FrameTokens, format: BodyFormat): string {
+  const ground = frameGround(format);
   /*
    * One stylesheet, two palettes. Everything below reads its colours through a
    * token, so choosing the token block chooses the ground — see [frameGround]
@@ -434,7 +490,11 @@ pre{white-space:pre;max-width:100%;overflow-x:auto;overflow-y:hidden}
    document in the first place — inside the scroller, being wide is the point. */
 [data-mach-scroll]{max-width:100%;overflow-x:auto;overflow-y:hidden}
 [data-mach-scroll]>table{max-width:none}
-hr{border:0;border-top:1px solid var(--border,currentColor)}`;
+hr{border:0;border-top:1px solid var(--border,currentColor)}${
+    ground === "light" ? "" : `\n/* See [TEXT_MEASURE]. Only a body we turned into HTML ourselves gets a
+   column chosen for it; a sender's own HTML already has one. */
+body{max-width:${TEXT_MEASURE}}`
+  }`;
 }
 
 export interface FrameDocumentOptions {
@@ -473,7 +533,7 @@ export function frameDocument({
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${frameCsp(allowRemoteImages)}">
 <meta name="referrer" content="no-referrer">
-<style>${frameStyles(tokens, frameGround(format))}</style>
+<style>${frameStyles(tokens, format)}</style>
 </head><body>${html}</body></html>`;
 }
 

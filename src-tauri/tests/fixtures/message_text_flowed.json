@@ -1,0 +1,69 @@
+{
+  "id": "18f2c4a9b1d3cccc",
+  "threadId": "18f2c4a9b1d3cccc",
+  "labelIds": [
+    "INBOX"
+  ],
+  "snippet": "The invoice is drafted",
+  "historyId": "884311",
+  "internalDate": "1754570500000",
+  "sizeEstimate": 620,
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/alternative",
+    "filename": "",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Whiny Nil <books@whinynil.example>"
+      },
+      {
+        "name": "To",
+        "value": "alex@example.com"
+      },
+      {
+        "name": "Subject",
+        "value": "Bookkeeping digest"
+      },
+      {
+        "name": "Content-Type",
+        "value": "multipart/alternative; boundary=\"b1\""
+      }
+    ],
+    "body": {
+      "size": 0
+    },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "text/plain; charset=UTF-8; format=flowed; delsp=yes"
+          }
+        ],
+        "body": {
+          "size": 96,
+          "data": "VGhlIGludm9pY2UgaXMgZHJhZnRlZCBhbmQgd2FpdGluZyAKZm9yIHlvdSB0byBzZW5kLiBOb3RoaW5nIGVsc2UgbmVlZHMgCnlvdSB0b2RheS4KCi0tIApXaGlueSBOaWwgYm9va2tlZXBpbmcK"
+        }
+      },
+      {
+        "partId": "1",
+        "mimeType": "text/html",
+        "filename": "",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "text/html; charset=UTF-8"
+          }
+        ],
+        "body": {
+          "size": 60,
+          "data": "PGRpdj5UaGUgaW52b2ljZSBpcyBkcmFmdGVkLjwvZGl2Pgo="
+        }
+      }
+    ]
+  }
+}

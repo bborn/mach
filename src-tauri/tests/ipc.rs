@@ -1283,6 +1283,8 @@ fn the_wire_sample_is_what_the_frontend_will_receive() {
         // read. Values here are chosen so no `||` or `??` hides a mapper's
         // reach into the payload.
         body_text: Some(String::new()),
+        body_text_flowed: false,
+        body_text_delsp: false,
         snippet: "Deck attached.".into(),
         internal_date: 1_700_000_000_000,
         is_unread: true,

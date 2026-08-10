@@ -58,7 +58,29 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 10,
         sql: M10_DROP_DENSITY,
     },
+    Migration {
+        version: 11,
+        sql: M11_TEXT_FLOWED,
+    },
 ];
+
+/// Migration 11 — whether a plain-text body's line breaks are the sender's.
+///
+/// `Content-Type: text/plain; format=flowed` (RFC 3676) is the sender saying
+/// that the breaks ending in a space were put there by their generator and may
+/// be undone. Without it a client cannot tell a wrapped paragraph from a
+/// numbered list, and guessing wrong scrambles the message — so this is stored
+/// rather than inferred.
+///
+/// Both columns are nullable and nothing backfills them. A row written before
+/// this migration reads as "we were never told", which every reader treats as
+/// *not* flowed — the answer that leaves the body exactly as it arrived. Mail
+/// synced from here on carries the real declaration; older mail keeps its
+/// breaks until it is re-fetched, which is the safe direction to be wrong in.
+const M11_TEXT_FLOWED: &str = r#"
+ALTER TABLE messages ADD COLUMN body_text_flowed INTEGER;
+ALTER TABLE messages ADD COLUMN body_text_delsp  INTEGER;
+"#;
 
 /// Migration 10 — delete the retired `density` preference.
 ///

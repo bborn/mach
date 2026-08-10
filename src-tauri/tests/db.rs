@@ -128,6 +128,7 @@ fn message(db: &Db, thread_id: i64, account_id: i64, gmail_id: &str, subject: &s
             internal_date: at,
             is_unread: true,
             is_draft: false,
+            ..Default::default()
         },
     )
     .expect("upsert message")
@@ -202,16 +203,15 @@ fn upgrading_deletes_the_retired_density_preference_and_leaves_the_rest() {
     // row. `density` has to go; every other setting in the same table has to
     // still be there afterwards.
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-    let before_density_was_retired = schema::MIGRATIONS
-        .iter()
-        .map(|m| m.version)
-        .filter(|v| *v < schema::LATEST_VERSION)
-        .max()
-        .expect("a version before the newest");
+    // Named rather than derived from LATEST_VERSION. Migration 10 is the one
+    // that drops `density`, and this used to say "everything before the newest",
+    // which stopped meaning that the moment migration 11 was appended: the
+    // store was brought up past the deletion before the row was even inserted.
+    const DENSITY_WAS_RETIRED_IN: u32 = 10;
 
     for migration in schema::MIGRATIONS
         .iter()
-        .filter(|m| m.version <= before_density_was_retired)
+        .filter(|m| m.version < DENSITY_WAS_RETIRED_IN)
     {
         let tx = conn.transaction().unwrap();
         tx.execute_batch(migration.sql).unwrap();
@@ -962,6 +962,7 @@ fn foreign_keys_are_enforced() {
             internal_date: 0,
             is_unread: false,
             is_draft: false,
+            ..Default::default()
         },
     );
     assert!(err.is_err(), "orphan message must be rejected");

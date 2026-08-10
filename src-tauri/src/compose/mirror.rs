@@ -146,6 +146,10 @@ pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
                 subject: subject.clone(),
                 body_html: Some(body_html.clone()),
                 body_text: Some(body_text.clone()),
+                // Mach's own plain-text alternative is derived from the HTML
+                // and is not flowed. It never claims to be.
+                body_text_flowed: false,
+                body_text_delsp: false,
                 snippet: snippet.clone(),
                 internal_date: now_ms,
                 is_unread: false,

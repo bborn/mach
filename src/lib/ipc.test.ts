@@ -905,6 +905,13 @@ const NOT_READ: Record<string, string[]> = {
     "bcc",
     "subject",
     "isUnread",
+    // Whether the sender declared `format=flowed` on the plain-text part. The
+    // decision it drives is made in `render::render_text_with`, which has
+    // already rejoined the soft breaks by the time the frontend sees anything;
+    // what arrives here is HTML, and there is nothing left for the UI to do
+    // with the flag.
+    "bodyTextFlowed",
+    "bodyTextDelsp",
     // Google's id for the blob and the path it lands at once fetched, both of
     // which belong to `lib/attachments.ts` and the Rust side that downloads it.
     "attachments.gmailAttachmentId",

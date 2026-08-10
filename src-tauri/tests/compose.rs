@@ -269,6 +269,7 @@ fn seed_message_with_reply_to(
                 internal_date: NOW - 60_000,
                 is_unread: false,
                 is_draft: false,
+                ..Default::default()
             },
         )
     })
@@ -2229,6 +2230,7 @@ fn seed_remote_draft(
                     internal_date: NOW,
                     is_unread: false,
                     is_draft: true,
+                    ..Default::default()
                 },
             )
         })

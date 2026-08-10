@@ -150,6 +150,7 @@ fn seed(db: &Db, account_id: i64, mail: &Mail<'_>) -> i64 {
             internal_date: mail.at,
             is_unread: mail.unread,
             is_draft: false,
+            ..Default::default()
         },
     )
     .expect("message");
@@ -400,6 +401,7 @@ fn from_still_finds_a_thread_whose_sender_rollup_overflowed() {
                 internal_date: 5_001,
                 is_unread: false,
                 is_draft: false,
+                ..Default::default()
             },
         )
         .expect("late message");

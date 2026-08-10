@@ -3,6 +3,7 @@ import { Archive, Bookmark, Clock, CornerUpLeft, PencilLine } from "lucide-react
 import { useMach } from "@/hooks/useMach";
 import { ACCOUNT_BG } from "@/lib/colors";
 import { loadDraftForMessage } from "@/lib/compose";
+import { MESSAGE_COLUMN_MAX } from "@/lib/message-body";
 import { fullDate } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import type { MessageId, ThreadId } from "@/types";
@@ -196,7 +197,19 @@ export function ReadingPane() {
       </header>
 
       <ScrollArea>
-        <div className="mx-auto max-w-[72ch] px-5 pb-16 pt-2">
+        {/*
+          The column is the message body's own measure plus this element's
+          padding, not a number chosen here.
+
+          It used to be a Tailwind cap of 72ch, which reads as "72 characters"
+          and is not: `ch` is the width of a zero in the *app's* font, so the
+          cap came out at 645px, and the body inside it — a different font, at
+          a different size — got 605px of that. A plain-text digest wrapped at
+          ninety columns needs about 625px, so every line in it spilled its last
+          word onto a line of its own. See [TEXT_MEASURE] for why a plain-text
+          body cannot be given less room than the sender used.
+        */}
+        <div className="mx-auto w-full px-5 pb-16 pt-2" style={{ maxWidth: MESSAGE_COLUMN_MAX }}>
           {/*
             The one slot a plugin may occupy in the reading pane: a line
             *above* the conversation, never a transform of the body. The

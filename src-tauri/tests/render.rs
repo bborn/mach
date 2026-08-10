@@ -696,13 +696,13 @@ fn remote_images_are_blocked_and_counted() {
 #[test]
 fn images_load_when_the_user_opts_in() {
     let body = r#"<img src="https://cdn.test/logo.png" alt="Logo">"#;
-    let r = render_html_with(body, RenderOptions { allow_remote_images: true });
+    let r = render_html_with(body, RenderOptions { allow_remote_images: true, ..Default::default() });
     assert!(r.html.contains(r#"src="https://cdn.test/logo.png""#), "{}", r.html);
     assert!(!r.html.contains("data-mach-blocked-src"), "{}", r.html);
     // Opting into images must not opt into anything else.
     let r = render_html_with(
         r#"<img src="https://cdn.test/l.png" onerror="alert(1)"><script>alert(1)</script>"#,
-        RenderOptions { allow_remote_images: true },
+        RenderOptions { allow_remote_images: true, ..Default::default() },
     );
     assert_inert(&r.html);
 }
@@ -1099,6 +1099,105 @@ fn render_text_splits_and_escapes() {
     assert_inert(&r.quoted_html);
 }
 
+/// The reported message: an automated digest, hard-wrapped by its generator,
+/// with a numbered list, a hanging indent and an indented copy-paste block.
+///
+/// Nothing may touch its line breaks, because every one of them is carrying
+/// structure. This is the default path — no `format=flowed` anywhere — and it
+/// is the one nearly every message takes.
+#[test]
+fn a_hard_wrapped_body_keeps_every_line_break() {
+    let body = [
+        "  1. Invoice #51 is drafted and waiting for you to send — OfferLab, 7/26-8/10, 64.0 hours",
+        "    at $125/hr = $8,000.00. The PDF is in your inbox.",
+        "",
+        "       Invoice 51",
+        "       Total due: $8,000.00",
+    ]
+    .join("\n");
+    let r = render_text(&body);
+    // One <br> per newline, and the indents intact inside the pre-wrap div.
+    assert_eq!(r.html.matches("<br>").count(), 4, "{}", r.html);
+    assert!(r.html.contains("white-space:pre-wrap"), "{}", r.html);
+    assert!(r.html.contains("  1. Invoice #51"), "{}", r.html);
+    assert!(r.html.contains("       Invoice 51"), "{}", r.html);
+    assert!(!r.has_quoted, "{r:#?}");
+}
+
+/// The same body, still not flowed, asked for explicitly. A body that did not
+/// declare `format=flowed` must render identically however it is requested.
+#[test]
+fn a_body_that_did_not_declare_flowed_is_never_rejoined() {
+    let body = "The generator wrapped this line here \nand carried on underneath it.";
+    let plain = render_text(body);
+    let opted_out = mach_lib::render::render_text_with(
+        body,
+        RenderOptions {
+            text_flowed: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(plain.html, opted_out.html);
+    assert_eq!(plain.html.matches("<br>").count(), 1, "{}", plain.html);
+}
+
+#[test]
+fn a_flowed_body_is_rejoined_into_paragraphs() {
+    // Two soft breaks (trailing space) inside one paragraph, then a hard break.
+    let body = "The invoice is drafted and waiting \nfor you to send. Nothing else \nneeds you today.\nThat is all.";
+    let r = mach_lib::render::render_text_with(
+        body,
+        RenderOptions {
+            text_flowed: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        r.html.contains("The invoice is drafted and waiting for you to send. Nothing else needs you today."),
+        "{}",
+        r.html
+    );
+    // Only the hard break survives.
+    assert_eq!(r.html.matches("<br>").count(), 1, "{}", r.html);
+}
+
+/// A flowed reply. The quote split still finds the history, because unflowing
+/// runs first and leaves the `>` prefixes on.
+#[test]
+fn a_flowed_reply_still_splits_from_its_quote() {
+    let body = "Agreed on all of \nthat, shipping Thursday.\n\n> The cohort tab still \n> shows blended retention.";
+    let r = mach_lib::render::render_text_with(
+        body,
+        RenderOptions {
+            text_flowed: true,
+            ..Default::default()
+        },
+    );
+    assert!(r.has_quoted, "{r:#?}");
+    assert!(r.html.contains("Agreed on all of that, shipping Thursday."), "{}", r.html);
+    assert!(
+        r.quoted_html.contains("The cohort tab still shows blended retention."),
+        "{}",
+        r.quoted_html
+    );
+    assert_inert(&r.html);
+    assert_inert(&r.quoted_html);
+}
+
+/// Unflowing happens before escaping, and the escaping still happens.
+#[test]
+fn a_flowed_body_is_still_escaped() {
+    let r = mach_lib::render::render_text_with(
+        "<not a tag> and \n<neither is this>",
+        RenderOptions {
+            text_flowed: true,
+            ..Default::default()
+        },
+    );
+    assert!(r.html.contains("&lt;not a tag&gt; and &lt;neither is this&gt;"), "{}", r.html);
+    assert_inert(&r.html);
+}
+
 #[test]
 fn ugly_marketing_email_survives_and_stays_readable() {
     let body = r##"<!--[if mso]><style>.x{}</style><![endif]-->
@@ -1221,6 +1320,7 @@ fn allow(html: &str) -> mach_lib::render::RenderedBody {
         html,
         RenderOptions {
             allow_remote_images: true,
+            ..Default::default()
         },
     )
 }

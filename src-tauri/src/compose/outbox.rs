@@ -281,6 +281,10 @@ impl Outbox {
             subject: out.subject.clone(),
             body_html: Some(out.html.clone()),
             body_text: Some(out.text.clone()),
+            // See the mirror: our own text alternative is not flowed, and the
+            // MIME we send does not say it is.
+            body_text_flowed: false,
+            body_text_delsp: false,
             snippet: snippet(&out.text),
             internal_date: now_ms,
             is_unread: false,

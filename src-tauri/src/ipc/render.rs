@@ -106,6 +106,11 @@ pub fn render_message(
 pub fn render_stored_message(message: &Message, allow_remote_images: bool) -> RenderedMessage {
     let opts = RenderOptions {
         allow_remote_images,
+        // Only ever what the sender declared, and only ever from the stored
+        // column. A message synced before migration 11 reads `false` here and
+        // keeps every line break it arrived with.
+        text_flowed: message.body_text_flowed,
+        text_delsp: message.body_text_delsp,
     };
 
     let (format, body) = match (

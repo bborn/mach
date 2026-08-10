@@ -35,11 +35,13 @@
 //! * run rendering off the UI thread, since a pathological body costs CPU.
 
 pub mod entities;
+pub mod flowed;
 pub mod quotes;
 pub mod sanitize;
 
 use serde::Serialize;
 
+pub use flowed::{flowed_params, unflow};
 pub use quotes::Split;
 pub use sanitize::{sanitize_fragment, text_to_html, ImageCounts};
 
@@ -73,6 +75,13 @@ pub struct RenderOptions {
     /// Set once the user has clicked "load remote images" for this message or
     /// sender. Affects images and nothing else.
     pub allow_remote_images: bool,
+    /// The sender declared `Content-Type: text/plain; format=flowed`, so the
+    /// line breaks that end in a space are theirs to undo — see [`flowed`].
+    /// Never inferred from the body: a `false` here means "we were not told",
+    /// and a body we were not told about keeps every break it arrived with.
+    pub text_flowed: bool,
+    /// `delsp=yes` alongside it. Meaningless without `text_flowed`.
+    pub text_delsp: bool,
 }
 
 /// Render a `text/html` body with remote images blocked.
@@ -113,7 +122,24 @@ pub fn render_text(raw: &str) -> RenderedBody {
     render_text_with(raw, RenderOptions::default())
 }
 
-pub fn render_text_with(raw: &str, _opts: RenderOptions) -> RenderedBody {
+/// # Why the flowed pass runs before the quote split
+///
+/// [`flowed::unflow`] is the decoder for the body: until it has run, the line
+/// breaks in a `format=flowed` message are a mix of the sender's and their
+/// generator's, and a quote is a run of lines at one depth rather than the
+/// lines as they arrived. Decoding first hands [`quotes::split_text`] the text
+/// the sender actually wrote, with the `>` prefixes still on it.
+pub fn render_text_with(raw: &str, opts: RenderOptions) -> RenderedBody {
+    // Truncated here rather than only in `text_to_html`, so the flowed pass and
+    // the quote split are both bounded by the same limit the sanitizer is.
+    let bounded = sanitize::truncate_on_char_boundary(raw, sanitize::MAX_INPUT_BYTES);
+    let decoded;
+    let raw: &str = if opts.text_flowed {
+        decoded = flowed::unflow(&bounded, opts.text_delsp);
+        &decoded
+    } else {
+        &bounded
+    };
     let split = quotes::split_text(raw);
     RenderedBody {
         html: text_to_html(&split.new),

@@ -1233,7 +1233,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn truncate_on_char_boundary(s: &str, max: usize) -> Cow<'_, str> {
+pub(crate) fn truncate_on_char_boundary(s: &str, max: usize) -> Cow<'_, str> {
     if s.len() <= max {
         return Cow::Borrowed(s);
     }

@@ -118,6 +118,8 @@
     ],
     "bodyHtml": "<p>Deck attached.</p>",
     "bodyText": "",
+    "bodyTextDelsp": false,
+    "bodyTextFlowed": false,
     "cc": [
       {
         "email": "alex@example.com",

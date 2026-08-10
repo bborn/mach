@@ -210,6 +210,13 @@ pub struct AttachmentMeta {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtractedBody {
     pub text: Option<String>,
+    /// The `text/plain` part declared `format=flowed` (RFC 3676), so its soft
+    /// line breaks are the generator's and can be rejoined. Only ever set from
+    /// the part's own `Content-Type`; there is no inference from the body, and
+    /// a part that says nothing leaves this `false`.
+    pub text_flowed: bool,
+    /// `delsp=yes` on the same part.
+    pub text_delsp: bool,
     pub html: Option<String>,
     pub attachments: Vec<AttachmentMeta>,
 }
@@ -261,13 +268,28 @@ fn walk(part: &MessagePart, out: &mut ExtractedBody) {
             let decoded = decode_base64url(encoded)
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .unwrap_or_default();
-            let slot = if mime == "text/html" {
-                &mut out.html
-            } else {
-                &mut out.text
-            };
+            let is_html = mime == "text/html";
+            let slot = if is_html { &mut out.html } else { &mut out.text };
             if slot.is_none() && !decoded.is_empty() {
                 *slot = Some(decoded);
+                if !is_html {
+                    /*
+                     * The Content-Type parameters, which live on the *part* and
+                     * are dropped everywhere else in this walk.
+                     *
+                     * `mimeType` is Gmail's normalized type and carries no
+                     * parameters, so the raw header is the only place
+                     * `format=flowed` appears. It is read from the part that
+                     * actually won the body slot, not from the message, because
+                     * a multipart/alternative can put a flowed plain part next
+                     * to an HTML one and only the plain part's declaration
+                     * means anything.
+                     */
+                    let content_type = part.header("content-type").unwrap_or_else(|| part.mime());
+                    let (flowed, delsp) = crate::render::flowed_params(content_type);
+                    out.text_flowed = flowed;
+                    out.text_delsp = delsp;
+                }
             }
         }
         return;

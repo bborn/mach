@@ -89,6 +89,8 @@ pub fn prepare_message(account_id: i64, msg: &g::Message) -> PreparedMessage {
             subject,
             body_html: body.html.clone(),
             body_text: body.text.clone(),
+            body_text_flowed: body.text_flowed,
+            body_text_delsp: body.text_delsp,
             snippet,
             internal_date: msg.internal_date_ms().unwrap_or(0),
             is_unread: label_ids.iter().any(|l| l == "UNREAD"),

@@ -285,6 +285,12 @@ pub struct Message {
     pub subject: String,
     pub body_html: Option<String>,
     pub body_text: Option<String>,
+    /// `body_text` declared `format=flowed` (RFC 3676). False also means "we
+    /// were never told", which is the same thing for every reader: the breaks
+    /// stay exactly as they arrived. See migration 11.
+    pub body_text_flowed: bool,
+    /// `delsp=yes` alongside it. Meaningless without `body_text_flowed`.
+    pub body_text_delsp: bool,
     pub snippet: String,
     pub internal_date: i64,
     pub is_unread: bool,
@@ -311,6 +317,11 @@ pub struct NewMessage {
     pub subject: String,
     pub body_html: Option<String>,
     pub body_text: Option<String>,
+    /// See [`Message::body_text_flowed`]. Defaults to `false`, so every writer
+    /// that does not know about `format=flowed` — the composer's own mirror
+    /// rows, the outbox — stores "not flowed", which is what they are.
+    pub body_text_flowed: bool,
+    pub body_text_delsp: bool,
     pub snippet: String,
     pub internal_date: i64,
     pub is_unread: bool,

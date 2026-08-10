@@ -429,7 +429,8 @@ pub fn delete_thread(conn: &Connection, thread_id: i64) -> Result<()> {
 const MESSAGE_COLUMNS: &str = "\
     id, thread_id, account_id, gmail_message_id, rfc822_message_id, in_reply_to, \
     references_header, from_name, from_email, to_json, cc_json, bcc_json, subject, \
-    body_html, body_text, snippet, internal_date, is_unread, is_draft, reply_to";
+    body_html, body_text, snippet, internal_date, is_unread, is_draft, reply_to, \
+    body_text_flowed, body_text_delsp";
 
 fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
     let to: String = row.get(9)?;
@@ -454,6 +455,10 @@ fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
         subject: row.get(12)?,
         body_html: row.get(13)?,
         body_text: row.get(14)?,
+        // NULL is a row written before migration 11, which is "we were never
+        // told" and is read as not flowed. See [`Message::body_text_flowed`].
+        body_text_flowed: row.get::<_, Option<bool>>(20)?.unwrap_or(false),
+        body_text_delsp: row.get::<_, Option<bool>>(21)?.unwrap_or(false),
         snippet: row.get(15)?,
         internal_date: row.get(16)?,
         is_unread: row.get(17)?,
@@ -514,8 +519,10 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
         "INSERT INTO messages (thread_id, account_id, gmail_message_id, rfc822_message_id,
                                in_reply_to, references_header, from_name, from_email,
                                to_json, cc_json, bcc_json, subject, body_html, body_text,
-                               snippet, internal_date, is_unread, is_draft, reply_to)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                               snippet, internal_date, is_unread, is_draft, reply_to,
+                               body_text_flowed, body_text_delsp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                 ?20, ?21)
          ON CONFLICT(account_id, gmail_message_id) DO UPDATE SET
              thread_id         = excluded.thread_id,
              rfc822_message_id = excluded.rfc822_message_id,
@@ -533,7 +540,9 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
              internal_date     = excluded.internal_date,
              is_unread         = excluded.is_unread,
              is_draft          = excluded.is_draft,
-             reply_to          = excluded.reply_to
+             reply_to          = excluded.reply_to,
+             body_text_flowed  = excluded.body_text_flowed,
+             body_text_delsp   = excluded.body_text_delsp
          RETURNING id",
         params![
             new.thread_id,
@@ -555,6 +564,8 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
             new.is_unread,
             new.is_draft,
             people_to_json(&new.reply_to),
+            new.body_text_flowed,
+            new.body_text_delsp,
         ],
         |row| row.get(0),
     )?;
