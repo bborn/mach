@@ -106,8 +106,10 @@
 //!    Mach's stream. The round trip self-heals.
 //!  * **A Mach snooze is visible in Gmail** as the `Mach/Snoozed` label, but
 //!    Gmail will not wake it — Mach's clock does, from the stored `wake_at`.
-//!    Because the wake time is a row and not a timer, a snooze that comes due
-//!    while Mach is closed fires at next launch instead of being lost.
+//!    That clock is [`crate::snooze`], which sweeps the due rows at launch and
+//!    on a tick and dispatches [`Command::Unsnooze`] for each. Because the wake
+//!    time is a row and not a timer, a snooze that comes due while Mach is
+//!    closed fires at next launch instead of being lost.
 //!  * **If the user strips the label in Gmail web**, sync removes it locally
 //!    and the stale wake row simply un-snoozes a thread that is already
 //!    un-snoozed, which is a no-op. Un-snooze is idempotent by construction.
@@ -783,7 +785,23 @@ pub(crate) async fn execute(
 
     let mut failed_ids: Vec<i64> = unaddressable;
     for ((account_id, add, remove, op), members) in groups {
-        let client = dispatcher.clients.gmail(account_id)?;
+        // Not `?`. The local write for this group has already committed, and
+        // returning here would leave it standing with nothing having been sent
+        // and nothing said — the store quietly disagreeing with Gmail, which is
+        // the one outcome the whole layer exists to prevent. A client that
+        // cannot be built (no OAuth client configured, an account row that has
+        // gone) is reported like any other refusal: rolled back, named, and
+        // retriable once the cause is fixed.
+        let client = match dispatcher.clients.gmail(account_id) {
+            Ok(client) => client,
+            Err(error) => {
+                rollback_local(&dispatcher.db, &members)?;
+                let ids: Vec<i64> = members.iter().map(|p| p.id()).collect();
+                failed_ids.extend(ids.iter().copied());
+                failures.push(CommandFailure::invalid(ids, error.to_string()));
+                continue;
+            }
+        };
         for chunk in chunk_threads(&members, dispatcher.max_batch_message_ids) {
             if let Err(error) =
                 run_chunk(&client, &dispatcher.user_id, op, &add, &remove, &chunk).await

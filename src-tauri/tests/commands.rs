@@ -1128,6 +1128,347 @@ async fn snoozing_creates_the_label_when_it_does_not_exist_yet() {
     );
 }
 
+// ================================================================ waking them
+
+// The sweep that brings a snoozed conversation back. `due_snoozes` had no
+// caller outside these tests for the whole life of the feature, so every snooze
+// was permanent: out of the inbox, labelled, and never returned.
+
+fn snooze_row(db: &Db, thread_id: i64) -> Option<mach_lib::db::command_queries::SnoozeRow> {
+    db.read(|c| mach_lib::db::command_queries::snooze_row(c, thread_id))
+        .unwrap()
+}
+
+/// A wake time already behind the clock — what a snooze looks like on disk to
+/// the process that opens the store after it came due.
+const ALREADY_PAST: i64 = 1_700_000_000_000;
+
+#[tokio::test]
+async fn a_due_snooze_wakes_and_the_row_is_cleared() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let wake_at = 1_800_000_000_000;
+    d.execute(Command::Snooze {
+        thread_ids: vec![thread],
+        until: wake_at,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["Label_snooze", "Receipts"]),
+        "the thread is out of the inbox to begin with"
+    );
+
+    let report = mach_lib::snooze::wake_due(&d, wake_at).await.unwrap();
+
+    assert_eq!(report.due, vec![thread]);
+    assert_eq!(report.woken, vec![thread]);
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["INBOX", "Receipts"]),
+        "waking restores the labels the thread was snoozed from"
+    );
+    assert!(
+        snooze_row(&db, thread).is_none(),
+        "a woken conversation is no longer snoozed"
+    );
+
+    // Sweeping again finds nothing, and costs no round trip.
+    let calls = transport.call_count();
+    let again = mach_lib::snooze::wake_due(&d, wake_at).await.unwrap();
+    assert!(again.is_empty());
+    assert_eq!(transport.call_count(), calls);
+}
+
+#[tokio::test]
+async fn a_snooze_that_is_not_due_yet_is_left_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    let thread = seed_thread(&db, account, "t1", &["INBOX"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let wake_at = 1_800_000_000_000;
+    d.execute(Command::Snooze {
+        thread_ids: vec![thread],
+        until: wake_at,
+    })
+    .await
+    .unwrap();
+    let calls = transport.call_count();
+
+    let report = mach_lib::snooze::wake_due(&d, wake_at - 1).await.unwrap();
+
+    assert!(report.is_empty(), "{report:?}");
+    assert_eq!(transport.call_count(), calls, "nothing went to Gmail");
+    assert_eq!(thread_labels(&db, thread), sorted(&["Label_snooze"]));
+    assert_eq!(snooze_row(&db, thread).map(|r| r.wake_at), Some(wake_at));
+}
+
+#[tokio::test]
+async fn a_wake_that_came_due_while_the_app_was_closed_fires_at_launch() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+
+    // The session that snoozed it, and then went away. Nothing is left running
+    // to notice the wake time pass — which is the point: the wake time is a row.
+    {
+        let d = dispatcher(&db, transport.clone());
+        d.execute(Command::Snooze {
+            thread_ids: vec![thread],
+            until: ALREADY_PAST,
+        })
+        .await
+        .unwrap();
+    }
+
+    // The next launch: a new dispatcher over the same store, and the sweep that
+    // starts with it. The tick is set an hour out, so only the *first* sweep —
+    // the immediate one — can possibly have woken anything by the time this
+    // test reads the result.
+    let d = Arc::new(dispatcher(&db, transport.clone()));
+    let cancel = mach_lib::sync::CancelToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(mach_lib::snooze::run(
+        Arc::clone(&d),
+        cancel.clone(),
+        std::time::Duration::from_secs(3600),
+        move |report| {
+            let _ = tx.send(report);
+        },
+    ));
+
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the sweep runs at launch rather than one tick later")
+        .expect("a report");
+    cancel.cancel();
+    let _ = task.await;
+
+    assert_eq!(report.woken, vec![thread]);
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX", "Receipts"]));
+    assert!(snooze_row(&db, thread).is_none());
+}
+
+#[tokio::test]
+async fn a_refused_wake_is_reported_and_stays_snoozed_for_the_next_sweep() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Receipts"]);
+
+    // The snooze lands; the first wake is refused; everything after succeeds.
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(200, "{}")),
+        Ok(HttpResponse::json(503, r#"{"error":{"message":"backend error"}}"#)),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    let wake_at = 1_800_000_000_000;
+    d.execute(Command::Snooze {
+        thread_ids: vec![thread],
+        until: wake_at,
+    })
+    .await
+    .unwrap();
+
+    let refused = mach_lib::snooze::wake_due(&d, wake_at).await.unwrap();
+
+    assert_eq!(refused.due, vec![thread]);
+    assert!(refused.woken.is_empty(), "nothing was woken");
+    assert_eq!(refused.failed.len(), 1, "{:?}", refused.failed);
+    let failure = &refused.failed[0];
+    assert_eq!(failure.ids, vec![thread]);
+    assert_eq!(failure.kind, FailureKind::Server);
+    assert!(failure.retriable, "a 503 is worth trying again");
+    assert!(failure.rolled_back);
+
+    // Rolled back completely: still out of the inbox, still labelled, and — the
+    // half-woken case — still holding the row that makes the retry possible.
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["Label_snooze", "Receipts"])
+    );
+    assert_eq!(snooze_row(&db, thread).map(|r| r.wake_at), Some(wake_at));
+
+    // The retry is the next sweep, and it needs no new information.
+    let woken = mach_lib::snooze::wake_due(&d, wake_at).await.unwrap();
+    assert_eq!(woken.woken, vec![thread]);
+    assert!(woken.failed.is_empty());
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX", "Receipts"]));
+    assert!(snooze_row(&db, thread).is_none());
+}
+
+#[tokio::test]
+async fn a_wake_applies_exactly_the_labels_the_snooze_did_in_reverse() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    let before = sorted(&["INBOX", "UNREAD", "IMPORTANT", "Receipts"]);
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "UNREAD", "IMPORTANT", "Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let wake_at = 1_800_000_000_000;
+    d.execute(Command::Snooze {
+        thread_ids: vec![thread],
+        until: wake_at,
+    })
+    .await
+    .unwrap();
+    mach_lib::snooze::wake_due(&d, wake_at).await.unwrap();
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2, "one modify each way");
+    let snoozed = body_json(&requests[0]);
+    let woken = body_json(&requests[1]);
+
+    // Not "roughly the opposite": the set added by one is the set removed by
+    // the other, both ways round.
+    assert_eq!(ids_of(&snoozed, "addLabelIds"), vec!["Label_snooze"]);
+    assert_eq!(ids_of(&snoozed, "removeLabelIds"), vec!["INBOX"]);
+    assert_eq!(
+        ids_of(&woken, "addLabelIds"),
+        ids_of(&snoozed, "removeLabelIds")
+    );
+    assert_eq!(
+        ids_of(&woken, "removeLabelIds"),
+        ids_of(&snoozed, "addLabelIds")
+    );
+
+    // And the store is back where it started, unread flag included.
+    assert_eq!(thread_labels(&db, thread), before);
+    assert!(thread_is_unread(&db, thread));
+}
+
+#[tokio::test]
+async fn waking_an_archived_snooze_does_not_hand_it_an_inbox_it_never_had() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    // Snoozed from the archive — a reminder about a thread already dealt with.
+    let thread = seed_thread(&db, account, "t1", &["Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let wake_at = 1_800_000_000_000;
+    d.execute(Command::Snooze {
+        thread_ids: vec![thread],
+        until: wake_at,
+    })
+    .await
+    .unwrap();
+    let report = mach_lib::snooze::wake_due(&d, wake_at).await.unwrap();
+
+    assert_eq!(report.woken, vec![thread]);
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["Receipts"]),
+        "the stored row is the authority on where it came from"
+    );
+}
+
+#[tokio::test]
+async fn several_due_snoozes_wake_together() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    let first = seed_thread(&db, account, "t1", &["INBOX"]);
+    let second = seed_thread(&db, account, "t2", &["INBOX"]);
+    let later = seed_thread(&db, account, "t3", &["INBOX"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let wake_at = 1_800_000_000_000;
+    d.execute(Command::Snooze {
+        thread_ids: vec![first, second],
+        until: wake_at,
+    })
+    .await
+    .unwrap();
+    d.execute(Command::Snooze {
+        thread_ids: vec![later],
+        until: wake_at + 60_000,
+    })
+    .await
+    .unwrap();
+
+    let report = mach_lib::snooze::wake_due(&d, wake_at).await.unwrap();
+
+    assert_eq!(report.woken, vec![first, second]);
+    assert_eq!(thread_labels(&db, first), sorted(&["INBOX"]));
+    assert_eq!(thread_labels(&db, second), sorted(&["INBOX"]));
+    assert_eq!(
+        thread_labels(&db, later),
+        sorted(&["Label_snooze"]),
+        "the one that is not due yet stays where it is"
+    );
+}
+
+#[tokio::test]
+async fn a_command_whose_account_has_no_client_rolls_back_rather_than_stranding_the_write() {
+    // The one failure that never happens against a scripted transport and does
+    // happen live: `ManagedClients` resolves an account id to a client through
+    // the store and the token manager, and that resolution can fail — Google not
+    // configured at all, an account row gone. The local write has already
+    // committed by then. Returning at that point would leave the store saying
+    // one thing and Gmail another, with nothing said and nothing to retry.
+    let db = Db::open_in_memory().unwrap();
+    seed_account(&db, "a@example.com");
+    seed_account(&db, "b@example.com");
+    let orphan = seed_account(&db, "c@example.com");
+    seed_label(&db, orphan, "Label_snooze", "Mach/Snoozed");
+    let thread = seed_thread(&db, orphan, "t1", &["INBOX", "Receipts"]);
+
+    // `dispatcher` registers credentials for accounts 1 and 2 only.
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let wake_at = 1_800_000_000_000;
+    let result = d
+        .execute(Command::Snooze {
+            thread_ids: vec![thread],
+            until: wake_at,
+        })
+        .await
+        .expect("a missing client is a reported failure, not an error that hides the write");
+
+    assert!(!result.ok);
+    assert!(result.applied.is_empty());
+    assert!(result.undo.is_none(), "nothing happened, so nothing to undo");
+    assert_eq!(result.failed.len(), 1, "{:?}", result.failed);
+    assert_eq!(result.failed[0].ids, vec![thread]);
+    assert!(result.failed[0].rolled_back);
+    assert_eq!(transport.call_count(), 0);
+
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["INBOX", "Receipts"]),
+        "the thread never left the inbox"
+    );
+    assert!(
+        snooze_row(&db, thread).is_none(),
+        "and it is not recorded as snoozed either"
+    );
+}
+
 // ======================================================================= rsvp
 
 #[tokio::test]

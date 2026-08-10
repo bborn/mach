@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   describeResult,
+  describeWakeFailure,
   failedIds,
   fixtureSource,
   inverseOf,
@@ -154,6 +155,19 @@ describe("partial failure", () => {
     expect(
       describeResult({ ok: true, message: "Snoozed 1 conversation", applied: [1], failed: [] }),
     ).toBe("Snoozed 1 conversation");
+  });
+
+  it("names the conversations a wake could not bring back, and why", () => {
+    expect(
+      describeWakeFailure({
+        threadIds: [7, 9],
+        message: "Gmail rate limited this account",
+        retriable: true,
+      }),
+    ).toBe("Could not wake 2 conversations — Gmail rate limited this account");
+    expect(
+      describeWakeFailure({ threadIds: [7], message: "no answer", retriable: true }),
+    ).toBe("Could not wake 1 conversation — no answer");
   });
 });
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import wireSample from "./wire-sample.json";
-import { MachError, type Command, type CommandResult } from "./data";
+import { MachError, type Command, type CommandResult, type WakeFailure } from "./data";
 import {
   createIpcSource,
   errorMessage,
@@ -745,6 +745,38 @@ describe("events", () => {
     const off = await createIpcSource(transport).onThreadsChanged(() => {});
     off();
     expect(unlisten).toHaveBeenCalled();
+  });
+
+  /*
+   * The wake sweep has no gesture behind it, so a refusal has no status line of
+   * its own to land on. This is the only way it reaches the window.
+   */
+  it("carries a refused wake through, ids and reason intact", async () => {
+    const { transport, listeners } = fakeTransport();
+    const seen: unknown[] = [];
+
+    await createIpcSource(transport).onWakeFailed((failure) => seen.push(failure));
+    listeners["wake-failed"]?.({
+      threadIds: [7, 9],
+      message: "google: 503 backend error",
+      retriable: true,
+    });
+
+    expect(seen).toEqual([
+      { threadIds: [7, 9], message: "google: 503 backend error", retriable: true },
+    ]);
+  });
+
+  it("does not let a wake failure arrive as an empty message", async () => {
+    const { transport, listeners } = fakeTransport();
+    const seen: WakeFailure[] = [];
+
+    await createIpcSource(transport).onWakeFailed((failure) => seen.push(failure));
+    listeners["wake-failed"]?.({});
+
+    expect(seen[0]?.message).not.toBe("");
+    expect(seen[0]?.threadIds).toEqual([]);
+    expect(seen[0]?.retriable).toBe(false);
   });
 });
 

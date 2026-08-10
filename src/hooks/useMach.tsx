@@ -27,6 +27,7 @@ import type {
 } from "@/types";
 import {
   describeResult,
+  describeWakeFailure,
   failedIds,
   getDataSource,
   isMailCommand,
@@ -753,6 +754,25 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
     void source.onSyncStatus(setSync).then(keep);
     void source.onThreadsChanged(scheduleRefresh).then(keep);
+
+    /*
+     * A snooze that came due and could not be woken.
+     *
+     * A conversation that *does* wake says nothing — it is simply back at the
+     * top of the inbox, which is what was asked for and what Gmail does. One
+     * that could not be is the opposite case: it is still hidden, still
+     * labelled, and nothing on screen would ever say so. It goes on the status
+     * line in the error tone, with no undo attached, because there is nothing
+     * to take back.
+     */
+    void source
+      .onWakeFailed((failure) =>
+        dispatchUi({
+          type: "status",
+          status: { message: describeWakeFailure(failure), tone: "error" },
+        }),
+      )
+      .then(keep);
 
     /*
      * Coming back from a notification banner. Mail mode first, then the

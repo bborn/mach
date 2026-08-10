@@ -248,11 +248,11 @@ pub fn delete_snooze(conn: &Connection, thread_id: i64) -> Result<()> {
 
 /// Threads whose wake time has arrived, oldest wake first.
 ///
-/// The clock that calls this belongs to the sync/scheduler unit; the command
-/// layer only supplies the query and the [`crate::commands::Command::Unsnooze`]
-/// that acts on the answer. Because the wake time is stored rather than held in
-/// a timer, a snooze that comes due while Mach is closed fires on next launch
-/// instead of being lost.
+/// The clock that calls this is [`crate::snooze`]; the command layer only
+/// supplies the query and the [`crate::commands::Command::Unsnooze`] that acts
+/// on the answer. Because the wake time is stored rather than held in a timer, a
+/// snooze that comes due while Mach is closed fires on next launch instead of
+/// being lost.
 pub fn due_snoozes(conn: &Connection, now_ms: i64) -> Result<Vec<SnoozeRow>> {
     let sql = format!(
         "SELECT {SNOOZE_COLUMNS} FROM snoozed_threads WHERE wake_at <= ?1 ORDER BY wake_at, thread_id"

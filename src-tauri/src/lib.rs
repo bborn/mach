@@ -45,6 +45,8 @@ pub mod plugins;
 pub mod qa;
 pub mod render;
 pub mod shell;
+/// The clock that brings a snoozed conversation back.
+pub mod snooze;
 pub mod staleness;
 pub mod sync;
 
@@ -114,6 +116,9 @@ pub fn run() {
 
             let sync = Arc::clone(&state.sync);
             let start_sync = state.should_start_sync();
+            // Cloned out before `manage` moves the state, like `sync` above.
+            let dispatcher = Arc::clone(&state.dispatcher);
+            let wake_cancel = state.sync.cancel_token();
 
             // The agent's bridge needs somewhere to send invoke requests, and
             // that is the window. Wired after `bootstrap` because it needs the
@@ -142,6 +147,22 @@ pub fn run() {
             // the state it is reporting on.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(ipc::events::run(handle, sync, start_sync));
+
+            // The snooze clock. Its first sweep is immediate, which is the only
+            // thing that brings back a conversation whose wake time passed while
+            // the app was closed — the wake time is a row, so there is nothing
+            // to miss. It is started unconditionally rather than behind
+            // `should_start_sync`: a snooze row can only exist if an account
+            // once did, and an account whose credentials have since gone is a
+            // failure the owner should be told about rather than a reason to
+            // stop trying.
+            let wake_handle = app.handle().clone();
+            tauri::async_runtime::spawn(snooze::run(
+                dispatcher,
+                wake_cancel,
+                snooze::DEFAULT_WAKE_INTERVAL,
+                move |report| ipc::events::emit_wake_report(&wake_handle, &report),
+            ));
 
             Ok(())
         })

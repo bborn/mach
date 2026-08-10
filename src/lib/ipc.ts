@@ -47,6 +47,7 @@ import {
   type CommandSpec,
   type MachDataSource,
   type Unsubscribe,
+  type WakeFailure,
 } from "./data";
 
 /* -------------------------------------------------------------------------- */
@@ -59,9 +60,10 @@ export interface IpcTransport {
   openExternal(url: string): Promise<void>;
 }
 
-/** The two push channels. Neither is polled; both refetch on arrival. */
+/** The three push channels. None is polled. */
 export const SYNC_STATUS_EVENT = "sync-status";
 export const THREADS_CHANGED_EVENT = "threads-changed";
+export const WAKE_FAILED_EVENT = "wake-failed";
 
 /** True inside a Tauri window, false in a browser tab running `bun run dev`. */
 export function isTauri(): boolean {
@@ -812,6 +814,16 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
 
     async onThreadsChanged(handler) {
       return transport.listen(THREADS_CHANGED_EVENT, () => handler());
+    },
+
+    async onWakeFailed(handler) {
+      return transport.listen<Partial<WakeFailure>>(WAKE_FAILED_EVENT, (payload) =>
+        handler({
+          threadIds: payload?.threadIds ?? [],
+          message: text(payload?.message, "Google refused the wake"),
+          retriable: payload?.retriable === true,
+        }),
+      );
     },
   };
 }

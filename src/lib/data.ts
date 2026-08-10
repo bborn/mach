@@ -396,9 +396,31 @@ export interface MachDataSource {
   /** Hand the URL to the system browser; Google's consent screen is not ours. */
   openExternal(url: string): Promise<void>;
 
-  /** Push, never poll. Both return an unsubscribe. */
+  /** Push, never poll. All three return an unsubscribe. */
   onSyncStatus(handler: (status: SyncStatus) => void): Promise<Unsubscribe>;
   onThreadsChanged(handler: () => void): Promise<Unsubscribe>;
+  /**
+   * A snooze that came due and could not be woken.
+   *
+   * The wake sweep runs on a tick with no gesture behind it, so its refusals
+   * have no status line of their own to land on. The conversation is still
+   * snoozed and the next sweep retries it; this is how the owner gets to know
+   * that is happening.
+   */
+  onWakeFailed(handler: (failure: WakeFailure) => void): Promise<Unsubscribe>;
+}
+
+/** One refused wake, as `ipc::events::WakeFailedPayload` sends it. */
+export interface WakeFailure {
+  threadIds: ThreadId[];
+  message: string;
+  retriable: boolean;
+}
+
+/** "Could not wake 2 conversations — Google had an error". */
+export function describeWakeFailure(failure: WakeFailure): string {
+  const what = pluralize(failure.threadIds.length, "conversation");
+  return `Could not wake ${what} — ${failure.message}`;
 }
 
 export const DEFAULT_PAGE_SIZE = 100;
@@ -609,6 +631,9 @@ export const fixtureSource: MachDataSource = {
     return () => {};
   },
   async onThreadsChanged() {
+    return () => {};
+  },
+  async onWakeFailed() {
     return () => {};
   },
 };
