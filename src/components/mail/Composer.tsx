@@ -345,6 +345,9 @@ export function Composer({
     // the top rule that joins the dock to the reading pane nor the reading
     // pane's own measure.
     <div
+      // Says "the keyboard is in a composer" to the shell — see
+      // `keyboardInComposer`. Nothing styles off it.
+      data-mach-composer=""
       className={cn(
         !overlay && "shrink-0 border-t border-border bg-surface",
         // A drop target has to say so before the file is let go, or the only
@@ -388,6 +391,9 @@ export function Composer({
                   (value) => onChange({ ...draft, subject: value }),
                 )}
                 placeholder="Subject"
+                // The placeholder is the only thing naming this field, and a
+                // placeholder disappears the moment there is a subject.
+                aria-label="Subject"
                 className={cn(
                   "w-full bg-transparent text-foreground",
                   SUBJECT_TYPE,

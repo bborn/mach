@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
+import { keyboardInComposer } from "@/lib/compose";
 import { LIST_WIDTH_BOUNDS } from "@/lib/prefs";
 import { FlexPane, Pane, Resizer } from "@/components/ui/split";
 import { AccountRail } from "./AccountRail";
@@ -91,15 +92,20 @@ export function MailMode() {
     {
       // The rail and the list are one loop, not two worlds. Tab is unclaimed in
       // mail mode and is the idiom for exactly this.
+      //
+      // Not while the keyboard is in a composer, though: there ⇥ means "next
+      // field", and this binding was firing on every stop that is not a text
+      // field — cc / bcc, attach, discard, pop out — and throwing the keyboard
+      // out of a half-written message into the rail. See `keyboardInComposer`.
       keys: "tab",
       group: "Mail",
       description: "Sidebar or list",
-      when: () => mail,
+      when: () => mail && !keyboardInComposer(),
       handler: () => actions.toggleFocus(),
     },
     {
       keys: "shift+tab",
-      when: () => mail,
+      when: () => mail && !keyboardInComposer(),
       handler: () => actions.toggleFocus(),
     },
 

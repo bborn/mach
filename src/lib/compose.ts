@@ -1039,6 +1039,33 @@ export const COMPOSER_KEYS = {
   popOut: "shift+mod+o",
 } as const;
 
+/**
+ * The marker the composer's root carries, so the shell can tell where the
+ * keyboard is.
+ */
+export const COMPOSER_ROOT = "data-mach-composer";
+
+/**
+ * Is the keyboard inside a composer right now?
+ *
+ * Mail mode binds ⇥ to "sidebar or list", which is right everywhere except
+ * here. The keymap already declines ordinary bindings while the target is a
+ * field, so ⇥ out of To behaved — but the moment focus sat on a *button* in the
+ * composer (cc / bcc, attach, discard, pop out) the binding fired and threw the
+ * keyboard out of a half-written message into the rail. In a docked forward
+ * that made the Subject field unreachable: ⇧⇥ out of To landed on cc / bcc, and
+ * the next ⇧⇥ left the composer entirely, one stop short of it.
+ *
+ * Read off `document.activeElement` rather than off `ui`, because "where the
+ * keyboard is" is a fact about the DOM and nothing in the store tracks it at
+ * this resolution.
+ */
+export function keyboardInComposer(): boolean {
+  if (typeof document === "undefined") return false;
+  const active = document.activeElement;
+  return active instanceof Element && active.closest(`[${COMPOSER_ROOT}]`) !== null;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Autosave                                                                    */
 /* -------------------------------------------------------------------------- */

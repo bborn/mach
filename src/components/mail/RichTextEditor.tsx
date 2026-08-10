@@ -259,6 +259,25 @@ export function RichTextEditor({
 
   return (
     <div className="mt-3">
+      {/*
+        Not a tab stop, and not seven of them.
+        ⇥ out of the address fields means "on to the message" — it always has,
+        in every mail client — and this row sat in the way of it: bold, italic,
+        underline, two lists, quote, link, and only then the body. The buttons
+        are held out of the sequence with `tabIndex={-1}`, so ⇥ goes from the
+        last address field straight into the writing area.
+
+        Nothing becomes mouse-only by it. Every action here has a key, all of
+        them Squire's own except the link, which `useKeyBindings` above
+        registers as ⌘K, and each button says which key in its tooltip. The
+        buttons are what makes the formatting *visible* — the half a keyboard
+        cannot do — and reading a toolbar is not something ⇥ is for.
+
+        The alternative was the ARIA toolbar pattern: one tab stop, ← → between
+        the buttons. It is the right shape for a toolbar whose actions have no
+        keys. These all have keys, and it would still leave a stop between the
+        To field and the body, which is the thing being fixed.
+      */}
       <div className="flex items-center gap-0.5 pb-1.5">
         <Tool label="Bold" keys="⌘B" on={inside("B")} onClick={() => toggle("B", (i) => i.bold(), (i) => i.removeBold())}>
           <Bold className="size-3.5" />
@@ -291,9 +310,10 @@ export function RichTextEditor({
         >
           <ListOrdered className="size-3.5" />
         </Tool>
+        {/* Two keys, because the button is a toggle and ⌘] only quotes. */}
         <Tool
           label="Quote"
-          keys="⌘]"
+          keys="⌘] / ⌘["
           on={inside("BLOCKQUOTE")}
           onClick={() =>
             apply((i) => (inside("BLOCKQUOTE") ? i.decreaseQuoteLevel() : i.increaseQuoteLevel()))
@@ -314,6 +334,9 @@ export function RichTextEditor({
             value={linkUrl}
             spellCheck={false}
             autoComplete="off"
+            // A tab stop, so it needs a name — the "Link" beside it is a
+            // sibling span, not a label this input is inside.
+            aria-label="Link"
             placeholder="example.com"
             onChange={(event) => setLinkUrl(event.target.value)}
             onKeyDown={(event) => {
@@ -392,6 +415,9 @@ function Tool({
       title={`${label} (${keys})`}
       aria-label={label}
       aria-pressed={on}
+      // Out of the tab sequence, so ⇥ from the last address field reaches the
+      // message. See the note above the toolbar.
+      tabIndex={-1}
       // The editor loses its selection when focus moves, and a toolbar button
       // that steals it would apply the format to nothing.
       onMouseDown={(event) => event.preventDefault()}
