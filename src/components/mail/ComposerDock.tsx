@@ -107,7 +107,6 @@ export function ComposerDock() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pending, setPending] = useState<OutboxEntry | null>(null);
-  const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [confirming, setConfirming] = useState<string | null>(null);
   const [dropping, setDropping] = useState(false);
@@ -115,6 +114,9 @@ export function ComposerDock() {
   // The draft that was queued, kept so undo restores the text rather than an
   // empty composer.
   const recalled = useRef<Draft | null>(null);
+  // The in-flight queue write, so undo can wait for the row's real id rather
+  // than recall the optimistic one. Resolves to the entry Rust wrote.
+  const queued = useRef<Promise<OutboxEntry> | null>(null);
   // Where focus starts in the new-message overlay. See `Composer`'s `toRef`.
   const toField = useRef<HTMLInputElement>(null);
 
@@ -595,34 +597,84 @@ export function ComposerDock() {
       // is the specific accident that put a duplicate in his mailbox.
       autosaves.current.get(id)?.cancel();
       autosaves.current.delete(id);
-      setBusy(true);
-      void (async () => {
-        try {
-          // ⌃S already named an instant; an ordinary send names one too, out of
-          // the preference. Rust falls back to its own ten seconds when no
-          // instant arrives, so passing it explicitly is what makes the setting
-          // the authority rather than a suggestion.
-          const result = await sendDraft(draft, scheduleAt ?? Date.now() + delay);
-          recalled.current = draft;
-          setPending(result.entry);
-          close(id);
-          setNow(Date.now());
+
+      // ⌃S already named an instant; an ordinary send names one too, out of
+      // the preference. Rust falls back to its own ten seconds when no instant
+      // arrives, so passing it explicitly is what makes the setting the
+      // authority rather than a suggestion.
+      const sendAfter = scheduleAt ?? Date.now() + delay;
+
+      /*
+       * The composer closes now, not when Rust answers.
+       *
+       * Queuing is entirely local — build the bytes, write one row, drop the
+       * draft — and it still is not instant: SQLite takes one writer at a time
+       * and the sync loop is usually holding it against a store measured in
+       * gigabytes. Waiting on that lock left `⌘⏎` sitting there for seconds
+       * with the message apparently unsent, which is the one moment a mail
+       * client cannot afford to feel uncertain.
+       *
+       * So the window closes, the undo pill appears, and the write happens
+       * behind them. Nothing is lost if it fails: the draft is still in hand,
+       * and the catch below puts it back on screen with the reason.
+       */
+      const optimistic: OutboxEntry = {
+        id: `pending-${id}`,
+        accountId: draft.accountId,
+        threadId: draft.threadId ?? null,
+        gmailThreadId: null,
+        subject: draft.subject,
+        state: "holding",
+        sendAfter,
+        createdAt: Date.now(),
+        attempts: 0,
+      };
+      recalled.current = draft;
+      setPending(optimistic);
+      close(id);
+      setNow(Date.now());
+
+      /*
+       * Undo has to work during the gap. The pill is on screen before the row
+       * exists, so ⌘Z can be pressed against an id Rust has never heard of;
+       * `recall` waits on this instead of reading `pending.id`.
+       */
+      queued.current = sendDraft(draft, sendAfter)
+        .then((result) => {
+          // Only if this send is still the one on screen — a second ⌘⏎ while
+          // the first was in flight would otherwise be overwritten by it.
+          setPending((current) => (current?.id === optimistic.id ? result.entry : current));
           // The reply is already in SQLite; this is what puts it on screen.
           actions.reload();
-        } catch (error) {
+          return result.entry;
+        })
+        .catch((error) => {
+          setPending((current) => (current?.id === optimistic.id ? null : current));
           actions.setStatus(errorMessage(error), "error");
-        } finally {
-          setBusy(false);
-        }
-      })();
+          const restored = recalled.current;
+          recalled.current = null;
+          if (restored) openDraft(restored);
+          throw error;
+        });
     },
-    [draft, actions, delay, close],
+    [draft, actions, delay, close, openDraft],
   );
 
   const recall = useCallback(async () => {
     if (!pending) return;
-    const id = pending.id;
     setPending(null);
+    /*
+     * Not `pending.id`. Between `⌘⏎` and Rust answering, that is the
+     * optimistic id and no row carries it; undo pressed in the gap — which is
+     * exactly when it is pressed — would recall nothing and report "Already
+     * sent" about a message that had not been queued yet.
+     *
+     * Waiting here costs nothing the user sees: the pill is already gone.
+     */
+    const id = await (queued.current ?? Promise.resolve(null))
+      .then((entry) => entry?.id ?? pending.id)
+      .catch(() => null);
+    if (id == null) return; // the queue failed; its catch has the screen
     const cancelled = await undoSend(id).catch(() => false);
     if (!cancelled) {
       actions.setStatus("Already sent", "error");
@@ -888,7 +940,6 @@ export function ComposerDock() {
     <Composer
       draft={visible}
       html={visible.body}
-      busy={busy}
       presentation={presentation}
       active
       dropping={dropping}
