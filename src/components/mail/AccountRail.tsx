@@ -6,6 +6,7 @@ import { useKeyBindings } from "@/hooks/useKeymap";
 import { useUiSession } from "@/components/prefs/PreferencesProvider";
 import { railMailboxes } from "@/lib/mailboxes";
 import { RAIL_WIDTH_BOUNDS } from "@/lib/prefs";
+import { suppressedIds } from "@/lib/projection";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { RESIZE_STEP, Resizer } from "@/components/ui/split";
@@ -107,8 +108,8 @@ export function AccountRail() {
    * while the rail still claims fifty unread is the exact lie this guards.
    */
   const suppressed = useMemo<ReadonlySet<ThreadId>>(
-    () => new Set<ThreadId>([...ui.archived, ...ui.readExtra]),
-    [ui.archived, ui.readExtra],
+    () => suppressedIds(ui.guesses, "INBOX"),
+    [ui.guesses],
   );
   const unread = useInboxUnread(suppressed);
 

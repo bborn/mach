@@ -72,7 +72,9 @@ export function useThreadStream(accountId: AccountId | null, labelId: LabelId): 
         });
         if (generationAtStart !== generation.current) return;
         setThreads((previous) => {
-          const next = after ? merge(previous, page.threads) : page.threads;
+          const next = after
+            ? merge(previous, page.threads)
+            : reconcile(previous, page.threads);
           loadedCount.current = next.length;
           return next;
         });
@@ -127,4 +129,64 @@ function merge(previous: Thread[], incoming: Thread[]): Thread[] {
   if (incoming.length === 0) return previous;
   const seen = new Set(previous.map((t) => t.id));
   return [...previous, ...incoming.filter((t) => !seen.has(t.id))];
+}
+
+/**
+ * A refetched list, keeping the object for every row that did not change.
+ *
+ * `threads-changed` fires on every command and on every batch a sync pass
+ * writes, and each one used to replace all sixty-to-three-hundred rows with
+ * freshly deserialised objects that were, almost always, equal to the ones they
+ * replaced. Nothing on screen changed and everything re-rendered — a repaint of
+ * the whole list, twice a second, for the duration of a backfill.
+ *
+ * Reusing the old object where the data is identical is what lets React skip
+ * that work, and returning `previous` itself when *nothing* moved is what stops
+ * the render from being scheduled at all: `setState` with the same reference
+ * bails out.
+ */
+export function reconcile(previous: Thread[], incoming: Thread[]): Thread[] {
+  if (previous.length === 0) return incoming;
+  const before = new Map(previous.map((t) => [t.id, t]));
+  let identical = previous.length === incoming.length;
+  const next = incoming.map((row, index) => {
+    const old = before.get(row.id);
+    if (old && sameThread(old, row)) {
+      identical &&= previous[index] === old;
+      return old;
+    }
+    identical = false;
+    return row;
+  });
+  return identical ? previous : next;
+}
+
+/**
+ * Whether two versions of a row would draw the same.
+ *
+ * Every field the list paints, compared by value. `labelIds` is included
+ * because the row's draft mark reads it and because the optimistic projection
+ * retires against it.
+ */
+function sameThread(a: Thread, b: Thread): boolean {
+  return (
+    a.id === b.id &&
+    a.accountId === b.accountId &&
+    a.subject === b.subject &&
+    a.snippet === b.snippet &&
+    a.timestamp === b.timestamp &&
+    a.unread === b.unread &&
+    a.starred === b.starred &&
+    a.hasAttachment === b.hasAttachment &&
+    a.messageCount === b.messageCount &&
+    sameStrings(a.labelIds, b.labelIds) &&
+    a.participants.length === b.participants.length &&
+    a.participants.every(
+      (p, i) => p.email === b.participants[i]!.email && p.name === b.participants[i]!.name,
+    )
+  );
+}
+
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, i) => value === b[i]);
 }

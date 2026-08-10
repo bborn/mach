@@ -36,6 +36,15 @@ import {
   type MailCommand,
 } from "@/lib/data";
 import {
+  applyGuess,
+  leavesMailbox,
+  leavingIds,
+  project,
+  settledGuesses,
+  READ_GUESS,
+  type Guesses,
+} from "@/lib/projection";
+import {
   emptyUndo,
   pushUndo,
   recordUndo,
@@ -221,19 +230,20 @@ interface UiState {
   listWidth: number;
   hiddenCalendars: CalendarId[];
   theme: Theme;
-  /** Threads hidden optimistically, until the command layer confirms. */
-  archived: ThreadId[];
-  readExtra: ThreadId[];
   /**
-   * Stars the user has toggled but the store has not confirmed yet.
+   * What has happened to a conversation that the loaded list does not say yet.
    *
-   * Archiving hides the row instantly, so it always felt immediate. Starring
-   * had no equivalent: it waited on the whole round trip — IPC, the local
-   * write, the Gmail call, the threads-changed event and a refetch — before
-   * the star appeared. Same optimistic idea as `readExtra`, applied to a
-   * property rather than to membership of the list.
+   * This was three fields — a list of hidden ids, a list of read ids and a map
+   * of stars — each written at a different call site, each with its own idea of
+   * when it stopped applying, and only the last of them ever retired at all.
+   * Label had none, and neither did the inverse a ⌘Z dispatches, so undoing a
+   * star flashed for the same 600ms the star itself used to.
+   *
+   * One map now, keyed by thread, holding the label delta the command applied.
+   * `lib/projection.ts` is where a command becomes one and where the list
+   * agreeing with one retires it; the reducer here only stores what it is told.
    */
-  starOverrides: Record<ThreadId, boolean>;
+  guesses: Guesses;
   status: StatusMessage | null;
 }
 
@@ -258,14 +268,10 @@ type UiAction =
   | { type: "listWidth"; width: number }
   | { type: "toggleCalendar"; calendarId: CalendarId }
   | { type: "theme"; theme: Theme }
-  | { type: "archive"; threadIds: ThreadId[] }
-  /** Put optimistically-hidden threads back — undo, or a command that failed. */
-  | { type: "restore"; threadIds: ThreadId[] }
-  | { type: "read"; threadIds: ThreadId[] }
-  /** Show a star before the store confirms it. */
-  | { type: "star"; threadIds: ThreadId[]; starred: boolean }
-  /** Drop the guess — the store agrees now, or the command failed. */
-  | { type: "unstar"; threadIds: ThreadId[] }
+  /** Show what a command did, before the list has been refetched. */
+  | { type: "project"; guesses: Guesses }
+  /** Drop guesses — the list agrees now, or the write was refused. */
+  | { type: "forget"; threadIds: ThreadId[] }
   | { type: "status"; status: UiState["status"] };
 
 export const initialUi: UiState = {
@@ -287,9 +293,7 @@ export const initialUi: UiState = {
   listWidth: 520,
   hiddenCalendars: [],
   theme: "system",
-  archived: [],
-  readExtra: [],
-  starOverrides: {},
+  guesses: {},
   status: null,
 };
 
@@ -315,10 +319,14 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
       return {
         ...state,
         threadId: action.threadId,
-        readExtra:
-          action.threadId !== null
-            ? uniq([...state.readExtra, action.threadId])
-            : state.readExtra,
+        // Opening a conversation is a claim that it has been read, made before
+        // the `markRead` command it will produce has run — and made through the
+        // same map that command's own guess lands in, so the two cannot
+        // disagree and the reading of it is retired by the one rule.
+        guesses:
+          action.threadId !== null && !(action.threadId in state.guesses)
+            ? { ...state.guesses, [action.threadId]: READ_GUESS }
+            : state.guesses,
         // Moving the cursor re-points the anchor without selecting anything:
         // walking past a row you ticked must never untick it.
         selection:
@@ -367,23 +375,18 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
       };
     case "theme":
       return { ...state, theme: action.theme };
-    case "archive":
-      return { ...state, archived: uniq([...state.archived, ...action.threadIds]) };
-    case "restore":
-      return { ...state, archived: state.archived.filter((id) => !action.threadIds.includes(id)) };
-    case "read":
-      return { ...state, readExtra: uniq([...state.readExtra, ...action.threadIds]) };
-    case "star": {
-      const next = { ...state.starOverrides };
-      for (const id of action.threadIds) next[id] = action.starred;
-      return { ...state, starOverrides: next };
-    }
-    case "unstar": {
-      // Drops the guess, either because the store now agrees or because the
-      // command failed. Either way the row goes back to whatever it says.
-      const next = { ...state.starOverrides };
+    // A later guess about the same conversation replaces the earlier one
+    // outright rather than merging with it. Two commands in a row are two
+    // statements about the same thread, and the second is the current one —
+    // starring and then archiving must not leave the star's delta behind to be
+    // re-applied to a row that has since been refetched.
+    case "project":
+      return { ...state, guesses: { ...state.guesses, ...action.guesses } };
+    case "forget": {
+      if (!action.threadIds.some((id) => id in state.guesses)) return state;
+      const next = { ...state.guesses };
       for (const id of action.threadIds) delete next[id];
-      return { ...state, starOverrides: next };
+      return { ...state, guesses: next };
     }
     case "status":
       return { ...state, status: action.status };
@@ -402,32 +405,6 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
  */
 export function overlayOwnsKeyboard(ui: Pick<UiState, "overlays">): boolean {
   return ui.overlays > 0;
-}
-
-function uniq<T>(values: T[]): T[] {
-  return [...new Set(values)];
-}
-
-/**
- * The ids whose optimistic star the loaded list now agrees with.
- *
- * Exported because it is the rule that decides when an optimistic value stops
- * being one, and that rule is worth a test of its own rather than only being
- * observable through a rendered row.
- */
-export function settledStars(
-  threads: Pick<Thread, "id" | "starred">[],
-  overrides: Record<ThreadId, boolean>,
-): ThreadId[] {
-  // Cheap when nothing is pending, which is almost always.
-  if (Object.keys(overrides).length === 0) return [];
-  const settled: ThreadId[] = [];
-  for (const thread of threads) {
-    if (thread.id in overrides && overrides[thread.id] === thread.starred) {
-      settled.push(thread.id);
-    }
-  }
-  return settled;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -663,6 +640,17 @@ export function MachProvider({ children }: { children: ReactNode }) {
   // Actions close over the stream without being rebuilt on every page it loads.
   const streamRef = useRef(stream);
   streamRef.current = stream;
+  /*
+   * The loaded rows, for `run` to build a guess against.
+   *
+   * A ref rather than a dependency, so `run` — and therefore every action built
+   * on it — is not rebuilt on each of the sixty-row pages the stream appends.
+   * Only two commands read it at all: `unarchive` and `untrash` carrying the
+   * exact label set undo restores, which has to be diffed against what the row
+   * has now to become a delta.
+   */
+  const threadsRef = useRef(stream.threads);
+  threadsRef.current = stream.threads;
 
   /*
    * A backfill can emit `threads-changed` hundreds of times a minute. Coalesce:
@@ -674,6 +662,16 @@ export function MachProvider({ children }: { children: ReactNode }) {
    * a sync pass removing a draft, another window, the agent — repainted the
    * list beside a reading pane still showing the old messages. The list has
    * always refetched here; the pane was the half nobody told.
+   *
+   * **This window is no longer in front of a keystroke.** It used to be: a
+   * command emitted `threads-changed` on its way out, and anything the frontend
+   * had not guessed at — a label, the inverse a ⌘Z dispatched — waited out these
+   * 600ms and then a `list_threads` round trip before it showed. What is left
+   * for the timer to do is what it was for: coalescing a backfill that emits
+   * hundreds of these a minute, and giving a guess something to be retired
+   * against. Both are background work, and a refetch that carries no change now
+   * costs nothing to apply — `reconcile` in `useThreadStream` keeps the object
+   * for every row that did not move, so the list does not re-render.
    */
   const refreshTimer = useRef<number | null>(null);
   const scheduleRefresh = useCallback(() => {
@@ -899,37 +897,49 @@ export function MachProvider({ children }: { children: ReactNode }) {
   /*
    * Retire a guess when the list catches up with it.
    *
-   * This is the other half of not dropping the override in `run`. An
-   * optimistic value has to stop being an override at some point, or a star
-   * turned off later — on the phone, in another window, by a filter — would be
-   * held out of the row forever by a guess nobody remembers making. The
-   * condition is not "enough time has passed" but "the store now says the same
-   * thing", which is the only version of it that cannot produce an
-   * intermediate frame: while the two disagree the override is still doing
-   * work, and the moment they agree removing it changes nothing on screen.
-   *
-   * A thread that is not in the list is left alone rather than dropped. The
-   * list is emptied and refilled on every change of mailbox, and clearing
-   * guesses on absence would unstar a row for the duration of a round trip
-   * purely because the user pressed `g i`.
+   * The other half of never dropping one on a clock. A guess has to stop being
+   * one at some point, or a star turned off later — on the phone, in another
+   * window, by a filter — would be held out of the row forever by something
+   * nobody remembers guessing, and a conversation unarchived elsewhere would
+   * stay invisible here until the app was relaunched. `settledGuesses` owns the
+   * rule and says what "the list agrees" means for each of a guess's two
+   * claims; this only reports the answer to the reducer.
    */
   useEffect(() => {
-    const settled = settledStars(allThreads, ui.starOverrides);
-    if (settled.length > 0) dispatchUi({ type: "unstar", threadIds: settled });
-  }, [allThreads, ui.starOverrides]);
+    const settled = settledGuesses(allThreads, ui.guesses, ui.labelId);
+    if (settled.length > 0) dispatchUi({ type: "forget", threadIds: settled });
+  }, [allThreads, ui.guesses, ui.labelId]);
 
+  /*
+   * The list, with every outstanding guess projected onto it.
+   *
+   * Two things happen here and they are the same thing: a guessed row is drawn
+   * as the command left it, and a guessed row whose labels no longer include
+   * the mailbox on screen is dropped from it. That second clause is what
+   * archive, trash and snooze ride on, and it is scoped to *this* mailbox —
+   * the conversation goes on showing in All Mail and in its labels, which a
+   * flat set of hidden ids could not express.
+   *
+   * A row with no guess is passed through untouched, identity included. Rows
+   * are only rebuilt where a guess actually changes something, so a refetch
+   * that returns the same data re-renders nothing.
+   */
   const visibleThreads = useMemo(() => {
-    const archived = new Set(ui.archived);
-    const overrides = ui.starOverrides;
-    const rows = allThreads.filter((t) => !archived.has(t.id));
+    const guesses = ui.guesses;
     // Cheap when nothing is pending, which is almost always.
-    if (Object.keys(overrides).length === 0) return rows;
-    return rows.map((t) =>
-      t.id in overrides && overrides[t.id] !== t.starred
-        ? { ...t, starred: overrides[t.id]! }
-        : t,
-    );
-  }, [allThreads, ui.archived, ui.starOverrides]);
+    if (Object.keys(guesses).length === 0) return allThreads;
+    const rows: Thread[] = [];
+    for (const thread of allThreads) {
+      const guess = guesses[thread.id];
+      if (!guess) {
+        rows.push(thread);
+        continue;
+      }
+      if (leavesMailbox(guess, ui.labelId)) continue;
+      rows.push(applyGuess(thread, guess));
+    }
+    return rows;
+  }, [allThreads, ui.guesses, ui.labelId]);
 
   const visibleEvents = useMemo(() => {
     const hidden = new Set(ui.hiddenCalendars);
@@ -982,9 +992,17 @@ export function MachProvider({ children }: { children: ReactNode }) {
     (id: CalendarId) => calendars.find((c) => c.id === id),
     [calendars],
   );
+  /*
+   * Whether a row should be drawn unread, guess included.
+   *
+   * A row out of `visibleThreads` has already had the guess applied to it, so
+   * this would be `thread.unread` for those. It reads the map anyway, because
+   * the reading pane and the search view ask about rows that never went through
+   * that projection, and the answer has to be the same in all three places.
+   */
   const isUnread = useCallback(
-    (thread: Thread) => thread.unread && !ui.readExtra.includes(thread.id),
-    [ui.readExtra],
+    (thread: Thread) => ui.guesses[thread.id]?.unread ?? thread.unread,
+    [ui.guesses],
   );
 
   // A favorited view is the label *and* the account filter it was pinned
@@ -1050,12 +1068,25 @@ export function MachProvider({ children }: { children: ReactNode }) {
    *
    * Returns the result so a traversal can collect the inverses it hands back;
    * `null` means the command never reached the command layer.
+   *
+   * # The guess goes out first
+   *
+   * Before anything is awaited, so it is on screen in the frame the keystroke
+   * produced rather than one round trip later. This is the only place it
+   * happens, which is what makes every command optimistic at once: a keystroke,
+   * a ⌘K entry, the snooze picker, the inverse a ⌘Z dispatches and the original
+   * a ⇧⌘Z re-applies all arrive here, and none of them has to remember to say
+   * what it is about to do to the list.
    */
   const run = useCallback(
     async (
       command: Command,
       options: { quiet?: boolean; reselectFailed?: boolean; label?: string } = {},
     ): Promise<CommandResult | null> => {
+      // Synchronous, and before the first `await`: everything down to here runs
+      // in the same tick as the gesture that called it.
+      const guesses = project(command, threadsRef.current);
+      if (guesses) dispatchUi({ type: "project", guesses });
       try {
         const result = await getDataSource().execute(command);
         // A calendar command's whole effect is rows in the event window, and
@@ -1070,25 +1101,26 @@ export function MachProvider({ children }: { children: ReactNode }) {
          * carries the truth". The refetch does — eventually. `execute_command`
          * emits `threads-changed` after it returns, `scheduleRefresh`
          * coalesces that over 600ms, and then `list_threads` has its own round
-         * trip to make. For that whole span the row rendered from a copy of
-         * the list fetched *before* the write, so dropping the override the
-         * instant the command answered put the star out again for most of a
-         * second and then lit it back up: "starring a msg flashes the star
-         * before it sticks".
+         * trip to make. For that whole span the row renders from a copy of the
+         * list fetched *before* the write, so dropping the guess the instant
+         * the command answered put the star out again for most of a second and
+         * then lit it back up: "starring a msg flashes the star before it
+         * sticks".
          *
          * What replaces it is the effect beside `allThreads` above: the guess
          * is dropped when the list actually agrees with it, which is the
          * condition the old code was trying to approximate by timing. Nothing
          * is pinned — an unstar arriving later from Gmail lands in a list the
-         * override has already been retired from.
+         * guess has already been retired from.
          */
         const failed = failedIds(result);
         if (failed.length > 0) {
           // A rolled-back id is the one case where the guess has to go now:
-          // the write did not happen, and the star has to say so rather than
-          // wait for a refetch to contradict it.
-          if (command.kind === "star") dispatchUi({ type: "unstar", threadIds: failed });
-          dispatchUi({ type: "restore", threadIds: failed });
+          // the write did not happen, and the row has to say so rather than
+          // wait for a refetch to contradict it. Exactly the rolled-back ids —
+          // a partial failure leaves the rest of the set projected, because
+          // for them it did happen.
+          dispatchUi({ type: "forget", threadIds: failed });
           if (options.reselectFailed) {
             dispatchUi({
               type: "selection",
@@ -1127,13 +1159,10 @@ export function MachProvider({ children }: { children: ReactNode }) {
         }
         return result;
       } catch (caught) {
-        // The command never ran, so nothing changed anywhere: undo the whole
-        // optimistic edit, not part of it.
-        if (isMailCommand(command)) {
-          dispatchUi({ type: "restore", threadIds: command.threadIds });
-          if (command.kind === "star") {
-            dispatchUi({ type: "unstar", threadIds: command.threadIds });
-          }
+        // The command never ran, so nothing changed anywhere: drop the whole
+        // guess, not part of it.
+        if (guesses) {
+          dispatchUi({ type: "forget", threadIds: Object.keys(guesses).map(Number) });
         }
         dispatchUi({
           type: "status",
@@ -1158,8 +1187,20 @@ export function MachProvider({ children }: { children: ReactNode }) {
       read: () => undoRef.current,
       write: commitUndo,
       execute: (command) => run(command, { quiet: true }),
-      restore: (threadIds) => dispatchUi({ type: "restore", threadIds }),
-      hide: (threadIds) => dispatchUi({ type: "archive", threadIds }),
+      /*
+       * Both of these are now the same thing: drop whatever guess is standing
+       * for these conversations.
+       *
+       * They used to be the two halves of the optimistic hide — clear it for an
+       * unarchive, set it for a redone archive — because `run` knew nothing
+       * about what a command did to the list and the traversal had to say so on
+       * its behalf. It does know now, and it projects the inverse it is handed
+       * a moment later in `execute` above. What is left for the traversal to do
+       * is retract the *previous* guess, so the archive's delta is not still
+       * sitting on the row the unarchive is about to describe.
+       */
+      restore: (threadIds) => dispatchUi({ type: "forget", threadIds }),
+      hide: (threadIds) => dispatchUi({ type: "forget", threadIds }),
       // A traversal's own message carries no inverse — the entry it moved is
       // the record of it — so it says which button to hold out next instead.
       say: (message, offer) =>
@@ -1217,18 +1258,24 @@ export function MachProvider({ children }: { children: ReactNode }) {
      * time would be fifty round trips, fifty status messages, and an undo
      * stack fifty deep for one gesture.
      *
-     * `hides` says whether the rows leave the list, which decides whether the
-     * cursor has to move and whether to hide them optimistically.
+     * Every caller used to pass a `hides` flag saying whether the rows would
+     * leave the list, because that decided both the optimistic hide and whether
+     * the cursor had to move. `run` projects the hide off the command itself
+     * now, and the same projection answers the cursor question better than the
+     * flag did: archiving from a label the conversation still carries does not
+     * take the row anywhere, and the cursor should not jump as though it had.
      */
-    const bulk = (command: MailCommand, hides: boolean, label?: string) => {
+    const bulk = (command: MailCommand, label?: string) => {
       const ids = command.threadIds;
       if (ids.length === 0) return;
-      if (hides) {
-        const nextFocus = nextAfterRemoval(listIds, ids, ui.threadId);
-        dispatch({ type: "archive", threadIds: ids });
+      const leaving = leavingIds(command, visibleThreads, ui.labelId);
+      if (leaving.length > 0) {
+        const nextFocus = nextAfterRemoval(listIds, leaving, ui.threadId);
         if (nextFocus !== ui.threadId) dispatch({ type: "thread", threadId: nextFocus });
       }
       dispatch({ type: "selection", selection: clearSelection(ui.selection) });
+      // Synchronous up to its first `await`, so the rows are gone in the same
+      // React batch as the cursor move above rather than a frame after it.
       void run(command, { reselectFailed: true, label });
     };
 
@@ -1352,12 +1399,11 @@ export function MachProvider({ children }: { children: ReactNode }) {
       clearSelection: () =>
         dispatch({ type: "selection", selection: clearSelection(ui.selection) }),
 
-      archiveSelected: () => bulk({ kind: "archive", threadIds: commandTargetIds }, true),
-      trashSelected: () => bulk({ kind: "trash", threadIds: commandTargetIds }, true),
+      archiveSelected: () => bulk({ kind: "archive", threadIds: commandTargetIds }),
+      trashSelected: () => bulk({ kind: "trash", threadIds: commandTargetIds }),
       snoozeSelected: (until) =>
         bulk(
           { kind: "snooze", threadIds: commandTargetIds, until },
-          true,
           snoozeLabel(commandTargetIds.length, until, Date.now()),
         ),
       // Starring a mixed set stars all of it; only an already-all-starred set
@@ -1368,8 +1414,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
         const allStarred =
           commandTargetIds.length > 0 &&
           commandTargetIds.every((id) => byId.get(id)?.starred === true);
-        dispatch({ type: "star", threadIds: commandTargetIds, starred: !allStarred });
-        bulk({ kind: "star", threadIds: commandTargetIds, starred: !allStarred }, false);
+        bulk({ kind: "star", threadIds: commandTargetIds, starred: !allStarred });
       },
 
       setFocus: (focus) => dispatch({ type: "focus", focus }),

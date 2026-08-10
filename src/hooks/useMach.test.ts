@@ -1,84 +1,75 @@
 import { describe, expect, it } from "vitest";
 
-import { initialUi, overlayOwnsKeyboard, settledStars, uiReducer } from "./useMach";
+import { initialUi, overlayOwnsKeyboard, uiReducer } from "./useMach";
 
 /**
- * Starring felt laggy because it had no optimistic path.
+ * The reducer half of the optimistic path.
  *
- * `bulk(command, hides)` only guessed ahead when `hides` was true — archive and
- * trash, which remove the row. Star passed `false`, so the star did not appear
- * until the whole round trip finished: IPC, the local write, the Gmail call,
- * the threads-changed event, and a refetch.
- *
- * These test the overlay rather than the timing, because the fixture data
- * source resolves instantly and cannot reproduce the delay that made it
- * visible.
+ * It holds one map of guesses, keyed by thread, and knows only how to add to it
+ * and take from it. What a command implies, and when the loaded list has caught
+ * up with it, both live in `lib/projection.ts` and are tested there.
+ * `useMach.optimistic.test.tsx` renders the two together and asserts on every
+ * frame, which is the only place the timing can actually be seen.
  */
-describe("optimistic starring", () => {
-  it("records the star before anything is confirmed", () => {
-    const state = uiReducer(initialUi, { type: "star", threadIds: [1, 2], starred: true });
-    expect(state.starOverrides).toEqual({ 1: true, 2: true });
+describe("holding a guess", () => {
+  it("starts with none", () => {
+    expect(initialUi.guesses).toEqual({});
   });
 
-  it("records un-starring too, rather than just forgetting", () => {
-    // `{}` would read as "no opinion" and the row would snap back to starred
-    // until the refetch landed — the exact flicker being fixed.
-    const state = uiReducer(initialUi, { type: "star", threadIds: [7], starred: false });
-    expect(state.starOverrides).toEqual({ 7: false });
+  it("records what a command did before anything confirms it", () => {
+    const state = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 1: { add: [], remove: ["INBOX"] }, 2: { add: [], remove: ["INBOX"] } },
+    });
+    expect(Object.keys(state.guesses)).toEqual(["1", "2"]);
   });
 
-  it("drops the guess once the command settles", () => {
-    const guessed = uiReducer(initialUi, { type: "star", threadIds: [1, 2], starred: true });
-    const settled = uiReducer(guessed, { type: "unstar", threadIds: [1] });
-    expect(settled.starOverrides).toEqual({ 2: true });
+  it("lets a later command about the same thread replace the earlier one", () => {
+    // Star, then archive. Merging the two deltas would leave the star's `add`
+    // to be re-applied to a row that has since been refetched with it already
+    // on — and the archive is the current statement about that thread anyway.
+    const starred = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 1: { add: ["STARRED"], remove: [] } },
+    });
+    const archived = uiReducer(starred, {
+      type: "project",
+      guesses: { 1: { add: [], remove: ["INBOX"] } },
+    });
+    expect(archived.guesses[1]).toEqual({ add: [], remove: ["INBOX"] });
   });
 
-  it("leaves other threads alone", () => {
-    const a = uiReducer(initialUi, { type: "star", threadIds: [1], starred: true });
-    const b = uiReducer(a, { type: "star", threadIds: [2], starred: false });
-    expect(b.starOverrides).toEqual({ 1: true, 2: false });
+  it("drops exactly the ids it is told to", () => {
+    const both = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 1: { add: [], remove: ["INBOX"] }, 2: { add: [], remove: ["INBOX"] } },
+    });
+    const one = uiReducer(both, { type: "forget", threadIds: [1] });
+    expect(Object.keys(one.guesses)).toEqual(["2"]);
   });
 
-  it("starts with no opinion at all", () => {
-    expect(initialUi.starOverrides).toEqual({});
-  });
-});
-
-/**
- * When a guess stops being one.
- *
- * The first version of this answered "when the command comes back", which is
- * the wrong event: the command answering says the write landed in SQLite, and
- * says nothing about whether the list on screen has been refetched since. It
- * had not — `threads-changed` is coalesced over 600ms and then has its own
- * round trip — so the star went out for most of a second between the command
- * answering and the rows arriving. `useMach.star.test.tsx` is that flash,
- * rendered; this is the rule that replaced the timing.
- */
-describe("settling an optimistic star", () => {
-  const row = (id: number, starred: boolean) => ({ id, starred });
-
-  it("retires the guess the list now agrees with", () => {
-    expect(settledStars([row(1, true), row(2, false)], { 1: true })).toEqual([1]);
+  it("returns the same state when there is nothing to forget", () => {
+    // The retirement effect runs on every list change; a new object every time
+    // would re-render the whole app on every sync pass for nothing.
+    const state = uiReducer(initialUi, { type: "forget", threadIds: [9] });
+    expect(state).toBe(initialUi);
   });
 
-  it("holds on while the list still disagrees", () => {
-    expect(settledStars([row(1, false)], { 1: true })).toEqual([]);
+  it("guesses that an opened conversation has been read", () => {
+    const state = uiReducer(initialUi, { type: "thread", threadId: 4 });
+    expect(state.guesses[4]).toEqual({ add: [], remove: ["UNREAD"], unread: false });
   });
 
-  it("holds on to a thread the loaded list does not carry", () => {
-    // Changing mailbox empties the list and refills it. Dropping guesses for
-    // rows that are momentarily absent would unstar them for a round trip.
-    expect(settledStars([], { 1: true })).toEqual([]);
-  });
-
-  it("settles an un-star the same way", () => {
-    expect(settledStars([row(3, false)], { 3: false })).toEqual([3]);
-    expect(settledStars([row(3, true)], { 3: false })).toEqual([]);
-  });
-
-  it("says nothing when nothing is pending", () => {
-    expect(settledStars([row(1, true)], {})).toEqual([]);
+  it("does not overwrite a command's guess with the read one", () => {
+    // Archiving moves the cursor onto the next row, and that row may be the one
+    // just archived in a one-row list. The archive is the statement that
+    // matters; a read guess written over it would put the row back.
+    const archived = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 4: { add: [], remove: ["INBOX"] } },
+    });
+    const moved = uiReducer(archived, { type: "thread", threadId: 4 });
+    expect(moved.guesses[4]).toEqual({ add: [], remove: ["INBOX"] });
   });
 });
 

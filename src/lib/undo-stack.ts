@@ -340,9 +340,22 @@ export interface UndoHost {
   write(next: UndoState): void;
   /** Dispatch a command. `null` means it never reached the command layer. */
   execute(command: Command): Promise<CommandResult | null>;
-  /** Clear the list's optimistic hide, so restored threads are visible again. */
+  /**
+   * Retract the guess standing for these conversations.
+   *
+   * The two used to be the optimistic edit itself — clear the hide for an
+   * unarchive, set it for a redone archive — because the command layer's caller
+   * knew nothing about what a command did to the list. It does now: `execute`
+   * projects the command it is handed. What is left to do here is drop the
+   * *previous* guess, so an archive's delta is not still sitting on the row the
+   * unarchive about to run is describing.
+   *
+   * They stay two methods rather than one because {@link restoresThreads} and
+   * {@link hidesThreads} are two different questions about a command, and the
+   * host is free to answer them differently.
+   */
   restore(threadIds: ThreadId[]): void;
-  /** Hide rows the way the original action did. */
+  /** The mirror of {@link UndoHost.restore}, for a redone action. */
   hide(threadIds: ThreadId[]): void;
   /**
    * Say what happened, once it has.
