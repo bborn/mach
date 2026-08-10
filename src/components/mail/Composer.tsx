@@ -20,6 +20,7 @@ import { anyPopupOpen } from "@/lib/popups";
 import { cn } from "@/lib/utils";
 import { RichTextEditor, type RichTextEditorHandle } from "./RichTextEditor";
 import type { Contact } from "@/lib/contacts";
+import { COMPOSER_COLUMN, COMPOSER_FIXED_ROW } from "./composer-layout";
 import {
   COMPOSER_KEYS,
   formatRecipients,
@@ -378,14 +379,23 @@ export function Composer({
       data-mach-composer=""
       data-mach-drop-target=""
       className={cn(
-        !overlay && "shrink-0 border-t border-border bg-surface",
+        // In the overlay the panel above this one has a maximum height and
+        // clips what does not fit, so this has to be a column that can
+        // shrink — see COMPOSER_COLUMN for what was cut off when it wasn't.
+        overlay ? COMPOSER_COLUMN : "shrink-0 border-t border-border bg-surface",
         // A drop target has to say so before the file is let go, or the only
         // feedback is whether it worked.
         dropping && "ring-1 ring-inset ring-accent",
       )}
     >
-      <div className={cn("px-5", overlay ? "py-4" : "mx-auto max-w-[72ch] py-3")}>
-        <div className="flex items-baseline gap-2">
+      <div
+        className={cn(
+          COMPOSER_COLUMN,
+          "flex-1 px-5",
+          overlay ? "py-4" : "mx-auto max-w-[72ch] py-3",
+        )}
+      >
+        <div className={cn(COMPOSER_FIXED_ROW, "flex items-baseline gap-2")}>
           {isReply ? (
             <h2 className="min-w-0 flex-1 truncate text-list font-medium text-foreground">
               {draft.subject}
@@ -442,7 +452,7 @@ export function Composer({
           )}
         </div>
 
-        <div className="mt-2 space-y-1 border-b border-border pb-2">
+        <div className={cn(COMPOSER_FIXED_ROW, "mt-2 space-y-1 border-b border-border pb-2")}>
           <AddressField label="To" typeahead={to} value={raw.to} disabled={busy} inputRef={toField} />
           {showCc && (
             <>
@@ -487,6 +497,7 @@ export function Composer({
         {dragging && (
           <div
             className={cn(
+              COMPOSER_FIXED_ROW,
               "mt-2 rounded-[var(--radius)] border border-dashed px-3 py-2 text-micro",
               dropping
                 ? "border-accent text-foreground"
@@ -498,7 +509,7 @@ export function Composer({
         )}
 
         {attachments.length > 0 && (
-          <ul className="mt-2 flex flex-wrap gap-1.5">
+          <ul className={cn(COMPOSER_FIXED_ROW, "mt-2 flex flex-wrap gap-1.5")}>
             {attachments.map((file) => (
               <AttachmentChip
                 key={file.id}
@@ -512,7 +523,12 @@ export function Composer({
         )}
 
         {scheduling && (
-          <div className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-border pt-2">
+          <div
+            className={cn(
+              COMPOSER_FIXED_ROW,
+              "mt-2 flex flex-wrap items-center gap-1.5 border-t border-border pt-2",
+            )}
+          >
             <span className="text-micro text-faint-foreground">Send</span>
             {options.map((option) => (
               <button
@@ -530,7 +546,19 @@ export function Composer({
           </div>
         )}
 
-        <div className="mt-2 flex items-center gap-3 text-micro text-faint-foreground">
+        {/*
+          The legend, and the only way to attach, discard or send with a mouse.
+          It keeps its size while the message gives up as much as the panel
+          asks for — see COMPOSER_FIXED_ROW. Named in the DOM because "is the
+          footer still inside the panel" is a question worth being able to ask.
+        */}
+        <div
+          data-mach-composer-footer=""
+          className={cn(
+            COMPOSER_FIXED_ROW,
+            "mt-2 flex items-center gap-3 text-micro text-faint-foreground",
+          )}
+        >
           <span className="inline-flex items-center gap-1">
             <Kbd keys={COMPOSER_KEYS.send} /> send
           </span>

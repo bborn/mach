@@ -13,6 +13,7 @@ import { useKeyBindings } from "@/hooks/useKeymap";
 import { cleanFragment, isBlankHtml } from "@/lib/email-html";
 import { cn } from "@/lib/utils";
 import { caretOffsetIn, caretRangeIn } from "./caret-offset";
+import { COMPOSER_BODY, COMPOSER_COLUMN, COMPOSER_FIXED_ROW } from "./composer-layout";
 
 /**
  * The composer's editor.
@@ -340,7 +341,12 @@ export function RichTextEditor({
   ]);
 
   return (
-    <div className="mt-3">
+    // The one part of the composer that gives up space, so it carries no
+    // `shrink-0` and its own column lets the squeeze reach the writing area
+    // rather than stopping at this box. Unconstrained — the dock, where the
+    // height is whatever the handle was dragged to — this lays out exactly as
+    // the block it replaced.
+    <div className={cn("mt-3", COMPOSER_COLUMN)}>
       {/*
         Not a tab stop, and not seven of them.
         ⇥ out of the address fields means "on to the message" — it always has,
@@ -360,7 +366,7 @@ export function RichTextEditor({
         keys. These all have keys, and it would still leave a stop between the
         To field and the body, which is the thing being fixed.
       */}
-      <div className="flex items-center gap-0.5 pb-1.5">
+      <div className={cn(COMPOSER_FIXED_ROW, "flex items-center gap-0.5 pb-1.5")}>
         <Tool label="Bold" keys="⌘B" on={inside("B")} onClick={() => toggle("B", (i) => i.bold(), (i) => i.removeBold())}>
           <Bold className="size-3.5" />
         </Tool>
@@ -409,7 +415,12 @@ export function RichTextEditor({
       </div>
 
       {linking && (
-        <div className="mb-1.5 flex items-center gap-2 border-b border-border pb-1.5">
+        <div
+          className={cn(
+            COMPOSER_FIXED_ROW,
+            "mb-1.5 flex items-center gap-2 border-b border-border pb-1.5",
+          )}
+        >
           <span className="text-micro uppercase tracking-wide text-faint-foreground">Link</span>
           <input
             ref={linkField}
@@ -439,7 +450,15 @@ export function RichTextEditor({
         </div>
       )}
 
-      <div className="relative">
+      {/*
+        The height lives here rather than on the contenteditable below it.
+        A box with a pixel height is what the handle on the composer's top edge
+        moves, and it is also the one box that has to be allowed to come back
+        down when the panel around it is shorter than the window it was
+        measured against — `min-h-0` is what permits that, and the writing area
+        follows it at `h-full` and scrolls the text it can no longer show.
+      */}
+      <div className={cn("relative", COMPOSER_BODY)} style={{ height }}>
         {empty && (
           <span className="pointer-events-none absolute left-0 top-0 text-reading leading-[1.6] text-faint-foreground">
             {placeholder}
@@ -454,9 +473,8 @@ export function RichTextEditor({
           aria-multiline="true"
           aria-label="Message"
           spellCheck
-          style={{ height }}
           className={cn(
-            "block w-full overflow-y-auto bg-transparent",
+            "block h-full w-full overflow-y-auto bg-transparent",
             "text-reading leading-[1.6] text-foreground focus:outline-none",
             // The editor's own rendering, scoped here rather than added to the
             // global sheet: a `<ul>` inside a contenteditable needs a marker and

@@ -122,6 +122,43 @@ export function forgetPopOut(popped: readonly string[], id: string): string[] {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Which box gives up space                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The composer's own column, for a composer inside something that limits it.
+ *
+ * The overlay's panel is `flex flex-col`, `max-h-[68vh]`, `overflow: hidden`.
+ * The composer inside it was a plain block whose height was the sum of its
+ * parts, and one of those parts — the editor — is sized from the *window*
+ * ({@link popOutComposerHeight} is the window less some chrome), not from the
+ * panel. The two numbers were never reconciled, so at 1440×900 the composer
+ * asked for 800px inside a 612px panel and the last 188 of it — the legend,
+ * the paperclip, discard — were cut off by that `overflow: hidden`. It was in
+ * the DOM the whole time, 173px below the panel's bottom edge.
+ *
+ * A column fixes it by making the constraint reach the editor. `min-h-0` is
+ * the half that is easy to leave out: a flex item's automatic minimum size is
+ * its content, so without it the box refuses to shrink and overflows instead,
+ * which is exactly the shape of the original bug one level down.
+ */
+export const COMPOSER_COLUMN = "flex min-h-0 flex-col";
+
+/**
+ * A row of that column that keeps its size.
+ *
+ * Every row of the composer carries this except the editor, which is
+ * {@link COMPOSER_BODY}. That is the whole rule: **the message gives up space,
+ * and nothing else does.** The footer is the only mouse route to attach,
+ * discard and send, so it is the last thing that may be squeezed, and a row
+ * that is 18px tall has nothing useful to give anyway.
+ */
+export const COMPOSER_FIXED_ROW = "shrink-0";
+
+/** The one row that gives way. Sized in pixels, shrinkable to nothing. */
+export const COMPOSER_BODY = "min-h-0";
+
+/* -------------------------------------------------------------------------- */
 /* Where a dropped file lands                                                  */
 /* -------------------------------------------------------------------------- */
 
