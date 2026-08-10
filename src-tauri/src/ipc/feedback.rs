@@ -1,4 +1,4 @@
-//! In-app feedback: window capture → annotation → a queued TaskYou task.
+//! In-app feedback: window capture → annotation → work handed to an agent.
 //!
 //! This is the loop that improves the app while it is being used, so it is
 //! written to the same standard as the mail path, not as tooling. Two commands:
@@ -18,18 +18,33 @@
 //! falls back to the main display (`-m`). Requires the Screen Recording
 //! permission; without it `screencapture` fails and the message is surfaced.
 //!
-//! # Filing
+//! # Where it goes
 //!
 //! The annotated PNG is written to `<repo>/.feedback/` — a durable directory,
-//! never a temp dir, because the agent reads it minutes later — and then:
+//! never a temp dir, because the agent reads it minutes later — and then the
+//! item goes to one of two [`Sink`]s.
+//!
+//! [`Sink::Session`] writes a JSON file into `<repo>/.feedback/inbox/`. A
+//! Claude Code session already working on Mach watches that directory, picks
+//! the file up within a second or two, and hands it to a subagent in a
+//! worktree. Nothing is spawned from here: the app writes a file and returns.
+//!
+//! [`Sink::TaskYou`] is the previous behaviour —
 //!
 //! ```text
 //! ty create "<title>" --body "<body>" --project mach --execute
 //! ```
 //!
-//! Everything that decides *what* runs is a pure function ([`derive_title`],
-//! [`build_body`], [`ty_args`], [`capture_args`], [`resolve_ty_binary`]) so
-//! `tests/feedback.rs` can assert the command line without executing anything.
+//! — which files a durable task for later. That is the right sink once the app
+//! has settled and nobody is sitting in front of it; during active development
+//! it means the request waits in a queue while its author is right here. So
+//! `Session` is the default, and `MACH_FEEDBACK_SINK=taskyou` asks for the
+//! other one.
+//!
+//! Everything that decides *what* happens is a pure function ([`derive_title`],
+//! [`build_body`], [`session_item`], [`ty_args`], [`capture_args`],
+//! [`resolve_ty_binary`], [`sink_from_env`]) so `tests/feedback.rs` can assert
+//! the file and the command line without writing or executing anything.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +59,26 @@ use super::error::IpcError;
 /// Every piece of feedback is filed into this TaskYou project.
 pub const TY_PROJECT: &str = "mach";
 
+/// Where a submitted item goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sink {
+    /// A JSON file in `<repo>/.feedback/inbox/`, picked up by the session that
+    /// is working on Mach right now.
+    Session,
+    /// `ty create … --execute` — a durable task, worked on whenever.
+    TaskYou,
+}
+
+/// `MACH_FEEDBACK_SINK`. Anything unrecognised is [`Sink::Session`], because
+/// the failure mode of a typo should be "the person in front of the app sees
+/// it" rather than "it went somewhere you are not looking".
+pub fn sink_from_env(value: Option<&str>) -> Sink {
+    match value.map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
+        "taskyou" | "ty" | "task" => Sink::TaskYou,
+        _ => Sink::Session,
+    }
+}
+
 const PNG_DATA_URL: &str = "data:image/png;base64,";
 const SCREENCAPTURE: &str = "/usr/sbin/screencapture";
 const TITLE_MAX: usize = 72;
@@ -57,7 +92,7 @@ const TITLE_MAX: usize = 72;
 /// The agent that picks the task up has no conversation context, so "which
 /// screen was this" has to travel with the screenshot. Every field is optional:
 /// a missing one is left out of the body rather than rendered as "unknown".
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeedbackContext {
     /// `mail` or `calendar`.
@@ -380,6 +415,43 @@ pub fn feedback_dir() -> PathBuf {
     repo_root().join(".feedback")
 }
 
+/// The directory a working session watches. One JSON file per item.
+///
+/// Under `.feedback/`, so the `.gitignore` written next to it already covers
+/// these: an item is a message to whoever is at the keyboard, not a commit.
+pub fn inbox_dir() -> PathBuf {
+    feedback_dir().join("inbox")
+}
+
+/// `item-20260810-142233-104.json`. Sorts in arrival order, which is the order
+/// they should be worked in.
+pub fn inbox_file_name(now_ms: i64) -> String {
+    format!("item-{}", screenshot_file_name(now_ms).trim_start_matches("feedback-"))
+        .replace(".png", ".json")
+}
+
+/// One inbox item, as the JSON that lands on disk.
+///
+/// `body` is the same markdown the TaskYou sink would have filed, so the two
+/// sinks hand an agent identical instructions and only the delivery differs.
+/// The structured fields beside it exist so the watching session can print a
+/// one-line summary without parsing prose.
+pub fn session_item(report: &FeedbackReport<'_>, title: &str, created_at_ms: i64) -> String {
+    let item = serde_json::json!({
+        "createdAt": created_at_ms,
+        "title": title,
+        "text": report.text.trim(),
+        "screenshot": report.screenshot.map(|p| p.display().to_string()),
+        "context": report.context,
+        "repoRoot": report.repo_root.display().to_string(),
+        "appVersion": report.app_version,
+        "commit": report.commit,
+        "body": build_body(report),
+    });
+    // Pretty and newline-terminated: a human reads these when the loop breaks.
+    format!("{}\n", serde_json::to_string_pretty(&item).unwrap_or_default())
+}
+
 /// `feedback-20260807-142233-104.png` — sortable, and correlates with "the
 /// thing I was just doing" at a glance.
 pub fn screenshot_file_name(now_ms: i64) -> String {
@@ -535,14 +607,21 @@ pub async fn submit_feedback(
         .unwrap_or_default();
 
     let title = derive_title(&text);
-    let body = build_body(&FeedbackReport {
+    let commit = git_commit(&root);
+    let report = FeedbackReport {
         text: &text,
         screenshot: screenshot.as_deref(),
         context: context.as_ref(),
         repo_root: &root,
         app_version: env!("CARGO_PKG_VERSION"),
-        commit: git_commit(&root).as_deref(),
-    });
+        commit: commit.as_deref(),
+    };
+
+    if sink_from_env(std::env::var("MACH_FEEDBACK_SINK").ok().as_deref()) == Sink::Session {
+        return hand_to_session(&report, &title, screenshot.as_deref(), &saved).await;
+    }
+
+    let body = build_body(&report);
 
     let binary = resolve_ty_binary(&ty_candidates())
         .map_err(|e| IpcError::internal(format!("{e}{saved}")))?;
@@ -582,6 +661,42 @@ pub async fn submit_feedback(
         task_id,
         screenshot_path: screenshot.map(|p| p.display().to_string()),
         output: if stdout.is_empty() { stderr } else { stdout },
+    })
+}
+
+/// Drop the item in the inbox and say so. No subprocess, no queue, no wait.
+async fn hand_to_session(
+    report: &FeedbackReport<'_>,
+    title: &str,
+    screenshot: Option<&Path>,
+    saved: &str,
+) -> Result<FeedbackReceipt, IpcError> {
+    let dir = inbox_dir();
+    ensure_feedback_dir(&feedback_dir()).await?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| IpcError::internal(format!("could not create {}: {e}{saved}", dir.display())))?;
+
+    let now = now_ms();
+    let path = dir.join(inbox_file_name(now));
+    let item = session_item(report, title, now);
+
+    // Written to a sibling and renamed: the watcher polls this directory, and
+    // a partially-written file it reads mid-write is an item silently lost.
+    // Rename within one directory is atomic.
+    let staging = path.with_extension("json.part");
+    tokio::fs::write(&staging, item.as_bytes())
+        .await
+        .map_err(|e| IpcError::internal(format!("could not write {}: {e}{saved}", staging.display())))?;
+    tokio::fs::rename(&staging, &path)
+        .await
+        .map_err(|e| IpcError::internal(format!("could not place {}: {e}{saved}", path.display())))?;
+
+    Ok(FeedbackReceipt {
+        task_id: None,
+        screenshot_path: screenshot.map(|p| p.display().to_string()),
+        message: "Picked up by the session working on Mach.".to_string(),
+        output: path.display().to_string(),
     })
 }
 

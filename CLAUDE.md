@@ -113,6 +113,35 @@ owes them `pl-[5.5rem]` — `chrome/TitleBar.tsx` is the reference.
 And "the tests pass" is not the same claim as "it looks right". Both are
 required; neither substitutes for the other.
 
+## Feedback from inside the app comes to you
+
+⌘K → Send feedback writes a JSON item into `.feedback/inbox/` and returns. It
+no longer shells out to `ty`. `MACH_FEEDBACK_SINK=taskyou` restores the old
+sink for when nobody is sitting in front of the app.
+
+A session working on Mach arms the watcher once:
+
+```
+Monitor({command: "scripts/feedback-inbox", persistent: true})
+```
+
+Each item arrives as `FEEDBACK <path> — <title>`. Read the file: it carries the
+brief, the annotated screenshot's path, and which view was open.
+
+Then, per item:
+
+1. Dispatch a subagent with `isolation: "worktree"`. Its first command is
+   `bin/worktree-setup`, which copies `.env.local`, installs node modules and
+   points cargo at the parent's build cache.
+2. The subagent implements and tests. It runs no git command.
+3. Bring the work in yourself: `git -C <worktree> add -A`, take the diff, apply
+   it to the main checkout, commit there.
+4. `scripts/qa restart` when Rust changed. Frontend edits hot-reload into the
+   running window already.
+
+The point is the round trip. An item submitted while he is using the app should
+be back in the app in minutes.
+
 ## Other standing rules
 
 - **Everything is keyboard navigable.** No mouse-only affordances, ever.

@@ -336,17 +336,13 @@ function Filed({ receipt }: { receipt: FeedbackReceipt }) {
         <CircleCheck size={15} strokeWidth={1.75} className="mt-px shrink-0 text-accent" />
         <div className="flex flex-col gap-1">
           <span className="text-body text-foreground">
-            {receipt.taskId ? `Task #${receipt.taskId}` : "Filed"}
+            {receipt.taskId ? `Task #${receipt.taskId}` : "Sent"}
           </span>
-          <span className="text-list text-muted-foreground">
-            Queued in <span className="font-mono">mach</span>.
-          </span>
+          <span className="text-list text-muted-foreground">{receipt.message}</span>
         </div>
       </div>
 
       <dl className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-1 text-micro">
-        <dt className="text-faint-foreground">What it says</dt>
-        <dd className="text-muted-foreground">{receipt.message}</dd>
         {receipt.screenshotPath && (
           <>
             <dt className="text-faint-foreground">Screenshot</dt>
@@ -357,7 +353,7 @@ function Filed({ receipt }: { receipt: FeedbackReceipt }) {
         )}
         {receipt.output && receipt.output !== receipt.message && (
           <>
-            <dt className="text-faint-foreground">ty said</dt>
+            <dt className="text-faint-foreground">{receipt.taskId ? "ty said" : "Item"}</dt>
             <dd className="whitespace-pre-wrap font-mono text-muted-foreground">
               {receipt.output}
             </dd>

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -uo pipefail
+#
+# scripts/feedback-inbox — stream in-app feedback into a working session.
+#
+# ⌘K → Send feedback writes one JSON file into `.feedback/inbox/`. This prints
+# a line per new file and moves it to `inbox/taken/`, so the session driving
+# this script is told about each item exactly once, within a second of it being
+# submitted, and a restarted watcher does not re-announce the backlog.
+#
+# Run it under the harness's Monitor, whose notifications are the delivery:
+#
+#   Monitor({command: "scripts/feedback-inbox", persistent: true})
+#
+# Each line is `FEEDBACK <path> — <title>`. The path is the moved file; read it
+# for the full brief, the screenshot path and what was on screen.
+#
+# The app writes `item-*.json.part` and renames, so a file matching `item-*.json`
+# is always complete. Nothing here parses the body: a malformed item is still
+# announced, because an item that vanishes silently is the failure this whole
+# loop exists to avoid.
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INBOX="${MACH_FEEDBACK_DIR:-$REPO/.feedback}/inbox"
+TAKEN="$INBOX/taken"
+
+mkdir -p "$TAKEN"
+
+title_of() {
+  python3 - "$1" <<'PY' 2>/dev/null || echo "(unreadable item)"
+import json, sys
+with open(sys.argv[1]) as f:
+    item = json.load(f)
+title = (item.get("title") or item.get("text") or "").strip().splitlines()
+print(title[0] if title else "(no text)")
+PY
+}
+
+while true; do
+  for item in "$INBOX"/item-*.json; do
+    [ -e "$item" ] || continue
+    dest="$TAKEN/$(basename "$item")"
+    mv "$item" "$dest" || continue
+    echo "FEEDBACK $dest — $(title_of "$dest")"
+  done
+  sleep 1
+done

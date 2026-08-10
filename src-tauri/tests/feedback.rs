@@ -9,9 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use mach_lib::ipc::feedback::{
-    build_body, capture_args, decode_png, derive_title, git_commit, parse_task_id,
-    resolve_ty_binary, screenshot_file_name, ty_args, FeedbackContext, FeedbackReport, WindowRect,
-    TY_PROJECT,
+    build_body, capture_args, decode_png, derive_title, git_commit, inbox_file_name, parse_task_id,
+    resolve_ty_binary, screenshot_file_name, session_item, sink_from_env, ty_args, FeedbackContext,
+    FeedbackReport, Sink, WindowRect, TY_PROJECT,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,6 +34,81 @@ fn report<'a>(text: &'a str, screenshot: Option<&'a Path>) -> FeedbackReport<'a>
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let index = args.iter().position(|a| a == name)?;
     args.get(index + 1).map(String::as_str)
+}
+
+// ---------------------------------------------------------------------------
+// which sink
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_session_is_the_default_sink() {
+    assert_eq!(sink_from_env(None), Sink::Session);
+    assert_eq!(sink_from_env(Some("")), Sink::Session);
+    assert_eq!(sink_from_env(Some("session")), Sink::Session);
+}
+
+#[test]
+fn taskyou_has_to_be_asked_for_by_name() {
+    assert_eq!(sink_from_env(Some("taskyou")), Sink::TaskYou);
+    assert_eq!(sink_from_env(Some(" TaskYou ")), Sink::TaskYou);
+    assert_eq!(sink_from_env(Some("ty")), Sink::TaskYou);
+}
+
+#[test]
+fn a_typo_lands_where_somebody_is_looking() {
+    // The two sinks fail differently: an item in the inbox nobody watches is
+    // still a file the owner can see, and a TaskYou task is a thing he was
+    // told about days later. A misspelling should not choose the second.
+    assert_eq!(sink_from_env(Some("taskyu")), Sink::Session);
+    assert_eq!(sink_from_env(Some("whatever")), Sink::Session);
+}
+
+// ---------------------------------------------------------------------------
+// the inbox item
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_item_is_named_in_arrival_order() {
+    let earlier = inbox_file_name(1_754_000_000_000);
+    let later = inbox_file_name(1_754_000_060_000);
+    assert!(earlier.starts_with("item-"), "{earlier}");
+    assert!(earlier.ends_with(".json"), "{earlier}");
+    assert!(!earlier.contains(".png"), "{earlier}");
+    assert!(earlier < later, "{earlier} should sort before {later}");
+}
+
+#[test]
+fn an_item_carries_the_same_brief_the_other_sink_would_have_filed() {
+    let shot = PathBuf::from("/Users/alex/Projects/mach/.feedback/feedback-1.png");
+    let report = report("the reply zone is cramped", Some(&shot));
+    let item = session_item(&report, "the reply zone is cramped", 1_754_000_000_000);
+    let parsed: serde_json::Value = serde_json::from_str(&item).expect("an item is JSON");
+
+    assert_eq!(parsed["title"], "the reply zone is cramped");
+    assert_eq!(parsed["text"], "the reply zone is cramped");
+    assert_eq!(parsed["screenshot"], shot.display().to_string());
+    assert_eq!(parsed["repoRoot"], "/Users/alex/Projects/mach");
+    assert_eq!(parsed["commit"], "abc123def456");
+    assert_eq!(parsed["createdAt"], 1_754_000_000_000_i64);
+    assert_eq!(parsed["body"], build_body(&report));
+}
+
+#[test]
+fn an_item_says_what_was_on_screen() {
+    let mut report = report("wrong account", None);
+    let context = FeedbackContext {
+        mode: Some("mail".into()),
+        account: Some("bruno@example.com".into()),
+        ..Default::default()
+    };
+    report.context = Some(&context);
+
+    let item = session_item(&report, "wrong account", 1_754_000_000_000);
+    let parsed: serde_json::Value = serde_json::from_str(&item).expect("an item is JSON");
+
+    assert_eq!(parsed["context"]["mode"], "mail");
+    assert_eq!(parsed["context"]["account"], "bruno@example.com");
+    assert!(parsed["screenshot"].is_null(), "no screenshot was taken");
 }
 
 // ---------------------------------------------------------------------------
