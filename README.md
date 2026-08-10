@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo/mark-on-dark.png">
+  <img src="assets/logo/mark-on-light.png" alt="Mach" width="64">
+</picture>
+
 # Mach
 
 A fast, keyboard-driven Gmail and Google Calendar desktop client for macOS, with

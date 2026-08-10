@@ -17,7 +17,16 @@
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://machmail.dev/" />
-    <meta property="og:image" content="https://machmail.dev/screenshot-mail.webp" />
+    <!-- The image an unfurl draws. It was the mail screenshot, which is WebP at
+         1440x813, so a large card trimmed the top and bottom off it and the UI
+         in it was unreadable at card size anyway. This is what
+         assets/logo/build.py writes: PNG at 1280x640, the 2:1 the cards crop
+         to, and the same image GitHub's repository card uses. -->
+    <meta property="og:image" content="https://machmail.dev/social-preview.png" />
+    <meta property="og:image:width" content="1280" />
+    <meta property="og:image:height" content="640" />
+    <meta property="og:image:alt" content="Mach" />
+    <meta name="twitter:card" content="summary_large_image" />
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111'/%3E%3Cg fill='none' stroke='%23fafafa' stroke-linecap='butt'%3E%3Cpath d='M3 8.7 L29 3.5' stroke-width='3'/%3E%3Cpath d='M3 16.35 L29 11.15' stroke-width='4.5'/%3E%3Cpath d='M3 25.5 L29 20.3' stroke-width='6'/%3E%3C/g%3E%3C/svg%3E"
@@ -162,6 +171,25 @@
 
       p + p {
         margin-top: 0.85em;
+      }
+
+      /* The mark beside the wordmark. Inlined from assets/logo/ramp.svg with
+         the viewBox cropped to the ink, so it costs no request and sits on the
+         text's baseline box rather than inside the transparent margin the app
+         icon carries for the Dock. Its ink is currentColor, which is why one
+         copy serves both themes. */
+      .brand {
+        display: flex;
+        align-items: center;
+        /* Wider than it measures, because the top lane pulls the mark's right
+           edge away from the wordmark. */
+        gap: 0.65rem;
+      }
+      .mark {
+        flex: none;
+        width: 1.75rem;
+        height: auto;
+        color: var(--foreground);
       }
 
       .wordmark {
@@ -459,7 +487,22 @@
   <body>
     <main class="page">
       <header>
-        <div class="wordmark">Mach</div>
+        <div class="brand">
+          <svg
+            class="mark"
+            viewBox="1.75 2 28.5 26.5"
+            width="28.5"
+            height="26.5"
+            fill="none"
+            stroke="currentColor"
+            aria-hidden="true"
+          >
+            <path d="M5 8.45 L27 3.25" stroke-width="2.5" stroke-linecap="round" />
+            <path d="M5 15.85 L27 10.65" stroke-width="4.5" stroke-linecap="round" />
+            <path d="M5 25.25 L27 20.05" stroke-width="6.5" stroke-linecap="round" />
+          </svg>
+          <span class="wordmark">Mach</span>
+        </div>
         <h1 class="measure" style="margin-top: 0.75rem">
           A fast Gmail and Google Calendar client for macOS.
         </h1>
