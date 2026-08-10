@@ -60,6 +60,7 @@ describe("parsePreferences", () => {
         agentBackend: "claudeCli",
         agentModel: "opus",
         agentCommand: "/usr/local/bin/my-agent",
+        handoffTerminalApp: "iTerm",
       }),
     ).toEqual({
       defaultAccountId: 7,
@@ -76,7 +77,16 @@ describe("parsePreferences", () => {
       agentBackend: "claudeCli",
       agentModel: "opus",
       agentCommand: "/usr/local/bin/my-agent",
+      handoffTerminalApp: "iTerm",
     });
+  });
+
+  it("keeps the terminal application as typed, trimmed", () => {
+    // A name or a bundle path, and `""` for the system's — the same free-text
+    // rule `agentModel` follows, because macOS is the thing that resolves it.
+    expect(parsePreferences({ handoffTerminalApp: "  iTerm " }).handoffTerminalApp).toBe("iTerm");
+    expect(parsePreferences({ handoffTerminalApp: 7 }).handoffTerminalApp).toBe("");
+    expect(DEFAULT_PREFERENCES.handoffTerminalApp).toBe("");
   });
 
   it("keeps the good fields when one of them is rubbish", () => {

@@ -217,6 +217,7 @@ pub fn run() {
             ipc::handoff::handoff_targets,
             ipc::handoff::handoff_save_targets,
             ipc::handoff::handoff_pick_directory,
+            ipc::handoff::handoff_terminals,
             ipc::handoff::handoff_preview,
             ipc::handoff::handoff_run,
             ipc::render::render_message_body,

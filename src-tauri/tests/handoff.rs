@@ -31,6 +31,7 @@ use mach_lib::ipc::handoff::engine::context::{
 use mach_lib::ipc::handoff::engine::plan::{self, LaunchPlan};
 use mach_lib::ipc::handoff::engine::target::{self, HandoffMode, HandoffTarget};
 use mach_lib::ipc::handoff::engine::template;
+use mach_lib::ipc::handoff::engine::terminal;
 use mach_lib::ipc::handoff::engine::{new_tag, HandoffError};
 
 /// Everything a sender might try, in one string.
@@ -705,15 +706,151 @@ fn the_command_layer_turns_a_thread_id_into_a_runnable_plan() {
     let _ = std::fs::remove_dir_all(&plan.work_dir);
 }
 
-#[test]
-fn the_terminal_app_can_be_named_but_defaults_to_whatever_opens_a_command_file() {
-    std::env::remove_var("MACH_HANDOFF_TERMINAL_APP");
-    assert_eq!(plan::open_args(Path::new("/tmp/x.command")), vec!["/tmp/x.command"]);
+// ---------------------------------------------------------------------------
+// Which terminal
+// ---------------------------------------------------------------------------
 
-    std::env::set_var("MACH_HANDOFF_TERMINAL_APP", "iTerm");
+#[test]
+fn the_system_default_is_a_bare_open_and_a_chosen_app_is_a_flag() {
+    // Nobody chose: whatever macOS opens a `.command` with.
     assert_eq!(
-        plan::open_args(Path::new("/tmp/x.command")),
+        plan::open_args(Path::new("/tmp/x.command"), None),
+        vec!["/tmp/x.command"]
+    );
+    // He chose: `open -a`, with the app as one argv element.
+    assert_eq!(
+        plan::open_args(Path::new("/tmp/x.command"), Some("iTerm")),
         vec!["-a", "iTerm", "/tmp/x.command"]
     );
-    std::env::remove_var("MACH_HANDOFF_TERMINAL_APP");
+    // A blank stored value is the same statement as no stored value, and a
+    // name is trimmed rather than handed to `open` with its spaces on.
+    assert_eq!(
+        plan::open_args(Path::new("/tmp/x.command"), Some("   ")),
+        vec!["/tmp/x.command"]
+    );
+    assert_eq!(
+        plan::open_args(Path::new("/tmp/x.command"), Some(" Ghostty ")),
+        vec!["-a", "Ghostty", "/tmp/x.command"]
+    );
+}
+
+/// A name that resolves to nothing must still reach `open` as itself.
+///
+/// This is the failure case the setting introduces: an application that has
+/// been renamed, moved, or never installed. `open` answers non-zero and opens
+/// nothing, and the sentence that comes back names the app — so the value that
+/// is wrong is in the message about it. Nothing is launched here; the argv is
+/// the assertion.
+#[test]
+fn a_terminal_that_does_not_exist_is_still_passed_through_by_name() {
+    assert_eq!(
+        plan::open_args(Path::new("/tmp/x.command"), Some("NotInstalled")),
+        vec!["-a", "NotInstalled", "/tmp/x.command"]
+    );
+    // A path is as legitimate an answer as a name — it is what `open -a` takes
+    // for an application somewhere macOS does not look.
+    assert_eq!(
+        plan::open_args(
+            Path::new("/tmp/x.command"),
+            Some("/Users/x/Applications/Ghostty.app")
+        ),
+        vec!["-a", "/Users/x/Applications/Ghostty.app", "/tmp/x.command"]
+    );
+}
+
+/// Detection reports what is on the disk it was pointed at, and nothing else.
+///
+/// Pointed at a tree the test built, because the answer on a real Mac depends
+/// on what happens to be installed there.
+#[test]
+fn only_the_terminals_that_are_installed_are_offered() {
+    let root = std::env::temp_dir().join(format!("mach-terminals-{}", new_tag()));
+    let apps = root.join("Applications");
+    let user_apps = root.join("UserApplications");
+    for name in ["iTerm.app", "Ghostty.app", "Slack.app"] {
+        std::fs::create_dir_all(apps.join(name)).expect("make a bundle");
+    }
+    std::fs::create_dir_all(user_apps.join("kitty.app")).expect("make a bundle");
+
+    let found = terminal::detect_in(&[apps.clone(), user_apps.clone()]);
+    let names: Vec<&str> = found.iter().map(|t| t.name.as_str()).collect();
+    // `KNOWN` order, so the menu does not shuffle between openings — and no
+    // Terminal.app, because this tree has none.
+    assert_eq!(names, vec!["iTerm", "Ghostty", "kitty"]);
+    assert!(!names.contains(&"Slack"), "a browser is not a terminal");
+    assert_eq!(found[0].path, apps.join("iTerm.app").to_string_lossy());
+    assert_eq!(found[2].path, user_apps.join("kitty.app").to_string_lossy());
+
+    // A machine with none of them offers none, rather than offering a name
+    // that would fail at `open`.
+    let empty = root.join("Empty");
+    std::fs::create_dir_all(&empty).expect("make a directory");
+    assert!(terminal::detect_in(&[empty]).is_empty());
+
+    // The real search covers where Terminal.app has lived since Catalina, and
+    // where a single-user install lands.
+    let dirs = terminal::search_dirs();
+    assert!(dirs.contains(&std::path::PathBuf::from("/System/Applications/Utilities")));
+    assert!(dirs.iter().any(|d| d.ends_with("Applications")));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The stored preference, the environment variable, and which wins.
+///
+/// One test rather than three because they all read the same process-wide
+/// environment, and three tests would race each other.
+#[test]
+fn the_environment_still_overrides_the_stored_choice() {
+    std::env::remove_var(terminal::TERMINAL_APP_ENV);
+    assert_eq!(terminal::chosen(None), None);
+    assert_eq!(terminal::chosen(Some("iTerm")), Some("iTerm".to_string()));
+    assert_eq!(terminal::chosen(Some("  ")), None);
+
+    std::env::set_var(terminal::TERMINAL_APP_ENV, "Ghostty");
+    assert_eq!(terminal::forced(), Some("Ghostty".to_string()));
+    assert_eq!(
+        terminal::chosen(Some("iTerm")),
+        Some("Ghostty".to_string()),
+        "an environment variable somebody set on purpose outranks the setting"
+    );
+    // An empty override is not an override.
+    std::env::set_var(terminal::TERMINAL_APP_ENV, "   ");
+    assert_eq!(terminal::forced(), None);
+    assert_eq!(terminal::chosen(Some("iTerm")), Some("iTerm".to_string()));
+    std::env::remove_var(terminal::TERMINAL_APP_ENV);
+}
+
+/// The setting survives the store, and is read back the way the launcher reads
+/// it.
+#[test]
+fn the_chosen_terminal_is_a_preference_like_any_other() {
+    use mach_lib::ipc::handoff::terminal_app;
+
+    std::env::remove_var(terminal::TERMINAL_APP_ENV);
+    let db = db();
+    // Nothing written: the system default.
+    assert_eq!(terminal_app(&db).expect("read"), None);
+
+    // Written the way the frontend writes it — `set_preference` would take this
+    // key, which is the point of it having no dot in it.
+    assert!(mach_lib::ipc::prefs::is_valid_key(terminal::TERMINAL_APP_KEY));
+    db.write(|conn| {
+        mach_lib::ipc::prefs::set(
+            conn,
+            terminal::TERMINAL_APP_KEY,
+            &serde_json::json!("iTerm"),
+            0,
+        )
+    })
+    .expect("write the preference");
+    assert_eq!(terminal_app(&db).expect("read"), Some("iTerm".to_string()));
+
+    // A value of the wrong type is absent, not fatal — the rule the rest of the
+    // preferences layer follows.
+    db.write(|conn| {
+        mach_lib::ipc::prefs::set(conn, terminal::TERMINAL_APP_KEY, &serde_json::json!(7), 0)
+    })
+    .expect("write a nonsense value");
+    assert_eq!(terminal_app(&db).expect("read"), None);
 }

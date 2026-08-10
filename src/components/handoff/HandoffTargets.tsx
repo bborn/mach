@@ -2,21 +2,29 @@ import { FolderOpen, Plus, Trash2 } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import {
+  NO_TERMINALS,
+  OTHER_TERMINAL,
   PLACEHOLDERS,
   draftTarget,
+  loadTerminals,
   nameFromDir,
   pickDirectory,
   saveTargets,
   targetProblem,
   targetSnapshot,
+  terminalFromSelection,
+  terminalItems,
+  terminalSelection,
   type HandoffMode,
   type HandoffTarget,
+  type Terminals,
 } from "@/lib/handoff";
 import { errorMessage } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
+import { usePreferencesStore } from "@/components/prefs/PreferencesProvider";
 import { Overlay } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Field, FieldLabel } from "@/components/ui/field";
+import { Field, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -149,6 +157,10 @@ export function HandoffTargetsDialog({ onClose }: { onClose: () => void }) {
           Add target
         </Button>
 
+        <div className="mt-1 border-t border-border pt-2.5">
+          <TerminalChoice />
+        </div>
+
         {failure && <p className="text-list text-danger">{failure}</p>}
       </div>
 
@@ -166,6 +178,112 @@ export function HandoffTargetsDialog({ onClose }: { onClose: () => void }) {
         </span>
       </footer>
     </Overlay>
+  );
+}
+
+/**
+ * Which terminal `Terminal` mode means.
+ *
+ * One control for the whole app rather than one per row: a person has one
+ * terminal, and a column repeating the same word in every target would be a
+ * column that can only ever disagree with itself. It lives here rather than in
+ * ⌘, because this is the surface where `Terminal` is chosen, and splitting one
+ * feature's configuration across two dialogs is how a setting becomes
+ * unfindable. The value itself is an ordinary preference — see
+ * `handoffTerminalApp` in `lib/prefs.ts`.
+ *
+ * The menu offers what is installed, found by looking for the bundles rather
+ * than by listing names. Eight terminals in a menu on a Mac that has two is a
+ * menu you have to read; `Other…` is underneath for a build kept somewhere
+ * macOS does not look, and takes a name or a path. A name that resolves to
+ * nothing fails at launch with a sentence naming it — `open` opens nothing and
+ * says so, and `handoff::plan` passes that through.
+ */
+function TerminalChoice() {
+  const { prefs, set, loaded } = usePreferencesStore();
+  const [terminals, setTerminals] = useState<Terminals>(NO_TERMINALS);
+  const [detected, setDetected] = useState(false);
+  // Whether the text field is open. Not derivable from the value: `iTerm` is a
+  // detected name whether he picked it from the menu or typed it.
+  const [custom, setCustom] = useState(false);
+  const settled = useRef(false);
+  const id = useId();
+
+  useEffect(() => {
+    let live = true;
+    void loadTerminals().then((next) => {
+      if (!live) return;
+      setTerminals(next);
+      setDetected(true);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  // Which row is selected on arrival, decided once both halves have landed —
+  // asking before the terminals are known would read a configured `iTerm` as
+  // "something I have never heard of" and open the text field over it.
+  useEffect(() => {
+    if (settled.current || !loaded || !detected) return;
+    settled.current = true;
+    setCustom(terminalSelection(prefs.handoffTerminalApp, terminals.installed) === OTHER_TERMINAL);
+  }, [loaded, detected, prefs.handoffTerminalApp, terminals.installed]);
+
+  const stored = prefs.handoffTerminalApp;
+  const items = terminalItems(terminals.installed);
+  const selection = custom ? OTHER_TERMINAL : terminalSelection(stored, terminals.installed);
+
+  // The environment variable predates this control and still wins, so the
+  // control says so rather than offering a choice that would not be applied.
+  if (terminals.forced) {
+    return (
+      <Field orientation="row">
+        <FieldLabel htmlFor={id}>Terminal</FieldLabel>
+        <Input id={id} value={terminals.forced} readOnly className="w-[13rem] font-mono" />
+        <FieldDescription>Set by MACH_HANDOFF_TERMINAL_APP</FieldDescription>
+      </Field>
+    );
+  }
+
+  return (
+    <Field orientation="row">
+      <FieldLabel htmlFor={id}>Terminal</FieldLabel>
+      <span className="flex min-w-0 items-center gap-1.5">
+        <span className={cn("shrink-0", custom ? "w-[9rem]" : "w-[13rem]")}>
+          <Select
+            items={items}
+            value={selection}
+            onValueChange={(next) => {
+              if (next === null) return;
+              setCustom(next === OTHER_TERMINAL);
+              set("handoffTerminalApp", terminalFromSelection(next, stored));
+            }}
+          >
+            <SelectTrigger id={id} aria-label="Terminal">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {items.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </span>
+        {custom && (
+          <Input
+            aria-label="Application name or path"
+            spellCheck={false}
+            placeholder="/Applications/iTerm.app"
+            className="font-mono"
+            value={stored}
+            onChange={(event) => set("handoffTerminalApp", event.target.value)}
+          />
+        )}
+      </span>
+    </Field>
   );
 }
 

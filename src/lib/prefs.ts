@@ -44,8 +44,9 @@
  *   | `agentBackend` | Rust: `agent::backend`, when a session starts |
  *   | `agentModel` | Rust: `agent::backend`, likewise |
  *   | `agentCommand` | Rust: `agent::backend`, likewise |
+ *   | `handoffTerminalApp` | Rust: `handoff::terminal`, when a handoff opens one |
  *
- * The last three are read only in Rust, and that is not an inconsistency. A
+ * The last four are read only in Rust, and that is not an inconsistency. A
  * notification is a decision about a message that has *just arrived*, which is
  * knowledge the sync loop has and the window does not — the window may not even
  * be open. So these three are settings the frontend writes and never reads,
@@ -154,6 +155,15 @@ export interface Preferences {
   agentModel: string;
   /** The command line for `agentBackend: "command"`. See `docs/agent-backends.md`. */
   agentCommand: string;
+  /**
+   * Which application a terminal-mode handoff opens in.
+   *
+   * The argument `open -a` is given: an application name (`iTerm`) or a bundle
+   * path, and `""` for whatever macOS opens a `.command` with. One value rather
+   * than one per handoff target, because a person has one terminal — the
+   * editor writes it, and only Rust reads it.
+   */
+  handoffTerminalApp: string;
 }
 
 /**
@@ -175,6 +185,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
   agentBackend: "auto",
   agentModel: "",
   agentCommand: "",
+  handoffTerminalApp: "",
 };
 
 export interface Bounds {
@@ -318,6 +329,7 @@ export function parsePreferences(raw: unknown): Preferences {
     // id is a failure two layers away from where it was made.
     agentModel: text(source.agentModel),
     agentCommand: text(source.agentCommand),
+    handoffTerminalApp: text(source.handoffTerminalApp),
   };
 }
 

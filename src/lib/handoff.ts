@@ -79,6 +79,78 @@ export interface HandoffReceipt {
   stderr: string;
 }
 
+/** One terminal application that is installed on this Mac. */
+export interface InstalledTerminal {
+  /** What `open -a` is given, and what the menu says. */
+  name: string;
+  /** The bundle it was found at. */
+  path: string;
+}
+
+/** What the editor's terminal menu is built from. */
+export interface Terminals {
+  installed: InstalledTerminal[];
+  /** `MACH_HANDOFF_TERMINAL_APP`, when it is set. It wins over the setting. */
+  forced: string | null;
+}
+
+/** Nothing installed, nothing forced. What the browser and a failed call get. */
+export const NO_TERMINALS: Terminals = { installed: [], forced: null };
+
+/**
+ * The two menu entries that are not applications.
+ *
+ * Sentinels rather than values, because the stored preference is free text:
+ * `""` means the system default and anything unrecognised means he typed a
+ * name of his own, and neither of those is a row the menu can hold as itself.
+ */
+export const SYSTEM_TERMINAL = "system";
+export const OTHER_TERMINAL = "other";
+
+/**
+ * Which menu row a stored value selects.
+ *
+ * `""` is the system default. A value naming something that was detected
+ * selects that row. Anything else is a name he typed — an application in a
+ * place macOS does not look, or one that is no longer there — and it selects
+ * "Other", where the text is still on screen and still editable.
+ */
+export function terminalSelection(stored: string, installed: readonly InstalledTerminal[]): string {
+  const value = stored.trim();
+  if (!value) return SYSTEM_TERMINAL;
+  return installed.some((terminal) => terminal.name === value) ? value : OTHER_TERMINAL;
+}
+
+/** The menu, in the order it reads: the system's, what is installed, then Other. */
+export function terminalItems(
+  installed: readonly InstalledTerminal[],
+): { value: string; label: string }[] {
+  return [
+    { value: SYSTEM_TERMINAL, label: "System default" },
+    ...installed.map((terminal) => ({ value: terminal.name, label: terminal.name })),
+    { value: OTHER_TERMINAL, label: "Other…" },
+  ];
+}
+
+/**
+ * What picking a menu row stores.
+ *
+ * "Other" stores nothing new: it opens a text field, and what he types there is
+ * the next write. Keeping the current value rather than clearing it means
+ * picking it while `iTerm` is selected leaves `iTerm` in the box to be edited
+ * into a path, instead of an empty field and a handoff that has silently gone
+ * back to the system default.
+ *
+ * Which is why "Other" cannot be inferred from the value alone — `iTerm` is a
+ * detected name whichever way it was arrived at — and the editor holds it as
+ * its own state. {@link terminalSelection} is only the answer on first render.
+ */
+export function terminalFromSelection(selection: string, stored: string): string {
+  if (selection === SYSTEM_TERMINAL) return "";
+  if (selection === OTHER_TERMINAL) return stored.trim();
+  return selection;
+}
+
 /** Every `{{name}}` a `run` template understands. Shown under the field. */
 export const PLACEHOLDERS = [
   "prompt",
@@ -336,6 +408,25 @@ export async function loadTargets(): Promise<HandoffTarget[]> {
 /** Replace the list. Comes back normalized — trimmed, with ids filled in. */
 export async function saveTargets(next: HandoffTarget[]): Promise<HandoffTarget[]> {
   return setTargets(await call<HandoffTarget[]>("handoff_save_targets", { targets: next }));
+}
+
+/**
+ * The terminals this Mac has, and any environment override.
+ *
+ * Never rejects: a browser tab has no applications to find, and an editor that
+ * refused to render because it could not enumerate them would be worse than one
+ * offering the system default and a text field.
+ */
+export async function loadTerminals(): Promise<Terminals> {
+  try {
+    const answer = await call<Terminals>("handoff_terminals");
+    return {
+      installed: Array.isArray(answer?.installed) ? answer.installed : [],
+      forced: answer?.forced ?? null,
+    };
+  } catch {
+    return NO_TERMINALS;
+  }
 }
 
 /** The system folder panel. `null` when he cancelled. */

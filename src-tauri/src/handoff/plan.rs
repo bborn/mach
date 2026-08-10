@@ -445,7 +445,11 @@ pub async fn run_inline(plan: &LaunchPlan) -> Result<Launched, HandoffError> {
 }
 
 /// Write the three files and let the terminal have it.
-pub fn open_in_terminal(plan: &LaunchPlan) -> Result<Launched, HandoffError> {
+///
+/// `app` is the application `open -a` should hand the script to — his choice,
+/// resolved by [`super::terminal::chosen`] — or `None` for whatever macOS opens
+/// a `.command` with.
+pub fn open_in_terminal(plan: &LaunchPlan, app: Option<&str>) -> Result<Launched, HandoffError> {
     let argv_file = plan.work_dir.join("argv.bin");
     std::fs::write(&argv_file, plan.argv_file_bytes())
         .map_err(|e| HandoffError::Io(format!("could not write {}: {e}", argv_file.display())))?;
@@ -456,13 +460,23 @@ pub fn open_in_terminal(plan: &LaunchPlan) -> Result<Launched, HandoffError> {
     make_executable(&script)?;
 
     let open = std::process::Command::new("/usr/bin/open")
-        .args(open_args(&script))
+        .args(open_args(&script, app))
         .status()
         .map_err(|e| HandoffError::Io(format!("could not run /usr/bin/open: {e}")))?;
 
     if !open.success() {
+        // Naming the app is the whole point of this branch. `open` refuses a
+        // name it cannot resolve — an application that has been renamed, moved
+        // or never installed — and it refuses it *quietly*, having opened
+        // nothing. A message that said only "the terminal would not open"
+        // would leave him looking at the setting that is wrong without saying
+        // that it is the setting that is wrong.
         return Err(HandoffError::Io(format!(
-            "the terminal would not open{}. The command is ready at {}.",
+            "{} would not open{}. The command is ready at {}.",
+            match app {
+                Some(app) => app,
+                None => "the terminal",
+            },
             open.code().map(|c| format!(" (exit {c})")).unwrap_or_default(),
             script.display()
         )));
@@ -485,13 +499,17 @@ pub fn open_in_terminal(plan: &LaunchPlan) -> Result<Launched, HandoffError> {
 ///
 /// The bare form goes to whatever handles `.command`, which is Terminal unless
 /// he has told macOS otherwise — and if he has, that is the answer he wants.
-pub fn open_args(script: &Path) -> Vec<String> {
+///
+/// The app is an argument rather than something read from the environment here:
+/// where the choice comes from is [`super::terminal`]'s business, and this is
+/// argv. It reaches `open` as one element of that vector, so a name with a
+/// space in it — `Google Chrome.app` — needs no quoting and cannot become two
+/// arguments.
+pub fn open_args(script: &Path, app: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
-    if let Ok(app) = std::env::var("MACH_HANDOFF_TERMINAL_APP") {
-        if !app.trim().is_empty() {
-            args.push("-a".to_string());
-            args.push(app.trim().to_string());
-        }
+    if let Some(app) = app.map(str::trim).filter(|app| !app.is_empty()) {
+        args.push("-a".to_string());
+        args.push(app.to_string());
     }
     args.push(script.to_string_lossy().into_owned());
     args

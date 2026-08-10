@@ -12,8 +12,14 @@ import {
   rankTargets,
   setTargets,
   targetProblem,
+  terminalFromSelection,
+  terminalItems,
+  terminalSelection,
   unbalanced,
+  OTHER_TERMINAL,
+  SYSTEM_TERMINAL,
   type HandoffTarget,
+  type InstalledTerminal,
 } from "./handoff";
 import { registerResolver, resolve, type PaletteContext } from "./palette/resolver";
 
@@ -199,5 +205,48 @@ describe("a target", () => {
     expect(unbalanced(`claude 'a "b" c'`)).toBe(false);
     expect(unbalanced(`claude "unterminated`)).toBe(true);
     expect(unbalanced(`claude \\" fine`)).toBe(false);
+  });
+});
+
+describe("the terminal a handoff opens in", () => {
+  const installed: InstalledTerminal[] = [
+    { name: "Terminal", path: "/System/Applications/Utilities/Terminal.app" },
+    { name: "iTerm", path: "/Applications/iTerm.app" },
+  ];
+
+  it("offers the system's, then what is installed, then a way to name one", () => {
+    expect(terminalItems(installed).map((item) => item.label)).toEqual([
+      "System default",
+      "Terminal",
+      "iTerm",
+      "Other…",
+    ]);
+    // A Mac with nothing detectable still offers both ends of the menu.
+    expect(terminalItems([]).map((item) => item.value)).toEqual([SYSTEM_TERMINAL, OTHER_TERMINAL]);
+  });
+
+  it("selects the system's when nothing is stored", () => {
+    expect(terminalSelection("", installed)).toBe(SYSTEM_TERMINAL);
+    expect(terminalSelection("   ", installed)).toBe(SYSTEM_TERMINAL);
+  });
+
+  it("selects an installed terminal by its own name", () => {
+    expect(terminalSelection("iTerm", installed)).toBe("iTerm");
+  });
+
+  it("keeps a name it did not detect in the text field rather than dropping it", () => {
+    // The escape hatch, and the application that has been uninstalled since it
+    // was chosen. Both keep their text on screen: a value that will fail at
+    // launch has to be visible in the control that set it.
+    expect(terminalSelection("/Users/x/Applications/Ghostty.app", installed)).toBe(OTHER_TERMINAL);
+    expect(terminalSelection("Warp", installed)).toBe(OTHER_TERMINAL);
+  });
+
+  it("stores the empty string for the system default and the name for anything else", () => {
+    expect(terminalFromSelection(SYSTEM_TERMINAL, "iTerm")).toBe("");
+    expect(terminalFromSelection("iTerm", "")).toBe("iTerm");
+    // "Other" opens a field; what is already there stays there to be edited.
+    expect(terminalFromSelection(OTHER_TERMINAL, "iTerm")).toBe("iTerm");
+    expect(terminalFromSelection(OTHER_TERMINAL, "")).toBe("");
   });
 });

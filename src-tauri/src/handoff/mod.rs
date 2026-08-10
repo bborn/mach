@@ -57,6 +57,7 @@
 //! | [`template`] | tokenizing `run`, and substitution that cannot escape a token |
 //! | [`context`] | a thread or an event as fenced, untrusted text |
 //! | [`plan`] | argv + environment + files, and the two ways to launch |
+//! | [`terminal`] | which terminal application the terminal path opens |
 //!
 //! Everything that decides anything is a plain function over plain data, so
 //! `tests/handoff.rs` drives the whole surface without launching a process.
@@ -65,10 +66,12 @@ pub mod context;
 pub mod plan;
 pub mod target;
 pub mod template;
+pub mod terminal;
 
 pub use context::{HandoffContext, HandoffSource};
 pub use plan::{LaunchPlan, Launched};
 pub use target::{HandoffMode, HandoffTarget};
+pub use terminal::Terminal;
 
 /// The value the fence markers carry, and the name of the scratch directory.
 ///

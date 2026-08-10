@@ -5,6 +5,7 @@
 //! | `handoff_targets` | — | [`HandoffTarget`]`[]` |
 //! | `handoff_save_targets` | `targets` | the normalized list |
 //! | `handoff_pick_directory` | — | `String?` — a folder, or `null` if cancelled |
+//! | `handoff_terminals` | — | [`Terminals`] — what is installed, and any override |
 //! | `handoff_preview` | `targetId?`, `note`, `source` | [`HandoffPreview`] |
 //! | `handoff_run` | `targetId`, `note`, `source` | [`Launched`] |
 //!
@@ -34,6 +35,7 @@ use tauri::State;
 use engine::context::{AttachmentRef, EventSource, HandoffSource, MailMessage, MailSource};
 use engine::plan::{self, LaunchPlan, Launched};
 use engine::target::{self, HandoffTarget};
+use engine::terminal::{self, Terminal};
 use engine::{context, HandoffError};
 
 use crate::db::{command_queries, queries, Db};
@@ -84,6 +86,19 @@ pub struct HandoffPreview {
     pub context_file: String,
     /// Whether this target has ever launched anything. Drives the confirmation.
     pub unproven: bool,
+}
+
+/// The terminals to choose between, and whether the choice is being made
+/// somewhere else.
+///
+/// `forced` is [`terminal::TERMINAL_APP_ENV`], and it is on the wire so that the
+/// editor can say the environment is deciding rather than render a menu whose
+/// selection would have no effect.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Terminals {
+    pub installed: Vec<Terminal>,
+    pub forced: Option<String>,
 }
 
 // ===========================================================================
@@ -142,6 +157,19 @@ pub async fn handoff_pick_directory(app: tauri::AppHandle) -> Result<Option<Stri
         .map_err(|e| IpcError::internal(format!("that is not a directory Mach can use: {e}")))
 }
 
+/// The terminals this Mac has, for the menu in the editor.
+///
+/// Asked every time the editor opens rather than cached: applications are
+/// installed and thrown away while the app is running, and this is four
+/// `stat`s in a directory the filesystem has in cache.
+#[tauri::command]
+pub fn handoff_terminals() -> Result<Terminals, IpcError> {
+    Ok(Terminals {
+        installed: terminal::installed(),
+        forced: terminal::forced(),
+    })
+}
+
 /// What would be sent, without sending it.
 #[tauri::command]
 pub fn handoff_preview(
@@ -182,11 +210,14 @@ pub async fn handoff_run(
     let launched = match target.mode {
         target::HandoffMode::Inline => plan::run_inline(&plan).await?,
         target::HandoffMode::Terminal => {
+            let app = terminal_app(&state.db)?;
             // `open` waits for LaunchServices, which for a cold Terminal is a
             // second or two of doing nothing on a Tokio worker.
-            tauri::async_runtime::spawn_blocking(move || plan::open_in_terminal(&plan))
-                .await
-                .map_err(|e| IpcError::internal(format!("the launcher did not answer: {e}")))??
+            tauri::async_runtime::spawn_blocking(move || {
+                plan::open_in_terminal(&plan, app.as_deref())
+            })
+            .await
+            .map_err(|e| IpcError::internal(format!("the launcher did not answer: {e}")))??
         }
     };
 
@@ -234,6 +265,19 @@ pub fn prepare(
     let context = context::build(&source, &tag);
     let plan = LaunchPlan::prepare(&target, note, &context, &tag)?;
     Ok((target, plan))
+}
+
+/// His terminal, as `open -a` will be given it, or `None` for the system's.
+///
+/// Public for the same reason [`prepare`] is: it is a decision, and
+/// `tests/handoff.rs` drives it over a real database rather than over an
+/// application it cannot start.
+pub fn terminal_app(db: &Db) -> Result<Option<String>, IpcError> {
+    let stored = db.read(|conn| super::prefs::get(conn, terminal::TERMINAL_APP_KEY))?;
+    // A value of the wrong type is treated as absent, which is the rule the
+    // whole preferences layer follows: one bad row costs one setting.
+    let stored = stored.as_ref().and_then(|value| value.as_str());
+    Ok(terminal::chosen(stored))
 }
 
 pub fn read_source(db: &Db, source: Option<&SourceRef>) -> Result<HandoffSource, IpcError> {
