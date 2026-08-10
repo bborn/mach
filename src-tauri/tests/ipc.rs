@@ -908,6 +908,7 @@ fn camel_case_sync_status() {
         "configured",
         "configurationError",
         "needsReauthorization",
+        "missingScope",
     ] {
         assert!(payload.get(key).is_some(), "sync status is missing {key}");
     }
@@ -1209,6 +1210,49 @@ fn a_seeded_store_reports_every_account_as_needing_credentials_and_returns() {
         ]
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// The other way an account comes to need authorizing: the credential is fine
+/// and the grant is too narrow.
+///
+/// Adding `gmail.settings.basic` to `oauth::SCOPES` puts every account here at
+/// once, so this failure has to be a state the window can render rather than a
+/// sentence in one dialog. It lands in `needsReauthorization` beside the dead
+/// credentials — the remedy is the same — and in `missingScope` as well, which
+/// is what lets a surface say which of the two it is looking at.
+#[tokio::test]
+async fn a_grant_missing_a_scope_puts_the_account_on_the_reauthorization_list() {
+    let path = temp_path("scope-notice");
+    let config = AppConfig::from_values(
+        &path,
+        Some("id.apps.googleusercontent.com".into()),
+        Some("GOCSPX-secret".into()),
+    );
+    let state = mach_lib::ipc::bootstrap(config).expect("boot");
+
+    assert!(state.status_payload().needs_reauthorization.is_empty());
+
+    // What `commands::filters` does when Gmail answers 403
+    // `insufficientPermissions`.
+    state
+        .dispatcher
+        .scope_notices()
+        .record("alex@lumen.example");
+
+    let status = state.status_payload();
+    assert_eq!(status.needs_reauthorization, vec!["alex@lumen.example"]);
+    assert_eq!(status.missing_scope, vec!["alex@lumen.example"]);
+
+    // Signing in again is the remedy, and taking it clears the record — a
+    // notice that outlived the grant that caused it would leave the account
+    // permanently marked.
+    state.mark_reauthorized("alex@lumen.example");
+    let status = state.status_payload();
+    assert!(status.needs_reauthorization.is_empty());
+    assert!(status.missing_scope.is_empty());
+
+    drop(state);
+    remove_db_files(&path);
 }
 
 // ---------------------------------------------------------------------------

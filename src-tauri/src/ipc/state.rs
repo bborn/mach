@@ -25,6 +25,13 @@
 //! makes that account appear in `needsReauthorization` — it is not an error and
 //! it does not stop the other four from syncing.
 //!
+//! An account whose credential is fine and whose *grant* is too narrow lands in
+//! the same list, from the other end: a 403 with `insufficientPermissions` is
+//! recorded by the command layer (see [`crate::commands::filters::ScopeNotices`])
+//! and merged in here. Both mean "consent again"; `missing_scope` is what lets a
+//! surface say which of the two it is looking at, because they are not the same
+//! failure and the account with the narrow grant is still syncing mail perfectly.
+//!
 //! A QA instance is the same case for every row at once. It addresses its own
 //! Keychain namespace (see [`crate::auth::tokens::keychain_service`]), so a
 //! store copied from the owner by `scripts/qa seed` arrives with accounts and
@@ -246,6 +253,7 @@ impl AppState {
     /// The engine's picture plus the two questions it cannot answer.
     pub fn status_payload(&self) -> SyncStatusPayload {
         let status = self.sync.status_snapshot();
+        let missing_scope = self.dispatcher.scope_notices().emails();
         SyncStatusPayload {
             running: status.running,
             accounts: status.accounts,
@@ -254,24 +262,34 @@ impl AppState {
             configured: self.config.is_configured(),
             configuration_error: self.config.configuration_error.clone(),
             needs_reauthorization: self.needs_reauthorization(),
+            missing_scope,
         }
     }
 
-    /// Every address that needs a person to sign in again, from both places
-    /// that can know.
+    /// Every address that needs a person to sign in again, from all three
+    /// places that can know.
     ///
     /// The startup check finds accounts with *no* Keychain entry. It cannot find
     /// the other and more common case — an entry that is present and dead —
     /// because a revoked refresh token is a perfectly ordinary string until
     /// Google is asked about it. That one is found by the sync loop, on the
-    /// first pass after launch, and it is why this is a union rather than the
-    /// list `bootstrap` built.
+    /// first pass after launch.
+    ///
+    /// The third is a grant that is missing a scope, which belongs here and not
+    /// only in `missing_scope`: the remedy is identical, and the status bar
+    /// counts this list. `missing_scope` is the narrower fact, for the surfaces
+    /// that can say *which* of the three it is.
     pub fn needs_reauthorization(&self) -> Vec<String> {
         let mut out = lock(&self.needs_reauthorization).clone();
         let live = self.sync.status_snapshot();
         for email in live.needs_reauthorization() {
             if !out.iter().any(|e| e == email) {
                 out.push(email.to_string());
+            }
+        }
+        for email in self.dispatcher.scope_notices().emails() {
+            if !out.contains(&email) {
+                out.push(email);
             }
         }
         out
@@ -282,6 +300,9 @@ impl AppState {
         // And the sync loop's own verdict, or a successful sign-in would leave
         // the label up until the next pass proved it wrong.
         self.sync.clear_reauthorization(email);
+        // A fresh grant is a fresh set of scopes, so whatever was refused
+        // before is worth trying again rather than being remembered forever.
+        self.dispatcher.scope_notices().clear(email);
     }
 
     pub fn mark_needs_reauthorization(&self, email: &str) {

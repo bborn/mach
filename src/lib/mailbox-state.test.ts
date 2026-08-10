@@ -28,6 +28,7 @@ function status(accounts: AccountSyncStatus[], overrides: Partial<SyncStatus> = 
     configured: true,
     configurationError: null,
     needsReauthorization: [],
+    missingScope: [],
     ...overrides,
   };
 }
@@ -319,6 +320,30 @@ describe("sync progress", () => {
     // rail counts them and the detail says which is which. "Sync failed" alone
     // would under-report by one.
     expect(progress.label).toBe("Sync failed on 2 accounts");
+  });
+
+  /**
+   * The other reason an account is on that list, and not the same failure.
+   *
+   * Adding a scope invalidates every grant the owner already has. His mail is
+   * still syncing; one feature is not. Telling him to sign in again with no
+   * mention of a permission sends him looking for a broken mailbox.
+   */
+  it("distinguishes a grant that is missing a permission from a dead credential", () => {
+    const progress = syncProgress(
+      status([account({ phase: "done", lastSuccessAt: 1 })], {
+        lastPassFinishedAt: 2,
+        needsReauthorization: ["alex@lumen.example", "gone@lumen.example"],
+        missingScope: ["alex@lumen.example"],
+      }),
+    );
+    expect(progress.errors).toEqual([
+      {
+        email: "alex@lumen.example",
+        message: "alex@lumen.example has not granted a permission Mach now needs",
+      },
+      { email: "gone@lumen.example", message: "gone@lumen.example needs signing in again" },
+    ]);
   });
 
   it("says up to date once a pass has finished with nothing running", () => {

@@ -561,6 +561,14 @@ fn the_mcp_surface_is_exactly_the_command_layer_and_nothing_more() {
         tools::DRAFT_TOOL,
         tools::NEW_DRAFT_TOOL,
         tools::SEND_TOOL,
+        // Gmail filters are not commands — they have no local row, no inverse
+        // and no thread ids, which is why `commands::filters` sits beside the
+        // catalogue rather than in it. They still reach Gmail through the same
+        // dispatcher, so the guarantee this test is really making — no
+        // privileged path to Google — is intact.
+        tools::LIST_FILTERS_TOOL,
+        tools::CREATE_FILTER_TOOL,
+        tools::DELETE_FILTER_TOOL,
     ];
     for name in &names {
         let is_command = Command::catalogue().iter().any(|s| s.kind == name);

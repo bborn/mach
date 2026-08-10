@@ -21,8 +21,11 @@ import type {
   CalendarEvent,
   CalendarId,
   EventId,
+  FilterAction,
+  FilterCriteria,
   Label,
   LabelId,
+  MailFilter,
   Participant,
   Rsvp,
   SyncStatus,
@@ -393,6 +396,23 @@ export interface MachDataSource {
   beginAddAccount(email?: string): Promise<PendingAuthorization>;
   completeAddAccount(pendingId: string): Promise<Account>;
   removeAccount(accountId: AccountId): Promise<void>;
+
+  /**
+   * Gmail filters, read live from Google rather than from the local store.
+   *
+   * The one place the app waits on Google, and the argument is in
+   * `src-tauri/src/commands/filters.rs`: a filter has never been a local row,
+   * Google offers no change feed to keep a copy fresh, and a delete addressing
+   * an id from a stale list is worse than a moment of waiting. Callers must
+   * render the failure — `MachError` carries the sentence.
+   */
+  listFilters(accountId?: AccountId | null): Promise<MailFilter[]>;
+  createFilter(
+    accountId: AccountId,
+    criteria: FilterCriteria,
+    action: FilterAction,
+  ): Promise<MailFilter>;
+  deleteFilter(accountId: AccountId, filterId: string): Promise<void>;
   /** Hand the URL to the system browser; Google's consent screen is not ours. */
   openExternal(url: string): Promise<void>;
 
@@ -606,6 +626,7 @@ export const fixtureSource: MachDataSource = {
       configured: true,
       configurationError: null,
       needsReauthorization: [],
+      missingScope: [],
     };
   },
   async syncNow() {
@@ -623,6 +644,18 @@ export const fixtureSource: MachDataSource = {
   },
   async removeAccount() {
     throw new MachError("unavailable", "Accounts can only be removed in the desktop app.");
+  },
+
+  // A filter lives in Gmail, not in the fixture set, so there is nothing
+  // honest to render here and nothing to pretend was created.
+  async listFilters() {
+    return [];
+  },
+  async createFilter(): Promise<MailFilter> {
+    throw new MachError("unavailable", "Filters can only be created in the desktop app.");
+  },
+  async deleteFilter() {
+    throw new MachError("unavailable", "Filters can only be removed in the desktop app.");
   },
   async openExternal(url) {
     if (typeof window !== "undefined") window.open(url, "_blank", "noopener");

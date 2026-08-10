@@ -150,7 +150,7 @@ impl ToolGate {
             let pending = PendingApproval {
                 tool_use_id: call_id.to_string(),
                 name: name.to_string(),
-                summary: self.approval_summary(name, input),
+                summary: self.approval_summary(name, input).await,
                 input: input.clone(),
             };
             match self.desk.ask(pending).await {
@@ -206,9 +206,20 @@ impl ToolGate {
 
     /// The sentence the owner approves. It has to name the consequence — "Send"
     /// and "to whom" and "when" — because that is the whole point of asking.
-    pub fn approval_summary(&self, name: &str, input: &Value) -> String {
+    ///
+    /// Async because one of these has to be looked up before it can be written:
+    /// see [`delete_filter_summary`](Self::delete_filter_summary). Nothing has
+    /// run at this point and nothing will until the owner answers, so the wait
+    /// costs a prompt that appears a beat later rather than an action that
+    /// happens early.
+    pub async fn approval_summary(&self, name: &str, input: &Value) -> String {
         if let Some(summary) = super::plugin_tools::approval_summary(&self.plugins, name) {
             return summary;
+        }
+        match name {
+            tools::CREATE_FILTER_TOOL => return self.create_filter_summary(input),
+            tools::DELETE_FILTER_TOOL => return self.delete_filter_summary(input).await,
+            _ => {}
         }
         if name != tools::SEND_TOOL {
             return format!("Run {name}");
@@ -240,6 +251,80 @@ impl ToolGate {
             None => format!("Send \u{201c}{subject}\u{201d} to {to} now"),
         }
     }
+
+    /// What a new filter will actually do, in a sentence.
+    ///
+    /// > Create a filter on alex@lumen.example. Mail from no-reply@okta.com
+    /// > with “code” in the subject. It skips the inbox and is labelled Codes.
+    /// > It applies to mail that arrives from now on.
+    ///
+    /// The last line is there because it is the question the owner would
+    /// otherwise have to ask, and getting it wrong in the optimistic direction
+    /// — believing the inbox is about to be cleared — is how somebody approves
+    /// a rule and then goes looking for the mail it did not touch.
+    ///
+    /// Label ids are resolved to names through the same store the mail list
+    /// uses, so this says "Codes" rather than "Label_18".
+    fn create_filter_summary(&self, input: &Value) -> String {
+        let filter = tools::filter_from_call(input);
+        let account = tools::filter_account(&self.ctx, input);
+        let (where_, description) = match account {
+            Ok(account_id) => (
+                account_email(&self.ctx, account_id)
+                    .map(|email| format!(" on {email}"))
+                    .unwrap_or_default(),
+                self.ctx.dispatcher.describe_filter(account_id, &filter),
+            ),
+            // The call is going to fail on the same resolution a moment from
+            // now. Describe the rule anyway rather than showing nothing.
+            Err(_) => (
+                String::new(),
+                crate::commands::filters::describe(&filter, &Default::default()),
+            ),
+        };
+        format!(
+            "Create a filter{where_}. {description} It applies to mail that arrives from now on."
+        )
+    }
+
+    /// Which rule is about to stop existing, said the same way it was created.
+    ///
+    /// The filter is fetched to write this. A filter id is an opaque string of
+    /// twenty characters and approving its deletion on sight is not consent to
+    /// anything — the owner has to be told which rule, and the only place that
+    /// knows is Google. One GET, on a path that is already about to make a
+    /// request, and the id is the fallback if it fails.
+    async fn delete_filter_summary(&self, input: &Value) -> String {
+        let filter_id = input
+            .get("filterId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let account_id = tools::filter_account(&self.ctx, input).ok();
+
+        let described = match account_id {
+            Some(account_id) => self
+                .ctx
+                .dispatcher
+                .list_filters(Some(account_id))
+                .await
+                .ok()
+                .and_then(|filters| filters.into_iter().find(|f| f.id == filter_id))
+                .map(|f| format!("this filter: {}", f.description)),
+            None => None,
+        }
+        .unwrap_or_else(|| format!("the filter with id {filter_id}."));
+
+        format!("Delete {described} Mail it has already moved stays where it is; only the rule goes.")
+    }
+}
+
+/// The address of an account, for a sentence that has to name a mailbox.
+fn account_email(ctx: &ToolContext, account_id: i64) -> Option<String> {
+    ctx.db
+        .read(|conn| crate::db::command_queries::account_by_id(conn, account_id))
+        .ok()
+        .flatten()
+        .map(|account| account.email)
 }
 
 fn running_summary(name: &str) -> String {
@@ -252,6 +337,9 @@ fn running_summary(name: &str) -> String {
         tools::DRAFT_TOOL => "Writing a reply…".to_string(),
         tools::NEW_DRAFT_TOOL => "Writing a message…".to_string(),
         tools::SEND_TOOL => "Ready to send…".to_string(),
+        tools::LIST_FILTERS_TOOL => "Reading the filters…".to_string(),
+        tools::CREATE_FILTER_TOOL => "Ready to make a filter…".to_string(),
+        tools::DELETE_FILTER_TOOL => "Ready to delete a filter…".to_string(),
         other => format!("{other}…"),
     }
 }

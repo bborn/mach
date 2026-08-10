@@ -158,16 +158,26 @@ export function syncProgress(status: SyncStatus | null): SyncProgress {
   const accounts = status?.accounts ?? [];
   const working = accounts.filter(isActive);
 
-  // Two sources, one list. The engine knows which accounts Google refused
+  // Three sources, one list. The engine knows which accounts Google refused
   // during this run; `needsReauthorization` also carries the ones whose
   // Keychain entry was already gone at launch, which no pass can discover
   // because a *missing* credential is never sent anywhere.
   const flagged = new Set(status?.needsReauthorization ?? []);
+  // The reasons an account is on that list are not the same failure and must
+  // not read as the same sentence. A missing credential stops the mail; a grant
+  // that is missing a scope does not, so telling the owner his mail is broken
+  // would send him looking for a problem that is not there.
+  const missingScope = new Set(status?.missingScope ?? []);
+  const why = (email: string) =>
+    missingScope.has(email)
+      ? `${email} has not granted a permission Mach now needs`
+      : NO_CREDENTIAL;
+
   const errors: SyncFailure[] = accounts
     .filter((a) => a.lastError || a.needsReauthorization || flagged.has(a.email))
     .map((a) => ({
       email: a.email,
-      message: a.lastError ?? NO_CREDENTIAL,
+      message: a.lastError ?? why(a.email),
       needsReauthorization: a.needsReauthorization || flagged.has(a.email),
       lastSuccessAt: a.lastSuccessAt,
     }));
@@ -178,7 +188,7 @@ export function syncProgress(status: SyncStatus | null): SyncProgress {
     if (!errors.some((e) => e.email === email)) {
       errors.push({
         email,
-        message: NO_CREDENTIAL,
+        message: why(email),
         needsReauthorization: true,
         lastSuccessAt: null,
       });

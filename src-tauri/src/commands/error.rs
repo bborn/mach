@@ -35,6 +35,21 @@ pub enum CommandError {
     #[error("account {account_id} has no label named {label_name:?}; create it before snoozing")]
     MissingLabel { account_id: i64, label_name: String },
 
+    /// The account is signed in and its grant does not cover what was asked.
+    ///
+    /// Separate from every other refusal because it is the only one the owner
+    /// can fix and the only one that never resolves itself: a token cannot be
+    /// widened by refreshing it, so this is permanent until the consent screen
+    /// is walked through again. The message names that remedy, because a
+    /// sentence that only says "forbidden" leaves the reader with nothing to do.
+    #[error("{email} has not granted Mach permission to {action}. Remove the account in Preferences → Accounts and add it again to grant it.")]
+    MissingScope {
+        account_id: i64,
+        email: String,
+        /// What was being attempted, as a verb phrase: "manage Gmail filters".
+        action: &'static str,
+    },
+
     #[error("{message}")]
     Invalid { message: String },
 
@@ -51,6 +66,7 @@ impl CommandError {
             CommandError::UnknownEvent { .. } => "unknownEvent",
             CommandError::UnknownAccount { .. } => "unknownAccount",
             CommandError::MissingLabel { .. } => "missingLabel",
+            CommandError::MissingScope { .. } => "missingScope",
             CommandError::Invalid { .. } => "invalid",
             CommandError::Db(_) => "db",
         }
@@ -80,9 +96,12 @@ pub enum FailureKind {
     Auth,
     /// 429, or a 403 whose reason is a quota. Worth trying again later.
     RateLimited,
-    /// 403 that is not a quota — missing scope, or policy. Retrying will not
-    /// help.
+    /// 403 that is not a quota and not a scope — an admin policy. Retrying will
+    /// not help.
     Forbidden,
+    /// 403 because the account never granted the scope this call needs. Only
+    /// re-authorizing the account fixes it.
+    InsufficientScope,
     /// 404 — the thread, message or event is gone on Google's side. Sync will
     /// notice; the command will not.
     NotFound,
@@ -103,6 +122,7 @@ impl FailureKind {
             GoogleError::Auth { .. } | GoogleError::CredentialRejected { .. } => FailureKind::Auth,
             GoogleError::RateLimited { .. } => FailureKind::RateLimited,
             GoogleError::Forbidden { .. } => FailureKind::Forbidden,
+            GoogleError::InsufficientScope { .. } => FailureKind::InsufficientScope,
             GoogleError::NotFound { .. }
             | GoogleError::HistoryExpired { .. }
             | GoogleError::SyncTokenExpired { .. } => FailureKind::NotFound,

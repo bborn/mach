@@ -395,8 +395,42 @@ export interface SyncStatus {
   configured: boolean;
   /** Set exactly when `configured` is false — a sentence to render. */
   configurationError: string | null;
-  /** Accounts whose refresh token is gone from the Keychain. */
+  /** Every account that has to be authorized again, for either reason below. */
   needsReauthorization: string[];
+  /**
+   * The subset whose credential is alive and whose grant is missing a scope.
+   * Mail keeps syncing for these; the scope-gated feature does not work until
+   * the account consents again.
+   */
+  missingScope: string[];
+}
+
+/** One Gmail filter, as `list_filters` returns it. */
+export interface MailFilter {
+  accountId: AccountId;
+  accountEmail: string;
+  /** Google's id. The only handle a delete has. */
+  id: string;
+  criteria: FilterCriteria;
+  action: FilterAction;
+  /** What it does, in plain words. Written by Rust so every surface agrees. */
+  description: string;
+}
+
+export interface FilterCriteria {
+  from?: string | null;
+  to?: string | null;
+  subject?: string | null;
+  query?: string | null;
+  negatedQuery?: string | null;
+  hasAttachment?: boolean | null;
+  excludeChats?: boolean | null;
+}
+
+export interface FilterAction {
+  addLabelIds?: string[];
+  removeLabelIds?: string[];
+  forward?: string | null;
 }
 
 /** What `begin_add_account` hands back: where to send the user, and a claim tag. */
