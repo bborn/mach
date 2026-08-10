@@ -64,3 +64,13 @@ sha2 = "0.10.9"
 hex = "0.4.3"
 tauri-plugin-notification = "2.3.3"
 
+
+# Debug builds default to full DWARF for every dependency, which is what turned
+# this target dir into tens of gigabytes across parallel agent worktrees.
+# Line tables keep backtraces readable at a fraction of the size.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = false

@@ -663,6 +663,8 @@
                 "
                 width="1440"
                 height="813"
+                loading="lazy"
+                decoding="async"
                 alt="The Mach calendar in week view: five accounts' calendars overlaid in one grid, each event tinted by the calendar it belongs to, with a red line marking the current time."
               />
             </picture>
@@ -670,6 +672,76 @@
           <figcaption>
             Week view, with five accounts' calendars in one grid. Fixture data
             again.
+          </figcaption>
+        </figure>
+      </section>
+
+      <section>
+        <span class="eyebrow">The agent, and handoffs</span>
+
+        <p class="measure">
+          You ask from <kbd>⌘K</kbd>, and the answer arrives in a drawer under
+          the list, showing each tool it ran and what that returned.
+        </p>
+
+        <figure>
+          <div class="shot">
+            <picture>
+              <source
+                srcset="
+                  screenshot-agent-dark.webp    1x,
+                  screenshot-agent-dark@2x.webp 2x
+                "
+                media="(prefers-color-scheme: dark)"
+              />
+              <img
+                src="screenshot-agent.webp"
+                srcset="
+                  screenshot-agent.webp    1x,
+                  screenshot-agent@2x.webp 2x
+                "
+                width="1440"
+                height="813"
+                loading="lazy"
+                decoding="async"
+                alt="The Mach window with the agent drawer open across the lower half: the question at its head, chips naming the conversation and mailbox it was given, four monospaced lines for the tools it ran, its answer, and a bar asking to approve sending the reply it drafted."
+              />
+            </picture>
+          </div>
+          <figcaption>
+            A session that drafted a reply and stopped for approval before
+            sending it. Fixture data.
+          </figcaption>
+        </figure>
+
+        <figure>
+          <div class="shot">
+            <picture>
+              <source
+                srcset="
+                  screenshot-handoff-dark.webp    1x,
+                  screenshot-handoff-dark@2x.webp 2x
+                "
+                media="(prefers-color-scheme: dark)"
+              />
+              <img
+                src="screenshot-handoff.webp"
+                srcset="
+                  screenshot-handoff.webp    1x,
+                  screenshot-handoff@2x.webp 2x
+                "
+                width="1440"
+                height="813"
+                loading="lazy"
+                decoding="async"
+                alt="A panel over the dimmed Mach window headed 'Hand off to OfferLab': labelled rows for the command, the directory, the mode and the conversation, and under them the whole text that will be sent to the external agent."
+              />
+            </picture>
+          </div>
+          <figcaption>
+            The same fixture conversation on its way to Claude Code in a
+            terminal. Before a target's first run, Mach shows the command, the
+            directory and the text it will send.
           </figcaption>
         </figure>
       </section>

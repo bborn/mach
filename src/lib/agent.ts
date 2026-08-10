@@ -458,7 +458,12 @@ export async function startSession(
 }
 
 export async function listSessions(): Promise<AgentSession[]> {
-  if (!isTauri()) return [];
+  if (!isTauri()) {
+    // `?showcase=agent` is the only way to see this surface without Rust; see
+    // the note beside `showcase()` in `fixtures.ts`.
+    const { agentSession, showcase } = await import("./fixtures");
+    return showcase() === "agent" ? [agentSession as AgentSession] : [];
+  }
   try {
     return await tauriTransport.invoke<AgentSession[]>("agent_sessions", {});
   } catch {
