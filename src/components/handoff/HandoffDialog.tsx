@@ -16,7 +16,7 @@ import {
   type HandoffReceipt,
   type HandoffSourceRef,
 } from "@/lib/handoff";
-import { errorMessage } from "@/lib/ipc";
+import { errorMessage, isTauri } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { Overlay } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -81,10 +81,7 @@ export function HandoffDialog() {
    */
   useEffect(() => {
     const unregister = registerResolver(handoffResolver);
-    // `loadTargets` answers in a browser tab too, from fixtures, under
-    // `?showcase=handoff`; without it the list is empty and the resolver only
-    // ever offers "Set up a handoff target…".
-    void loadTargets().catch(() => undefined);
+    if (isTauri()) void loadTargets().catch(() => undefined);
     return unregister;
   }, []);
 

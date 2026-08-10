@@ -662,7 +662,7 @@ describe("reply and forward subjects", () => {
  */
 describe("prepare, against the fixture source", () => {
   it("addresses a reply and carries the subject", async () => {
-    const { draft } = await prepareDraft(1, "reply");
+    const draft = await prepareDraft(1, "reply");
     expect(draft.to.map((m) => m.email)).toEqual(["tawny@northloop.example"]);
     expect(draft.subject).toBe("Re: Series A data room — a few gaps");
     expect(draft.accountId).toBe(1);
@@ -670,13 +670,13 @@ describe("prepare, against the fixture source", () => {
   });
 
   it("does the same for reply-all", async () => {
-    const { draft } = await prepareDraft(1, "replyAll");
+    const draft = await prepareDraft(1, "replyAll");
     expect(draft.to.map((m) => m.email)).toEqual(["tawny@northloop.example"]);
     expect(draft.cc).toEqual([]);
   });
 
   it("leaves a forward unaddressed but titled", async () => {
-    const { draft } = await prepareDraft(1, "forward");
+    const draft = await prepareDraft(1, "forward");
     expect(draft.to).toEqual([]);
     expect(draft.cc).toEqual([]);
     expect(draft.subject).toBe("Fwd: Re: Series A data room — a few gaps");

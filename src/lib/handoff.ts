@@ -402,12 +402,6 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 
 /** Load the list and publish it, so the resolver sees it on the next keystroke. */
 export async function loadTargets(): Promise<HandoffTarget[]> {
-  if (!isTauri()) {
-    // `?showcase=handoff` is the only way to see this surface without Rust; see
-    // the note beside `showcase()` in `fixtures.ts`.
-    const { handoffTargets, showcase } = await import("./fixtures");
-    return setTargets(showcase() === "handoff" ? handoffTargets : []);
-  }
   return setTargets(await call<HandoffTarget[]>("handoff_targets"));
 }
 
@@ -445,10 +439,6 @@ export async function previewHandoff(input: {
   note: string;
   source: HandoffSourceRef;
 }): Promise<HandoffPreview> {
-  if (!isTauri()) {
-    const { handoffPreview, showcase } = await import("./fixtures");
-    if (showcase() === "handoff") return handoffPreview;
-  }
   return call<HandoffPreview>("handoff_preview", {
     targetId: input.targetId,
     note: input.note,

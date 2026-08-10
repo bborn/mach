@@ -33,7 +33,6 @@ import { cn } from "@/lib/utils";
 import {
   attachPaths,
   bodyAsHtml,
-  carryForward,
   chooseAttachments,
   COMPOSER_KEYS,
   createAutosave,
@@ -54,7 +53,6 @@ import {
   setAttachmentInline,
   undoSend,
   withCidReferences,
-  type ArrivingFile,
   type Autosave,
   type Draft,
   type DraftKind,
@@ -175,30 +173,6 @@ export function ComposerDock() {
   );
   /** Draft ids currently over the window rather than under a conversation. */
   const [popped, setPopped] = useState<string[]>([]);
-  /**
-   * Files a forward is fetching, by draft id.
-   *
-   * They are chips before they are rows. A forward of "here's the invoice" has
-   * to show the invoice from the moment it opens, or the only difference
-   * between "the file is on its way" and "the file was dropped" is how long you
-   * wait — and dropping it silently is the bug this fixes.
-   */
-  const [arriving, setArriving] = useState<ReadonlyMap<string, ArrivingFile[]>>(
-    () => new Map(),
-  );
-
-  /**
-   * `drafts`, readable from a keystroke without depending on it.
-   *
-   * `open` has to know whether a composer is already up for this conversation
-   * *before* it prepares one, and a callback that closed over `drafts` would be
-   * rebuilt on every keystroke in every composer. The keystroke arrives long
-   * after the render that set this, so it is current when it is read.
-   */
-  const held = useRef<Draft[]>([]);
-  useEffect(() => {
-    held.current = drafts;
-  }, [drafts]);
 
   // The draft that was queued, kept so undo restores the text rather than an
   // empty composer.
@@ -346,79 +320,6 @@ export function ComposerDock() {
     [],
   );
 
-  /* ----------------------------------------------------------- attachments */
-
-  const applyAttachments = useCallback(
-    (id: string, attachments: Draft["attachments"]) => {
-      setDrafts((current) =>
-        current.map((entry) => (entry.id === id ? { ...entry, attachments } : entry)),
-      );
-    },
-    [],
-  );
-
-  /**
-   * Attaching writes to the store, and the store keys the files by draft id —
-   * so the draft has to *have* a row before a file can point at it. A composer
-   * opened and never typed in has no row yet, which is why this saves first.
-   */
-  const ensureSaved = useCallback(
-    async (target: Draft): Promise<Draft> => {
-      autosaves.current.get(target.id)?.cancel();
-      const saved = await saveDraft(target).catch(() => null);
-      if (!saved) return target;
-      setDrafts((current) =>
-        current.map((entry) =>
-          entry.id === target.id
-            ? { ...entry, remote: saved.remote, threadId: saved.threadId }
-            : entry,
-        ),
-      );
-      return saved;
-    },
-    [],
-  );
-
-  /**
-   * Put the original's files on a forward, without the composer waiting for
-   * them.
-   *
-   * The draft is already open when this runs. Anything the local cache holds
-   * lands within a moment; the rest is a download and an upload away, and the
-   * chips for those are drawn from `arriving` until the real rows arrive — a
-   * name and a size the store already knew, so the composer never shows a file
-   * count that is quietly short.
-   *
-   * Saved first, in the order [[attach]] uses and for the same reason: the
-   * files are keyed by draft id, and a draft that is never written cannot own
-   * them. It also means closing the composer offers to throw them away rather
-   * than leaving rows nothing points at.
-   */
-  const carry = useCallback(
-    async (target: Draft, expected: readonly ArrivingFile[]) => {
-      const parent = target.replyToId;
-      if (parent == null) return;
-      setArriving((current) => new Map(current).set(target.id, [...expected]));
-      try {
-        const saved = await ensureSaved(target);
-        const result = await carryForward(saved.id, parent);
-        applyAttachments(saved.id, result.attachments);
-        if (result.refused.length > 0) {
-          actions.setStatus(result.refused.join(" · "), "error");
-        }
-      } catch (error: unknown) {
-        actions.setStatus(errorMessage(error), "error");
-      } finally {
-        setArriving((current) => {
-          const next = new Map(current);
-          next.delete(target.id);
-          return next;
-        });
-      }
-    },
-    [ensureSaved, applyAttachments, actions],
-  );
-
   /* --------------------------------------------------------------- opening */
 
   /**
@@ -454,25 +355,11 @@ export function ComposerDock() {
   const open = useCallback(
     (kind: DraftKind) => {
       if (threadId === null) return;
-      // A composer already up for this conversation is focused, never doubled —
-      // `openDraft` would decline a second one anyway, and preparing one to be
-      // declined would leave a forward fetching the original's files onto a
-      // draft id nothing on screen points at.
-      const already = held.current.find((entry) => entry.threadId === threadId);
-      if (already) {
-        setActiveId(already.id);
-        return;
-      }
       void (async () => {
         // A half-written reply wins over a freshly prepared one: reopening a
         // conversation must not throw away what you already typed.
-        //
-        // Files count as having started it. A forward carries the original's
-        // attachments and may not have a word typed in it yet; preparing a
-        // second one would download them all again and leave the first set of
-        // rows behind with nothing pointing at them.
         const existing = await loadDraftForThread(threadId).catch(() => null);
-        if (existing && (hasWrittenBody(existing) || (existing.attachments?.length ?? 0) > 0)) {
+        if (existing && hasWrittenBody(existing)) {
           openDraft(signed(existing));
           return;
         }
@@ -483,19 +370,10 @@ export function ComposerDock() {
         // `prepare` reads the thread — its account, its recipients, its
         // References header — and comes back with an empty body. The signature
         // is the one thing it cannot know, because it is not in the thread.
-        if (!prepared) return;
-        const opened = signed(prepared.draft);
-        openDraft(opened);
-        // What will not fit is said now, while the draft is still being
-        // written, rather than after ⌘⏎ when nothing can be done about it.
-        if (prepared.refused.length > 0) {
-          actions.setStatus(prepared.refused.join(" · "), "error");
-        }
-        // And the composer is already on screen before this starts.
-        if (prepared.carries) void carry(opened, prepared.carrying);
+        if (prepared) openDraft(signed(prepared));
       })();
     },
-    [threadId, actions, signed, openDraft, carry],
+    [threadId, actions, signed, openDraft],
   );
 
   /**
@@ -635,6 +513,39 @@ export function ComposerDock() {
         .catch((error: unknown) => actions.setStatus(errorMessage(error), "error"));
     },
     [drafts, confirming, close, actions],
+  );
+
+  /* ------------------------------------------------------------ attachments */
+
+  const applyAttachments = useCallback(
+    (id: string, attachments: Draft["attachments"]) => {
+      setDrafts((current) =>
+        current.map((entry) => (entry.id === id ? { ...entry, attachments } : entry)),
+      );
+    },
+    [],
+  );
+
+  /**
+   * Attaching writes to the store, and the store keys the files by draft id —
+   * so the draft has to *have* a row before a file can point at it. A composer
+   * opened and never typed in has no row yet, which is why this saves first.
+   */
+  const ensureSaved = useCallback(
+    async (target: Draft): Promise<Draft> => {
+      autosaves.current.get(target.id)?.cancel();
+      const saved = await saveDraft(target).catch(() => null);
+      if (!saved) return target;
+      setDrafts((current) =>
+        current.map((entry) =>
+          entry.id === target.id
+            ? { ...entry, remote: saved.remote, threadId: saved.threadId }
+            : entry,
+        ),
+      );
+      return saved;
+    },
+    [],
   );
 
   /**
@@ -1356,7 +1267,6 @@ export function ComposerDock() {
       ghostContext={visible.kind === "new" ? undefined : ghostContext}
       dropping={dropping}
       dragging={dragging}
-      arriving={arriving.get(visible.id)}
       inlineImages={inlineUrls}
       toRef={toField}
       bodyRef={bodyField}

@@ -296,6 +296,27 @@ export function buildItems(
     });
   };
 
+  /**
+   * The put-back, whatever this mailbox calls it.
+   *
+   * The one item found by its key rather than by its description, because the
+   * description is the thing that varies: ⇧E is registered once with the name
+   * of the command that is live — "Restore", "Not spam", "Move to inbox" — so
+   * the menu can only say the right word by reading it off the binding. Same
+   * guarantee either way round: no live binding, no item.
+   */
+  const pushPutBack = () => {
+    const binding = bindings.find((b) => b.group === "Actions" && b.keys === "shift+e");
+    if (!binding?.description) return;
+    items.push({
+      kind: "item",
+      key: "Actions/putBack",
+      label: binding.description,
+      shortcut: binding.keys,
+      run: () => void binding.handler(keyEventFromToken("shift+e")),
+    });
+  };
+
   const separate = () => {
     if (items.length > 0 && items[items.length - 1]?.kind !== "separator") {
       items.push({ kind: "separator", key: `sep-${items.length}` });
@@ -322,10 +343,19 @@ export function buildItems(
   const allStarred = threads.length > 0 && threads.every((t) => t.starred);
   push("Actions", "Star", allStarred ? "Unstar" : "Star");
   push("Actions", "Snooze", "Snooze");
+  // Both keys are always registered together; which one is worth offering is
+  // the same question `SelectionBar` asks — see `readAction` there.
+  const anyUnread = threads.some((t) => t.unread);
+  if (anyUnread) push("Actions", "Mark read", "Mark read");
+  else if (threads.length > 0) push("Actions", "Mark unread", "Mark unread");
 
   separate();
   push("Actions", "Archive", "Archive");
+  pushPutBack();
   push("Actions", "Trash", "Trash", "danger");
+  // Drafts, where `#` means this instead. It asks before it acts, exactly as
+  // the key does — choosing it puts the question in the selection bar.
+  push("Actions", "Discard drafts", "Discard", "danger");
 
   /*
    * Not a `Command` and deliberately without a key: `openSearch` is the same

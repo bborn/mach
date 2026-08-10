@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { keyboardInComposer } from "@/lib/compose";
@@ -6,7 +6,7 @@ import { LIST_WIDTH_BOUNDS } from "@/lib/prefs";
 import { FlexPane, Pane, Resizer } from "@/components/ui/split";
 import { AccountRail } from "./AccountRail";
 import { ComposerDock } from "./ComposerDock";
-import { mailActionBindings } from "./mail-bindings";
+import { mailActionBindings, mailActionHandlers } from "./mail-bindings";
 import { ReadingPane } from "./ReadingPane";
 import { SearchView } from "./SearchView";
 import { SnoozePicker } from "./SnoozePicker";
@@ -28,6 +28,10 @@ export function MailMode() {
   const mail = ui.mode === "mail" && !overlayOwnsKeyboard(ui);
   const active = mail && ui.focus === "list";
   const selecting = ui.selection.ids.length > 0;
+
+  // The same handlers `SelectionBar` draws buttons for. Built in one place so
+  // "the button does what the key does" needs no keeping in step.
+  const on = useMemo(() => mailActionHandlers(actions), [actions]);
 
   const onResize = useCallback(
     (width: number) => dispatch({ type: "listWidth", width }),
@@ -117,16 +121,13 @@ export function MailMode() {
     // The rest live in `mail-bindings.ts` as data. They are spread in place, so
     // the help sheet still prints them here, between the movement keys and the
     // selection keys — see that file for why they were moved at all.
+    //
+    // Several of them are now gated on the mailbox as well as on the focus,
+    // which is why `mailbox` is a gate: `e` in Drafts archived nothing and said
+    // nothing, and `#` there trashed a thread that stayed in Drafts anyway.
     ...mailActionBindings(
-      { mail: () => mail, active: () => active },
-      {
-        archive: () => actions.archiveSelected(),
-        openSnooze: () => actions.setSnooze(true),
-        star: () => actions.starSelected(),
-        trash: () => actions.trashSelected(),
-        favorite: () => actions.toggleFavoriteFocused(),
-        undo: () => actions.undo(),
-      },
+      { mail: () => mail, active: () => active, mailbox: () => ui.labelId },
+      on,
     ),
 
     /* -------------------------------------------------------- Selection --- */

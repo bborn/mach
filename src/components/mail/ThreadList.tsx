@@ -5,6 +5,7 @@ import { mailboxName } from "@/lib/mailboxes";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { MailboxNotice } from "./MailboxNotice";
+import { SelectionBar } from "./SelectionBar";
 import { ThreadContextMenu } from "./ThreadContextMenu";
 import { GMAIL_DRAFT, ThreadRow } from "./ThreadRow";
 
@@ -86,20 +87,19 @@ export function ThreadList() {
             fill={favorited ? "currentColor" : "none"}
           />
         </button>
-        {/* While a selection is live the header counts that instead: it is the
-            number the next keystroke is about to act on. */}
-        {selectedCount > 0 ? (
-          <span className="shrink-0 font-mono text-micro tabular-nums text-accent">
-            {selectedCount} selected
-          </span>
-        ) : (
-          <span className="shrink-0 font-mono text-micro tabular-nums text-faint-foreground">
-            {unreadCount > 0 ? `${unreadCount} / ` : ""}
-            {visibleThreads.length}
-            {hasMore ? "+" : ""}
-          </span>
-        )}
+        {/* The header counts the mailbox and only the mailbox now. The
+            selection is counted by the bar below, which is where the verbs
+            that act on it are — one number, beside the buttons that use it,
+            instead of the same number in three places. */}
+        <span className="shrink-0 font-mono text-micro tabular-nums text-faint-foreground">
+          {unreadCount > 0 ? `${unreadCount} / ` : ""}
+          {visibleThreads.length}
+          {hasMore ? "+" : ""}
+        </span>
       </header>
+
+      {/* Renders nothing until something is ticked. */}
+      <SelectionBar />
 
       <ScrollArea ref={scroller} role="listbox" aria-label="Conversations">
         {state.kind !== "ready" ? (

@@ -29,7 +29,6 @@ import {
   isLocalOnly,
   parseRecipients,
   scheduleOptions,
-  type ArrivingFile,
   type Draft,
   type DraftAttachment,
 } from "@/lib/compose";
@@ -61,14 +60,6 @@ interface ComposerProps {
   onRemoveAttachment: (attachmentId: string) => void;
   /** Move one image between the body and the list under the message. */
   onSetInline?: (attachmentId: string, inline: boolean) => void;
-  /**
-   * Files a forward is still fetching.
-   *
-   * Drawn beside the real chips, without the controls: there is nothing yet to
-   * remove or to put in the body. They come from the original message's own
-   * rows, so the name and the size are the truth and not a placeholder.
-   */
-  arriving?: readonly ArrivingFile[];
   /**
    * Move this draft between the dock and the window, carrying the caret.
    *
@@ -189,7 +180,6 @@ export function Composer({
   onAttach,
   onRemoveAttachment,
   onSetInline,
-  arriving,
   onPopOut,
   poppedOut = false,
   bodyHeight,
@@ -518,7 +508,7 @@ export function Composer({
           </div>
         )}
 
-        {(attachments.length > 0 || (arriving?.length ?? 0) > 0) && (
+        {attachments.length > 0 && (
           <ul className={cn(COMPOSER_FIXED_ROW, "mt-2 flex flex-wrap gap-1.5")}>
             {attachments.map((file) => (
               <AttachmentChip
@@ -529,15 +519,6 @@ export function Composer({
                 onSetInline={onSetInline}
               />
             ))}
-            {/* The files a forward has not finished fetching. Only the ones
-                that are not already here: a chip lands the moment its row
-                does, and the same file drawn twice for a second would read as
-                two copies of it. */}
-            {(arriving ?? [])
-              .filter((file) => !attachments.some((held) => held.filename === file.filename))
-              .map((file) => (
-                <ArrivingChip key={`arriving-${file.filename}`} file={file} />
-              ))}
           </ul>
         )}
 
@@ -707,32 +688,6 @@ function AttachmentChip({
       >
         <X className="size-3" />
       </button>
-    </li>
-  );
-}
-
-/**
- * A file a forward is fetching: the name and the size, and nothing to press.
- *
- * The chip exists at all because the alternative is a composer that looks
- * complete while a file is still on its way. It says "fetching" rather than
- * nothing, because a greyed chip with no explanation reads as a file that
- * failed.
- */
-function ArrivingChip({ file }: { file: ArrivingFile }) {
-  return (
-    <li
-      className={cn(
-        "inline-flex max-w-[40ch] items-center gap-1.5 rounded-[var(--radius)]",
-        "border border-dashed border-border px-2 py-0.5 text-micro text-faint-foreground",
-      )}
-    >
-      <Paperclip className="size-3 shrink-0" />
-      <span className="min-w-0 truncate" title={file.filename}>
-        {file.filename}
-      </span>
-      <span className="shrink-0">{humanSize(file.sizeBytes)}</span>
-      <span className="shrink-0">fetching</span>
     </li>
   );
 }

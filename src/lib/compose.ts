@@ -204,77 +204,10 @@ async function call<T>(payload: Record<string, unknown>): Promise<T> {
   return invoke<T>("send_message", { draft: payload });
 }
 
-/**
- * A file a forward is going to carry, before its bytes are here.
- *
- * It has no id because it has no row yet — the row is written when the bytes
- * land. Until then the composer draws it from this, so the chips are on screen
- * naming real files at the instant the draft opens rather than a second later.
- */
-export interface ArrivingFile {
-  filename: string;
-  mimeType: string;
-  sizeBytes: number;
-}
-
-/**
- * A prepared draft, and what forwarding it will take with it.
- *
- * `carrying` and `refused` are empty for every kind but `forward`: a reply
- * quotes the original and carries none of its files, which is what every mail
- * client does and what anyone pressing `r` expects.
- */
-export interface PreparedDraft {
-  draft: Draft;
-  /**
-   * Whether there is anything to fetch at all.
-   *
-   * Not the same question as `carrying.length > 0`: an inline picture has no
-   * attachment row and so no name or size to show, and a message whose only
-   * baggage is the logo in its signature would otherwise look like a message
-   * with nothing to carry.
-   */
-  carries: boolean;
-  carrying: ArrivingFile[];
-  /** One sentence per file that will not be on the message, naming it. */
-  refused: string[];
-}
-
-export async function prepareDraft(
-  threadId: number,
-  kind: DraftKind,
-): Promise<PreparedDraft> {
-  if (!isTauri()) {
-    return { draft: localPrepare(threadId, kind), carries: false, carrying: [], refused: [] };
-  }
-  const result = await call<Partial<PreparedDraft> & { draft: Draft }>({
-    op: "prepare",
-    threadId,
-    kind,
-  });
-  return {
-    draft: result.draft,
-    carries: result.carries ?? false,
-    carrying: result.carrying ?? [],
-    refused: result.refused ?? [],
-  };
-}
-
-/**
- * Fetch the original's files onto a forward.
- *
- * Separate from `prepareDraft` because this is the half that can reach Gmail,
- * and the composer is already on screen before it is called. Bytes already in
- * the local attachment cache never leave the machine; the rest are downloaded
- * once and re-uploaded, because Gmail has no way to be told "send the file that
- * is already on message X".
- */
-export async function carryForward(
-  draftId: string,
-  messageId: number,
-): Promise<AttachResult> {
-  if (!isTauri()) return { attachments: localAttachments(draftId), added: [], refused: [] };
-  return call<AttachResult>({ op: "carryForward", draftId, messageId });
+export async function prepareDraft(threadId: number, kind: DraftKind): Promise<Draft> {
+  if (!isTauri()) return localPrepare(threadId, kind);
+  const result = await call<{ draft: Draft }>({ op: "prepare", threadId, kind });
+  return result.draft;
 }
 
 /**
@@ -372,6 +305,51 @@ export async function discardDraft(draftId: string): Promise<DiscardResult> {
   const result = await call<Partial<DiscardResult>>({ op: "discardDraft", draftId });
   // A build of Rust that predates the remote half answers `{ ok: true }` alone.
   return { ok: result.ok ?? true, remote: result.remote ?? "none", error: result.error };
+}
+
+/** What became of a selection's worth of drafts. */
+export interface BulkDiscardResult {
+  /** Drafts that are gone here, whatever Gmail did about it. */
+  discarded: number;
+  /** Threads that turned out to hold no draft at all. */
+  missing: number;
+  /** Discarded here and still on Gmail — the sync pass will bring them back. */
+  remoteFailed: number;
+}
+
+/**
+ * Throw away the drafts on several conversations.
+ *
+ * The bulk half of the thing `ComposerDock` does for one, and it goes through
+ * the same two calls — resolve the thread's draft, then delete it — because
+ * those are the only calls that exist for a draft. There is no `Command` for
+ * discarding one, and there cannot be a useful one: a discard ends at
+ * `drafts.delete`, Gmail does not hand the id back, and an "undo" could only
+ * mean creating a *different* draft containing the same words. So this is not a
+ * second command path around `run`; it is the one draft path, reached from the
+ * list instead of from a composer.
+ *
+ * A thread with no draft is counted rather than raised. The Drafts mailbox
+ * matches on `messages.is_draft` as well as on the label, and a row can lose
+ * its draft between the list being fetched and the key being pressed — a send
+ * on the phone, another window. Six selected and five discarded is a fact worth
+ * reporting, not a failure.
+ */
+export async function discardThreadDrafts(
+  threadIds: readonly number[],
+): Promise<BulkDiscardResult> {
+  const found = await Promise.all(
+    threadIds.map((threadId) => loadDraftForThread(threadId).catch(() => null)),
+  );
+  const ids = found.filter((draft): draft is Draft => draft !== null).map((d) => d.id);
+  const results = await Promise.all(
+    ids.map((id) => discardDraft(id).catch((): DiscardResult => ({ ok: false, remote: "failed" }))),
+  );
+  return {
+    discarded: results.length,
+    missing: threadIds.length - ids.length,
+    remoteFailed: results.filter((r) => r.remote === "failed").length,
+  };
 }
 
 /* -------------------------------------------------------------------------- */

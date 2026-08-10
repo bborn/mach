@@ -47,25 +47,47 @@ describe("the mail action keys", () => {
   let handlers: MailActionHandlers;
   let active: boolean;
   let mail: boolean;
+  let mailbox: string;
+
+  /*
+   * Re-registering rather than mutating a gate, because the *set* of bindings
+   * changes with the mailbox: ⇧E only exists where there is somewhere to go
+   * back to, and `#` is a different binding in Drafts. A test that only flipped
+   * a boolean would be asking the inbox's registry about Drafts.
+   */
+  const register = () => {
+    keymap = createKeymap("meta");
+    for (const binding of mailActionBindings(
+      { active: () => active, mail: () => mail, mailbox: () => mailbox },
+      handlers,
+    )) {
+      keymap.register(binding);
+    }
+  };
+
+  const inMailbox = (id: string) => {
+    mailbox = id;
+    register();
+  };
 
   beforeEach(() => {
     keymap = createKeymap("meta");
     active = true;
     mail = true;
+    mailbox = "INBOX";
     handlers = {
       archive: vi.fn(),
       openSnooze: vi.fn(),
       star: vi.fn(),
+      markRead: vi.fn(),
+      markUnread: vi.fn(),
       trash: vi.fn(),
+      discard: vi.fn(),
+      putBack: vi.fn(),
       favorite: vi.fn(),
       undo: vi.fn(),
     };
-    for (const binding of mailActionBindings(
-      { active: () => active, mail: () => mail },
-      handlers,
-    )) {
-      keymap.register(binding);
-    }
+    register();
   });
 
   it("archives on e", () => {
@@ -196,17 +218,109 @@ describe("the mail action keys", () => {
     expect(handlers.trash).toHaveBeenCalledTimes(1);
   });
 
+  /* ------------------------------------------------------- read/unread --- */
+
+  it("marks read on ⇧I and unread on ⇧U, Gmail's pair", () => {
+    expect(keymap.handle(press("I", { shiftKey: true }))).toBe(true);
+    expect(handlers.markRead).toHaveBeenCalledTimes(1);
+    expect(keymap.handle(press("U", { shiftKey: true }))).toBe(true);
+    expect(handlers.markUnread).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves plain u alone, which is still 'back to the list'", () => {
+    // Registered in `MailMode`, not here — so the assertion is that nothing in
+    // this file has quietly claimed the bare key.
+    expect(keymap.handle(press("u"))).toBe(false);
+    expect(handlers.markUnread).not.toHaveBeenCalled();
+  });
+
+  /* ---------------------------------------------------- by the mailbox --- */
+
+  it("discards on # in Drafts rather than trashing", () => {
+    // Trashing a draft leaves it in Drafts — `list_threads` matches that
+    // mailbox on `messages.is_draft` too — so the key means the thing the
+    // mailbox can honour.
+    inMailbox("DRAFT");
+    expect(keymap.handle(press("#"))).toBe(true);
+    expect(handlers.discard).toHaveBeenCalledTimes(1);
+    expect(handlers.trash).not.toHaveBeenCalled();
+  });
+
+  it("does not archive, snooze or trash in Drafts", () => {
+    inMailbox("DRAFT");
+    expect(keymap.handle(press("e"))).toBe(false);
+    expect(keymap.handle(press("b"))).toBe(false);
+    expect(keymap.handle(press("Backspace", { metaKey: true }))).toBe(false);
+    expect(handlers.archive).not.toHaveBeenCalled();
+    expect(handlers.openSnooze).not.toHaveBeenCalled();
+    expect(handlers.trash).not.toHaveBeenCalled();
+  });
+
+  it("does not discard outside Drafts", () => {
+    expect(keymap.handle(press("#"))).toBe(true);
+    expect(handlers.trash).toHaveBeenCalledTimes(1);
+    expect(handlers.discard).not.toHaveBeenCalled();
+  });
+
+  it("puts back on ⇧E in Trash, Spam and Archive, and nowhere else", () => {
+    for (const id of ["TRASH", "SPAM", "ARCHIVE"]) {
+      inMailbox(id);
+      expect(keymap.handle(press("E", { shiftKey: true }))).toBe(true);
+    }
+    expect(handlers.putBack).toHaveBeenCalledTimes(3);
+
+    for (const id of ["INBOX", "DRAFT", "SENT", "Label_17"]) {
+      inMailbox(id);
+      expect(keymap.handle(press("E", { shiftKey: true }))).toBe(false);
+    }
+    expect(handlers.putBack).toHaveBeenCalledTimes(3);
+  });
+
+  it("names the command ⇧E is currently for, so the help sheet can print it", () => {
+    const description = (id: string) =>
+      mailActionBindings(
+        { active: () => true, mail: () => true, mailbox: () => id },
+        handlers,
+      ).find((b) => b.keys === "shift+e")?.description;
+
+    expect(description("TRASH")).toBe("Restore");
+    expect(description("SPAM")).toBe("Not spam");
+    expect(description("ARCHIVE")).toBe("Move to inbox");
+  });
+
+  it("registers no two live bindings that fight over one key, in any mailbox", () => {
+    for (const id of ["INBOX", "DRAFT", "TRASH", "SPAM", "SENT", "SNOOZED", "ARCHIVE"]) {
+      inMailbox(id);
+      expect(keymap.conflicts()).toEqual([]);
+    }
+  });
+
   it("publishes exactly the keys the help sheet should print", () => {
     // `h` and ⌘⌫ are deliberately absent: both are aliases for a key that is
     // already documented, and a sheet with two rows reading "Trash" teaches
     // nobody anything. See the comments in `mail-bindings.ts`.
-    const documented = mailActionBindings(
-      { active: () => true, mail: () => true },
-      handlers,
-    )
-      .filter((b) => b.description)
-      .map((b) => b.keys);
-    expect(documented).toEqual(["e", "b", "s", "#", "shift+f", "z"]);
+    const documented = (id: string) =>
+      mailActionBindings(
+        { active: () => true, mail: () => true, mailbox: () => id },
+        handlers,
+      )
+        .filter((b) => b.description)
+        .map((b) => b.keys);
+
+    // Every key is listed in every mailbox — the sheet reads `active()`, which
+    // drops the ones whose gate is shut, so the mailbox does the filtering.
+    expect(documented("INBOX")).toEqual([
+      "e",
+      "shift+e",
+      "b",
+      "s",
+      "shift+i",
+      "shift+u",
+      "#",
+      "#",
+      "shift+f",
+      "z",
+    ]);
   });
 });
 
