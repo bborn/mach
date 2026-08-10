@@ -389,6 +389,28 @@ function uniq<T>(values: T[]): T[] {
   return [...new Set(values)];
 }
 
+/**
+ * The ids whose optimistic star the loaded list now agrees with.
+ *
+ * Exported because it is the rule that decides when an optimistic value stops
+ * being one, and that rule is worth a test of its own rather than only being
+ * observable through a rendered row.
+ */
+export function settledStars(
+  threads: Pick<Thread, "id" | "starred">[],
+  overrides: Record<ThreadId, boolean>,
+): ThreadId[] {
+  // Cheap when nothing is pending, which is almost always.
+  if (Object.keys(overrides).length === 0) return [];
+  const settled: ThreadId[] = [];
+  for (const thread of threads) {
+    if (thread.id in overrides && overrides[thread.id] === thread.starred) {
+      settled.push(thread.id);
+    }
+  }
+  return settled;
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
@@ -835,6 +857,28 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
   const allThreads = stream.threads;
 
+  /*
+   * Retire a guess when the list catches up with it.
+   *
+   * This is the other half of not dropping the override in `run`. An
+   * optimistic value has to stop being an override at some point, or a star
+   * turned off later — on the phone, in another window, by a filter — would be
+   * held out of the row forever by a guess nobody remembers making. The
+   * condition is not "enough time has passed" but "the store now says the same
+   * thing", which is the only version of it that cannot produce an
+   * intermediate frame: while the two disagree the override is still doing
+   * work, and the moment they agree removing it changes nothing on screen.
+   *
+   * A thread that is not in the list is left alone rather than dropped. The
+   * list is emptied and refilled on every change of mailbox, and clearing
+   * guesses on absence would unstar a row for the duration of a round trip
+   * purely because the user pressed `g i`.
+   */
+  useEffect(() => {
+    const settled = settledStars(allThreads, ui.starOverrides);
+    if (settled.length > 0) dispatchUi({ type: "unstar", threadIds: settled });
+  }, [allThreads, ui.starOverrides]);
+
   const visibleThreads = useMemo(() => {
     const archived = new Set(ui.archived);
     const overrides = ui.starOverrides;
@@ -980,13 +1024,31 @@ export function MachProvider({ children }: { children: ReactNode }) {
         // event puts it back on Google and in SQLite and leaves the grid empty —
         // undo that reports success and visibly does nothing.
         if (!isMailCommand(command)) setEventsKey((k) => k + 1);
-        if (command.kind === "star") {
-          // The refetch that follows carries the truth; keeping the guess past
-          // that point would pin a stale star if Gmail disagreed.
-          dispatchUi({ type: "unstar", threadIds: command.threadIds });
-        }
+        /*
+         * The guess is deliberately *not* dropped here on success.
+         *
+         * It used to be, on the reasoning that "the refetch that follows
+         * carries the truth". The refetch does — eventually. `execute_command`
+         * emits `threads-changed` after it returns, `scheduleRefresh`
+         * coalesces that over 600ms, and then `list_threads` has its own round
+         * trip to make. For that whole span the row rendered from a copy of
+         * the list fetched *before* the write, so dropping the override the
+         * instant the command answered put the star out again for most of a
+         * second and then lit it back up: "starring a msg flashes the star
+         * before it sticks".
+         *
+         * What replaces it is the effect beside `allThreads` above: the guess
+         * is dropped when the list actually agrees with it, which is the
+         * condition the old code was trying to approximate by timing. Nothing
+         * is pinned — an unstar arriving later from Gmail lands in a list the
+         * override has already been retired from.
+         */
         const failed = failedIds(result);
         if (failed.length > 0) {
+          // A rolled-back id is the one case where the guess has to go now:
+          // the write did not happen, and the star has to say so rather than
+          // wait for a refetch to contradict it.
+          if (command.kind === "star") dispatchUi({ type: "unstar", threadIds: failed });
           dispatchUi({ type: "restore", threadIds: failed });
           if (options.reselectFailed) {
             dispatchUi({

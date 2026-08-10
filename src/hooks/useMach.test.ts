@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { initialUi, overlayOwnsKeyboard, uiReducer } from "./useMach";
+import { initialUi, overlayOwnsKeyboard, settledStars, uiReducer } from "./useMach";
 
 /**
  * Starring felt laggy because it had no optimistic path.
@@ -41,6 +41,44 @@ describe("optimistic starring", () => {
 
   it("starts with no opinion at all", () => {
     expect(initialUi.starOverrides).toEqual({});
+  });
+});
+
+/**
+ * When a guess stops being one.
+ *
+ * The first version of this answered "when the command comes back", which is
+ * the wrong event: the command answering says the write landed in SQLite, and
+ * says nothing about whether the list on screen has been refetched since. It
+ * had not — `threads-changed` is coalesced over 600ms and then has its own
+ * round trip — so the star went out for most of a second between the command
+ * answering and the rows arriving. `useMach.star.test.tsx` is that flash,
+ * rendered; this is the rule that replaced the timing.
+ */
+describe("settling an optimistic star", () => {
+  const row = (id: number, starred: boolean) => ({ id, starred });
+
+  it("retires the guess the list now agrees with", () => {
+    expect(settledStars([row(1, true), row(2, false)], { 1: true })).toEqual([1]);
+  });
+
+  it("holds on while the list still disagrees", () => {
+    expect(settledStars([row(1, false)], { 1: true })).toEqual([]);
+  });
+
+  it("holds on to a thread the loaded list does not carry", () => {
+    // Changing mailbox empties the list and refills it. Dropping guesses for
+    // rows that are momentarily absent would unstar them for a round trip.
+    expect(settledStars([], { 1: true })).toEqual([]);
+  });
+
+  it("settles an un-star the same way", () => {
+    expect(settledStars([row(3, false)], { 3: false })).toEqual([3]);
+    expect(settledStars([row(3, true)], { 3: false })).toEqual([]);
+  });
+
+  it("says nothing when nothing is pending", () => {
+    expect(settledStars([row(1, true)], {})).toEqual([]);
   });
 });
 
