@@ -6,6 +6,7 @@ import {
   crossesDay,
   dayIndexAt,
   dragLabel,
+  isCopyDrag,
   isDrag,
   moveResult,
   msToPixels,
@@ -230,6 +231,17 @@ describe("feedback helpers", () => {
     expect(isDrag(0, 2)).toBe(false);
     expect(isDrag(0, 3)).toBe(true);
     expect(isDrag(-4, 0)).toBe(true);
+  });
+});
+
+describe("isCopyDrag", () => {
+  it("copies when alt is held on a move", () => {
+    expect(isCopyDrag("move", true)).toBe(true);
+    expect(isCopyDrag("move", false)).toBe(false);
+  });
+
+  it("ignores alt on a resize, which has nothing to copy", () => {
+    expect(isCopyDrag("resize", true)).toBe(false);
   });
 });
 

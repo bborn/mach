@@ -41,6 +41,7 @@ import {
   createResult,
   dayIndexAt,
   dragLabel,
+  isCopyDrag,
   isDrag,
   moveResult,
   resizeResult,
@@ -67,6 +68,8 @@ export interface EventMove {
   eventId: EventId;
   start: number;
   end: number;
+  /** Alt was held: leave the original where it is and create a copy here. */
+  copy: boolean;
 }
 
 interface TimeGridProps {
@@ -114,6 +117,8 @@ interface DragSession {
   contentLeft: number;
   contentWidth: number;
   moved: boolean;
+  /** Alt is held right now. Recomputed as the drag runs, not fixed at grab. */
+  copy: boolean;
   outcome: DragOutcome;
 }
 
@@ -142,6 +147,10 @@ function gridTop(ts: number): number {
  * `requestAnimationFrame`, and its time label by writing `textContent`. Nothing
  * above it in the tree knows the pointer is moving. The grid only re-lays-out
  * once, on release, when the command comes back.
+ *
+ * Alt is the exception, and it earns one render each time it goes down or up:
+ * it changes what the drag *means* — move, or copy — and the source block and
+ * the ghost both have to say so.
  */
 export function TimeGrid({
   days,
@@ -173,6 +182,17 @@ export function TimeGrid({
   const [editing, setEditing] = useState(false);
   /** Non-null while a drag is live — the only state a drag ever sets. */
   const [dragging, setDragging] = useState<DragSession | null>(null);
+  /*
+   * Alt held during a move, as state rather than as part of the session.
+   *
+   * It has to re-render — the source block stops being dimmed, the ghost grows
+   * a `+`, the cursor stays on the original — and it is the one thing about a
+   * live drag that can change without the pointer moving. Keeping it out of
+   * `dragging` matters: the window listeners are keyed on that object, and
+   * rebuilding them every time a thumb touches the option key would tear down
+   * and reattach the drag mid-gesture.
+   */
+  const [copying, setCopying] = useState(false);
 
   /*
    * The working day, as a preference.
@@ -315,6 +335,7 @@ export function TimeGrid({
         frame.current = null;
       }
       setDragging(null);
+      setCopying(false);
       if (!live) return;
       swallowClick.current = live.moved;
       if (
@@ -322,7 +343,12 @@ export function TimeGrid({
         live.moved &&
         (live.outcome.start !== live.origin.start || live.outcome.end !== live.origin.end)
       ) {
-        onMove({ eventId: live.eventId, start: live.outcome.start, end: live.outcome.end });
+        onMove({
+          eventId: live.eventId,
+          start: live.outcome.start,
+          end: live.outcome.end,
+          copy: live.copy,
+        });
       }
     },
     [onMove],
@@ -334,9 +360,20 @@ export function TimeGrid({
   useEffect(() => {
     if (!dragging) return;
 
+    /** Take alt from whatever event carries it. Cheap, and idempotent. */
+    const syncCopy = (altKey: boolean) => {
+      const live = session.current;
+      if (!live) return;
+      const next = isCopyDrag(live.kind, altKey);
+      if (next === live.copy) return;
+      live.copy = next;
+      setCopying(next);
+    };
+
     const onPointerMove = (event: PointerEvent) => {
       const live = session.current;
       if (!live || event.pointerId !== live.pointerId) return;
+      syncCopy(event.altKey);
       const dx = event.clientX - live.startX;
       const dy = event.clientY - live.startY;
       if (!live.moved && !isDrag(dx, dy)) return;
@@ -358,6 +395,10 @@ export function TimeGrid({
 
     const onPointerUp = (event: PointerEvent) => {
       if (session.current && event.pointerId !== session.current.pointerId) return;
+      // The release is the last word on the modifier: letting go of alt a
+      // frame before the button is the user changing their mind, and the
+      // event they are dropping is the one they can see.
+      syncCopy(event.altKey);
       endDrag(true);
     };
 
@@ -365,21 +406,26 @@ export function TimeGrid({
     // gesture you can explore and one you have to be sure about before you
     // start.
     const onKeyDown = (event: KeyboardEvent) => {
+      syncCopy(event.altKey);
       if (event.key !== "Escape") return;
       event.preventDefault();
       event.stopPropagation();
       endDrag(false);
     };
 
+    const onKeyUp = (event: KeyboardEvent) => syncCopy(event.altKey);
+
     window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("pointerup", onPointerUp);
     window.addEventListener("pointercancel", onPointerUp);
     window.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("keyup", onKeyUp, true);
     return () => {
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
       window.removeEventListener("pointercancel", onPointerUp);
       window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("keyup", onKeyUp, true);
     };
   }, [dragging, days, schedule, endDrag]);
 
@@ -411,10 +457,12 @@ export function TimeGrid({
         contentLeft: rect.left + TIME_GUTTER,
         contentWidth: rect.width - TIME_GUTTER,
         moved: false,
+        copy: isCopyDrag(kind, event.altKey),
         outcome: { start: target.start, end: target.end },
       };
       session.current = next;
       setDragging(next);
+      setCopying(next.copy);
       onSelect(target.id);
       event.preventDefault();
     },
@@ -588,7 +636,10 @@ export function TimeGrid({
             dark={dark}
             selectedId={selectedId}
             dimIds={dimIds}
-            draggingId={dragging?.eventId ?? null}
+            // A copy leaves the original alone, so the block underneath is not
+            // the thing being dragged: it keeps its colour and keeps the
+            // cursor, and the ghost is a new event rather than that one moved.
+            draggingId={dragging && !copying ? dragging.eventId : null}
             onSelect={onSelect}
             onOpen={onOpen}
             onGrab={grab}
@@ -634,7 +685,7 @@ export function TimeGrid({
               // need to know which block just moved.
               boxShadow: [
                 ghostPaint.border ? `inset 0 0 0 1px ${ghostPaint.border}` : undefined,
-                dragging.eventId === selectedId
+                dragging.eventId === selectedId && !copying
                   ? selectionShadow(ghostPaint.selectionGap)
                   : "0 4px 16px -4px color-mix(in oklab, var(--foreground) 45%, transparent)",
               ]
@@ -644,9 +695,26 @@ export function TimeGrid({
               willChange: "transform",
             }}
           >
+            {/* The badge every desktop uses for "this one is a copy". It sits
+                over the title rather than beside it because the ghost is one
+                column wide and the title already truncates. */}
+            {copying && (
+              <span
+                aria-hidden
+                className="absolute right-[3px] top-[2px] flex h-[14px] w-[14px] items-center justify-center rounded-full font-semibold"
+                style={{
+                  fontSize: 11,
+                  lineHeight: "14px",
+                  background: ghostPaint.color,
+                  color: ghostPaint.background,
+                }}
+              >
+                +
+              </span>
+            )}
             <span
               className="block truncate font-semibold"
-              style={{ fontSize: 12, lineHeight: "15px" }}
+              style={{ fontSize: 12, lineHeight: "15px", paddingRight: copying ? 16 : 0 }}
             >
               {dragging.title}
             </span>
