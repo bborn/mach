@@ -31,6 +31,14 @@
 //! ([`crate::ipc::compose::dispatch`]) rather than reimplementing threading and
 //! MIME. Drafting is local and free; sending is the one thing that reaches
 //! another human, so it is [`ToolPolicy::Approve`].
+//!
+//! # Filters
+//!
+//! `list_filters`, `create_filter` and `delete_filter` reach Gmail through the
+//! same [`CommandDispatcher`] everything else does — see
+//! [`crate::commands::filters`]. Creating and deleting are
+//! [`ToolPolicy::Approve`] for a reason that is not "it is a write": see
+//! [`filter_tools`].
 
 use std::sync::Arc;
 
@@ -38,6 +46,7 @@ use serde_json::{json, Map, Value};
 
 use crate::commands::{Command, CommandDispatcher, CommandSpec, ParamSpec, ParamType};
 use crate::db::Db;
+use crate::google::types::{Filter, FilterAction, FilterCriteria};
 use crate::plugins::{InstalledPlugin, PluginRuntime};
 use crate::ipc::compose::engine::outbox::Outbox;
 use crate::ipc::compose::{dispatch as compose_dispatch, now_ms};
@@ -99,6 +108,11 @@ pub const APPROVAL_COMMANDS: &[&str] = &[
 pub const SEND_TOOL: &str = "send_draft";
 pub const DRAFT_TOOL: &str = "draft_reply";
 
+/// Gmail filters. Listing is a read; the other two are standing rules.
+pub const LIST_FILTERS_TOOL: &str = "list_filters";
+pub const CREATE_FILTER_TOOL: &str = "create_filter";
+pub const DELETE_FILTER_TOOL: &str = "delete_filter";
+
 // ===========================================================================
 // Definitions
 // ===========================================================================
@@ -108,6 +122,7 @@ pub fn tools() -> Vec<Tool> {
     let mut all = read_tools();
     all.extend(command_tools());
     all.extend(compose_tools());
+    all.extend(filter_tools());
     all
 }
 
@@ -416,6 +431,108 @@ fn compose_tools() -> Vec<Tool> {
     ]
 }
 
+/// Gmail filters — the one thing the agent can make that outlives the session.
+///
+/// # Why creating one has to ask
+///
+/// Every other write the agent performs is an act on mail that already exists,
+/// bounded by the ids it names and undoable by the command layer's own inverse.
+/// A filter is neither. It is a standing rule that acts on mail nobody has
+/// written yet, silently, for as long as it exists, and the two most useful
+/// things it can express are the two least visible: `removeLabelIds: ["INBOX"]`
+/// means the mail never appears, and `addLabelIds: ["TRASH"]` means it is
+/// deleted on arrival. Nothing in the mailbox moves when the rule is made, so
+/// there is no moment at which the owner could notice it and take it back.
+///
+/// That is the exact shape of thing that must not happen because a model
+/// inferred it from a sentence, so both writes are [`ToolPolicy::Approve`] and
+/// the prompt is the sentence in [`crate::commands::filters::describe`], not
+/// the JSON.
+///
+/// Listing is a read of the account's own settings and asks nothing.
+fn filter_tools() -> Vec<Tool> {
+    vec![
+        Tool::auto(
+            LIST_FILTERS_TOOL,
+            "The Gmail filters on an account: what each one matches, what it does, and \
+             the filterId delete_filter needs. Read this before creating one — the rule \
+             the user is asking for may already exist.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "accountId": { "type": "integer", "description": "Omit for every account." },
+                },
+                "additionalProperties": false,
+            }),
+        ),
+        Tool {
+            definition: ToolDefinition {
+                name: CREATE_FILTER_TOOL.to_string(),
+                description:
+                    "Create a Gmail filter: a standing rule Google applies to mail as it \
+                     arrives. Requires the owner's confirmation before it runs. It does \
+                     nothing to mail already in the mailbox — to deal with that, search \
+                     and use the archive, trash or label commands, which are undoable. \
+                     Removing the INBOX label is how \u{201c}skip the inbox\u{201d} is \
+                     expressed; adding TRASH is how \u{201c}delete it\u{201d} is. There \
+                     is no way to edit a filter: delete it and make another."
+                        .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "accountId": {
+                            "type": "integer",
+                            "description": "Required unless exactly one account is connected.",
+                        },
+                        "from": { "type": "string", "description": "Sender. Matched as a substring, so a bare domain catches every address at it." },
+                        "to": { "type": "string" },
+                        "subject": { "type": "string", "description": "Matched anywhere in the subject." },
+                        "query": { "type": "string", "description": "A Gmail search expression, the same language the search box takes." },
+                        "negatedQuery": { "type": "string", "description": "A Gmail search expression that must not match." },
+                        "hasAttachment": { "type": "boolean" },
+                        "addLabelIds": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Label ids from list_labels, or TRASH, SPAM, STARRED, IMPORTANT.",
+                        },
+                        "removeLabelIds": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "INBOX to skip the inbox, UNREAD to mark it read.",
+                        },
+                        "forward": {
+                            "type": "string",
+                            "description": "An address Gmail already has verified for this account. Anything else is refused by Google.",
+                        },
+                    },
+                    "additionalProperties": false,
+                }),
+            },
+            policy: ToolPolicy::Approve,
+        },
+        Tool {
+            definition: ToolDefinition {
+                name: DELETE_FILTER_TOOL.to_string(),
+                description:
+                    "Delete a Gmail filter by its filterId. Requires the owner's \
+                     confirmation. Mail the filter has already acted on stays where it \
+                     was put; only the rule goes."
+                        .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "accountId": { "type": "integer", "description": "Required unless exactly one account is connected." },
+                        "filterId": { "type": "string" },
+                    },
+                    "required": ["filterId"],
+                    "additionalProperties": false,
+                }),
+            },
+            policy: ToolPolicy::Approve,
+        },
+    ]
+}
+
 // ===========================================================================
 // Execution
 // ===========================================================================
@@ -501,6 +618,9 @@ pub async fn execute(ctx: &ToolContext, name: &str, input: &Value) -> Result<Too
         "list_accounts" => list_accounts(ctx),
         DRAFT_TOOL => draft_reply(ctx, input).await,
         SEND_TOOL => send_draft(ctx, input).await,
+        LIST_FILTERS_TOOL => list_filters(ctx, input).await,
+        CREATE_FILTER_TOOL => create_filter(ctx, input).await,
+        DELETE_FILTER_TOOL => delete_filter(ctx, input).await,
         other if super::plugin_tools::is_plugin_tool(other) => run_plugin(ctx, other, input).await,
         _ => run_command(ctx, name, input).await,
     }
@@ -872,6 +992,137 @@ async fn send_draft(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Age
         },
         payload: sent,
         mutated: true,
+        artifact: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// filters
+// ---------------------------------------------------------------------------
+
+/// The account a filter tool call is about.
+///
+/// Optional in the schema and resolved here, because with one account "make a
+/// filter for the login codes" should not fail on a field the model had no way
+/// to know. With more than one, guessing would put a rule on the wrong mailbox,
+/// so it asks — through an error the model reports back rather than a silent
+/// pick.
+pub fn filter_account(ctx: &ToolContext, input: &Value) -> Result<i64, AgentError> {
+    if let Some(id) = input.get("accountId").and_then(Value::as_i64) {
+        return Ok(id);
+    }
+    let accounts = reads::list_accounts(&ctx.db).map_err(ipc_to_agent)?;
+    match accounts.as_slice() {
+        [only] => Ok(only.id),
+        [] => Err(AgentError::invalid("no account is connected")),
+        many => Err(AgentError::invalid(format!(
+            "accountId is required — {} accounts are connected: {}",
+            many.len(),
+            many.iter()
+                .map(|a| format!("{} ({})", a.email, a.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// A `create_filter` call as the two halves Gmail wants.
+///
+/// Shared with the gate: the sentence the owner approves has to be built from
+/// the same arguments the call will use, or it is describing something else.
+pub fn filter_from_call(input: &Value) -> Filter {
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let ids = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    Filter {
+        id: String::new(),
+        criteria: FilterCriteria {
+            from: text("from"),
+            to: text("to"),
+            subject: text("subject"),
+            query: text("query"),
+            negated_query: text("negatedQuery"),
+            has_attachment: input.get("hasAttachment").and_then(Value::as_bool),
+            exclude_chats: None,
+        },
+        action: FilterAction {
+            add_label_ids: ids("addLabelIds"),
+            remove_label_ids: ids("removeLabelIds"),
+            forward: text("forward"),
+        },
+    }
+}
+
+async fn list_filters(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+    let account_id = input.get("accountId").and_then(Value::as_i64);
+    let filters = ctx.dispatcher.list_filters(account_id).await?;
+    let items: Vec<Value> = filters
+        .iter()
+        .map(|f| {
+            json!({
+                "filterId": f.id,
+                "accountId": f.account_id,
+                "accountEmail": f.account_email,
+                "description": f.description,
+                "criteria": f.criteria,
+                "action": f.action,
+            })
+        })
+        .collect();
+    Ok(ToolOutcome {
+        summary: format!("{} filters", items.len()),
+        payload: json!({ "filters": items }),
+        mutated: false,
+        artifact: None,
+    })
+}
+
+async fn create_filter(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+    let account_id = filter_account(ctx, input)?;
+    let created = ctx
+        .dispatcher
+        .create_filter(account_id, filter_from_call(input))
+        .await?;
+    Ok(ToolOutcome {
+        summary: created.description.clone(),
+        payload: json!({ "filterId": created.id, "description": created.description }),
+        // Nothing in the mailbox moved: a filter acts on what arrives next.
+        // Saying otherwise would make the window re-read for no reason.
+        mutated: false,
+        artifact: None,
+    })
+}
+
+async fn delete_filter(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+    let account_id = filter_account(ctx, input)?;
+    let filter_id = input
+        .get("filterId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AgentError::invalid("delete_filter needs a filterId"))?;
+    ctx.dispatcher.delete_filter(account_id, filter_id).await?;
+    Ok(ToolOutcome {
+        summary: "Filter deleted".to_string(),
+        payload: json!({ "filterId": filter_id, "deleted": true }),
+        mutated: false,
         artifact: None,
     })
 }

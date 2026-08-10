@@ -692,6 +692,69 @@ describe("sync status", () => {
   });
 });
 
+describe("filters", () => {
+  const WIRE_FILTER = {
+    accountId: 2,
+    accountEmail: "alex@lumen.example",
+    id: "ANe1Bmh",
+    criteria: { from: "no-reply@okta.com" },
+    action: { removeLabelIds: ["INBOX"] },
+    description: "Mail from no-reply@okta.com. It skips the inbox.",
+  };
+
+  it("reads every account's filters when none is named", async () => {
+    const { transport, calls } = fakeTransport({ list_filters: [WIRE_FILTER] });
+    const filters = await createIpcSource(transport).listFilters();
+
+    expect(calls[0]).toEqual({ command: "list_filters", args: {} });
+    // The sentence is Rust's and is carried through rather than rebuilt, so
+    // Preferences and an approval prompt cannot describe the same rule
+    // differently.
+    expect(filters[0]?.description).toBe("Mail from no-reply@okta.com. It skips the inbox.");
+    expect(filters[0]?.accountEmail).toBe("alex@lumen.example");
+  });
+
+  it("sends the criteria and the action as Gmail's two halves", async () => {
+    const { transport, calls } = fakeTransport({ create_filter: WIRE_FILTER });
+    await createIpcSource(transport).createFilter(
+      2,
+      { from: "no-reply@okta.com" },
+      { addLabelIds: [], removeLabelIds: ["INBOX"] },
+    );
+
+    expect(calls[0]).toEqual({
+      command: "create_filter",
+      args: {
+        accountId: 2,
+        criteria: { from: "no-reply@okta.com" },
+        action: { addLabelIds: [], removeLabelIds: ["INBOX"] },
+      },
+    });
+  });
+
+  it("deletes by the id Google assigned", async () => {
+    const { transport, calls } = fakeTransport({ delete_filter: null });
+    await createIpcSource(transport).deleteFilter(2, "ANe1Bmh");
+    expect(calls[0]).toEqual({
+      command: "delete_filter",
+      args: { accountId: 2, filterId: "ANe1Bmh" },
+    });
+  });
+
+  it("does not invent a description a backend did not send", async () => {
+    const { transport } = fakeTransport({ list_filters: [{ id: "x" }] });
+    const filters = await createIpcSource(transport).listFilters();
+    expect(filters[0]).toEqual({
+      accountId: 0,
+      accountEmail: "",
+      id: "x",
+      criteria: {},
+      action: {},
+      description: "",
+    });
+  });
+});
+
 describe("events", () => {
   it("subscribes to the push channels and maps the payload before handing it on", async () => {
     const { transport, listeners } = fakeTransport();
@@ -710,6 +773,7 @@ describe("events", () => {
         configured: true,
         configurationError: null,
         needsReauthorization: [],
+        missingScope: [],
       },
     ]);
   });

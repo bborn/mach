@@ -434,6 +434,97 @@ pub struct LabelsListResponse {
     pub labels: Vec<Label>,
 }
 
+// ------------------------------------------------------------------ filters
+
+/// `users.settings.filters` — one standing rule, server-side.
+///
+/// A filter is two halves and nothing else: what it matches, and what happens
+/// to what it matched. Gmail evaluates it as mail *arrives*; it has no bearing
+/// on anything already in the mailbox, which is why Gmail's own web UI offers
+/// "also apply to matching conversations" as a separate checkbox rather than as
+/// part of the filter. See `commands::filters` for what Mach does about that.
+///
+/// `id` is assigned by Google on create and is the only handle a delete has.
+/// It is skipped when empty so the same struct serializes as a create body.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Filter {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default)]
+    pub criteria: FilterCriteria,
+    #[serde(default)]
+    pub action: FilterAction,
+}
+
+impl Filter {
+    /// True when nothing at all is being matched on.
+    ///
+    /// Gmail's API accepts this and it means *every message, forever*, which is
+    /// never what anybody typed on purpose. Callers refuse it.
+    pub fn matches_everything(&self) -> bool {
+        self.criteria == FilterCriteria::default()
+    }
+
+    /// True when the rule would do nothing to what it matched.
+    pub fn does_nothing(&self) -> bool {
+        self.action == FilterAction::default()
+    }
+}
+
+/// What a filter matches. Every field is optional; the ones that are set are
+/// combined with AND, which is Gmail's rule, not ours.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterCriteria {
+    /// A sender. Gmail matches this as a substring of the From header, so
+    /// `stripe.com` catches every address at the domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// A Gmail search expression, the same language the search box takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// A Gmail search expression that must *not* match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negated_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_attachment: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_chats: Option<bool>,
+}
+
+/// What happens to a message the criteria matched.
+///
+/// Gmail expresses all of it as label movement, including the two things that
+/// do not sound like labels: removing `INBOX` is "skip the inbox", and adding
+/// `TRASH` is "delete it". `SPAM`, `UNREAD`, `STARRED` and `IMPORTANT` are the
+/// same trick.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterAction {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_label_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_label_ids: Vec<String>,
+    /// An address Gmail forwards the message to. Only an address the account
+    /// has already verified in Gmail's own settings is accepted — registering a
+    /// new one needs `gmail.settings.sharing`, which Mach does not request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward: Option<String>,
+}
+
+/// `users.settings.filters.list`. The field really is singular.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FiltersListResponse {
+    #[serde(default)]
+    pub filter: Vec<Filter>,
+}
+
 /// `users.getProfile` — the account's own address and its current watermark.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

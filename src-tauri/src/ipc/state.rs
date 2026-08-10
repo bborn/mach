@@ -25,6 +25,13 @@
 //! makes that account appear in `needsReauthorization` — it is not an error and
 //! it does not stop the other four from syncing.
 //!
+//! An account whose credential is fine and whose *grant* is too narrow lands in
+//! the same list, from the other end: a 403 with `insufficientPermissions` is
+//! recorded by the command layer (see [`crate::commands::filters::ScopeNotices`])
+//! and merged in here. Both mean "consent again"; `missing_scope` is what lets a
+//! surface say which of the two it is looking at, because they are not the same
+//! failure and the account with the narrow grant is still syncing mail perfectly.
+//!
 //! A QA instance is the same case for every row at once. It addresses its own
 //! Keychain namespace (see [`crate::auth::tokens::keychain_service`]), so a
 //! store copied from the owner by `scripts/qa seed` arrives with accounts and
@@ -224,6 +231,7 @@ impl AppState {
     /// The engine's picture plus the two questions it cannot answer.
     pub fn status_payload(&self) -> SyncStatusPayload {
         let status = self.sync.status_snapshot();
+        let missing_scope = self.dispatcher.scope_notices().emails();
         SyncStatusPayload {
             running: status.running,
             accounts: status.accounts,
@@ -232,15 +240,32 @@ impl AppState {
             configured: self.config.is_configured(),
             configuration_error: self.config.configuration_error.clone(),
             needs_reauthorization: self.needs_reauthorization(),
+            missing_scope,
         }
     }
 
+    /// Every account that has to go through the consent screen again, for
+    /// either of the two reasons that can put it there.
+    ///
+    /// A grant that is missing a scope belongs in this list and not only in
+    /// `missing_scope`: the remedy is identical, and the status bar counts this
+    /// list. `missing_scope` is the narrower fact, for the surfaces that can say
+    /// *which* of the two it is.
     pub fn needs_reauthorization(&self) -> Vec<String> {
-        lock(&self.needs_reauthorization).clone()
+        let mut all = lock(&self.needs_reauthorization).clone();
+        for email in self.dispatcher.scope_notices().emails() {
+            if !all.contains(&email) {
+                all.push(email);
+            }
+        }
+        all
     }
 
     pub fn mark_reauthorized(&self, email: &str) {
         lock(&self.needs_reauthorization).retain(|e| e != email);
+        // A fresh grant is a fresh set of scopes, so whatever was refused
+        // before is worth trying again rather than being remembered forever.
+        self.dispatcher.scope_notices().clear(email);
     }
 
     pub fn mark_needs_reauthorization(&self, email: &str) {

@@ -58,10 +58,25 @@ pub enum GoogleError {
         retry_after: Option<Duration>,
     },
 
-    /// A 403 that is *not* a rate limit — missing scope, or an admin policy.
-    /// Retrying will not help.
+    /// A 403 that is *not* a rate limit — an admin policy, a resource somebody
+    /// else owns. Retrying will not help.
     #[error("google forbidden (403): {message}")]
     Forbidden { message: String, reason: Option<String> },
+
+    /// **The grant is too narrow.** A 403 whose reason is
+    /// `insufficientPermissions`: the token is alive, the account is fine, and
+    /// the scope this endpoint needs was never consented to.
+    ///
+    /// Its own variant rather than a [`Forbidden`](GoogleError::Forbidden)
+    /// because the remedy is different and only the user can perform it. A dead
+    /// token refreshes itself; a revoked one produces a 401 and re-authorizing
+    /// fixes it; this one survives every refresh forever, because refreshing a
+    /// token cannot widen it. It appears the moment [`SCOPES`] grows and it goes
+    /// away only when the owner walks through the consent screen again.
+    ///
+    /// [`SCOPES`]: crate::auth::oauth::SCOPES
+    #[error("google refused because the account has not granted this permission (403): {message}")]
+    InsufficientScope { message: String },
 
     /// **The watermark is too old.** `users.history.list` answers 404 when the
     /// stored `historyId` has aged out of Gmail's retention window. It is not a
@@ -119,6 +134,12 @@ impl GoogleError {
         matches!(self, GoogleError::NotFound { .. })
     }
 
+    /// True when the account's grant is missing the scope the call needed.
+    /// The caller should report the account as needing authorization again.
+    pub fn is_insufficient_scope(&self) -> bool {
+        matches!(self, GoogleError::InsufficientScope { .. })
+    }
+
     /// True for both expired-watermark cases: the caller must throw away its
     /// incremental cursor and re-sync from scratch.
     pub fn requires_full_resync(&self) -> bool {
@@ -161,6 +182,23 @@ struct ErrorDetail {
     reason: Option<String>,
 }
 
+/// The 403 reason Google sends when the *token* is fine and the *grant* is too
+/// narrow. Its body reads:
+///
+/// ```json
+/// { "error": { "code": 403, "status": "PERMISSION_DENIED",
+///   "message": "Request had insufficient authentication scopes.",
+///   "errors": [{ "reason": "insufficientPermissions",
+///                "message": "Insufficient Permission" }] } }
+/// ```
+///
+/// The `message` is matched as well as the reason, because Google has shipped
+/// this response with `ACCESS_TOKEN_SCOPE_INSUFFICIENT` in `details` and no
+/// `errors[].reason` at all, and mistaking it for an ordinary refusal would put
+/// "Google refused" on screen in place of the one instruction that fixes it.
+const INSUFFICIENT_SCOPE_REASON: &str = "insufficientpermissions";
+const INSUFFICIENT_SCOPE_MESSAGE: &str = "insufficient authentication scopes";
+
 /// 403 reasons that mean "slow down" rather than "you may not".
 const RATE_LIMIT_REASONS: &[&str] = &[
     "ratelimitexceeded",
@@ -197,12 +235,18 @@ fn classify(response: &HttpResponse) -> GoogleError {
                 .map(|r| RATE_LIMIT_REASONS.contains(&r))
                 .unwrap_or(false)
                 || parsed.error.status.as_deref() == Some("RESOURCE_EXHAUSTED");
+            let scope = reason.as_deref() == Some(INSUFFICIENT_SCOPE_REASON)
+                || message
+                    .to_ascii_lowercase()
+                    .contains(INSUFFICIENT_SCOPE_MESSAGE);
             if limited {
                 GoogleError::RateLimited {
                     status,
                     message,
                     retry_after,
                 }
+            } else if scope {
+                GoogleError::InsufficientScope { message }
             } else {
                 GoogleError::Forbidden { message, reason }
             }

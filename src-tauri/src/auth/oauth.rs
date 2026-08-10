@@ -44,17 +44,43 @@ pub const CALLBACK_PATH: &str = "/oauth/callback";
 ///   administer may also be blocked by that org's admin.
 /// - `calendar` and `calendar.events` are **SENSITIVE**, not restricted — a
 ///   lighter verification tier with no CASA requirement.
+/// - `gmail.settings.basic` is **SENSITIVE**, the same tier as `gmail.send`, so
+///   it adds no verification burden that `gmail.send` had not already added.
 /// - `userinfo.email` (with `openid`) is how we learn which account just
 ///   authorized, so tokens can be keyed by email. It is non-sensitive.
 ///
 /// `gmail.modify` is deliberately chosen over the wider `https://mail.google.com/`:
 /// it covers read, label, archive and trash — everything the triage commands
 /// need — without granting permanent delete.
+///
+/// `gmail.settings.basic` is chosen on the same reasoning, one level down.
+/// `users.settings.filters` is behind it and behind nothing narrower: Gmail has
+/// no per-resource settings scope, so creating a filter costs the whole of
+/// "basic settings" — filters, the vacation responder, IMAP/POP, language and
+/// the existing send-as aliases. Mach reads and writes only filters. The scope
+/// above it, `gmail.settings.sharing`, is **not** requested and must not be:
+/// that one adds delegation, sending as another address, and registering a new
+/// forwarding destination, which is the difference between a rule that files
+/// mail and a rule that can send mail somewhere new. A filter with a `forward`
+/// action still works under `basic`, because Gmail only accepts a forwarding
+/// address the account has already verified — a gate Mach neither owns nor can
+/// open with this scope.
+///
+/// **Adding a scope invalidates every existing grant.** A refresh token issued
+/// before this line changed keeps working for mail and calendar and gets a 403
+/// from `users.settings.filters`, because the token carries the scopes it was
+/// granted, not the ones the app now asks for. Every account has to go through
+/// the consent screen again. That failure has to read as what it is rather than
+/// as a dead credential — see [`GoogleError::InsufficientScope`] and
+/// `SyncStatusPayload::missing_scope`.
+///
+/// [`GoogleError::InsufficientScope`]: crate::google::GoogleError::InsufficientScope
 pub const SCOPES: &[&str] = &[
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/calendar.events",
 ];

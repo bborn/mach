@@ -26,7 +26,10 @@ import type {
   ColorIndex,
   EventConference,
   EventGuest,
+  FilterAction,
+  FilterCriteria,
   Label,
+  MailFilter,
   Message,
   Participant,
   PendingAuthorization,
@@ -273,6 +276,17 @@ interface WireSyncStatus {
   configured?: Nullable<boolean>;
   configurationError?: Nullable<string>;
   needsReauthorization?: Nullable<string[]>;
+  missingScope?: Nullable<string[]>;
+}
+
+/** `list_filters` / `create_filter`, straight off the wire. */
+interface WireFilter {
+  accountId?: Nullable<number>;
+  accountEmail?: Nullable<string>;
+  id?: Nullable<string>;
+  criteria?: Nullable<FilterCriteria>;
+  action?: Nullable<FilterAction>;
+  description?: Nullable<string>;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -651,6 +665,26 @@ export function mapSyncStatus(wire: Nullable<WireSyncStatus>): SyncStatus {
     configured: wire?.configured !== false,
     configurationError: optional(wire?.configurationError) ?? null,
     needsReauthorization: wire?.needsReauthorization ?? [],
+    missingScope: wire?.missingScope ?? [],
+  };
+}
+
+/**
+ * A filter as the UI holds it.
+ *
+ * `description` is Rust's sentence and is not rebuilt here: the line in
+ * Preferences and the line in an approval prompt have to be the same line, and
+ * two implementations of "removeLabelIds: [INBOX] means skip the inbox" is one
+ * too many.
+ */
+export function mapFilter(wire: Nullable<WireFilter>): MailFilter {
+  return {
+    accountId: typeof wire?.accountId === "number" ? wire.accountId : 0,
+    accountEmail: text(wire?.accountEmail),
+    id: text(wire?.id),
+    criteria: wire?.criteria ?? {},
+    action: wire?.action ?? {},
+    description: text(wire?.description),
   };
 }
 
@@ -789,6 +823,22 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
 
     async removeAccount(accountId: AccountId) {
       await call<void>("remove_account", { accountId });
+    },
+
+    async listFilters(accountId) {
+      const wire = await call<WireFilter[]>(
+        "list_filters",
+        accountId == null ? {} : { accountId },
+      );
+      return (wire ?? []).map(mapFilter);
+    },
+
+    async createFilter(accountId, criteria, action) {
+      return mapFilter(await call<WireFilter>("create_filter", { accountId, criteria, action }));
+    },
+
+    async deleteFilter(accountId, filterId) {
+      await call<void>("delete_filter", { accountId, filterId });
     },
 
     async openExternal(url: string) {

@@ -127,8 +127,18 @@ export function syncProgress(status: SyncStatus | null): SyncProgress {
   const reauth = (status?.needsReauthorization ?? []).filter(
     (email) => !errors.some((e) => e.email === email),
   );
+  // The two reasons an account is on that list are not the same failure and
+  // must not read as the same sentence. A missing credential stops the mail; a
+  // grant that is missing a scope does not, so telling the owner his mail is
+  // broken would send him looking for a problem that is not there.
+  const missingScope = new Set(status?.missingScope ?? []);
   for (const email of reauth) {
-    errors.push({ email, message: `${email} needs signing in again` });
+    errors.push({
+      email,
+      message: missingScope.has(email)
+        ? `${email} has not granted a permission Mach now needs`
+        : `${email} needs signing in again`,
+    });
   }
 
   const backfilling = working.filter((a) => a.phase === "backfill");

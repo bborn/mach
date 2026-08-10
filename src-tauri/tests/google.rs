@@ -12,7 +12,8 @@ use mach_lib::google::gmail::{
     GmailClient, HistoryListQuery, HistoryType, MessageFormat, MessagesListQuery,
 };
 use mach_lib::google::types::{
-    Event, EventsListResponse, HistoryListResponse, Message, ResponseStatus,
+    Event, EventsListResponse, Filter, FilterAction, FilterCriteria, HistoryListResponse, Message,
+    ResponseStatus,
 };
 use mach_lib::google::{
     BoxFuture, GoogleError, HttpMethod, HttpRequest, HttpResponse, HttpTransport, RetryPolicy,
@@ -425,6 +426,118 @@ async fn labels_list_parses() {
     assert_eq!(user.messages_total, Some(412));
 }
 
+// ================================================================== filters
+//
+// The endpoint Mach never had, and the one whose request shape matters most:
+// there is no update, so a wrong body is a wrong standing rule.
+
+#[tokio::test]
+async fn filters_list_parses_and_addresses_the_settings_path() {
+    let t = FakeTransport::new(vec![ok_json("filters_list.json")]);
+    let filters = gmail(t.clone()).filters_list("me").await.unwrap();
+
+    assert_eq!(filters.len(), 2);
+    assert_eq!(filters[0].id, "ANe1BmhVQ3nJx0dK7Yc");
+    assert_eq!(filters[0].criteria.from.as_deref(), Some("no-reply@okta.com"));
+    assert_eq!(filters[0].action.remove_label_ids, ["INBOX", "UNREAD"]);
+    assert_eq!(filters[1].action.add_label_ids, ["TRASH"]);
+
+    let req = &t.requests()[0];
+    assert_eq!(req.method, HttpMethod::Get);
+    assert!(
+        req.url.ends_with("/users/me/settings/filters"),
+        "{}",
+        req.url
+    );
+}
+
+#[tokio::test]
+async fn filters_create_posts_criteria_and_action_without_an_id() {
+    let t = FakeTransport::new(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"ANe1BmNEW","criteria":{"from":"no-reply@okta.com"},"action":{"removeLabelIds":["INBOX"]}}"#,
+    ))]);
+
+    let filter = Filter {
+        // An id a caller might have carried in from a list. Gmail has no
+        // filter update, so sending it would either be ignored or rejected;
+        // either way the body must not contain it.
+        id: "ANe1BmOLD".to_string(),
+        criteria: FilterCriteria {
+            from: Some("no-reply@okta.com".to_string()),
+            ..FilterCriteria::default()
+        },
+        action: FilterAction {
+            remove_label_ids: vec!["INBOX".to_string()],
+            ..FilterAction::default()
+        },
+    };
+    let created = gmail(t.clone())
+        .filters_create("me", &filter)
+        .await
+        .unwrap();
+    assert_eq!(created.id, "ANe1BmNEW");
+
+    let req = &t.requests()[0];
+    assert_eq!(req.method, HttpMethod::Post);
+    assert!(
+        req.url.ends_with("/users/me/settings/filters"),
+        "{}",
+        req.url
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(req.body.as_ref().expect("a create has a body")).unwrap();
+    assert_eq!(body["criteria"]["from"], "no-reply@okta.com");
+    assert_eq!(body["action"]["removeLabelIds"][0], "INBOX");
+    assert!(body.get("id").is_none(), "the create body carried an id: {body}");
+    // Absent fields are absent rather than null: Gmail treats an explicit null
+    // criteria field as a value and refuses the request.
+    assert!(body["criteria"].get("to").is_none(), "{body}");
+    assert!(body["action"].get("forward").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn filters_delete_addresses_the_filter_by_id() {
+    let t = FakeTransport::new(vec![Ok(HttpResponse::new(204, Vec::new()))]);
+    gmail(t.clone())
+        .filters_delete("me", "ANe1BmhVQ3nJx0dK7Yc")
+        .await
+        .unwrap();
+
+    let req = &t.requests()[0];
+    assert_eq!(req.method, HttpMethod::Delete);
+    assert!(
+        req.url
+            .ends_with("/users/me/settings/filters/ANe1BmhVQ3nJx0dK7Yc"),
+        "{}",
+        req.url
+    );
+    assert!(req.body.is_none());
+}
+
+/// The failure that every account gets the first time it runs a build with a
+/// wider [`SCOPES`] list, and the one that must not read as a dead credential.
+#[tokio::test]
+async fn a_grant_missing_a_scope_is_not_an_ordinary_refusal() {
+    let body = r#"{"error":{"code":403,"message":"Request had insufficient authentication scopes.","errors":[{"reason":"insufficientPermissions","domain":"global","message":"Insufficient Permission"}],"status":"PERMISSION_DENIED"}}"#;
+    let t = FakeTransport::new(vec![Ok(HttpResponse::json(403, body))]);
+    let err = gmail(t).filters_list("me").await.unwrap_err();
+
+    assert!(err.is_insufficient_scope(), "got {err:?}");
+    assert!(!err.is_auth(), "a narrow grant is not a dead token");
+    assert!(!err.is_retriable(), "refreshing cannot widen a token");
+}
+
+/// Google has shipped this response without `errors[].reason`, which is why the
+/// message is matched too.
+#[tokio::test]
+async fn a_scope_failure_is_recognised_from_the_message_alone() {
+    let body = r#"{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED"}}"#;
+    let t = FakeTransport::new(vec![Ok(HttpResponse::json(403, body))]);
+    let err = gmail(t).filters_list("me").await.unwrap_err();
+    assert!(err.is_insufficient_scope(), "got {err:?}");
+}
+
 #[tokio::test]
 async fn get_profile_parses_email_and_history_id() {
     let t = FakeTransport::new(vec![ok_json("profile.json")]);
@@ -590,7 +703,8 @@ async fn a_403_rate_limit_reason_maps_to_rate_limited_not_forbidden() {
 
 #[tokio::test]
 async fn a_403_without_a_rate_limit_reason_is_forbidden() {
-    let body = r#"{"error":{"code":403,"message":"Insufficient Permission","errors":[{"reason":"insufficientPermissions","domain":"global","message":"Insufficient Permission"}],"status":"PERMISSION_DENIED"}}"#;
+    // A domain policy, which is nobody's to fix from inside Mach.
+    let body = r#"{"error":{"code":403,"message":"Request is prohibited by policy","errors":[{"reason":"domainPolicy","domain":"global","message":"Request is prohibited by policy"}],"status":"PERMISSION_DENIED"}}"#;
     let t = FakeTransport::new(vec![Ok(HttpResponse::json(403, body))]);
     let err = gmail(t).get_profile("me").await.unwrap_err();
     assert!(matches!(err, GoogleError::Forbidden { .. }), "got {err:?}");

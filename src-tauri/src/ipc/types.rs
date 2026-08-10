@@ -179,8 +179,15 @@ pub struct SyncStatusPayload {
     pub configured: bool,
     /// Set exactly when `configured` is false — a sentence to render.
     pub configuration_error: Option<String>,
-    /// Emails of accounts whose refresh token is gone from the Keychain.
+    /// Emails of every account that has to be authorized again — a refresh
+    /// token gone from the Keychain, or a grant too narrow for what was asked.
     pub needs_reauthorization: Vec<String>,
+    /// The subset of the above whose credential is alive and whose *grant* is
+    /// missing a scope. Mail and calendar keep syncing for these; the account
+    /// has to consent again before the scope-gated feature works. Adding a
+    /// scope to `oauth::SCOPES` puts every account here at once.
+    #[serde(default)]
+    pub missing_scope: Vec<String>,
 }
 
 /// What `begin_add_account()` hands back: a URL for the frontend to open and an

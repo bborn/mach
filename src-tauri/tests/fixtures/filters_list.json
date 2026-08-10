@@ -1,0 +1,25 @@
+{
+  "filter": [
+    {
+      "id": "ANe1BmhVQ3nJx0dK7Yc",
+      "criteria": {
+        "from": "no-reply@okta.com",
+        "subject": "verification code"
+      },
+      "action": {
+        "addLabelIds": ["Label_18"],
+        "removeLabelIds": ["INBOX", "UNREAD"]
+      }
+    },
+    {
+      "id": "ANe1Bmicb2S9pQwEr4t",
+      "criteria": {
+        "query": "list:newsletters.example.com",
+        "hasAttachment": false
+      },
+      "action": {
+        "addLabelIds": ["TRASH"]
+      }
+    }
+  ]
+}

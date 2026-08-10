@@ -41,6 +41,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { Filters } from "./Filters";
 import { PREFERENCES_EVENT, preferencesResolver } from "./palette";
 import { usePreferencesStore } from "./PreferencesProvider";
 
@@ -221,7 +222,7 @@ type SectionId = (typeof SECTIONS)[number]["id"];
 
 export function PreferencesDialog() {
   const { prefs, set } = usePreferencesStore();
-  const { accounts, actions, sync } = useMach();
+  const { accounts, labels, actions, sync } = useMach();
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<SectionId>("accounts");
   // Which account is one keystroke from being deleted, if any. Held here rather
@@ -493,6 +494,16 @@ export function PreferencesDialog() {
                     accounts={accounts}
                     signatures={prefs.signatures}
                     onChange={(next) => set("signatures", next)}
+                  />
+
+                  {/* The one surface here that is not a preference: a filter
+                      lives in Gmail. It is here because this is where somebody
+                      looking for it would look, and because the alternative
+                      was telling them to open Gmail's web settings. */}
+                  <Filters
+                    accounts={accounts}
+                    labels={labels}
+                    missingScope={sync?.missingScope ?? []}
                   />
                 </>
               )}

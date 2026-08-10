@@ -1,7 +1,7 @@
 //! Gmail REST client.
 //!
 //! Covers exactly the endpoints Mach's sync engine and command layer need:
-//! list, get, modify, send, history, labels, attachments, profile.
+//! list, get, modify, send, history, labels, filters, attachments, profile.
 //!
 //! Authentication is not this module's job — a [`TokenProvider`] supplies the
 //! bearer token, and an [`HttpTransport`] does the I/O.
@@ -11,9 +11,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::types::{
-    encode_base64url, AttachmentBody, Draft, DraftsListResponse, HistoryListResponse, HistorySweep,
-    Label, LabelsListResponse, Message, MessageRef, MessagesListResponse, Profile,
-    ThreadsListResponse,
+    encode_base64url, AttachmentBody, Draft, DraftsListResponse, Filter, FiltersListResponse,
+    HistoryListResponse, HistorySweep, Label, LabelsListResponse, Message, MessageRef,
+    MessagesListResponse, Profile, ThreadsListResponse,
 };
 use super::{
     GoogleError, HttpMethod, HttpTransport, Page, RestClient, RetryPolicy, Sleeper, TokenProvider,
@@ -725,6 +725,71 @@ impl GmailClient {
         self.rest
             .send_json(HttpMethod::Post, url, Some(body.to_string().into_bytes()))
             .await
+    }
+
+    // -------------------------------------------------------------- filters
+
+    /// `users.settings.filters.list`. Not paginated by Google.
+    ///
+    /// # Why there is no local copy of this
+    ///
+    /// Every other list in this client feeds SQLite, because the app's rule is
+    /// that the UI renders locally and never waits for Google. Filters are the
+    /// case that rule was not written about. There is nothing to render them
+    /// beside — they are not mail — and there is no incremental path to keep a
+    /// copy fresh: `users.settings.filters` has no `historyId`, no `syncToken`
+    /// and no change feed, so a cached list can only be refreshed by fetching
+    /// the whole thing, which is this call. Caching would buy nothing and would
+    /// cost the one thing that matters here: a delete addresses an id, and an
+    /// id from a stale list is either gone or, worse, somebody else's rule.
+    pub async fn filters_list(&self, user_id: &str) -> Result<Vec<Filter>, GoogleError> {
+        let url = self
+            .rest
+            .endpoint(&["users", user_id, "settings", "filters"])?;
+        let response: FiltersListResponse = self.rest.send_json(HttpMethod::Get, url, None).await?;
+        Ok(response.filter)
+    }
+
+    /// `users.settings.filters.create`.
+    ///
+    /// The body is the filter without its id — Google assigns that, and the
+    /// returned [`Filter`] carries it. Takes effect on mail that arrives after
+    /// the call and on nothing that is already in the mailbox; the API has no
+    /// parameter for the latter and Mach does not simulate one.
+    pub async fn filters_create(
+        &self,
+        user_id: &str,
+        filter: &Filter,
+    ) -> Result<Filter, GoogleError> {
+        let url = self
+            .rest
+            .endpoint(&["users", user_id, "settings", "filters"])?;
+        // `id` is `skip_serializing_if = "String::is_empty"`, so a filter that
+        // has never been created serializes as exactly the create body. One
+        // that has is a caller error rather than an update: Gmail has no filter
+        // update, only delete and create.
+        let body = serde_json::to_vec(&Filter {
+            id: String::new(),
+            ..filter.clone()
+        })
+        .map_err(|e| GoogleError::InvalidRequest {
+            message: format!("filter could not be encoded: {e}"),
+        })?;
+        self.rest
+            .send_json(HttpMethod::Post, url, Some(body))
+            .await
+    }
+
+    /// `users.settings.filters.delete`. Returns nothing on success.
+    ///
+    /// Deletes the rule, and only the rule. Mail the rule already acted on
+    /// stays where it was put — there is no undo for a filter, on Google's side
+    /// or ours, which is half the reason creating one asks first.
+    pub async fn filters_delete(&self, user_id: &str, filter_id: &str) -> Result<(), GoogleError> {
+        let url = self
+            .rest
+            .endpoint(&["users", user_id, "settings", "filters", filter_id])?;
+        self.rest.send_empty(HttpMethod::Delete, url, None).await
     }
 
     // ---------------------------------------------------------- attachments

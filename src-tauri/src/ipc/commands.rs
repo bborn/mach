@@ -11,9 +11,10 @@
 
 use tauri::{AppHandle, State};
 
-use crate::commands::{Command, CommandResult, CommandSpec};
+use crate::commands::{AccountFilter, Command, CommandError, CommandResult, CommandSpec};
 use crate::db::models::{Account, Event, Label, ThreadCursor};
 use crate::db::queries::{SearchNode, SearchRequest};
+use crate::google::types::{Filter, FilterAction, FilterCriteria};
 
 use super::error::IpcError;
 use super::events;
@@ -139,6 +140,81 @@ pub async fn execute_command(
 #[tauri::command]
 pub fn command_catalogue() -> Vec<CommandSpec> {
     Command::catalogue().to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// filters
+// ---------------------------------------------------------------------------
+
+/// Gmail filters for one account, or for every account when `account_id` is
+/// absent.
+///
+/// Read live from Google rather than from SQLite, which is the one place in the
+/// app that does that and is argued in [`crate::commands::filters`]: a filter
+/// has never been a local row, there is no incremental feed to keep a copy
+/// fresh, and a delete addressing a stale id is worse than a spinner.
+#[tauri::command]
+pub async fn list_filters(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+) -> Result<Vec<AccountFilter>, IpcError> {
+    scope_aware(&app, &state, state.dispatcher.list_filters(account_id).await)
+}
+
+/// Create one filter.
+///
+/// Takes the two halves separately rather than a whole `Filter`, because a
+/// caller has no id to send and an id in the request would be silently dropped.
+#[tauri::command]
+pub async fn create_filter(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    criteria: FilterCriteria,
+    action: FilterAction,
+) -> Result<AccountFilter, IpcError> {
+    let filter = Filter {
+        id: String::new(),
+        criteria,
+        action,
+    };
+    scope_aware(
+        &app,
+        &state,
+        state.dispatcher.create_filter(account_id, filter).await,
+    )
+}
+
+#[tauri::command]
+pub async fn delete_filter(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    filter_id: String,
+) -> Result<(), IpcError> {
+    scope_aware(
+        &app,
+        &state,
+        state.dispatcher.delete_filter(account_id, &filter_id).await,
+    )
+}
+
+/// Pass a filter result through, and push a new sync status if the reason it
+/// failed was a grant that is too narrow.
+///
+/// The command layer has already recorded the account; this is what makes the
+/// window notice without waiting for the next sync pass, so "Needs permission"
+/// appears in Preferences → Accounts in the same breath as the error.
+fn scope_aware<T>(
+    app: &AppHandle,
+    state: &AppState,
+    result: Result<T, CommandError>,
+) -> Result<T, IpcError> {
+    if let Err(CommandError::MissingScope { .. }) = &result {
+        events::emit_sync_status(app, &state.status_payload());
+    }
+    result.map_err(IpcError::from)
 }
 
 // ---------------------------------------------------------------------------

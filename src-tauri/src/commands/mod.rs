@@ -35,6 +35,7 @@
 //! | [`types`] | the [`Command`] enum and [`CommandResult`] |
 //! | [`error`] | [`CommandError`] (did not run) and [`CommandFailure`] (ran, refused) |
 //! | [`clients`] | how a command reaches the right account's API client |
+//! | [`filters`] | Gmail filters, which are not commands and say why |
 //! | [`mail`] | the label-delta engine, batching, snooze |
 //! | [`calendar`] | RSVP, and the event write path (create/update/delete/move) |
 //! | [`catalogue`] | the self-describing schema |
@@ -45,6 +46,7 @@ pub mod calendar;
 pub mod catalogue;
 pub mod clients;
 pub mod error;
+pub mod filters;
 pub mod mail;
 pub mod types;
 
@@ -52,6 +54,7 @@ use std::sync::Arc;
 
 pub use catalogue::{CommandSpec, ParamSpec, ParamType};
 pub use clients::{AccountClients, GoogleClients};
+pub use filters::{AccountFilter, ScopeNotices};
 pub use error::{CommandError, CommandFailure, FailureKind};
 pub use types::{
     Command, CommandResult, EventDraft, EventPatch, EventScope, ThreadLabelState,
@@ -74,6 +77,10 @@ pub struct CommandDispatcher {
     pub(crate) user_id: String,
     pub(crate) snooze_label_name: String,
     pub(crate) max_batch_message_ids: usize,
+    /// Accounts whose OAuth grant turned out to be too narrow for something
+    /// that was attempted through this dispatcher. See [`filters::ScopeNotices`]
+    /// for why it hangs here rather than on the application state.
+    pub(crate) scope_notices: Arc<ScopeNotices>,
 }
 
 impl CommandDispatcher {
@@ -86,6 +93,7 @@ impl CommandDispatcher {
             user_id: "me".to_string(),
             snooze_label_name: mail::DEFAULT_SNOOZE_LABEL.to_string(),
             max_batch_message_ids: mail::DEFAULT_MAX_BATCH_MESSAGE_IDS,
+            scope_notices: Arc::new(ScopeNotices::default()),
         })
     }
 
@@ -168,5 +176,11 @@ impl CommandDispatcher {
 
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// Which accounts have been found to be missing a scope. Read by
+    /// `AppState::status_payload` so they land in `needsReauthorization`.
+    pub fn scope_notices(&self) -> &Arc<ScopeNotices> {
+        &self.scope_notices
     }
 }

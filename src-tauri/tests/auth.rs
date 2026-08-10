@@ -195,10 +195,27 @@ fn scopes_cover_mail_calendar_and_identity() {
         "https://www.googleapis.com/auth/calendar",
         "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/userinfo.email",
+        // Gmail filters. `users.settings.filters` is behind this and behind
+        // nothing narrower.
+        "https://www.googleapis.com/auth/gmail.settings.basic",
     ] {
         assert!(joined.contains(required), "missing scope {required}");
     }
     assert_eq!(oauth::scope_string(), joined);
+}
+
+/// The scope above `settings.basic` adds delegation, sending as another address
+/// and registering a new forwarding destination. Mach's filters need none of
+/// it, and asking for it would widen every grant the owner has issued.
+#[test]
+fn the_wider_settings_scopes_are_not_requested() {
+    let joined = SCOPES.join(" ");
+    for refused in [
+        "https://www.googleapis.com/auth/gmail.settings.sharing",
+        "https://mail.google.com/",
+    ] {
+        assert!(!joined.contains(refused), "asked for {refused}");
+    }
 }
 
 // ---------------------------------------------------------------------------
