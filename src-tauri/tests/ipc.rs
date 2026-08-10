@@ -1285,6 +1285,7 @@ fn the_wire_sample_is_what_the_frontend_will_receive() {
         body_text: Some(String::new()),
         body_text_flowed: false,
         body_text_delsp: false,
+        html_evicted: false,
         snippet: "Deck attached.".into(),
         internal_date: 1_700_000_000_000,
         is_unread: true,

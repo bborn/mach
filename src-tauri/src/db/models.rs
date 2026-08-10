@@ -291,6 +291,13 @@ pub struct Message {
     pub body_text_flowed: bool,
     /// `delsp=yes` alongside it. Meaningless without `body_text_flowed`.
     pub body_text_delsp: bool,
+    /// `body_html` was dropped to reclaim disk and Gmail still has it.
+    ///
+    /// The difference between "this message has no HTML part" — ordinary, and
+    /// true of every plain-text mail — and "we let go of the HTML we had". Only
+    /// the second is worth a request, and only the second renders as text now
+    /// and upgrades when the request lands. See [`crate::evict`].
+    pub html_evicted: bool,
     pub snippet: String,
     pub internal_date: i64,
     pub is_unread: bool,

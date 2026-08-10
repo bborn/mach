@@ -69,6 +69,11 @@ pub struct RenderedMessage {
     /// Echoed back so the UI can tell a "remote images allowed" render from a
     /// stale blocked one without tracking the request it made.
     pub remote_images_allowed: bool,
+    /// This is the text of a message whose HTML was evicted, and a request will
+    /// upgrade it. `format` alone cannot say that: a message that never had an
+    /// HTML part renders `Text` too, and asking Gmail for it would be a round
+    /// trip per open forever. See [`crate::evict`].
+    pub html_evicted: bool,
     #[serde(flatten)]
     pub body: RenderedBody,
 }
@@ -129,6 +134,7 @@ pub fn render_stored_message(message: &Message, allow_remote_images: bool) -> Re
         message_id: message.id,
         format,
         remote_images_allowed: allow_remote_images,
+        html_evicted: message.html_evicted,
         body,
     }
 }

@@ -62,7 +62,55 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 11,
         sql: M11_TEXT_FLOWED,
     },
+    Migration {
+        version: 12,
+        sql: M12_HTML_EVICTION,
+    },
 ];
+
+/// Migration 12 — two dates that say what happened to a message's HTML.
+///
+/// `body_html` is the bulk of this store. A 46 000-thread mailbox is 2.3 GB, and
+/// most of that is markup for mail nobody will open again. It is also the one
+/// column here that is a *cache*: Gmail still has it, addressed by
+/// `gmail_message_id`, so dropping it locally costs a request rather than the
+/// message. `body_text` is not that — it is small, it is what `messages_fts`
+/// indexes, and it is what an evicted message renders from while the request is
+/// in flight — so it is never touched. See [`crate::evict`].
+///
+/// Both columns are about the *cache*, not the message, which is why neither is
+/// on `NewMessage` and neither is written by sync's upsert:
+///
+///  * `html_evicted_at` — when this row's HTML was dropped. Non-NULL is the only
+///    thing that distinguishes "we had HTML and let it go, ask Gmail for it"
+///    from "this message never had an HTML part", which is an ordinary state for
+///    plain-text mail. Without it every plain-text message would cost a pointless
+///    request on every open, forever.
+///  * `html_restored_at` — when a re-fetch put it back. It is the read the sweep
+///    can see without writing on the read path: a message opened once stays
+///    resident for a while rather than being evicted again the same afternoon.
+///
+/// Neither column implies anything about `body_html` on its own. Sync's upsert
+/// rewrites `body_html` from `excluded.body_html` and knows nothing about either
+/// column, so a message re-fetched by a history replay comes back resident with
+/// `html_evicted_at` still set. Everything that asks "is this evicted" therefore
+/// asks `html_evicted_at IS NOT NULL AND body_html IS NULL`, which stays true
+/// through any order of those writes.
+///
+/// The index is partial on exactly the sweep's predicate, and it is partial in
+/// the direction that matters: rows *leave* it as they are evicted. On this
+/// mailbox it starts at one entry per message with HTML and settles at one entry
+/// per recent message — a few thousand — so the sweep is a range seek over the
+/// resident set rather than a scan of a 2 GB table, and the maintenance sync
+/// pays for it is one b-tree insert per message stored.
+const M12_HTML_EVICTION: &str = r#"
+ALTER TABLE messages ADD COLUMN html_evicted_at  INTEGER;
+ALTER TABLE messages ADD COLUMN html_restored_at INTEGER;
+
+CREATE INDEX IF NOT EXISTS idx_messages_html_resident
+    ON messages (internal_date)
+    WHERE body_html IS NOT NULL AND is_draft = 0;
+"#;
 
 /// Migration 11 — whether a plain-text body's line breaks are the sender's.
 ///

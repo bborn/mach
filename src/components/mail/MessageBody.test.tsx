@@ -45,6 +45,7 @@ function rendered(over: Partial<RenderedMessage> = {}): RenderedMessage {
     messageId: 1,
     format: "html",
     remoteImagesAllowed: false,
+    htmlEvicted: false,
     html: "<p>hello</p>",
     quotedHtml: "",
     hasQuoted: false,
@@ -403,6 +404,10 @@ describe("the wire payload", () => {
       messageId: 7,
       format: "empty",
       remoteImagesAllowed: false,
+      // Absent means "not evicted", which is the answer that costs nothing: a
+      // backend that forgot the field must not make the reading pane ask Gmail
+      // for a body on every open.
+      htmlEvicted: false,
       html: "",
       quotedHtml: "",
       hasQuoted: false,

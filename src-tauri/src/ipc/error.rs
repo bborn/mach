@@ -51,6 +51,16 @@ pub enum IpcError {
     #[error("sync: {0}")]
     Sync(#[from] SyncError),
 
+    /// An evicted body that could not be brought back. Carries
+    /// [`RestoreError`](crate::evict::RestoreError)'s own tag, because "no
+    /// longer in Gmail" and "could not reach Gmail" are different answers and
+    /// only one of them is worth trying again.
+    #[error("{message}")]
+    Restore {
+        kind: &'static str,
+        message: String,
+    },
+
     /// A lock we could not take, a thread we could not spawn — a bug, but one
     /// the UI still has to render instead of hanging.
     #[error("{0}")]
@@ -72,6 +82,7 @@ impl IpcError {
             IpcError::Command(inner) => inner.kind(),
             IpcError::Db(_) => "db",
             IpcError::Sync(_) => "sync",
+            IpcError::Restore { kind, .. } => kind,
             IpcError::Internal(_) => "internal",
         }
     }

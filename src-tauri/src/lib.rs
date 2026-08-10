@@ -32,6 +32,8 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod db;
+/// Dropping `body_html` for old mail, and fetching it back on demand.
+pub mod evict;
 pub mod google;
 pub mod ipc;
 pub mod notify;
@@ -119,6 +121,8 @@ pub fn run() {
             // Cloned out before `manage` moves the state, like `sync` above.
             let dispatcher = Arc::clone(&state.dispatcher);
             let wake_cancel = state.sync.cancel_token();
+            let evict_db = state.db.clone();
+            let evict_cancel = state.sync.cancel_token();
 
             // The agent's bridge needs somewhere to send invoke requests, and
             // that is the window. Wired after `bootstrap` because it needs the
@@ -164,6 +168,28 @@ pub fn run() {
                 move |report| ipc::events::emit_wake_report(&wake_handle, &report),
             ));
 
+            // The eviction sweep: `body_html` for mail older than the policy's
+            // window, dropped so the store stops growing without bound. It
+            // starts late and ticks slowly on purpose — nothing is waiting on
+            // it, and launch is when the sync loop needs the writer. It never
+            // vacuums; returning the pages to the filesystem takes an exclusive
+            // lock and is a thing the owner asks for, not a thing that happens
+            // to him. See `evict::reclaim`.
+            tauri::async_runtime::spawn(evict::run(
+                evict_db,
+                evict_cancel,
+                evict::EvictionPolicy::default(),
+                evict::FIRST_SWEEP_DELAY,
+                evict::DEFAULT_SWEEP_INTERVAL,
+                |report| {
+                    eprintln!(
+                        "evicted {} message bodies ({} MB of HTML)",
+                        report.evicted,
+                        report.bytes_freed / 1_000_000
+                    )
+                },
+            ));
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -195,6 +221,7 @@ pub fn run() {
             ipc::handoff::handoff_run,
             ipc::render::render_message_body,
             ipc::render::open_external,
+            evict::command::restore_message_body,
             ipc::attachments::attachment_open,
             ipc::attachments::attachment_save,
             ipc::attachments::attachment_inline_image,

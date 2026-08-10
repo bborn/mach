@@ -1,20 +1,36 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, ImageOff, TriangleAlert } from "lucide-react";
 import type { Message } from "@/types";
 import { errorMessage } from "@/lib/ipc";
 import {
   localTextRender,
   renderMessageBody,
+  restoreMessageBody,
   shouldAutoExpandQuote,
   BLOCK_ALL_REMOTE_IMAGES,
   type RenderedMessage,
 } from "@/lib/message-body";
+import {
+  correctedScrollTop,
+  findScroller,
+  needsCorrection,
+  shouldApplyUpgrade,
+  ANCHOR_HOLD_MS,
+} from "@/lib/body-upgrade";
 import { applyInlineImages, contentIdsIn, fetchInlineImages } from "@/lib/attachments";
 import { Button } from "@/components/ui/button";
 import { MessageFrame } from "./MessageFrame";
 
 /** Nothing resolved yet. Hoisted so it is one stable identity, not a new Map per render. */
 const NO_INLINE_IMAGES: ReadonlyMap<string, string> = new Map();
+
+/** `findScroller`'s view of a real element. The only DOM in the anchor path. */
+const DOM_PROBE = {
+  parent: (node: HTMLElement) => node.parentElement,
+  overflowY: (node: HTMLElement) => getComputedStyle(node).overflowY,
+  scrollHeight: (node: HTMLElement) => node.scrollHeight,
+  clientHeight: (node: HTMLElement) => node.clientHeight,
+};
 
 export interface MessageBodyProps {
   message: Message;
@@ -56,6 +72,18 @@ export interface MessageBodyProps {
  * message, independently of `allowRemoteImages` — which is exactly how the
  * sanitizer already counts them (see `render::sanitize`, which does *not* put
  * them in `blockedRemoteImages`).
+ *
+ * # An evicted body renders as text and upgrades
+ *
+ * `body_html` for old mail is dropped to keep the store from growing without
+ * bound (`src-tauri/src/evict/`). The first render for one of those messages
+ * comes back with `htmlEvicted`, and it is the plain text — on screen
+ * immediately, with no spinner and nothing waiting on Google, exactly like every
+ * other body. The HTML is fetched behind it and swapped in when it lands, pinned
+ * so nothing above the message moves and held while the reader is inside it. See
+ * `@/lib/body-upgrade`.
+ *
+ * A fetch that fails leaves the text where it is and puts the reason above it.
  */
 export function MessageBody({ message, live }: MessageBodyProps) {
   const [allowRemoteImages, setAllowRemoteImages] = useState(!BLOCK_ALL_REMOTE_IMAGES);
@@ -64,13 +92,22 @@ export function MessageBody({ message, live }: MessageBodyProps) {
   const [quotedOverride, setQuotedOverride] = useState<boolean | null>(null);
   const [inlineImages, setInlineImages] =
     useState<ReadonlyMap<string, string>>(NO_INLINE_IMAGES);
+  // The upgraded render, waiting for a moment when applying it will not move
+  // the sentence being read. Null once it has been applied.
+  const [pending, setPending] = useState<RenderedMessage | null>(null);
+  const box = useRef<HTMLDivElement>(null);
+  // Whether the reader has scrolled since this message opened. A ref rather
+  // than state: every scroll event would otherwise re-render the body.
+  const engaged = useRef(false);
 
   // A different message is a different decision.
   useEffect(() => {
     setAllowRemoteImages(!BLOCK_ALL_REMOTE_IMAGES);
     setQuotedOverride(null);
     setRendered(null);
+    setPending(null);
     setInlineImages(NO_INLINE_IMAGES);
+    engaged.current = false;
   }, [message.id]);
 
   useEffect(() => {
@@ -95,6 +132,96 @@ export function MessageBody({ message, live }: MessageBodyProps) {
       cancelled = true;
     };
   }, [message.id, message.bodyText, allowRemoteImages, live]);
+
+  /*
+   * The evicted body's second half: ask Gmail for the HTML.
+   *
+   * Keyed on `htmlEvicted` rather than on the message, so it runs once for a
+   * message that has one and never at all for the ones that do not. The result
+   * is cached in the store by Rust, so a second open of the same message finds
+   * it resident and this effect never fires again.
+   */
+  const evicted = rendered?.htmlEvicted === true;
+  useEffect(() => {
+    if (!live || !evicted) return;
+    let cancelled = false;
+    restoreMessageBody(message.id, allowRemoteImages)
+      .then((upgraded) => {
+        if (cancelled) return;
+        setPending(upgraded);
+        setError(null);
+      })
+      .catch((caught: unknown) => {
+        // The text stays. Saying so is the whole of the failure handling here:
+        // a body that quietly remained text would be indistinguishable from a
+        // message that never had any HTML.
+        if (!cancelled) setError(errorMessage(caught));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [live, evicted, message.id, allowRemoteImages]);
+
+  /**
+   * Put the upgraded body in without moving anything the reader can see.
+   *
+   * Two parts, and they are separate problems. The message's own top is pinned
+   * across the swap, so growth cannot push the conversation around it — held for
+   * a beat, because the frame reports its height over several frames as the
+   * images land. And the swap is refused outright while the reader is inside the
+   * message, in which case the render stays pending and the next scroll gets
+   * another chance at it.
+   */
+  const applyUpgrade = useCallback((upgraded: RenderedMessage) => {
+    const node = box.current;
+    if (!node) return false;
+
+    const container = findScroller(node, DOM_PROBE);
+    const frameTop = container ? container.getBoundingClientRect().top : 0;
+    const rect = node.getBoundingClientRect();
+    const anchor = rect.top - frameTop;
+
+    if (!shouldApplyUpgrade(engaged.current, { top: anchor, bottom: rect.bottom - frameTop })) {
+      return false;
+    }
+
+    setRendered(upgraded);
+    setPending(null);
+
+    if (!container) return true;
+
+    // Re-pin every frame until the iframe has finished settling. Reading the
+    // box fresh each time is the point: the height arrives in steps.
+    const until = Date.now() + ANCHOR_HOLD_MS;
+    const pin = () => {
+      const moved = node.getBoundingClientRect().top - container.getBoundingClientRect().top;
+      if (needsCorrection(anchor, moved)) {
+        container.scrollTop = correctedScrollTop(container.scrollTop, anchor, moved);
+      }
+      if (Date.now() < until) requestAnimationFrame(pin);
+    };
+    requestAnimationFrame(pin);
+    return true;
+  }, []);
+
+  // Apply as soon as it arrives, and again on every scroll until it takes.
+  useEffect(() => {
+    if (!pending) return;
+    if (applyUpgrade(pending)) return;
+    const onScroll = () => applyUpgrade(pending);
+    window.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    return () => window.removeEventListener("scroll", onScroll, { capture: true });
+  }, [pending, applyUpgrade]);
+
+  // "Has the reader moved since this opened." Capture-phase because the pane
+  // that scrolls is an ancestor, and scroll does not bubble.
+  useEffect(() => {
+    const onScroll = () => {
+      engaged.current = true;
+    };
+    window.addEventListener("scroll", onScroll, { capture: true, passive: true });
+    return () => window.removeEventListener("scroll", onScroll, { capture: true });
+  }, [message.id]);
 
   /*
    * Resolve the `cid:` references the sanitizer left behind.
@@ -136,19 +263,27 @@ export function MessageBody({ message, live }: MessageBodyProps) {
   }, [rendered, inlineImages]);
 
   if (!withImages) {
-    return <div className="mt-3 text-list text-faint-foreground">Rendering…</div>;
+    return (
+      <div ref={box} className="mt-3 text-list text-faint-foreground">
+        Rendering…
+      </div>
+    );
   }
 
+  // The box the anchor is measured from. It has to be the whole body, including
+  // the quoted history below it, because that is what grows when the HTML lands.
   return (
-    <MessageBodyView
-      rendered={withImages}
-      subject={message.from.name}
-      allowRemoteImages={allowRemoteImages}
-      onLoadRemoteImages={() => setAllowRemoteImages(true)}
-      quotedOpen={quotedOverride ?? shouldAutoExpandQuote(withImages)}
-      onToggleQuoted={(open) => setQuotedOverride(open)}
-      error={error}
-    />
+    <div ref={box}>
+      <MessageBodyView
+        rendered={withImages}
+        subject={message.from.name}
+        allowRemoteImages={allowRemoteImages}
+        onLoadRemoteImages={() => setAllowRemoteImages(true)}
+        quotedOpen={quotedOverride ?? shouldAutoExpandQuote(withImages)}
+        onToggleQuoted={(open) => setQuotedOverride(open)}
+        error={error}
+      />
+    </div>
   );
 }
 

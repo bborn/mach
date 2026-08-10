@@ -912,6 +912,13 @@ const NOT_READ: Record<string, string[]> = {
     // with the flag.
     "bodyTextFlowed",
     "bodyTextDelsp",
+    // Whether this row's `body_html` was evicted. A real fact about the row,
+    // and the reading pane learns it from `render_message_body` rather than
+    // from here: that answer is per render and this one is as old as the last
+    // `get_thread`, so a message whose body has just been re-fetched would
+    // still be carrying `true` on the thread payload. One source, and it is the
+    // render.
+    "htmlEvicted",
     // Google's id for the blob and the path it lands at once fetched, both of
     // which belong to `lib/attachments.ts` and the Rust side that downloads it.
     "attachments.gmailAttachmentId",

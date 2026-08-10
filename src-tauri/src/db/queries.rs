@@ -430,7 +430,8 @@ const MESSAGE_COLUMNS: &str = "\
     id, thread_id, account_id, gmail_message_id, rfc822_message_id, in_reply_to, \
     references_header, from_name, from_email, to_json, cc_json, bcc_json, subject, \
     body_html, body_text, snippet, internal_date, is_unread, is_draft, reply_to, \
-    body_text_flowed, body_text_delsp";
+    body_text_flowed, body_text_delsp, \
+    (html_evicted_at IS NOT NULL AND body_html IS NULL)";
 
 fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
     let to: String = row.get(9)?;
@@ -459,6 +460,10 @@ fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
         // told" and is read as not flowed. See [`Message::body_text_flowed`].
         body_text_flowed: row.get::<_, Option<bool>>(20)?.unwrap_or(false),
         body_text_delsp: row.get::<_, Option<bool>>(21)?.unwrap_or(false),
+        // Computed in SQL rather than from the two columns here, because the
+        // question is about the pair: sync's upsert can put `body_html` back
+        // without clearing `html_evicted_at`, and that row is resident.
+        html_evicted: row.get(22)?,
         snippet: row.get(15)?,
         internal_date: row.get(16)?,
         is_unread: row.get(17)?,

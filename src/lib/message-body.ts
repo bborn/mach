@@ -32,6 +32,13 @@ export interface RenderedMessage {
   format: BodyFormat;
   /** Echoed from the request, so a stale render is visible rather than silent. */
   remoteImagesAllowed: boolean;
+  /**
+   * This is the text of a message whose HTML was evicted to reclaim disk, and
+   * [`restoreMessageBody`] will upgrade it. Distinct from `format: "text"`,
+   * which is also what a message that never had an HTML part renders as — that
+   * one has nothing to fetch.
+   */
+  htmlEvicted: boolean;
   /** Sanitized HTML for the new content. */
   html: string;
   /** Sanitized HTML for the quoted history; empty when there is none. */
@@ -68,6 +75,7 @@ interface WireRenderedMessage {
   messageId?: Nullable<number>;
   format?: Nullable<string>;
   remoteImagesAllowed?: Nullable<boolean>;
+  htmlEvicted?: Nullable<boolean>;
   html?: Nullable<string>;
   quotedHtml?: Nullable<string>;
   hasQuoted?: Nullable<boolean>;
@@ -96,6 +104,7 @@ export function mapRenderedMessage(wire: Nullable<WireRenderedMessage>, messageI
     messageId: typeof wire?.messageId === "number" ? wire.messageId : messageId,
     format: format && FORMATS.has(format) ? format : "empty",
     remoteImagesAllowed: wire?.remoteImagesAllowed === true,
+    htmlEvicted: wire?.htmlEvicted === true,
     html: typeof wire?.html === "string" ? wire.html : "",
     quotedHtml: typeof wire?.quotedHtml === "string" ? wire.quotedHtml : "",
     hasQuoted: wire?.hasQuoted === true,
@@ -138,6 +147,25 @@ export async function renderMessageBody(
 }
 
 /**
+ * Fetch an evicted body from Gmail and render it.
+ *
+ * Only called for a render that came back with `htmlEvicted`. Rejects when the
+ * message is no longer in Gmail or the network refused, and the caller keeps the
+ * text it already has and shows the sentence — a body must never go blank
+ * because a fetch failed.
+ */
+export async function restoreMessageBody(
+  messageId: MessageId,
+  allowRemoteImages: boolean,
+): Promise<RenderedMessage> {
+  const wire = await invoke<WireRenderedMessage>("restore_message_body", {
+    messageId,
+    allowRemoteImages,
+  });
+  return mapRenderedMessage(wire, messageId);
+}
+
+/**
  * The fallback for `bun run dev` against the fixture source, where there is no
  * Rust process to sanitize anything.
  *
@@ -151,6 +179,7 @@ export function localTextRender(messageId: MessageId, text: string): RenderedMes
     messageId,
     format: text.trim() ? "text" : "empty",
     remoteImagesAllowed: false,
+    htmlEvicted: false,
     html: text.trim() ? `<div style="white-space:pre-wrap">${escapeHtml(text)}</div>` : "",
     quotedHtml: "",
     hasQuoted: false,
