@@ -1,6 +1,5 @@
 import { Search } from "lucide-react";
 import { useEffect, useRef } from "react";
-import { Kbd } from "@/components/ui/kbd";
 import { BareInput } from "@/components/ui/input";
 import { fullDate } from "@/lib/time";
 
@@ -101,10 +100,9 @@ export function EventFinder({
           not this view — {fullDate(matchStart)}
         </span>
       )}
-
-      <span className="shrink-0 whitespace-nowrap text-micro text-faint-foreground">
-        <Kbd keys="enter" /> open · <Kbd keys="tab" /> next · <Kbd keys="escape" /> cancel
-      </span>
+      {/* `⏎ open · ⇥ next · Esc cancel` used to be printed here. A find bar is
+          the one control where those three keys need no introduction, and the
+          bar has one job — the row it should carry is the match it found. */}
     </div>
   );
 }

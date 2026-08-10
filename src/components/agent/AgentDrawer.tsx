@@ -23,7 +23,6 @@ import {
 import { errorMessage } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Kbd } from "@/components/ui/kbd";
 import { parseMarkdown, type MarkdownLine, type Segment } from "./markdown";
 
 /**
@@ -198,14 +197,10 @@ export function AgentDrawer({
           placeholder="Say something else…"
           className="min-w-0 flex-1 bg-transparent text-list text-foreground outline-none placeholder:text-faint-foreground"
         />
-        {error ? (
-          <span className="shrink-0 text-micro text-danger">{error}</span>
-        ) : (
-          <span className="flex shrink-0 items-center gap-1">
-            <Kbd keys="escape" />
-            <span className="text-micro text-faint-foreground">minimise</span>
-          </span>
-        )}
+        {/* An `Esc minimise` chip used to fill this corner whenever there was no
+            error to put in it. The drawer's own header draws minimise and close
+            as buttons; a hint that exists to occupy space is furniture. */}
+        {error && <span className="shrink-0 text-micro text-danger">{error}</span>}
       </footer>
     </section>
   );

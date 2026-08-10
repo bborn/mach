@@ -8,19 +8,25 @@
 //!
 //! 1. **The reply goes to the author.** Except when the author is you: see
 //!    below.
-//! 2. **Your own address never appears.** The account the thread arrived on is
-//!    removed from every field. Only that address — your *other*
-//!    accounts are, as far as this thread is concerned, other people, and
-//!    silently dropping them would lose a real recipient.
+//! 2. **Your own addresses never appear.** Every account in the app is removed
+//!    from every field, not only the one the thread arrived on — the same rule
+//!    Gmail applies to an alias. A reply-all that mails you a copy at your other
+//!    address is the visible version of this mistake.
 //! 3. **Cc is preserved**, minus anyone already in To, minus yourself.
 //! 4. **Everything is deduped case-insensitively on the address**, keeping the
 //!    first occurrence — which is the one whose display name the thread has
 //!    been showing.
+//! 5. **Rule 2 may never empty the To field.** A reply that addresses nobody is
+//!    not a reply, and the composer opening with an empty To and a placeholder
+//!    in it is what the owner reported. When removing yourself leaves nothing,
+//!    the unfiltered recipients go back in — a note to self is a real message,
+//!    and Gmail sends it too.
 //!
 //! One case is easy to get wrong and is pinned by a test: replying to a message
 //! **you** sent. `From` is you, so rule 2 would empty the To field. The answer
 //! there is the original `To` — you are continuing your own message, not
-//! writing to yourself.
+//! writing to yourself. When that `To` was also only you — the one-line note you
+//! mailed yourself — rule 5 is what keeps the field addressed.
 //!
 //! # `Reply-To`
 //!
@@ -88,13 +94,36 @@ fn to_mailboxes(people: &[Participant]) -> Vec<Mailbox> {
         .collect()
 }
 
-/// The recipients of a reply.
+/// The recipients of a reply, for a client that holds one account.
 ///
 /// `self_address` is the address of the account the thread arrived on — the
-/// address the reply will be *from*, which is the only one that must not also
-/// receive it. `reply_all` false narrows the result to the single To field.
+/// address the reply will be *from*. `reply_all` false narrows the result to the
+/// single To field.
 pub fn reply_recipients(message: &Message, self_address: &str, reply_all: bool) -> Recipients {
-    let me = vec![self_address.trim().to_string()];
+    let mine = [self_address.trim().to_string()];
+    reply_recipients_for(message, self_address, &mine, reply_all)
+}
+
+/// The recipients of a reply, given every address that is *you*.
+///
+/// `mine` is every account address in the app; `self_address` is the one this
+/// thread arrived on, and it decides only one thing — whether the message being
+/// answered is one you wrote. Who is removed from the fields is `mine`, because
+/// a reply-all that Ccs you at your other address is still mailing you your own
+/// message.
+pub fn reply_recipients_for(
+    message: &Message,
+    self_address: &str,
+    mine: &[String],
+    reply_all: bool,
+) -> Recipients {
+    let mine: Vec<String> = mine
+        .iter()
+        .map(|address| address.trim().to_string())
+        .filter(|address| !address.is_empty())
+        .chain(std::iter::once(self_address.trim().to_string()))
+        .filter(|address| !address.is_empty())
+        .collect();
 
     // Rule 1. `Reply-To` wins over `From` when the sender set one: they asked
     // for the answer to go elsewhere. Mailing lists depend on this — without
@@ -112,13 +141,16 @@ pub fn reply_recipients(message: &Message, self_address: &str, reply_all: bool) 
     let primary = if from_is_me {
         to_mailboxes(&message.to)
     } else {
-        author
+        author.clone()
     };
 
-    let to = dedupe(without(primary, &me));
+    let to = dedupe(without(primary.clone(), &mine));
 
     if !reply_all {
-        return Recipients { to, cc: Vec::new() };
+        return Recipients {
+            to: addressed(to, primary, author),
+            cc: Vec::new(),
+        };
     }
 
     // Everyone else who was on it: the original To (unless it already became
@@ -132,17 +164,41 @@ pub fn reply_recipients(message: &Message, self_address: &str, reply_all: bool) 
     let already: Vec<String> = to
         .iter()
         .map(|m| m.email.clone())
-        .chain(me.iter().cloned())
+        .chain(mine.iter().cloned())
         .collect();
     let cc = dedupe(without(rest, &already));
 
     // A reply-all whose To emptied out (you were the only recipient of your own
-    // message) should promote the Cc rather than send nowhere.
+    // message) promotes the Cc rather than falling back to your own address:
+    // somebody else was on the message and they are the better answer.
     if to.is_empty() && !cc.is_empty() {
-        return Recipients { to: cc, cc: Vec::new() };
+        return Recipients {
+            to: cc,
+            cc: Vec::new(),
+        };
     }
 
-    Recipients { to, cc }
+    Recipients {
+        to: addressed(to, primary, author),
+        cc,
+    }
+}
+
+/// Rule 5: a reply is addressed to somebody.
+///
+/// `to` is the field after your own addresses were taken out of it. When that
+/// leaves nothing — a note you mailed to yourself, which is a message like any
+/// other — the recipients go back in unfiltered rather than the composer opening
+/// with a placeholder where the address should be.
+fn addressed(to: Vec<Mailbox>, primary: Vec<Mailbox>, author: Vec<Mailbox>) -> Vec<Mailbox> {
+    if !to.is_empty() {
+        return to;
+    }
+    let unfiltered = dedupe(primary);
+    if !unfiltered.is_empty() {
+        return unfiltered;
+    }
+    dedupe(author)
 }
 
 /// The recipients of a forward: none. A forward is addressed by hand, and

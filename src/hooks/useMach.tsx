@@ -79,6 +79,7 @@ import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
 import { toMailboxError, useThreadStream } from "@/hooks/useThreadStream";
 import { DAY, addDays, addMonths, startOfWeek } from "@/lib/time";
+import { snoozeLabel } from "@/lib/snooze";
 import { undoWindowMs, type WeekStart } from "@/lib/prefs";
 import {
   setPreferenceFromAnywhere,
@@ -192,6 +193,20 @@ interface UiState {
    */
   overlays: number;
   addAccountOpen: boolean;
+  /**
+   * Whether the snooze picker is asking for a wake time.
+   *
+   * It has to be here rather than inside the picker because two other surfaces
+   * open it — the reading pane's clock button and the ⌘K command — and neither
+   * can reach into another component's `useState`.
+   *
+   * The threads it will act on are deliberately *not* stored alongside it. The
+   * picker commits through the same `snoozeSelected` every other caller uses,
+   * which reads the selection at the moment of the commit; opening an overlay
+   * does not disturb the selection, so the set is the same one the user was
+   * looking at when they pressed `b`.
+   */
+  snoozeOpen: boolean;
   listWidth: number;
   hiddenCalendars: CalendarId[];
   theme: Theme;
@@ -228,6 +243,7 @@ type UiAction =
   | { type: "event"; eventId: EventId | null }
   | { type: "palette"; open: boolean }
   | { type: "addAccount"; open: boolean }
+  | { type: "snooze"; open: boolean }
   | { type: "listWidth"; width: number }
   | { type: "toggleCalendar"; calendarId: CalendarId }
   | { type: "theme"; theme: Theme }
@@ -255,6 +271,7 @@ export const initialUi: UiState = {
   paletteOpen: false,
   overlays: 0,
   addAccountOpen: false,
+  snoozeOpen: false,
   listWidth: 520,
   hiddenCalendars: [],
   theme: "system",
@@ -315,6 +332,11 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
       return { ...state, paletteOpen: action.open };
     case "addAccount":
       return { ...state, addAccountOpen: action.open, paletteOpen: false };
+    // Closing the palette on the way, for the same reason `addAccount` does:
+    // the ⌘K command that opens this is chosen *from* the palette, and two
+    // overlays stacked on each other is a surface nobody asked for.
+    case "snooze":
+      return { ...state, snoozeOpen: action.open, paletteOpen: false };
     case "listWidth":
       return { ...state, listWidth: clamp(action.width, 280, 640) };
     case "toggleCalendar":
@@ -437,7 +459,16 @@ export interface MachActions {
   archiveSelected: () => void;
   trashSelected: () => void;
   starSelected: () => void;
-  snoozeSelected: () => void;
+  /**
+   * Snooze to a named instant.
+   *
+   * The instant is a parameter and has no default on purpose. This used to
+   * take none and commit `Date.now() + DAY`, which meant the answer to "when
+   * does this come back" depended on the second the key was pressed and was
+   * never shown to anybody. Every caller now goes through the picker, and the
+   * picker resolves the instant before it calls this.
+   */
+  snoozeSelected: (until: number) => void;
   replySelected: () => void;
   /** Move the keyboard between the rail and the list. */
   setFocus: (focus: MailFocus) => void;
@@ -469,6 +500,8 @@ export interface MachActions {
   goToday: () => void;
   setPalette: (open: boolean) => void;
   setAddAccount: (open: boolean) => void;
+  /** Open or shut the snooze picker. `b`, the clock button and ⌘K all call it. */
+  setSnooze: (open: boolean) => void;
   setStatus: (message: string, tone?: StatusMessage["tone"]) => void;
   /** Pin or unpin the mailbox being looked at, account scope included. */
   toggleFavoriteView: () => void;
@@ -938,7 +971,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
   const run = useCallback(
     async (
       command: Command,
-      options: { quiet?: boolean; reselectFailed?: boolean } = {},
+      options: { quiet?: boolean; reselectFailed?: boolean; label?: string } = {},
     ): Promise<CommandResult | null> => {
       try {
         const result = await getDataSource().execute(command);
@@ -962,7 +995,17 @@ export function MachProvider({ children }: { children: ReactNode }) {
             });
           }
         }
-        const message = describeResult(result);
+        /*
+         * `label` is how a caller says something the command layer cannot
+         * know. Only snooze uses it, and only because the interesting half of
+         * a snooze is the wake time: Rust answers "Snoozed 3 conversations",
+         * which leaves the status line and the ⌘Z entry unable to say whether
+         * the user picked tomorrow or next week — the one thing they just
+         * chose. It is ignored the moment anything fails, because
+         * `describeResult` is then reporting a partial application and a
+         * caller's optimistic phrasing would be a lie about what happened.
+         */
+        const message = options.label && result.ok ? options.label : describeResult(result);
         if (!options.quiet || !result.ok) {
           dispatchUi({
             type: "status",
@@ -1076,7 +1119,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
      * `hides` says whether the rows leave the list, which decides whether the
      * cursor has to move and whether to hide them optimistically.
      */
-    const bulk = (command: MailCommand, hides: boolean) => {
+    const bulk = (command: MailCommand, hides: boolean, label?: string) => {
       const ids = command.threadIds;
       if (ids.length === 0) return;
       if (hides) {
@@ -1085,7 +1128,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
         if (nextFocus !== ui.threadId) dispatch({ type: "thread", threadId: nextFocus });
       }
       dispatch({ type: "selection", selection: clearSelection(ui.selection) });
-      void run(command, { reselectFailed: true });
+      void run(command, { reselectFailed: true, label });
     };
 
     const pin = (favorite: Favorite) => {
@@ -1210,8 +1253,12 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
       archiveSelected: () => bulk({ kind: "archive", threadIds: commandTargetIds }, true),
       trashSelected: () => bulk({ kind: "trash", threadIds: commandTargetIds }, true),
-      snoozeSelected: () =>
-        bulk({ kind: "snooze", threadIds: commandTargetIds, until: Date.now() + DAY }, true),
+      snoozeSelected: (until) =>
+        bulk(
+          { kind: "snooze", threadIds: commandTargetIds, until },
+          true,
+          snoozeLabel(commandTargetIds.length, until, Date.now()),
+        ),
       // Starring a mixed set stars all of it; only an already-all-starred set
       // unstars. Anything else and the same keystroke does opposite things to
       // different rows of one selection.
@@ -1290,6 +1337,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
       goToday: () => dispatch({ type: "anchor", anchor: Date.now() }),
       setPalette: (open) => dispatch({ type: "palette", open }),
       setAddAccount: (open) => dispatch({ type: "addAccount", open }),
+      setSnooze: (open) => dispatch({ type: "snooze", open }),
       setStatus: (message, tone = "info") =>
         dispatch({ type: "status", status: { message, tone } }),
       toggleFavoriteView: () => pin(viewFavorite),

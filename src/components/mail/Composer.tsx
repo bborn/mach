@@ -47,6 +47,21 @@ interface ComposerProps {
   onDiscard: () => void;
   onAttach: () => void;
   onRemoveAttachment: (attachmentId: string) => void;
+  /**
+   * Move this draft between the dock and the window, carrying the caret.
+   *
+   * The offset is handed up rather than kept here because this component is
+   * the thing being unmounted: the composer that comes back is a different
+   * one, and only the dock is around to tell it where the caret was. Absent
+   * for a composer with nowhere to go — see `canPopOut`.
+   */
+  onPopOut?: (caret: number | null) => void;
+  /** Whether this composer is currently the popped-out one. Labels the key. */
+  poppedOut?: boolean;
+  /** How tall the writing area stands. The handle on the top edge moves it. */
+  bodyHeight: number;
+  /** Where the caret was in the composer this one is replacing, if it is. */
+  initialCaret?: number | null;
   /** Set while the send is in flight — the fields go read-only, not blank. */
   busy?: boolean;
   presentation?: ComposerPresentation;
@@ -63,6 +78,12 @@ interface ComposerProps {
    * subject. This is how it is told which field is the one to start in.
    */
   toRef?: RefObject<HTMLInputElement | null>;
+  /**
+   * The same again for the writing area, which the popped-out overlay starts
+   * focus in. It is a contenteditable rather than an input, so the overlay's
+   * own "first field in the panel" fallback cannot find it.
+   */
+  bodyRef?: RefObject<HTMLElement | null>;
 }
 
 /**
@@ -103,11 +124,16 @@ export function Composer({
   onDiscard,
   onAttach,
   onRemoveAttachment,
+  onPopOut,
+  poppedOut = false,
+  bodyHeight,
+  initialCaret = null,
   busy = false,
   presentation = "dock",
   active = true,
   dropping = false,
   toRef,
+  bodyRef,
 }: ComposerProps) {
   const editor = useRef<RichTextEditorHandle>(null);
   const ownToField = useRef<HTMLInputElement>(null);
@@ -153,6 +179,17 @@ export function Composer({
     [onSend],
   );
 
+  /**
+   * Hand the caret up on the way out.
+   *
+   * Read here rather than in the dock because the editor is this component's:
+   * by the time the dock has re-rendered with the other presentation, this
+   * editor has been unmounted and its selection has gone with the element.
+   */
+  const popOut = useCallback(() => {
+    onPopOut?.(editor.current?.caret() ?? null);
+  }, [onPopOut]);
+
   useKeyBindings([
     {
       keys: COMPOSER_KEYS.send,
@@ -189,6 +226,17 @@ export function Composer({
       priority: 100,
       when: () => active && !busy,
       handler: () => onDiscard(),
+    },
+    {
+      keys: COMPOSER_KEYS.popOut,
+      group: "Composer",
+      description: "Pop out, or put back",
+      allowInInput: true,
+      // Above the floor the overlay claims, because half of what this key does
+      // is done from inside that overlay.
+      priority: 110,
+      when: () => active && onPopOut !== undefined,
+      handler: () => popOut(),
     },
     {
       keys: COMPOSER_KEYS.close,
@@ -282,7 +330,9 @@ export function Composer({
           disabled={busy}
           active={active}
           handle={editor}
-          maxHeight={overlay ? 340 : 15 * 22}
+          height={bodyHeight}
+          initialCaret={initialCaret}
+          bodyRef={bodyRef}
         />
 
         {attachments.length > 0 && (
@@ -340,6 +390,15 @@ export function Composer({
           >
             discard
           </button>
+          {onPopOut && (
+            <button
+              type="button"
+              onClick={popOut}
+              className="inline-flex items-center gap-1 hover:text-foreground"
+            >
+              <Kbd keys={COMPOSER_KEYS.popOut} /> {poppedOut ? "put back" : "pop out"}
+            </button>
+          )}
           <span className="inline-flex items-center gap-1">
             <Kbd keys={COMPOSER_KEYS.close} /> close
           </span>

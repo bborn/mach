@@ -37,7 +37,6 @@ import { errorMessage } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { Overlay } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Kbd } from "@/components/ui/kbd";
 import { Textarea } from "@/components/ui/textarea";
 import { AnnotationCanvas } from "./AnnotationCanvas";
 
@@ -207,10 +206,6 @@ export function FeedbackDialog() {
         <span className="truncate text-micro text-faint-foreground">
           {phase === "sent" ? "filed" : "to an agent in this repo"}
         </span>
-        <span className="ml-auto flex shrink-0 items-center gap-1">
-          <Kbd keys="escape" />
-          <span className="text-micro text-faint-foreground">close</span>
-        </span>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -307,10 +302,8 @@ export function FeedbackDialog() {
           </>
         ) : (
           <>
-            <span className="flex items-center gap-1 text-micro text-faint-foreground">
-              <Kbd keys="mod+enter" />
-              send
-            </span>
+            {/* No `⌘⏎ send` chip: the button that sends is right there, and it
+                is the only thing this footer is for. */}
             <span className="ml-auto flex items-center gap-1.5">
               <Button size="sm" onClick={closeFeedback}>
                 Cancel

@@ -39,7 +39,6 @@ import {
 } from "@/lib/search-query";
 import { cn } from "@/lib/utils";
 import { BareInput } from "@/components/ui/input";
-import { Hint } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SEARCH_EVENT, type SearchEventDetail } from "@/components/search/palette";
 import { ThreadRow } from "./ThreadRow";
@@ -431,12 +430,14 @@ export function SearchView({ children }: { children: ReactNode }) {
           </>
         )}
       </ScrollArea>
+      {/*
+        No legend under the results.
 
-      <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border px-3">
-        <Hint keys={["j", "k"]} label="move" />
-        <Hint keys={["enter"]} label="open" />
-        <Hint keys={["escape"]} label="mailbox" />
-      </footer>
+        It read `j k move · ⏎ open · Esc mailbox` — the first two are the same
+        rows, moved the same way, as the mailbox this list replaced, and Escape
+        leaving a search is the one thing every keyboard user tries first. It
+        also sat one strip above the status bar's copy of the same three.
+      */}
     </>
   );
 }

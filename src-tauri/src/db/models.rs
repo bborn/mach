@@ -236,6 +236,34 @@ pub struct ThreadQuery {
 // messages
 // ---------------------------------------------------------------------------
 
+/// The namespace Mach mints its own message ids in.
+///
+/// A row Google has not been told about still needs a `gmail_message_id`: that
+/// column is the key `messages` is upserted on, and it is what lets the same
+/// row be found again when Google finally answers. So the composer writes one
+/// of its own — `mach-draft:<draft id>` for an unsent draft,
+/// `mach-outbox:<entry id>` for a message sitting out its send delay — and
+/// swaps in Google's the moment it arrives.
+///
+/// Gmail's message ids are lowercase hex, so nothing real can start with this.
+/// The two halves of the app can therefore ask one question, "is this id ours
+/// or Google's", and get one answer: [`is_local_message_id`].
+pub const LOCAL_ID_PREFIX: &str = "mach-";
+
+/// An unsent draft's placeholder namespace. See [`LOCAL_ID_PREFIX`].
+pub const DRAFT_ID_PREFIX: &str = "mach-draft:";
+
+/// A queued outgoing message's placeholder namespace. See [`LOCAL_ID_PREFIX`].
+pub const OUTBOX_ID_PREFIX: &str = "mach-outbox:";
+
+/// Whether this id is Mach's own placeholder rather than one Google minted.
+///
+/// The empty string counts, because a row with no id is unaddressable for the
+/// same reason and in the same place.
+pub fn is_local_message_id(gmail_message_id: &str) -> bool {
+    gmail_message_id.is_empty() || gmail_message_id.starts_with(LOCAL_ID_PREFIX)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {

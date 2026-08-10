@@ -33,7 +33,6 @@ import {
   FieldLabel,
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { Kbd } from "@/components/ui/kbd";
 import {
   Select,
   SelectContent,
@@ -330,11 +329,9 @@ export function PreferencesDialog() {
         <h2 id="preferences-title" className="text-reading font-medium text-foreground">
           Preferences
         </h2>
-        <span className="ml-auto flex items-center gap-1.5">
-          <Kbd keys="escape" />
-          <span className="text-micro text-faint-foreground">close</span>
-        </span>
-        <Button variant="subtle" onClick={() => setOpen(false)}>
+        {/* An `Esc close` chip used to sit immediately left of this button,
+            which does the same thing and says so in a word. */}
+        <Button variant="subtle" className="ml-auto" onClick={() => setOpen(false)}>
           Done
         </Button>
       </header>

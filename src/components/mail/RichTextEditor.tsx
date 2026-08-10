@@ -1,9 +1,18 @@
-import { useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type Ref,
+  type RefObject,
+} from "react";
 import Squire from "squire-rte";
 import { Bold, Italic, Underline, List, ListOrdered, Quote, Link2 } from "lucide-react";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { cleanFragment, isBlankHtml } from "@/lib/email-html";
 import { cn } from "@/lib/utils";
+import { caretOffsetIn, caretRangeIn } from "./caret-offset";
 
 /**
  * The composer's editor.
@@ -41,6 +50,14 @@ export interface RichTextEditorHandle {
   focus(): void;
   /** The current HTML, read straight out of the editor rather than from state. */
   html(): string;
+  /**
+   * Where the caret is, as a character offset into the message.
+   *
+   * Read before the composer is moved between the dock and the window, which
+   * unmounts this editor and builds another — see `caret-offset.ts` for why a
+   * number is the only form of the answer that survives that.
+   */
+  caret(): number | null;
 }
 
 interface RichTextEditorProps {
@@ -54,11 +71,31 @@ interface RichTextEditorProps {
   onChange: (html: string) => void;
   disabled?: boolean;
   placeholder?: string;
-  /** Past this the editor scrolls instead of growing. */
-  maxHeight?: number;
+  /**
+   * How tall the writing area stands. Past it the editor scrolls.
+   *
+   * A height rather than a maximum, because it is the thing the handle on the
+   * composer's top edge moves: a box that grew with the text would answer a
+   * drag with a size the next keystroke changed again.
+   */
+  height?: number;
+  /**
+   * Where to put the caret once the document is in, as a character offset.
+   *
+   * Only read when a document is loaded — on mount, and when `docKey` names a
+   * different draft — so it is a starting position, not a controlled value.
+   */
+  initialCaret?: number | null;
   handle?: Ref<RichTextEditorHandle>;
   /** Whether this editor's keys are live. False for a composer in the background. */
   active?: boolean;
+  /**
+   * Somewhere for the surface around the composer to hold on to the writing
+   * area — the popped-out overlay places focus there. Mirrored from the ref
+   * this component keeps for Squire rather than replacing it: React owns this
+   * element exactly once, at mount, and Squire owns everything inside it.
+   */
+  bodyRef?: RefObject<HTMLElement | null>;
 }
 
 export function RichTextEditor({
@@ -67,14 +104,20 @@ export function RichTextEditor({
   onChange,
   disabled = false,
   placeholder = "Write your message",
-  maxHeight = 340,
+  height = 340,
+  initialCaret = null,
   handle,
   active = true,
+  bodyRef,
 }: RichTextEditorProps) {
   const root = useRef<HTMLDivElement>(null);
   const editor = useRef<Squire | null>(null);
   const latest = useRef(onChange);
   latest.current = onChange;
+  // Read when a document is loaded, never depended on: a re-render because the
+  // caret moved would be a re-render on every keystroke.
+  const startAt = useRef(initialCaret);
+  startAt.current = initialCaret;
 
   const [empty, setEmpty] = useState(() => isBlankHtml(initialHtml));
   /** Which formats the cursor is inside, so the toolbar reflects the text. */
@@ -123,6 +166,15 @@ export function RichTextEditor({
     instance.setHTML(initialHtml);
     setEmpty(isBlankHtml(initialHtml));
     setLinking(false);
+    // Where the caret was before this editor existed — the composer moving
+    // between the dock and the window is the case this is for. `setHTML` has
+    // just rebuilt every node, so this has to happen after it.
+    const node = root.current;
+    const at = startAt.current;
+    if (node && at != null) {
+      const range = caretRangeIn(node, at);
+      if (range) instance.setSelection(range);
+    }
   }, [docKey]); // eslint-disable-line -- the body is not a prop, it is a document
 
   useEffect(() => {
@@ -135,6 +187,17 @@ export function RichTextEditor({
     () => ({
       focus: () => editor.current?.focus(),
       html: () => editor.current?.getHTML() ?? "",
+      caret: () => {
+        const node = root.current;
+        if (!node) return null;
+        try {
+          return caretOffsetIn(node, editor.current?.getSelection());
+        } catch {
+          // Squire asks the document for a selection it may not have. An
+          // editor that was never typed into simply has no caret to keep.
+          return null;
+        }
+      },
     }),
     [],
   );
@@ -278,14 +341,17 @@ export function RichTextEditor({
           </span>
         )}
         <div
-          ref={root}
+          ref={(node) => {
+            root.current = node;
+            if (bodyRef) bodyRef.current = node;
+          }}
           role="textbox"
           aria-multiline="true"
           aria-label="Message"
           spellCheck
-          style={{ maxHeight }}
+          style={{ height }}
           className={cn(
-            "block min-h-[5.5rem] w-full overflow-y-auto bg-transparent",
+            "block w-full overflow-y-auto bg-transparent",
             "text-reading leading-[1.6] text-foreground focus:outline-none",
             // The editor's own rendering, scoped here rather than added to the
             // global sheet: a `<ul>` inside a contenteditable needs a marker and

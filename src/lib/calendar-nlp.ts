@@ -159,8 +159,13 @@ export function parseEventText(
  * "Lunch at 1:30" means half past one in the afternoon. Nobody schedules a
  * standup at 01:30, and Fantastical assumes daylight too: an hour of 1–6 with
  * no am/pm said out loud gets twelve hours added.
+ *
+ * Exported because it is a convention rather than a detail: the snooze picker
+ * parses "tuesday at 3" through chrono too, and a 3 that means the afternoon
+ * in the event field and the small hours in the snooze field would be the app
+ * contradicting itself between two boxes a person types dates into.
  */
-function pmShift(component: chrono.ParsedComponents): number {
+export function pmShift(component: chrono.ParsedComponents): number {
   if (!component.isCertain("hour") || component.isCertain("meridiem")) return 0;
   const hour = component.get("hour") ?? 0;
   return hour >= 1 && hour <= 6 ? 12 * 60 * 60_000 : 0;

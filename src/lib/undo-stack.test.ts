@@ -442,6 +442,144 @@ describe("runRedo", () => {
   });
 });
 
+/**
+ * ⌘⌫ and `b`, all the way round the stack.
+ *
+ * Both are new keys onto old commands — `trash` and `snooze` have been in the
+ * command layer since it was written — so what these guard is not the commands
+ * but the claim the two features make: that they are undoable exactly the way
+ * archive is, with no confirmation in front of them because ⌘Z is behind them.
+ * The optimistic hide is the part worth pinning, because a trash that undoes
+ * into an invisible row is a bug that reports success.
+ */
+describe("trash and snooze on the stack", () => {
+  const trash = (ids: number[]): Command => ({ kind: "trash", threadIds: ids });
+  const untrash = (ids: number[]): Command => ({ kind: "untrash", threadIds: ids });
+  const snooze = (ids: number[], until: number): Command => ({
+    kind: "snooze",
+    threadIds: ids,
+    until,
+  });
+  const unsnooze = (ids: number[]): Command => ({ kind: "unsnooze", threadIds: ids });
+
+  it("records a trash with untrash as its inverse", () => {
+    const s = pushUndo(
+      emptyUndo(),
+      trash([4, 5]),
+      ok([4, 5], untrash([4, 5])),
+      "Trashed 2 conversations",
+      NOW,
+    );
+    expect(peekUndo(s)?.inverse).toEqual(untrash([4, 5]));
+    expect(describeUndo(peekUndo(s))).toBe("Undo trashed 2 conversations");
+  });
+
+  it("takes a trash back, clearing the hide before it dispatches", async () => {
+    const s = pushUndo(
+      emptyUndo(),
+      trash([4, 5]),
+      ok([4, 5], untrash([4, 5])),
+      "Trashed 2 conversations",
+      NOW,
+    );
+    const app = fakeHost(s, () => ok([4, 5], trash([4, 5])));
+    const outcome = await runUndo(app.host);
+
+    expect(outcome.ok).toBe(true);
+    expect(app.ran).toEqual([untrash([4, 5])]);
+    // Restore first, then run: the rows left the list the instant ⌘⌫ was
+    // pressed, and putting the threads back without clearing that hide would
+    // restore them where nobody can see them.
+    expect(app.events.slice(0, 2)).toEqual(["restore:4,5", "run:untrash"]);
+    expect(app.events).toContain("say:Undid trashed 2 conversations");
+    expect(peekUndo(app.state)).toBeNull();
+  });
+
+  it("re-trashes on redo, hiding the rows again", async () => {
+    const s = pushUndo(emptyUndo(), trash([4]), ok([4], untrash([4])), "Trashed 1 conversation", NOW);
+    const undoneApp = fakeHost(s, () => ok([4], trash([4])));
+    await runUndo(undoneApp.host);
+
+    // The undo taught the entry how to re-apply itself, from the command
+    // layer's own answer rather than a guess.
+    expect(peekRedo(undoneApp.state)?.original).toEqual(trash([4]));
+
+    const app = fakeHost(undoneApp.state, () => ok([4], untrash([4])));
+    await runRedo(app.host);
+    expect(app.ran).toEqual([trash([4])]);
+    expect(app.events.slice(0, 2)).toEqual(["hide:4", "run:trash"]);
+  });
+
+  it("keeps the entry when Google refuses the untrash", async () => {
+    const s = pushUndo(emptyUndo(), trash([4]), ok([4], untrash([4])), "Trashed 1 conversation", NOW);
+    const app = fakeHost(s, () => failed());
+    const outcome = await runUndo(app.host);
+
+    expect(outcome.ok).toBe(false);
+    // The affordance must not vanish because the network blipped.
+    expect(peekUndo(app.state)?.label).toBe("Trashed 1 conversation");
+  });
+
+  it("records a snooze with the instant in its label, and unsnooze as its inverse", () => {
+    const until = NOW + 86_400_000;
+    const s = pushUndo(
+      emptyUndo(),
+      snooze([9], until),
+      ok([9], unsnooze([9])),
+      "Snoozed 1 conversation until Tomorrow, 8:00 AM",
+      NOW,
+    );
+    expect(peekUndo(s)?.inverse).toEqual(unsnooze([9]));
+    expect(describeUndo(peekUndo(s))).toBe(
+      "Undo snoozed 1 conversation until Tomorrow, 8:00 AM",
+    );
+  });
+
+  it("wakes a snoozed thread on undo and puts the row back", async () => {
+    const until = NOW + 86_400_000;
+    const s = pushUndo(
+      emptyUndo(),
+      snooze([9], until),
+      ok([9], unsnooze([9])),
+      "Snoozed 1 conversation until Tomorrow, 8:00 AM",
+      NOW,
+    );
+    const app = fakeHost(s, () => ok([9], snooze([9], until)));
+    const outcome = await runUndo(app.host);
+
+    expect(outcome.ok).toBe(true);
+    expect(app.ran).toEqual([unsnooze([9])]);
+    expect(app.events.slice(0, 2)).toEqual(["restore:9", "run:unsnooze"]);
+  });
+
+  it("re-snoozes to the same instant on redo, not to a fresh one", async () => {
+    const until = NOW + 86_400_000;
+    const s = pushUndo(
+      emptyUndo(),
+      snooze([9], until),
+      ok([9], unsnooze([9])),
+      "Snoozed 1 conversation until Tomorrow, 8:00 AM",
+      NOW,
+    );
+    const undoneApp = fakeHost(s, () => ok([9], snooze([9], until)));
+    await runUndo(undoneApp.host);
+
+    const app = fakeHost(undoneApp.state, () => ok([9], unsnooze([9])));
+    await runRedo(app.host);
+    // The wake time survives the round trip. A redo that recomputed "tomorrow"
+    // would quietly move the thread's return by however long the user thought
+    // about it.
+    expect(app.ran).toEqual([snooze([9], until)]);
+  });
+
+  it("treats trash and snooze as commands that hide rows", () => {
+    expect(hidesThreads(trash([1]))).toBe(true);
+    expect(hidesThreads(snooze([1], NOW))).toBe(true);
+    expect(restoresThreads(untrash([1]))).toBe(true);
+    expect(restoresThreads(unsnooze([1]))).toBe(true);
+  });
+});
+
 function draft() {
   return {
     title: "Lunch",

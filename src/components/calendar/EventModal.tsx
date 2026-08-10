@@ -402,9 +402,8 @@ export function EventModal({
         {(event?.visibility === "private" || event?.visibility === "confidential") && (
           <span className="text-micro text-faint-foreground">private</span>
         )}
-        <span className="text-micro text-faint-foreground">
-          <Kbd keys="mod+enter" /> save · <Kbd keys="escape" /> close
-        </span>
+        {/* `⌘⏎ save · Esc close` sat here. The footer of this same panel draws
+            both as buttons, and the Save button carries the ⌘⏎ chip itself. */}
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-x-hidden overflow-y-auto p-3">

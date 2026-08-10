@@ -50,6 +50,34 @@
 //!  * `undo` covers **only** the applied threads, so undoing after a partial
 //!    failure cannot resurrect a change that never happened.
 //!
+//! # Conversations holding an unsent draft
+//!
+//! Saving a draft writes a message row into the conversation it answers, so the
+//! thread repaints without waiting for Gmail (see `compose::mirror`).
+//! Until the push to Gmail lands, that row is filed under
+//! `mach-draft:<draft id>`, an id Mach mints for itself. A reply waiting out its
+//! send delay is the same shape, under `mach-outbox:<entry id>`.
+//!
+//! Neither is a Gmail message id. `messages.batchModify` answers a request
+//! containing one with `400 Invalid ids value`, and it rejects the whole
+//! request, so a single unsent draft failed the archive of its entire
+//! conversation. A command therefore names only the ids Google minted;
+//! [`ThreadSnapshot`] separates them from Mach's own.
+//!
+//! **The draft itself is left alone.** That is what Gmail does: a draft message
+//! carries `DRAFT` and never `INBOX`, so removing `INBOX` from the conversation
+//! never reached it. The thread leaves the inbox and the draft stays in Drafts,
+//! still editable and still sendable. Mach lands in the same state by the same
+//! route, because archive only removes `INBOX` from the local label set, so the
+//! thread keeps `DRAFT` and stays in the Drafts mailbox. Star, snooze,
+//! mark-read and trash work the same way: whatever the conversation's labels
+//! become, the draft's own row is untouched.
+//!
+//! The two alternatives were discarding the draft, and pushing it to Gmail
+//! first so that it has an id to modify. Both give archive a side effect it
+//! does not have in Gmail, and the second uploads unfinished text as a
+//! consequence of a triage keystroke.
+//!
 //! # Snooze
 //!
 //! Gmail's API has no snooze. Google's own snooze is implemented with an
@@ -547,6 +575,10 @@ async fn run_chunk(
     remove: &[String],
     chunk: &[&ThreadPlan],
 ) -> Result<(), GoogleError> {
+    // `message_ids` is the Gmail-minted half of the snapshot; the placeholders
+    // an unsent draft or a queued reply is filed under are in
+    // `local_message_ids` and never reach here. One of them in this list is a
+    // `400 Invalid ids value` for every id beside it.
     let ids: Vec<&str> = chunk
         .iter()
         .flat_map(|p| p.snap.message_ids.iter().map(String::as_str))
@@ -686,21 +718,40 @@ pub(crate) async fn execute(
         return Ok(CommandResult::noop(describe(command, 0)));
     }
 
-    // A thread whose messages we have never fetched cannot be named in a Gmail
-    // request. Rather than write locally and let the store drift, it is
-    // reported as a failure and left untouched.
+    // A thread with nothing Gmail will accept as an id cannot be named in a
+    // request. Rather than write locally and let the store drift, it is reported
+    // as a failure and left untouched.
+    //
+    // There are two ways to get here and they are not the same news, so they are
+    // reported separately: a conversation nobody has synced yet, and one whose
+    // only messages are Mach's own — a draft that has not been pushed, a reply
+    // still in the outbox. The second is not a sync problem and telling the
+    // owner to sync would send them after a fix that does not exist.
     let mut failures: Vec<CommandFailure> = Vec::new();
-    let unaddressable: Vec<i64> = plans
+    let stranded = |p: &&ThreadPlan| p.remote_needed() && p.snap.message_ids.is_empty();
+    let unsynced: Vec<i64> = plans
         .iter()
-        .filter(|p| p.remote_needed() && p.snap.message_ids.is_empty())
+        .filter(|p| stranded(p) && p.snap.local_message_ids.is_empty())
         .map(|p| p.id())
         .collect();
-    if !unaddressable.is_empty() {
+    let unsent_only: Vec<i64> = plans
+        .iter()
+        .filter(|p| stranded(p) && !p.snap.local_message_ids.is_empty())
+        .map(|p| p.id())
+        .collect();
+    if !unsynced.is_empty() {
         failures.push(CommandFailure::invalid(
-            unaddressable.clone(),
+            unsynced.clone(),
             "thread has no locally known Gmail message ids; sync it before acting on it",
         ));
     }
+    if !unsent_only.is_empty() {
+        failures.push(CommandFailure::invalid(
+            unsent_only.clone(),
+            "conversation holds only unsent mail; there is nothing in Gmail to change yet",
+        ));
+    }
+    let unaddressable: Vec<i64> = unsynced.into_iter().chain(unsent_only).collect();
 
     let actionable: Vec<&ThreadPlan> = plans
         .iter()

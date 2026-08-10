@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::models::{Message, Participant};
 use crate::db::{command_queries, queries, Db};
 
-use super::address::{forward_recipients, reply_recipients};
+use super::address::{forward_recipients, reply_recipients_for};
 use super::markdown;
 use super::mime::{
     forward_subject, generate_message_id, references_for_reply, reply_subject, Mailbox, Outgoing,
@@ -291,8 +291,17 @@ pub struct ReplyContext {
     pub account_id: i64,
     pub account_email: String,
     pub account_name: Option<String>,
+    /// Every address the app holds an account for, this one included.
+    ///
+    /// Recipients are filtered against all of them rather than against
+    /// `account_email` alone: a reply-all that Ccs you at your other address is
+    /// still mailing you your own message. See [`super::address`].
+    pub my_addresses: Vec<String>,
     pub thread_id: i64,
     pub gmail_thread_id: String,
+    /// The conversation's subject, which a message in it can lack: `Subject` is
+    /// an optional header and the sync pass stores what Gmail gives it.
+    pub thread_subject: String,
     pub parent: Message,
 }
 
@@ -321,18 +330,41 @@ pub fn context_for_thread(db: &Db, thread_id: i64) -> Result<ReplyContext> {
         .ok_or_else(|| ComposeError::invalid("that conversation has no messages to reply to"))?;
 
     let account_id = detail.thread.account_id;
-    let account = db
-        .read(|conn| command_queries::account_by_id(conn, account_id))?
+    let accounts = db.read(queries::list_accounts)?;
+    let account = accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .cloned()
         .ok_or(ComposeError::UnknownAccount(account_id))?;
+    let my_addresses = accounts.into_iter().map(|a| a.email).collect();
 
     Ok(ReplyContext {
         account_id,
         account_email: account.email,
         account_name: account.display_name,
+        my_addresses,
         thread_id,
         gmail_thread_id: detail.thread.gmail_thread_id,
+        thread_subject: detail.thread.subject,
         parent,
     })
+}
+
+impl ReplyContext {
+    /// What `Re:` and `Fwd:` are put in front of.
+    ///
+    /// The message's own subject, falling back to the conversation's. A message
+    /// row can carry an empty `Subject` — the header is optional and the sync
+    /// pass stores what Gmail gives it — while the thread it belongs to has one,
+    /// and taking the message's blindly is how the composer opens showing `Re:`
+    /// with nothing after it.
+    pub fn original_subject(&self) -> &str {
+        if self.parent.subject.trim().is_empty() {
+            &self.thread_subject
+        } else {
+            &self.parent.subject
+        }
+    }
 }
 
 /// A draft, pre-filled from a thread.
@@ -347,12 +379,17 @@ pub fn prepare(db: &Db, thread_id: i64, kind: DraftKind, draft_id: String) -> Re
     let (to, cc, subject) = match kind {
         DraftKind::Forward => {
             let r = forward_recipients();
-            (r.to, r.cc, forward_subject(&ctx.parent.subject))
+            (r.to, r.cc, forward_subject(ctx.original_subject()))
         }
         DraftKind::New => (Vec::new(), Vec::new(), String::new()),
         other => {
-            let r = reply_recipients(&ctx.parent, &ctx.account_email, other == DraftKind::ReplyAll);
-            (r.to, r.cc, reply_subject(&ctx.parent.subject))
+            let r = reply_recipients_for(
+                &ctx.parent,
+                &ctx.account_email,
+                &ctx.my_addresses,
+                other == DraftKind::ReplyAll,
+            );
+            (r.to, r.cc, reply_subject(ctx.original_subject()))
         }
     };
 

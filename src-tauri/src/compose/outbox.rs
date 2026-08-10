@@ -39,7 +39,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::commands::GoogleClients;
-use crate::db::models::{NewMessage, Participant};
+use crate::db::models::{NewMessage, Participant, OUTBOX_ID_PREFIX};
 use crate::db::{queries, Db};
 use crate::google::GoogleError;
 
@@ -262,7 +262,7 @@ impl Outbox {
         let new = NewMessage {
             thread_id,
             account_id: entry.account_id,
-            gmail_message_id: format!("mach-outbox:{}", entry.id),
+            gmail_message_id: placeholder_message_id(&entry.id),
             rfc822_message_id: Some(format!("<{}>", out.message_id)),
             in_reply_to: out.in_reply_to.as_ref().map(|id| format!("<{id}>")),
             // Our own outgoing mail never sets Reply-To.
@@ -325,13 +325,13 @@ impl Outbox {
                 let thread_id: Option<i64> = conn
                     .query_row(
                         "SELECT thread_id FROM messages WHERE gmail_message_id = ?1",
-                        [format!("mach-outbox:{id}")],
+                        [placeholder_message_id(id)],
                         |row| row.get(0),
                     )
                     .optional()?;
                 conn.execute(
                     "DELETE FROM messages WHERE gmail_message_id = ?1",
-                    [format!("mach-outbox:{id}")],
+                    [placeholder_message_id(id)],
                 )?;
                 if let Some(thread_id) = thread_id {
                     conn.execute(
@@ -598,7 +598,7 @@ impl Outbox {
                 entry.gmail_draft_message_id.as_deref(),
             )?;
         }
-        let placeholder = format!("mach-outbox:{}", entry.id);
+        let placeholder = placeholder_message_id(&entry.id);
         self.db.write(|conn| {
             conn.execute(
                 "UPDATE compose_outbox
@@ -675,13 +675,13 @@ impl Outbox {
                 let thread_id: Option<i64> = conn
                     .query_row(
                         "SELECT thread_id FROM messages WHERE gmail_message_id = ?1",
-                        [format!("mach-outbox:{}", entry.id)],
+                        [placeholder_message_id(&entry.id)],
                         |row| row.get(0),
                     )
                     .optional()?;
                 conn.execute(
                     "DELETE FROM messages WHERE gmail_message_id = ?1",
-                    [format!("mach-outbox:{}", entry.id)],
+                    [placeholder_message_id(&entry.id)],
                 )?;
                 if let Some(thread_id) = thread_id {
                     conn.execute(
@@ -743,6 +743,14 @@ fn map_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxEntry> {
         gmail_draft_id: row.get(12)?,
         gmail_draft_message_id: row.get(13)?,
     })
+}
+
+/// The id the optimistic local copy is filed under until Gmail answers with a
+/// real one. See [`OUTBOX_ID_PREFIX`]: the command layer recognises the
+/// namespace and keeps these out of Gmail requests, which it can only do while
+/// every mint of one goes through here.
+fn placeholder_message_id(entry_id: &str) -> String {
+    format!("{OUTBOX_ID_PREFIX}{entry_id}")
 }
 
 fn participants(list: &[super::mime::Mailbox]) -> Vec<Participant> {

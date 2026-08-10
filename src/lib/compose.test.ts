@@ -13,6 +13,11 @@ import {
   newDraft,
   markdownToHtml,
   parseRecipients,
+  prepareDraft,
+  replyRecipients,
+  replySubject,
+  forwardRecipients,
+  forwardSubject,
   scheduleOptions,
   toPlainText,
   type Draft,
@@ -530,5 +535,150 @@ describe("the composer's keys", () => {
     keymap.handle(press());
     expect([palette, link]).toEqual([1, 1]);
     expect(keymap.conflicts()).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* What a reply is made of                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The defect these pin: `r` on an open conversation produced a composer with an
+ * empty To showing its placeholder and `Re:` with nothing after it.
+ *
+ * The arithmetic is Rust's — `compose::address` is what a real reply is built
+ * from — and this is the twin that serves the fixture source, so the same cases
+ * are asserted in `src-tauri/tests/compose.rs`. Drift fails both suites.
+ */
+describe("reply recipients", () => {
+  const tawny = { name: "Tawny", email: "tawny@partner.com" };
+  const sam = { name: "Sam", email: "sam@partner.com" };
+  const dana = { name: "Dana", email: "dana@partner.com" };
+  const me = { name: "Alex", email: "alex@example.com" };
+  const mine = ["alex@example.com"];
+
+  it("addresses a reply to the author", () => {
+    const r = replyRecipients({ from: tawny, to: [me], cc: [] }, me.email, mine, false);
+    expect(r.to.map((m) => m.email)).toEqual([tawny.email]);
+    expect(r.cc).toEqual([]);
+  });
+
+  it("prefers Reply-To over From", () => {
+    const list = { name: "The List", email: "list@lists.example" };
+    const r = replyRecipients(
+      { from: tawny, replyTo: [list], to: [me], cc: [] },
+      me.email,
+      mine,
+      false,
+    );
+    expect(r.to.map((m) => m.email)).toEqual([list.email]);
+  });
+
+  it("keeps everyone else on a reply-all and never yourself", () => {
+    const r = replyRecipients({ from: tawny, to: [me, sam], cc: [dana] }, me.email, mine, true);
+    expect(r.to.map((m) => m.email)).toEqual([tawny.email]);
+    expect(r.cc.map((m) => m.email)).toEqual([sam.email, dana.email]);
+  });
+
+  it("removes every account the app holds, not only the sending one", () => {
+    const other = { name: "Alex at home", email: "alex@personal.example" };
+    const r = replyRecipients(
+      { from: tawny, to: [me, other], cc: [sam] },
+      me.email,
+      [me.email, other.email],
+      true,
+    );
+    expect(r.to.map((m) => m.email)).toEqual([tawny.email]);
+    expect(r.cc.map((m) => m.email)).toEqual([sam.email]);
+  });
+
+  it("continues your own message rather than answering yourself", () => {
+    const r = replyRecipients({ from: me, to: [tawny], cc: [sam] }, me.email, mine, true);
+    expect(r.to.map((m) => m.email)).toEqual([tawny.email]);
+    expect(r.cc.map((m) => m.email)).toEqual([sam.email]);
+  });
+
+  // The reported bug, at its root: the owner replied to a note he had mailed
+  // himself. `from`, `to` and the account were one address, so removing
+  // "yourself" removed everybody and the composer opened addressed to nobody.
+  it("still addresses a note you mailed yourself", () => {
+    const r = replyRecipients({ from: me, to: [me], cc: [] }, me.email, mine, false);
+    expect(r.to.map((m) => m.email)).toEqual([me.email]);
+  });
+
+  it("still addresses that note on reply-all", () => {
+    const r = replyRecipients({ from: me, to: [me], cc: [] }, me.email, mine, true);
+    expect(r.to.map((m) => m.email)).toEqual([me.email]);
+    expect(r.cc).toEqual([]);
+  });
+
+  it("dedupes case-insensitively", () => {
+    const r = replyRecipients(
+      { from: tawny, to: [me, sam, { name: "Sam again", email: "SAM@partner.com" }], cc: [] },
+      me.email,
+      mine,
+      true,
+    );
+    expect(r.cc.map((m) => m.email)).toEqual([sam.email]);
+  });
+
+  it("leaves a forward for the sender to address", () => {
+    expect(forwardRecipients()).toEqual({ to: [], cc: [] });
+  });
+});
+
+describe("reply and forward subjects", () => {
+  it("adds one Re: and never a second", () => {
+    expect(replySubject("Invoice")).toBe("Re: Invoice");
+    expect(replySubject("Re: Invoice")).toBe("Re: Invoice");
+    expect(replySubject("RE: Invoice")).toBe("Re: Invoice");
+    expect(replySubject("re: re: Invoice")).toBe("Re: Invoice");
+    expect(replySubject("Re[2]: Invoice")).toBe("Re: Invoice");
+    expect(replySubject("RE : Invoice")).toBe("Re: Invoice");
+  });
+
+  it("leaves a word that merely starts with re alone", () => {
+    expect(replySubject("Rethinking pricing")).toBe("Re: Rethinking pricing");
+    expect(replySubject("Regarding: pricing")).toBe("Re: Regarding: pricing");
+  });
+
+  it("keeps the Fwd: on a reply to a forward, and vice versa", () => {
+    expect(replySubject("Fwd: Invoice")).toBe("Re: Fwd: Invoice");
+    expect(forwardSubject("Fwd: Invoice")).toBe("Fwd: Invoice");
+    expect(forwardSubject("FW: Invoice")).toBe("Fwd: Invoice");
+    expect(forwardSubject("Re: Invoice")).toBe("Fwd: Re: Invoice");
+  });
+
+  it("says Re: on its own when there was no subject at all", () => {
+    expect(replySubject("")).toBe("Re:");
+    expect(forwardSubject("")).toBe("Fwd:");
+  });
+});
+
+/**
+ * The browser fallback answers the same questions as `draft::prepare`, so `r`
+ * against the fixture source opens the composer a real reply opens. It used to
+ * hand back an empty draft, which is the reported symptom exactly.
+ */
+describe("prepare, against the fixture source", () => {
+  it("addresses a reply and carries the subject", async () => {
+    const draft = await prepareDraft(1, "reply");
+    expect(draft.to.map((m) => m.email)).toEqual(["tawny@northloop.example"]);
+    expect(draft.subject).toBe("Re: Series A data room — a few gaps");
+    expect(draft.accountId).toBe(1);
+    expect(draft.replyToId).toBe(101);
+  });
+
+  it("does the same for reply-all", async () => {
+    const draft = await prepareDraft(1, "replyAll");
+    expect(draft.to.map((m) => m.email)).toEqual(["tawny@northloop.example"]);
+    expect(draft.cc).toEqual([]);
+  });
+
+  it("leaves a forward unaddressed but titled", async () => {
+    const draft = await prepareDraft(1, "forward");
+    expect(draft.to).toEqual([]);
+    expect(draft.cc).toEqual([]);
+    expect(draft.subject).toBe("Fwd: Re: Series A data room — a few gaps");
   });
 });

@@ -807,6 +807,241 @@ async fn a_multi_message_thread_never_straddles_two_chunks() {
     assert_eq!(sizes, vec![3, 3]);
 }
 
+// ======================================================== unsent mail in a thread
+
+/// Put a row Google has not been told about into a conversation: the mirror
+/// `compose::mirror` writes when a draft is saved (`mach-draft:…`), or the
+/// optimistic copy `compose::outbox` writes when a reply is queued
+/// (`mach-outbox:…`). Neither id exists at Gmail.
+fn seed_unsent_message(
+    db: &Db,
+    account_id: i64,
+    thread_id: i64,
+    gmail_message_id: &str,
+    is_draft: bool,
+) {
+    db.write(|c| {
+        queries::upsert_message(
+            c,
+            &NewMessage {
+                thread_id,
+                account_id,
+                gmail_message_id: gmail_message_id.to_string(),
+                from: Participant::new("me@example.com"),
+                subject: "subject".into(),
+                snippet: "snippet".into(),
+                internal_date: 1_700_000_500_000,
+                is_unread: false,
+                is_draft,
+                ..Default::default()
+            },
+        )?;
+        if is_draft {
+            // What the Drafts mailbox reads, and what `mirror` writes alongside
+            // the message row.
+            c.execute(
+                "INSERT OR IGNORE INTO thread_labels (thread_id, gmail_label_id) VALUES (?1, 'DRAFT')",
+                [thread_id],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The reported bug, exactly: `E` on a conversation holding one real message and
+/// one unsent draft answered `400 Invalid ids value` and archived nothing,
+/// because the draft's `mach-draft:` placeholder rode along in the request.
+#[tokio::test]
+async fn archiving_a_conversation_with_an_unsent_draft_leaves_the_draft_out_of_the_request() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX"]);
+    seed_unsent_message(&db, account, thread, "mach-draft:draft-19fe992a3f8", true);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.applied, vec![thread]);
+    assert!(result.failed.is_empty());
+
+    // One addressable id, so the single-message endpoint — the placeholder did
+    // not even turn this into a batch.
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].url.ends_with("/users/me/messages/t1-m0/modify"),
+        "unexpected url {}",
+        requests[0].url
+    );
+    // Nothing Mach minted for itself appears anywhere on the wire.
+    let sent = String::from_utf8_lossy(requests[0].body.as_deref().unwrap_or(b"")).to_string();
+    assert!(
+        !requests[0].url.contains("mach-draft") && !sent.contains("mach-draft"),
+        "the draft placeholder reached Gmail: {} {sent}",
+        requests[0].url
+    );
+
+    // The conversation left the inbox and stayed in Drafts, which is where
+    // Gmail leaves it too. The draft row itself is untouched.
+    assert_eq!(thread_labels(&db, thread), sorted(&["DRAFT"]));
+    let messages = db
+        .read(|c| queries::thread_with_messages(c, thread))
+        .unwrap()
+        .expect("thread")
+        .messages;
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.gmail_message_id == "mach-draft:draft-19fe992a3f8" && m.is_draft),
+        "the draft was removed from the conversation"
+    );
+}
+
+/// Exactly which ids leave, for a conversation holding two real messages, an
+/// unsent draft and a reply still in the outbox.
+async fn ids_named_to_gmail(make: &dyn Fn(i64) -> Command) -> (Vec<String>, bool) {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
+    let thread = seed_thread_with_messages(&db, account, "t1", &["INBOX", "UNREAD"], 2);
+    seed_unsent_message(&db, account, thread, "mach-draft:d1", true);
+    seed_unsent_message(&db, account, thread, "mach-outbox:o1", false);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+    let result = d.execute(make(thread)).await.unwrap();
+
+    let ids = transport
+        .requests()
+        .iter()
+        .flat_map(|r| ids_of(&body_json(r), "ids"))
+        .collect();
+    (ids, result.ok)
+}
+
+/// One case: a name, and the command to run against the seeded thread.
+type Case = (&'static str, Box<dyn Fn(i64) -> Command>);
+
+/// Archive was the one that was reported; every sibling gathers its ids the same
+/// way and had the same defect.
+#[tokio::test]
+async fn no_mail_command_names_an_unsent_message_to_gmail() {
+    let cases: Vec<Case> = vec![
+        (
+            "archive",
+            Box::new(|t| Command::Archive { thread_ids: vec![t] }),
+        ),
+        (
+            "trash",
+            Box::new(|t| Command::Trash { thread_ids: vec![t] }),
+        ),
+        (
+            "star",
+            Box::new(|t| Command::Star {
+                thread_ids: vec![t],
+                starred: true,
+            }),
+        ),
+        (
+            "mark read",
+            Box::new(|t| Command::MarkRead {
+                thread_ids: vec![t],
+                read: true,
+            }),
+        ),
+        (
+            "snooze",
+            Box::new(|t| Command::Snooze {
+                thread_ids: vec![t],
+                until: 1_800_000_000_000,
+            }),
+        ),
+        (
+            "label",
+            Box::new(|t| Command::Label {
+                thread_ids: vec![t],
+                label_id: "Label_7".into(),
+                add: true,
+            }),
+        ),
+    ];
+
+    for (name, make) in cases {
+        let (ids, ok) = ids_named_to_gmail(&*make).await;
+        assert!(ok, "{name} failed");
+        assert_eq!(
+            ids,
+            vec!["t1-m0".to_string(), "t1-m1".to_string()],
+            "{name} named the wrong ids"
+        );
+    }
+}
+
+/// A conversation that is *only* a draft has nothing Gmail can be told about.
+/// That is a different report from "sync this first", because syncing would not
+/// help.
+#[tokio::test]
+async fn a_conversation_that_is_only_a_draft_is_reported_as_unsent_not_unsynced() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    // What `mirror` writes for a draft with no conversation behind it.
+    let drafted = seed_thread_with_messages(&db, account, "mach-draft:d2", &["DRAFT"], 0);
+    seed_unsent_message(&db, account, drafted, "mach-draft:d2", true);
+    // And one that has genuinely never been synced.
+    let unsynced = seed_thread_with_messages(&db, account, "t9", &["INBOX"], 0);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![drafted, unsynced],
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert_eq!(transport.call_count(), 0, "nothing was addressable");
+    assert!(result.applied.is_empty());
+    assert_eq!(result.failed.len(), 2, "{:?}", result.failed);
+
+    let unsent = result
+        .failed
+        .iter()
+        .find(|f| f.ids == vec![drafted])
+        .expect("a failure naming the draft-only conversation");
+    assert_eq!(unsent.kind, FailureKind::Invalid);
+    assert!(
+        unsent.message.contains("unsent"),
+        "unhelpful message {:?}",
+        unsent.message
+    );
+
+    let never_synced = result
+        .failed
+        .iter()
+        .find(|f| f.ids == vec![unsynced])
+        .expect("a failure naming the unsynced conversation");
+    assert!(
+        never_synced.message.contains("sync it"),
+        "unhelpful message {:?}",
+        never_synced.message
+    );
+
+    // Neither thread moved.
+    assert_eq!(thread_labels(&db, drafted), sorted(&["DRAFT"]));
+    assert_eq!(thread_labels(&db, unsynced), sorted(&["INBOX"]));
+}
+
 // ===================================================================== snooze
 
 #[tokio::test]

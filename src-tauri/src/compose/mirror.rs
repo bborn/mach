@@ -42,8 +42,10 @@ use super::{ensure_compose_schema, ComposeError, Result};
 
 /// The namespace a not-yet-pushed draft's ids live in. Shares its shape with
 /// the outbox's `mach-outbox:` so that "is this row ours and provisional" is
-/// one question with one answer.
-pub const MIRROR_PREFIX: &str = "mach-draft:";
+/// one question with one answer —
+/// [`is_local_message_id`](crate::db::models::is_local_message_id), which the
+/// command layer asks before naming any id to Gmail.
+pub const MIRROR_PREFIX: &str = crate::db::models::DRAFT_ID_PREFIX;
 
 pub fn mirror_message_id(draft_id: &str) -> String {
     format!("{MIRROR_PREFIX}{draft_id}")

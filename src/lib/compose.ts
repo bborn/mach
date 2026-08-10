@@ -450,6 +450,144 @@ function splitTopLevel(input: string): string[] {
 }
 
 /* -------------------------------------------------------------------------- */
+/* What a reply is made of — a mirror of `compose::address` and the subject     */
+/* half of `compose::mime`                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `Re: ` without stacking. Mirrors `compose::mime::reply_subject`.
+ *
+ * Only *reply* prefixes are stripped: Gmail's own answer to "Fwd: Invoice" is
+ * "Re: Fwd: Invoice", and dropping the Fwd would rename somebody else's thread.
+ */
+export function replySubject(subject: string): string {
+  const base = stripPrefixes(subject, ["re"]);
+  return base === "" ? "Re:" : `Re: ${base}`;
+}
+
+/** `Fwd: ` without stacking, by the same rule. */
+export function forwardSubject(subject: string): string {
+  const base = stripPrefixes(subject, ["fwd", "fw"]);
+  return base === "" ? "Fwd:" : `Fwd: ${base}`;
+}
+
+function stripPrefixes(subject: string, words: string[]): string {
+  let rest = subject.trim();
+  for (;;) {
+    let stripped: string | null = null;
+    for (const word of words) {
+      stripped = stripOne(rest, word);
+      if (stripped !== null) break;
+    }
+    if (stripped === null) return rest;
+    rest = stripped.replace(/^\s+/, "");
+  }
+}
+
+/** One leading `word:` / `word[n]:` / `word(n):`, case-insensitively. */
+function stripOne(subject: string, word: string): string | null {
+  const lower = subject.toLowerCase();
+  if (!lower.startsWith(word)) return null;
+  let rest = lower.slice(word.length).replace(/^\s+/, "");
+  // `Re[2]:` and `Re(2):` are what some clients count replies with.
+  const counted = /^[[(]\d*[\])]\s*/.exec(rest);
+  if (counted) rest = rest.slice(counted[0].length);
+  if (!rest.startsWith(":")) return null;
+  // The offsets are the same in the lowercase copy.
+  return subject.slice(subject.length - rest.length + 1);
+}
+
+/** The message a reply is being written against, as much of it as this matters. */
+export interface ReplySource {
+  from: Mailbox;
+  /** `Reply-To`, when the sender set one. It wins over `from`. */
+  replyTo?: Mailbox[];
+  to: Mailbox[];
+  cc: Mailbox[];
+}
+
+/**
+ * Who a reply goes to. The rules, and the reasoning behind each, are in
+ * `src-tauri/src/compose/address.rs`; this is the same arithmetic, and the two
+ * are pinned to the same cases in `compose.test.ts` and `tests/compose.rs`.
+ *
+ * `mine` is every account address in the app — a reply-all that Ccs you at your
+ * other address is still mailing you your own message. `selfAddress` decides
+ * only whether the message being answered is one you wrote.
+ */
+export function replyRecipients(
+  message: ReplySource,
+  selfAddress: string,
+  mine: string[],
+  replyAll: boolean,
+): { to: Mailbox[]; cc: Mailbox[] } {
+  const me = [...mine, selfAddress].map((a) => a.trim()).filter((a) => a !== "");
+
+  const author = (message.replyTo?.length ? message.replyTo : [message.from]).filter(
+    (m) => m.email.trim() !== "",
+  );
+  const fromIsMe = message.from.email.trim().toLowerCase() === selfAddress.trim().toLowerCase();
+  const primary = fromIsMe ? message.to.filter((m) => m.email.trim() !== "") : author;
+
+  const to = dedupeMailboxes(without(primary, me));
+
+  if (!replyAll) return { to: addressed(to, primary, author), cc: [] };
+
+  const rest = [...(fromIsMe ? [] : message.to), ...message.cc];
+  const already = [...to.map((m) => m.email), ...me];
+  const cc = dedupeMailboxes(without(rest, already));
+
+  // A reply-all whose To emptied out promotes the Cc: somebody else was on the
+  // message and they are the better answer than your own address.
+  if (to.length === 0 && cc.length > 0) return { to: cc, cc: [] };
+
+  return { to: addressed(to, primary, author), cc };
+}
+
+/** A forward is addressed by hand. Mirrors `address::forward_recipients`. */
+export function forwardRecipients(): { to: Mailbox[]; cc: Mailbox[] } {
+  return { to: [], cc: [] };
+}
+
+/**
+ * A reply is addressed to somebody.
+ *
+ * When removing your own addresses leaves nothing — a note you mailed to
+ * yourself — they go back in, rather than the composer opening on a placeholder
+ * where the address should be.
+ */
+function addressed(to: Mailbox[], primary: Mailbox[], author: Mailbox[]): Mailbox[] {
+  if (to.length > 0) return to;
+  const unfiltered = dedupeMailboxes(primary);
+  return unfiltered.length > 0 ? unfiltered : dedupeMailboxes(author);
+}
+
+function without(list: Mailbox[], excluded: string[]): Mailbox[] {
+  return list.filter(
+    (m) => !excluded.some((e) => e.toLowerCase() === m.email.trim().toLowerCase()),
+  );
+}
+
+/**
+ * Case-insensitive dedupe on the address, first occurrence wins — except that a
+ * later occurrence carrying a name beats an earlier one that had none.
+ */
+export function dedupeMailboxes(list: Mailbox[]): Mailbox[] {
+  const out: Mailbox[] = [];
+  for (const mailbox of list) {
+    const email = mailbox.email.trim();
+    if (email === "") continue;
+    const existing = out.find((m) => m.email.toLowerCase() === email.toLowerCase());
+    if (existing) {
+      if (!existing.name && mailbox.name) existing.name = mailbox.name;
+      continue;
+    }
+    out.push({ ...mailbox, email });
+  }
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Scheduling                                                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -765,19 +903,51 @@ function localLookup(key: string): Draft | null {
   return localDrafts.get(key) ?? null;
 }
 
+/**
+ * `prepare`, against the fixture source.
+ *
+ * It reads the conversation the same way `draft::prepare` does — the last
+ * message somebody actually sent, the account it arrived on, every account the
+ * app holds — so `r` in a browser tab opens the composer a real reply opens:
+ * addressed, with a subject. It used to answer an empty draft, which made the
+ * one keystroke this file exists to support unexercisable outside Tauri.
+ */
 function localPrepare(threadId: number, kind: DraftKind): Draft {
+  const thread = fixtures.threads.find((t) => t.id === threadId);
+  const messages = fixtures.messagesByThread.get(threadId) ?? [];
+  // Not the last message: a draft mirrored into the conversation is one, and
+  // threading a reply onto your own unsent text is `context_for_thread`'s bug
+  // to avoid here too.
+  const parent = [...messages].reverse().find((m) => !m.isDraft) ?? messages[messages.length - 1];
+  const accountId = thread?.accountId ?? parent?.accountId ?? 0;
+  const account = fixtures.accounts.find((a) => a.id === accountId);
+  const subject = thread?.subject ?? "";
+
+  const { to, cc } =
+    parent && kind !== "forward" && kind !== "new"
+      ? replyRecipients(
+          { from: parent.from, to: parent.to, cc: parent.cc },
+          account?.email ?? "",
+          fixtures.accounts.map((a) => a.email),
+          kind === "replyAll",
+        )
+      : forwardRecipients();
+
   return {
     id: `draft-local-${threadId}-${kind}`,
-    accountId: 0,
+    accountId,
     threadId,
-    replyToId: null,
+    replyToId: parent?.id ?? null,
     kind,
-    to: [],
-    cc: [],
+    to,
+    cc,
     bcc: [],
-    subject: "",
+    subject:
+      kind === "forward" ? forwardSubject(subject) : kind === "new" ? "" : replySubject(subject),
     body: "",
+    bodyFormat: "html",
     updatedAt: 0,
+    attachments: [],
   };
 }
 
@@ -858,6 +1028,15 @@ export const COMPOSER_KEYS = {
   reply: "r",
   replyAll: "a",
   forward: "f",
+  /**
+   * Take the draft off the conversation and give it the window, or put it back.
+   *
+   * Gmail pops its composer out with a modifier held over a mouse target and
+   * has no key for it, so there is nothing to match and nothing to diverge
+   * from. ⇧⌘O is free in this app, reads as "out", and is a modified letter —
+   * which it has to be, because it is pressed while typing.
+   */
+  popOut: "shift+mod+o",
 } as const;
 
 /* -------------------------------------------------------------------------- */

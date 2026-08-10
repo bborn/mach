@@ -585,6 +585,14 @@ export interface UiSession {
    * window it was dragged in may not fit the one it is restored into.
    */
   agentDrawerHeight: number;
+  /**
+   * How tall the reply composer's body stands, in pixels.
+   *
+   * The same kind of value again: the editor is the part that grows, so this
+   * is the number the handle on the composer's top edge moves, and what fits
+   * is decided at render — see `components/mail/composer-layout.ts`.
+   */
+  composerHeight: number;
   /** Account ids whose calendar group is folded up in the sidebar. */
   collapsedCalendarAccounts: number[];
   /** Mail rail sections folded up — `"inbox"`, `"folders"`, `"favorites"`. */
@@ -612,6 +620,15 @@ export const LIST_WIDTH_BOUNDS: Bounds = { min: 280, max: 640 };
  * known in this file. `clampDrawerHeight` applies both.
  */
 export const AGENT_DRAWER_HEIGHT_BOUNDS: Bounds = { min: 160, max: 900 };
+
+/**
+ * The bounds the composer's body is held to, on the same terms.
+ *
+ * The floor is the height the editor had before it could be dragged — five and
+ * a half rem, about four lines — because a composer shorter than that is the
+ * complaint this handle answers, not a size anybody wants to choose.
+ */
+export const COMPOSER_HEIGHT_BOUNDS: Bounds = { min: 88, max: 900 };
 
 const MODES = new Set<string>(["mail", "calendar"]);
 const CALENDAR_VIEWS = new Set<string>(["day", "week", "month"]);
@@ -645,6 +662,9 @@ export function parseSession(raw: unknown): Partial<UiSession> {
   }
   if (typeof raw.agentDrawerHeight === "number" && Number.isFinite(raw.agentDrawerHeight)) {
     out.agentDrawerHeight = clamp(Math.round(raw.agentDrawerHeight), AGENT_DRAWER_HEIGHT_BOUNDS);
+  }
+  if (typeof raw.composerHeight === "number" && Number.isFinite(raw.composerHeight)) {
+    out.composerHeight = clamp(Math.round(raw.composerHeight), COMPOSER_HEIGHT_BOUNDS);
   }
   if (Array.isArray(raw.collapsedCalendarAccounts)) {
     out.collapsedCalendarAccounts = raw.collapsedCalendarAccounts.filter(

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   AGENT_DRAWER_HEIGHT_BOUNDS,
+  COMPOSER_HEIGHT_BOUNDS,
   DEFAULT_PREFERENCES,
   LIST_WIDTH_BOUNDS,
   NO_NOTIFICATIONS,
@@ -369,11 +370,24 @@ describe("parseSession", () => {
     expect(parseSession({}).agentDrawerHeight).toBeUndefined();
   });
 
-  it("remembers the drawer height beside the divider, in the one session blob", () => {
-    // One key, one write: the drawer must not have invented a second store.
-    expect(parseSession({ listWidth: 480, agentDrawerHeight: 420 })).toEqual({
+  it("clamps a stored composer height, and forgets one it cannot read", () => {
+    expect(parseSession({ composerHeight: 9000 }).composerHeight).toBe(
+      COMPOSER_HEIGHT_BOUNDS.max,
+    );
+    expect(parseSession({ composerHeight: 2 }).composerHeight).toBe(COMPOSER_HEIGHT_BOUNDS.min);
+    expect(parseSession({ composerHeight: 200.4 }).composerHeight).toBe(200);
+    expect(parseSession({ composerHeight: "200" }).composerHeight).toBeUndefined();
+    expect(parseSession({ composerHeight: Number.NaN }).composerHeight).toBeUndefined();
+    expect(parseSession({}).composerHeight).toBeUndefined();
+  });
+
+  it("remembers every dragged edge beside the divider, in the one session blob", () => {
+    // One key, one write: neither the drawer nor the composer may invent a
+    // second store for the one gesture they share.
+    expect(parseSession({ listWidth: 480, agentDrawerHeight: 420, composerHeight: 260 })).toEqual({
       listWidth: 480,
       agentDrawerHeight: 420,
+      composerHeight: 260,
     });
   });
 });

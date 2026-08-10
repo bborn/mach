@@ -1,24 +1,7 @@
 import { usePendingSequence } from "@/hooks/useKeymap";
 import { useMach } from "@/hooks/useMach";
 import { formatBinding } from "@/lib/keymap";
-import { Hint } from "@/components/ui/kbd";
 import { SyncIndicator } from "./SyncIndicator";
-
-const MAIL_HINTS: [string[], string][] = [
-  [["j", "k"], "move"],
-  [["enter"], "open"],
-  [["x"], "select"],
-  [["e"], "archive"],
-  [["b"], "snooze"],
-  [["r"], "reply"],
-  [["c"], "new"],
-];
-
-const CALENDAR_HINTS: [string[], string][] = [
-  [["1", "2", "3"], "day / week / month"],
-  [["j", "k"], "period"],
-  [["t"], "today"],
-];
 
 /**
  * The bottom rail carries what is *true*, not what just happened: how much is
@@ -44,12 +27,25 @@ const CALENDAR_HINTS: [string[], string][] = [
  * view that nothing else on screen states. The count of conversations, the
  * count selected, the pending `g …`, the fixture warning, and the sync
  * indicator — which renders nothing at all unless a sync is running or has
- * failed. The hints are a reference card rather than news.
+ * failed.
+ *
+ * # The keymap is not one of those facts
+ *
+ * The rail also carried a permanent legend of the current mode's bindings —
+ * `j k move · ⏎ open · x select · e archive · b snooze · r reply · c new` in
+ * mail, the three view keys in calendar. It failed the same test twice over.
+ * In mail it sat directly under the composer strip, which offers `r` and `c`
+ * again as buttons; in calendar every one of its three rows was a second copy
+ * of a button in the calendar header. And a legend of the whole keymap is not
+ * a fact about the current view at all — it says the same thing in an empty
+ * inbox as in an open thread, which is what makes it furniture.
+ *
+ * `?` opens the reference card. That is where a legend belongs, and the sheet
+ * is one key away rather than buried in settings. Bindings are untouched.
  */
 export function StatusBar() {
   const { ui, visibleThreads, hasMore, live } = useMach();
   const pending = usePendingSequence();
-  const hints = ui.mode === "mail" ? MAIL_HINTS : CALENDAR_HINTS;
   const selected = ui.mode === "mail" ? ui.selection.ids.length : 0;
 
   return (
@@ -90,12 +86,6 @@ export function StatusBar() {
 
       <span className="ml-auto flex min-w-0 shrink items-center justify-end">
         <SyncIndicator />
-      </span>
-
-      <span className="flex shrink-0 items-center gap-3 overflow-hidden">
-        {hints.map(([keys, label]) => (
-          <Hint key={label} keys={keys} label={label} />
-        ))}
       </span>
     </footer>
   );

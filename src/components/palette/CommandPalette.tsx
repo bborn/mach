@@ -1,4 +1,4 @@
-import { Calendar, CornerDownLeft, Mail, Search, Sparkles, Tag, Terminal, User } from "lucide-react";
+import { Calendar, Mail, Search, Sparkles, Tag, Terminal, User } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Participant } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
@@ -176,7 +176,10 @@ export function CommandPalette() {
         case "archive":
           return actions.archiveSelected();
         case "snooze":
-          return actions.snoozeSelected();
+          // Hands over to the picker rather than committing a time of its own.
+          // The reducer's `snooze` case shuts this palette on the way out, so
+          // the two overlays never stack.
+          return actions.setSnooze(true);
         case "favorite-view":
           return actions.toggleFavoriteView();
         case "favorite-thread":
@@ -383,20 +386,14 @@ export function CommandPalette() {
         )}
       </div>
 
-      <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border px-3">
-        <span className="flex items-center gap-1">
-          <Kbd keys="up" />
-          <Kbd keys="down" />
-          <span className="text-micro text-faint-foreground">navigate</span>
-        </span>
-        <span className="flex items-center gap-1">
-          <CornerDownLeft size={11} strokeWidth={1.75} className="text-faint-foreground" />
-          <span className="text-micro text-faint-foreground">open</span>
-        </span>
-        <span className="ml-auto text-micro text-faint-foreground">
-          ⇥ asks the agent
-        </span>
-      </footer>
+      {/*
+        No footer legend.
+
+        It said `↑↓ navigate · ⏎ open · ⇥ asks the agent`. Arrows and Enter are
+        how every palette anyone has used already works, and the third was a
+        second copy of the `⇥ ask` chip in the field above — which appears the
+        moment there is a query, which is the moment it means anything.
+      */}
     </Overlay>
   );
 

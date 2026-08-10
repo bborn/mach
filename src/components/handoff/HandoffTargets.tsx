@@ -18,7 +18,6 @@ import { Overlay } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { Kbd } from "@/components/ui/kbd";
 import {
   Select,
   SelectContent,
@@ -121,10 +120,7 @@ export function HandoffTargetsDialog({ onClose }: { onClose: () => void }) {
         <span id="handoff-targets-title" className="text-body text-foreground">
           Handoff targets
         </span>
-        <span className="ml-auto flex shrink-0 items-center gap-1">
-          <Kbd keys="escape" />
-          <span className="text-micro text-faint-foreground">close</span>
-        </span>
+        {/* No `Esc close`: the footer of this dialog has Cancel and Done. */}
       </header>
 
       <div className="flex min-h-0 flex-col gap-2 overflow-y-auto p-3">

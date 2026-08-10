@@ -5,8 +5,10 @@ import { LIST_WIDTH_BOUNDS } from "@/lib/prefs";
 import { FlexPane, Pane, Resizer } from "@/components/ui/split";
 import { AccountRail } from "./AccountRail";
 import { ComposerDock } from "./ComposerDock";
+import { mailActionBindings } from "./mail-bindings";
 import { ReadingPane } from "./ReadingPane";
 import { SearchView } from "./SearchView";
+import { SnoozePicker } from "./SnoozePicker";
 import { ThreadList } from "./ThreadList";
 
 export function MailMode() {
@@ -105,78 +107,21 @@ export function MailMode() {
     // `c`, `r`, `a` and `f` are registered by <ComposerDock/>, which owns the
     // draft they open. A binding here would have to reach into that state
     // through the shell to do anything useful.
-    {
-      keys: "e",
-      group: "Actions",
-      description: "Archive",
-      when: () => active,
-      handler: () => actions.archiveSelected(),
-    },
-    {
-      // Gmail's snooze key. Mach shipped `h` — a Superhuman habit — and `b` is
-      // what the Gmail hand this app is for actually presses.
-      keys: "b",
-      group: "Actions",
-      description: "Snooze",
-      when: () => active,
-      handler: () => actions.snoozeSelected(),
-    },
-    {
-      // The old key, kept and undocumented. Nothing else wants `h`, and taking
-      // a working key out from under someone mid-week buys nothing.
-      keys: "h",
-      when: () => active,
-      handler: () => actions.snoozeSelected(),
-    },
-    {
-      keys: "s",
-      group: "Actions",
-      description: "Star",
-      when: () => active,
-      handler: () => actions.starSelected(),
-    },
-    {
-      keys: "#",
-      group: "Actions",
-      description: "Trash",
-      when: () => active,
-      handler: () => actions.trashSelected(),
-    },
-    {
-      /*
-       * ⇧F, not F: `f` is forward, and Superhuman's muscle memory outranks a
-       * new feature's first choice of key. The mnemonic survives the shift.
-       *
-       * Gmail spends ⇧F on "forward in a new window", which is not a thing
-       * this app has — one window, composer inline — so the key is free and
-       * this is a divergence with nothing on the other side of it.
-       */
-      keys: "shift+f",
-      group: "Actions",
-      description: "Favorite the conversation or mailbox",
-      when: () => active,
-      handler: () => actions.toggleFavoriteFocused(),
-    },
-    {
-      /*
-       * Gmail's undo key, and ⌘Z's, are one implementation.
-       *
-       * Both call `actions.undo()`, which walks the undo stack — so `z` is no
-       * longer "take back the thing the status bar is still talking about". It
-       * reaches as far back as ⌘Z does. The calendar's `z` is the same call
-       * against the same stack, which is why undoing a drag and undoing an
-       * archive are the same gesture even though they are different modes.
-       *
-       * It stays a bare key, and stays mode-scoped, because that is what a
-       * Gmail hand presses. ⌘Z is the platform's spelling of it and lives in
-       * `App.tsx` where it can be global.
-       */
-      keys: "z",
-      group: "Actions",
-      description: "Undo",
-      when: () => mail,
-      handler: () => actions.undo(),
-    },
+    //
+    // The rest live in `mail-bindings.ts` as data. They are spread in place, so
+    // the help sheet still prints them here, between the movement keys and the
+    // selection keys — see that file for why they were moved at all.
+    ...mailActionBindings(
+      { mail: () => mail, active: () => active },
+      {
+        archive: () => actions.archiveSelected(),
+        openSnooze: () => actions.setSnooze(true),
+        star: () => actions.starSelected(),
+        trash: () => actions.trashSelected(),
+        favorite: () => actions.toggleFavoriteFocused(),
+        undo: () => actions.undo(),
+      },
+    ),
 
     /* -------------------------------------------------------- Selection --- */
     /* `x` is the Gmail/Superhuman verb and the one his hands already know;
@@ -287,6 +232,10 @@ export function MailMode() {
         <ReadingPane />
         <ComposerDock />
       </FlexPane>
+      {/* Renders nothing until `b` opens it. Mounted here rather than beside
+          the palette in `App` because it acts on the thread list's selection
+          and has no meaning in the calendar. */}
+      <SnoozePicker />
     </div>
   );
 }

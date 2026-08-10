@@ -20,7 +20,6 @@ import { errorMessage, isTauri } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
 import { Overlay } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Kbd } from "@/components/ui/kbd";
 import { HandoffTargetsDialog } from "./HandoffTargets";
 
 /**
@@ -240,10 +239,6 @@ export function HandoffDialog() {
         {phase === "confirming" && (
           <span className="truncate text-micro text-faint-foreground">first run of this target</span>
         )}
-        <span className="ml-auto flex shrink-0 items-center gap-1">
-          <Kbd keys="escape" />
-          <span className="text-micro text-faint-foreground">close</span>
-        </span>
       </header>
 
       <div className="min-h-0 overflow-y-auto p-3">
@@ -265,26 +260,22 @@ export function HandoffDialog() {
 
       <footer className="flex h-9 shrink-0 items-center gap-2 border-t border-border px-3">
         {phase === "confirming" && preview ? (
-          <>
-            <span className="flex items-center gap-1 text-micro text-faint-foreground">
-              <Kbd keys="enter" />
-              run it
-            </span>
-            <span className="ml-auto flex shrink-0 items-center gap-1.5">
-              <Button size="sm" onClick={dismiss}>
-                Cancel
-              </Button>
-              <Button
-                size="sm"
-                variant="default"
-                onClick={() => {
-                  if (request?.kind === "run") void launch(preview.targetId, request.note);
-                }}
-              >
-                Hand off
-              </Button>
-            </span>
-          </>
+          /* The `⏎ run it` chip that used to lead this row is what the button
+             beside it already is. */
+          <span className="ml-auto flex shrink-0 items-center gap-1.5">
+            <Button size="sm" onClick={dismiss}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              variant="default"
+              onClick={() => {
+                if (request?.kind === "run") void launch(preview.targetId, request.note);
+              }}
+            >
+              Hand off
+            </Button>
+          </span>
         ) : (
           <Button size="sm" className="ml-auto" onClick={dismiss}>
             Done

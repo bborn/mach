@@ -803,6 +803,157 @@ fn a_forward_is_addressed_by_hand() {
     assert!(d.cc.is_empty());
 }
 
+// ------------------------------------------------------ a reply is addressed
+//
+// The defect these pin: `r` on a note the owner had mailed to himself opened a
+// composer with an empty To showing its placeholder, and `Re:` with nothing
+// after it. Both halves came from the same message — `from`, `to` and the
+// account were one address, so removing "yourself" removed everybody, and the
+// message row's `Subject` was empty while the conversation's was not.
+
+/// Rule 5. Taking your own address out must not leave the field empty.
+#[test]
+fn replying_to_a_note_you_mailed_yourself_still_addresses_it() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "alex@example.com", None);
+    let thread = seed_thread(&db, account, "a note");
+    seed_message(
+        &db,
+        thread,
+        account,
+        "gmsg-self",
+        person("Alex", "alex@example.com"),
+        vec![person("Alex", "alex@example.com")],
+        vec![],
+        "a note",
+        "<self-1@x>",
+        None,
+        "test",
+    );
+
+    let d = draft::prepare(&db, thread, DraftKind::Reply, "d1".into()).unwrap();
+    assert_eq!(
+        d.to.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["alex@example.com"],
+        "a reply that addresses nobody is not a reply"
+    );
+    assert_eq!(d.subject, "Re: a note");
+}
+
+/// The same message, reply-all. Nobody else was on it, so there is nothing to
+/// promote out of Cc — and the To must still name somebody.
+#[test]
+fn reply_all_to_a_note_you_mailed_yourself_still_addresses_it() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "alex@example.com", None);
+    let thread = seed_thread(&db, account, "a note");
+    seed_message(
+        &db,
+        thread,
+        account,
+        "gmsg-self",
+        person("Alex", "alex@example.com"),
+        vec![person("Alex", "alex@example.com")],
+        vec![],
+        "a note",
+        "<self-1@x>",
+        None,
+        "test",
+    );
+
+    let d = draft::prepare(&db, thread, DraftKind::ReplyAll, "d1".into()).unwrap();
+    assert_eq!(
+        d.to.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["alex@example.com"]
+    );
+    assert!(d.cc.is_empty());
+}
+
+/// A message with no `Subject` header at all still belongs to a conversation
+/// that has one, and that is the subject the reply carries.
+#[test]
+fn a_reply_falls_back_to_the_conversations_subject() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "alex@example.com", None);
+    let thread = seed_thread(&db, account, "Series A data room");
+    seed_message(
+        &db,
+        thread,
+        account,
+        "gmsg-nosubject",
+        person("Tawny", "tawny@partner.com"),
+        vec![person("Alex", "alex@example.com")],
+        vec![],
+        "",
+        "<nosubject-1@x>",
+        None,
+        "test",
+    );
+
+    let reply = draft::prepare(&db, thread, DraftKind::Reply, "d1".into()).unwrap();
+    assert_eq!(reply.subject, "Re: Series A data room");
+    assert_eq!(
+        reply.to.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["tawny@partner.com"]
+    );
+
+    let forward = draft::prepare(&db, thread, DraftKind::Forward, "d2".into()).unwrap();
+    assert_eq!(forward.subject, "Fwd: Series A data room");
+    assert!(forward.to.is_empty(), "a forward is addressed by hand");
+}
+
+/// Rule 2 across accounts: a reply-all must not Cc you at your other address.
+#[test]
+fn reply_all_removes_every_account_you_hold_not_just_the_sending_one() {
+    let db = Db::open_in_memory().unwrap();
+    let work = seed_account(&db, "alex@example.com", None);
+    seed_account(&db, "alex@personal.example", None);
+    let thread = seed_thread(&db, work, "Both of me");
+    seed_message(
+        &db,
+        thread,
+        work,
+        "gmsg-both",
+        person("Tawny", "tawny@partner.com"),
+        vec![
+            person("Alex", "alex@example.com"),
+            person("Alex at home", "alex@personal.example"),
+        ],
+        vec![person("Sam", "sam@partner.com")],
+        "Both of me",
+        "<both-1@x>",
+        None,
+        "hello",
+    );
+
+    let d = draft::prepare(&db, thread, DraftKind::ReplyAll, "d1".into()).unwrap();
+    assert_eq!(
+        d.to.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["tawny@partner.com"]
+    );
+    assert_eq!(
+        d.cc.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["sam@partner.com"],
+        "your other account is still you; a reply-all must not mail you a copy"
+    );
+}
+
+/// A forward carries the original, whoever it is eventually addressed to.
+#[test]
+fn a_forward_reproduces_the_original_and_says_so_in_the_subject() {
+    let (db, _a, thread, _m) = seeded();
+    let mut d = draft::prepare(&db, thread, DraftKind::Forward, "d1".into()).unwrap();
+    assert_eq!(d.subject, "Fwd: Series A data room");
+    d.to = vec![Mailbox::new("newperson@partner.com")];
+    d.body = "See below.".into();
+
+    let parsed_bytes = built_bytes(&db, &d);
+    let parsed = MessageParser::new().parse(&parsed_bytes).unwrap();
+    let plain = parsed.body_text(0).expect("text part");
+    assert!(plain.contains("Forwarded message"), "{plain}");
+    assert!(plain.contains("Can you send the data room link?"), "{plain}");
+}
+
 #[test]
 fn a_message_with_no_recipients_is_refused_before_it_is_built() {
     let result = build_rfc822(&Outgoing {

@@ -29,7 +29,7 @@
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::db::models::{Account, Event, EventReminders, Participant, RsvpStatus};
+use crate::db::models::{self, Account, Event, EventReminders, Participant, RsvpStatus};
 use crate::db::{queries, Result};
 
 // ---------------------------------------------------------------------------
@@ -78,7 +78,22 @@ pub struct ThreadSnapshot {
     /// Gmail message ids, oldest first — the ids `messages.modify` and
     /// `messages.batchModify` address. Gmail has no thread-level modify that
     /// takes a label delta, so every mail command is expressed over messages.
+    ///
+    /// **Only ids Google minted.** A conversation can also hold rows Mach wrote
+    /// for itself — an unsent draft, a reply waiting out its send delay — and
+    /// those are in [`local_message_ids`](Self::local_message_ids) instead.
     pub message_ids: Vec<String>,
+    /// The rows in this conversation Google has not been told about yet, under
+    /// the placeholder ids Mach filed them under (`mach-draft:…`,
+    /// `mach-outbox:…`).
+    ///
+    /// They are messages to the reader and to the store, and they are not ids
+    /// Gmail will accept: naming one in `batchModify` is a `400 Invalid ids
+    /// value` that takes the whole request down with it. Kept as a separate
+    /// list rather than dropped so that a command with nothing left to send can
+    /// say *why* — "this conversation is only a draft" and "this conversation
+    /// has never been synced" are different news.
+    pub local_message_ids: Vec<String>,
 }
 
 pub fn thread_snapshot(conn: &Connection, thread_id: i64) -> Result<Option<ThreadSnapshot>> {
@@ -110,9 +125,16 @@ pub fn thread_snapshot(conn: &Connection, thread_id: i64) -> Result<Option<Threa
     let mut stmt = conn.prepare(
         "SELECT gmail_message_id FROM messages WHERE thread_id = ?1 ORDER BY internal_date, id",
     )?;
-    let message_ids = stmt
+    let all_ids = stmt
         .query_map([thread_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // The split is done here, once, rather than at each of the nine mail
+    // commands: every one of them reads this struct to build a Gmail request,
+    // and every one of them was sending the placeholders.
+    let (local_message_ids, message_ids): (Vec<String>, Vec<String>) = all_ids
+        .into_iter()
+        .partition(|id| models::is_local_message_id(id));
 
     Ok(Some(ThreadSnapshot {
         thread_id: id,
@@ -121,6 +143,7 @@ pub fn thread_snapshot(conn: &Connection, thread_id: i64) -> Result<Option<Threa
         label_ids,
         is_unread,
         message_ids,
+        local_message_ids,
     }))
 }
 

@@ -87,14 +87,25 @@ export function ReadingPane() {
   }
 
   if (!detail) {
+    /*
+     * The one place in the app that still spells a binding out, because it is
+     * the one place with nothing else to read. A pane that says only "No
+     * conversation selected" tells a first-run user what is missing and not how
+     * to fix it, and there is no button here to infer it from.
+     *
+     * Three rows, not seven: how to move, how to open, and where the rest of
+     * them are. `e archive` and `⌘K search` used to be here too — the first is
+     * not what anyone needs before they have opened anything, and the second is
+     * printed on the search field at the top of the window, so it was a second
+     * copy of something on screen at the same time.
+     */
     return (
       <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3">
         <div className="text-list text-faint-foreground">No conversation selected</div>
         <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
           <Hint keys={["j", "k"]} label="move" />
           <Hint keys={["enter"]} label="open" />
-          <Hint keys={["e"]} label="archive" />
-          <Hint keys={["mod+k"]} label="search" />
+          <Hint keys={["?"]} label="shortcuts" />
         </div>
       </div>
     );
@@ -162,7 +173,7 @@ export function ReadingPane() {
               bar, and it is the one a Gmail hand will reach for. A tooltip that
               names the undocumented alias teaches the wrong key.
             */}
-            <Button size="icon" title="Snooze (b)" onClick={actions.snoozeSelected}>
+            <Button size="icon" title="Snooze (b)" onClick={() => actions.setSnooze(true)}>
               <Clock size={14} strokeWidth={1.75} />
             </Button>
             <Button

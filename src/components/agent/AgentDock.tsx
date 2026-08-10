@@ -28,6 +28,7 @@ import {
 import { errorMessage } from "@/lib/ipc";
 import { AGENT_DRAWER_HEIGHT_BOUNDS } from "@/lib/prefs";
 import { useUiSession } from "@/components/prefs/PreferencesProvider";
+import { useViewportHeight } from "@/hooks/useViewportHeight";
 import { RESIZE_STEP, Resizer } from "@/components/ui/split";
 import { AgentDrawer } from "./AgentDrawer";
 import { AgentPill } from "./AgentPill";
@@ -302,24 +303,4 @@ export function AgentDock() {
       </div>
     </>
   );
-}
-
-/**
- * How tall the window is, as state, so a resize re-clamps the drawer.
- *
- * Without it a drawer dragged tall on an external display would still be tall
- * on the laptop the window was moved to, with the mail list behind it reduced
- * to a strip.
- */
-function useViewportHeight(): number {
-  const [height, setHeight] = useState(() =>
-    typeof window === "undefined" ? 0 : window.innerHeight,
-  );
-  useEffect(() => {
-    const measure = () => setHeight(window.innerHeight);
-    measure();
-    window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
-  }, []);
-  return height;
 }

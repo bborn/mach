@@ -1,12 +1,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
-import { usePreferences } from "@/components/prefs/PreferencesProvider";
-import { composeAccountId, sendDelayMs, signatureFor } from "@/lib/prefs";
+import { useViewportHeight } from "@/hooks/useViewportHeight";
+import { usePreferences, useUiSession } from "@/components/prefs/PreferencesProvider";
+import {
+  COMPOSER_HEIGHT_BOUNDS,
+  composeAccountId,
+  sendDelayMs,
+  signatureFor,
+} from "@/lib/prefs";
 import { withHtmlSignature } from "@/lib/email-html";
 import { Kbd } from "@/components/ui/kbd";
 import { Overlay } from "@/components/ui/dialog";
+import { RESIZE_STEP, Resizer } from "@/components/ui/split";
 import { Composer, type ComposerPresentation } from "./Composer";
+import {
+  DEFAULT_COMPOSER_HEIGHT,
+  canPopOut,
+  clampComposerHeight,
+  composerPlacement,
+  forgetPopOut,
+  isPoppedOut,
+  popOutComposerHeight,
+  togglePopOut,
+} from "./composer-layout";
 import { clockTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import {
@@ -53,6 +70,28 @@ import {
  * navigates to its conversation, which is what puts it back in the dock where a
  * reply belongs; a draft whose conversation is not the one on screen keeps its
  * tab and its text and simply is not rendered.
+ *
+ * # How big it is, and where
+ *
+ * The docked composer had four lines to write in and no way to ask for more,
+ * under a conversation that kept the rest of the pane whether it needed it or
+ * not. Two answers, and they are different sizes of answer.
+ *
+ * The handle on its top edge is the same `Resizer` the list divider and the
+ * agent drawer use, so it is a focus stop with arrow keys as well as something
+ * to drag, and ⌘⌥↑ ⌘⌥↓ reach it from inside the editor where the hands
+ * already are. What it moves is the *body* height — the fields and the legend
+ * are fixed furniture — which is kept in the UI session next to the list
+ * width, because it is a divider somebody dragged rather than a decision they
+ * would go looking for in ⌘,.
+ *
+ * ⇧⌘O gives the draft the whole window instead, through the same `Overlay` a
+ * new message already uses. Nothing about the draft changes: it is the same
+ * row, the same entry in the strip and the same text, with only the
+ * presentation prop and a view flag keyed by draft id different — which is the
+ * only way to add this without adding a second door in beside [[openDraft]].
+ * React unmounts the editor to move it, so the caret is carried across by
+ * number; see `caret-offset.ts`.
  *
  * # The undo window
  *
@@ -109,6 +148,8 @@ export function ComposerDock() {
   const [pending, setPending] = useState<OutboxEntry | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [dropping, setDropping] = useState(false);
+  /** Draft ids currently over the window rather than under a conversation. */
+  const [popped, setPopped] = useState<string[]>([]);
 
   // The draft that was queued, kept so undo restores the text rather than an
   // empty composer.
@@ -118,6 +159,16 @@ export function ComposerDock() {
   const queued = useRef<Promise<OutboxEntry> | null>(null);
   // Where focus starts in the new-message overlay. See `Composer`'s `toRef`.
   const toField = useRef<HTMLInputElement>(null);
+  // And where it starts in the popped-out one: the message, not its address.
+  const bodyField = useRef<HTMLElement>(null);
+  /*
+   * Where the caret was in the composer that is being replaced, and whose.
+   *
+   * Kept by draft id rather than as a bare number: the strip can switch to
+   * another draft between the two composers, and putting draft A's caret into
+   * draft B would be worse than not restoring one at all.
+   */
+  const caret = useRef<{ id: string; offset: number } | null>(null);
 
   const draft = useMemo(
     () => drafts.find((entry) => entry.id === activeId) ?? null,
@@ -173,11 +224,48 @@ export function ComposerDock() {
     [drafts, activeId, change],
   );
 
+  /* ---------------------------------------------------------------- sizing */
+
+  const { session: where, remember } = useUiSession();
+  const [chosenHeight, setChosenHeight] = useState(DEFAULT_COMPOSER_HEIGHT);
+  const restoredHeight = useRef(false);
+  const viewport = useViewportHeight();
+
+  // The stored height lands a tick after mount, like the rest of the session,
+  // and only the first one counts: `remember` writes back into the same object,
+  // so a second restore would fight every drag.
+  const storedHeight = where.composerHeight;
+  useEffect(() => {
+    if (restoredHeight.current || storedHeight === undefined) return;
+    restoredHeight.current = true;
+    setChosenHeight(storedHeight);
+  }, [storedHeight]);
+
+  /*
+   * What he chose and what fits are two different numbers, as they are for the
+   * agent drawer. Keeping the choice unclamped is what makes a short window a
+   * temporary condition rather than a decision.
+   */
+  const dockedHeight = clampComposerHeight(chosenHeight, viewport);
+  const maxHeight = clampComposerHeight(COMPOSER_HEIGHT_BOUNDS.max, viewport);
+
+  const resize = useCallback(
+    (next: number) => {
+      const clamped = clampComposerHeight(next, viewport);
+      setChosenHeight(clamped);
+      remember({ composerHeight: clamped });
+    },
+    [remember, viewport],
+  );
+
   /** Close one composer, keeping its draft. */
   const close = useCallback(
     (id: string) => {
       autosaves.current.get(id)?.flush();
       autosaves.current.delete(id);
+      // A composer that has gone is not popped out; leaving the id behind
+      // would reopen the next one over the window without being asked.
+      setPopped((current) => forgetPopOut(current, id));
       setDrafts((current) => {
         const remaining = current.filter((entry) => entry.id !== id);
         // Closing one must not disturb another: whichever was open next takes
@@ -309,6 +397,19 @@ export function ComposerDock() {
     },
     [drafts, threadId, actions],
   );
+
+  /**
+   * Between the dock and the window, and back, without touching the draft.
+   *
+   * The only thing that changes is a view flag and where the composer is
+   * rendered — no new row, no second entry in the strip, nothing that goes
+   * near [[openDraft]]. The caret arrives from the composer that is about to
+   * be unmounted, because it is the only thing that still knows it.
+   */
+  const popOut = useCallback((id: string, at: number | null) => {
+    caret.current = at === null ? null : { id, offset: at };
+    setPopped((current) => togglePopOut(current, id));
+  }, []);
 
   // The reading pane's reply button lives in another unit's file, so it asks
   // for the composer through an event rather than a prop. So does the agent
@@ -490,7 +591,55 @@ export function ComposerDock() {
 
   /* ------------------------------------------------------------------ keys */
 
+  /**
+   * Which composer is on screen.
+   *
+   * A new message floats over the window and is shown wherever you are. A reply
+   * is rendered only inside its own conversation — its tab is still in the
+   * strip, and switching to it navigates there. A reply drawn under somebody
+   * else's thread would read as a reply to *that*, which is the exact mistake
+   * the overlay exists to prevent, seen from the other side.
+   *
+   * Derived here rather than at the render because the resize keys are gated on
+   * it: they belong to a composer that is actually in the dock.
+   */
+  const visible =
+    draft && (draft.kind === "new" || draft.threadId == null || draft.threadId === threadId)
+      ? draft
+      : null;
+  const poppedOut = visible !== null && isPoppedOut(popped, visible.id);
+  const docked = visible !== null && composerPlacement(visible.kind, poppedOut) === "dock";
+
   useKeyBindings([
+    /*
+     * The keyboard's own route to the handle on the top edge.
+     *
+     * The handle is a focus stop and answers ↑ ↓ once it has focus, but focus
+     * is inside the editor while a reply is being written and ⇥ there is a
+     * character, not a way out. These are the same two keystrokes the agent
+     * drawer uses for its own divider — one gesture for "make this taller",
+     * learned once — and they are live only while a composer is docked, which
+     * is when the drawer's are not the ones the hands are aimed at. The
+     * priority is what makes that an ordering rather than a tie.
+     */
+    {
+      keys: "mod+alt+up",
+      group: "Composer",
+      description: "Taller",
+      allowInInput: true,
+      priority: 100,
+      when: () => active && docked,
+      handler: () => resize(dockedHeight + RESIZE_STEP),
+    },
+    {
+      keys: "mod+alt+down",
+      group: "Composer",
+      description: "Shorter",
+      allowInInput: true,
+      priority: 100,
+      when: () => active && docked,
+      handler: () => resize(dockedHeight - RESIZE_STEP),
+    },
     {
       keys: COMPOSER_KEYS.compose,
       group: "Write",
@@ -816,20 +965,6 @@ export function ComposerDock() {
     );
   }
 
-  /**
-   * Which composer is on screen.
-   *
-   * A new message floats over the window and is shown wherever you are. A reply
-   * is rendered only inside its own conversation — its tab is still in the
-   * strip, and switching to it navigates there. A reply drawn under somebody
-   * else's thread would read as a reply to *that*, which is the exact mistake
-   * the overlay exists to prevent, seen from the other side.
-   */
-  const visible =
-    draft && (draft.kind === "new" || draft.threadId == null || draft.threadId === threadId)
-      ? draft
-      : null;
-
   const strip = drafts.length > 1 && (
     <div className="shrink-0 border-t border-border bg-surface">
       <div className="mx-auto flex max-w-[72ch] items-center gap-1 overflow-x-auto px-5 py-1.5">
@@ -945,6 +1080,12 @@ export function ComposerDock() {
       active
       dropping={dropping}
       toRef={toField}
+      bodyRef={bodyField}
+      bodyHeight={presentation === "dock" ? dockedHeight : popOutComposerHeight(viewport)}
+      // Only the composer this caret was taken from may have it back.
+      initialCaret={caret.current?.id === visible.id ? caret.current.offset : null}
+      poppedOut={poppedOut}
+      onPopOut={canPopOut(visible.kind) ? (at) => popOut(visible.id, at) : undefined}
       onChange={change}
       onBodyChange={changeBody}
       onSend={send}
@@ -992,22 +1133,35 @@ export function ComposerDock() {
    * Nothing about the draft changes with the presentation: `newDraft` carries
    * no thread, no recipients, no subject and no references, so the message
    * genuinely has nothing to do with what is behind it.
+   *
+   * A reply that has been popped out asks for the same surface, for as long as
+   * it is being written. The two differ only in the way out: a new message has
+   * nowhere to go, so the backdrop closes it; a popped-out reply has a dock
+   * waiting, so the backdrop puts it back rather than taking the composer away
+   * for a click that landed beside it.
    */
-  if (visible.kind === "new") {
+  if (composerPlacement(visible.kind, poppedOut) === "overlay") {
+    const isNew = visible.kind === "new";
     return (
       <>
         {strip}
         {question}
         <Overlay
           open
-          onClose={dismiss}
+          onClose={isNew ? dismiss : () => popOut(visible.id, null)}
           align="center"
-          // A new message starts where the message does not yet have anywhere to
-          // go. The overlay's fallback is "the first field in the panel", which
-          // is the subject.
-          initialFocus={toField}
+          /*
+           * A new message starts where the message does not yet have anywhere
+           * to go. A reply that has just been popped out starts where the
+           * caret already was — the overlay places focus after its children
+           * have, so without naming the body here the trap would land in the
+           * To field and the drag of the last sentence would be over.
+           */
+          initialFocus={isNew ? toField : bodyField}
           labelledBy="composer-subject"
-          className="max-w-[44rem]"
+          // Popped out means "this draft is the thing I am doing": as tall as
+          // the window will allow, where the new-message panel is a panel.
+          className={isNew ? "max-w-[44rem]" : "max-w-[52rem] max-h-[90vh]"}
         >
           {editor("overlay")}
         </Overlay>
@@ -1017,6 +1171,20 @@ export function ComposerDock() {
 
   return (
     <>
+      {/* The handle sits on the composer's own top edge, above the strip, so
+          the thing being sized is everything below it. `-my-1` costs the
+          layout nothing and straddles the rule the composer already draws:
+          the line it lights while it moves is that same edge, not a second
+          one four pixels above it. */}
+      <Resizer
+        axis="y"
+        size={dockedHeight}
+        onResize={resize}
+        min={COMPOSER_HEIGHT_BOUNDS.min}
+        max={maxHeight}
+        label="Reply height"
+        className="-my-1 w-full"
+      />
       {strip}
       {question}
       {editor("dock")}
