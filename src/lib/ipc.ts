@@ -263,6 +263,7 @@ interface WireAccountSyncStatus {
   messagesWritten?: Nullable<number>;
   eventsWritten?: Nullable<number>;
   lastError?: Nullable<string>;
+  needsReauthorization?: Nullable<boolean>;
   lastSuccessAt?: Nullable<number>;
   updatedAt?: Nullable<number>;
 }
@@ -636,6 +637,7 @@ function mapAccountSyncStatus(wire: WireAccountSyncStatus): AccountSyncStatus {
     messagesWritten: num(wire.messagesWritten),
     eventsWritten: num(wire.eventsWritten),
     lastError: optional(wire.lastError) ?? null,
+    needsReauthorization: wire.needsReauthorization === true,
     lastSuccessAt: typeof wire.lastSuccessAt === "number" ? wire.lastSuccessAt : null,
     updatedAt: num(wire.updatedAt),
   };

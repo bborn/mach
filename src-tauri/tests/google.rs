@@ -211,6 +211,59 @@ fn a_plain_part_that_says_nothing_is_not_flowed() {
     }
 }
 
+/// The message the owner could not open an attachment on.
+///
+/// Sent from the Gmail web composer with nothing typed in it: a `text/plain`
+/// part of `\r\n`, a `text/html` part of `<div dir="ltr"><br></div>\r\n`, and a
+/// signed PDF. Gmail stamps **every** file its own composer attaches with a
+/// `Content-ID: <f_…>` alongside `Content-Disposition: attachment`, and the walk
+/// used to read a Content-ID as "this belongs in the body". So the PDF was
+/// classified inline, never became a row in `attachments`, and — the body being
+/// empty, with no `cid:` reference to it — appeared nowhere at all.
+///
+/// His report was exactly that: "this email has an attachment but I can't see
+/// it at all or download it".
+#[test]
+fn a_file_gmails_composer_attached_is_a_file_and_not_part_of_the_body() {
+    let msg: Message =
+        serde_json::from_str(&fixture("message_gmail_composed_attachment.json")).unwrap();
+    let body = msg.extract_body();
+
+    // The body arrived intact. There simply is not one — which is why nothing
+    // about a thin body is evidence that a sync dropped anything.
+    assert_eq!(body.text.as_deref(), Some("\r\n"));
+    assert_eq!(body.html.as_deref(), Some("<div dir=\"ltr\"><br></div>\r\n"));
+    assert_eq!(body.html.as_deref().unwrap().len(), 27);
+
+    let files: Vec<_> = body.files().collect();
+    assert_eq!(files.len(), 1, "{:#?}", body.attachments);
+    assert_eq!(files[0].filename, "Agreement-signed.pdf");
+    assert_eq!(files[0].mime_type, "application/pdf");
+    assert_eq!(files[0].attachment_id.as_deref(), Some("ANGjdJ_signed_001"));
+    assert_eq!(files[0].size, 94218);
+
+    // The Content-ID is still carried, because `cid:` resolution looks the part
+    // up by it. Being addressable is not the same as being displayed.
+    assert_eq!(files[0].content_id.as_deref(), Some("f_mdz1k9rt0"));
+    assert_eq!(body.inline_parts().count(), 0);
+}
+
+/// The other side of the same rule: a sender who said nothing about disposition
+/// and gave the part a Content-ID still gets an inline part, because that is the
+/// mailer that embeds an image without declaring it. Only an explicit
+/// `attachment` overrides the Content-ID.
+#[test]
+fn a_content_id_still_decides_when_the_sender_declared_no_disposition() {
+    let msg: Message = serde_json::from_str(&fixture("message_nested_multipart.json")).unwrap();
+    let body = msg.extract_body();
+    let inline: Vec<_> = body.inline_parts().collect();
+    assert_eq!(inline.len(), 1, "{:#?}", body.attachments);
+    assert_eq!(inline[0].filename, "chart.png");
+    assert_eq!(inline[0].content_id.as_deref(), Some("chart-inline-001"));
+    // And the two real files are still files.
+    assert_eq!(body.files().count(), 2);
+}
+
 #[test]
 fn headers_are_readable_case_insensitively() {
     let msg: Message = serde_json::from_str(&fixture("message_nested_multipart.json")).unwrap();

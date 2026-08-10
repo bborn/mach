@@ -81,8 +81,18 @@ impl TokenProvider for ManagedToken {
                 .access_token(&self.email)
                 .await
                 .map(|s| s.expose().to_string())
-                .map_err(|e| GoogleError::Auth {
-                    message: e.to_string(),
+                // The one classification this adapter has to preserve. A
+                // refresh Google answered `invalid_grant` is the account being
+                // logged out, and it arrives here as an ordinary `Err` among
+                // timeouts and 503s; flattening it to `Auth` is what left the
+                // owner with "Sync failed" and no way to see or fix why.
+                .map_err(|e| {
+                    let message = e.to_string();
+                    if e.is_credential_rejected() {
+                        GoogleError::CredentialRejected { message }
+                    } else {
+                        GoogleError::Auth { message }
+                    }
                 })
         })
     }
@@ -247,12 +257,31 @@ impl AppState {
         }
     }
 
+    /// Every address that needs a person to sign in again, from both places
+    /// that can know.
+    ///
+    /// The startup check finds accounts with *no* Keychain entry. It cannot find
+    /// the other and more common case — an entry that is present and dead —
+    /// because a revoked refresh token is a perfectly ordinary string until
+    /// Google is asked about it. That one is found by the sync loop, on the
+    /// first pass after launch, and it is why this is a union rather than the
+    /// list `bootstrap` built.
     pub fn needs_reauthorization(&self) -> Vec<String> {
-        lock(&self.needs_reauthorization).clone()
+        let mut out = lock(&self.needs_reauthorization).clone();
+        let live = self.sync.status_snapshot();
+        for email in live.needs_reauthorization() {
+            if !out.iter().any(|e| e == email) {
+                out.push(email.to_string());
+            }
+        }
+        out
     }
 
     pub fn mark_reauthorized(&self, email: &str) {
         lock(&self.needs_reauthorization).retain(|e| e != email);
+        // And the sync loop's own verdict, or a successful sign-in would leave
+        // the label up until the next pass proved it wrong.
+        self.sync.clear_reauthorization(email);
     }
 
     pub fn mark_needs_reauthorization(&self, email: &str) {

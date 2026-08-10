@@ -85,6 +85,17 @@ impl SyncError {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, SyncError::Cancelled)
     }
+
+    /// Google refused the stored credential, so no later pass can get past this
+    /// without a person authorizing the account again.
+    ///
+    /// The whole reason it is asked here rather than at the token layer: by the
+    /// time a pass fails, the cause has been through a `TokenProvider`, a
+    /// `GoogleError` and a `SyncError`, and this is the last place that still
+    /// knows which account it belongs to.
+    pub fn is_credential_rejected(&self) -> bool {
+        matches!(self, SyncError::Google(e) if e.is_credential_rejected())
+    }
 }
 
 // ===========================================================================
@@ -278,12 +289,30 @@ pub struct AccountOutcome {
     /// `None` on success. An account that failed still leaves its siblings'
     /// outcomes untouched.
     pub error: Option<String>,
+    /// The failure was Google refusing the stored credential. Retrying is not
+    /// the recovery; signing in again is.
+    #[serde(default)]
+    pub needs_reauthorization: bool,
     pub cancelled: bool,
 }
 
 impl AccountOutcome {
     pub fn is_ok(&self) -> bool {
         self.error.is_none() && !self.cancelled
+    }
+
+    /// Record a failure, keeping the first reason and the strongest verdict.
+    ///
+    /// Mail and calendar are synced independently against the same credential,
+    /// so a dead token fails both. The *first* message is kept, because it is
+    /// the one that describes what the pass was doing when it stopped; the
+    /// reauthorization flag is kept if either half raised it, because whether
+    /// the credential is dead is not a matter of which request noticed.
+    fn record(&mut self, error: SyncError) {
+        self.needs_reauthorization |= error.is_credential_rejected();
+        if self.error.is_none() {
+            self.error = Some(error.to_string());
+        }
     }
 }
 
@@ -385,6 +414,15 @@ impl SyncEngine {
     /// The current picture, copied.
     pub fn status_snapshot(&self) -> SyncStatus {
         self.inner.status.snapshot()
+    }
+
+    /// Forget that an address needed authorizing, without waiting for a pass.
+    ///
+    /// What a completed sign-in calls, so the row and the status bar clear
+    /// together. The next pass either confirms it by succeeding or sets the flag
+    /// again, so an optimistic clear costs at most one interval of quiet.
+    pub fn clear_reauthorization(&self, email: &str) {
+        self.inner.status.clear_reauthorization(email);
     }
 
     /// The token every task in this engine watches. Handy for wiring an app
@@ -572,6 +610,7 @@ async fn sync_account(inner: Arc<Inner>, account: Account) -> AccountOutcome {
         messages_written: 0,
         events_written: 0,
         error: None,
+        needs_reauthorization: false,
         cancelled: false,
     };
 
@@ -596,10 +635,10 @@ async fn sync_account(inner: Arc<Inner>, account: Account) -> AccountOutcome {
                 match sync.run().await {
                     Ok(n) => outcome.messages_written = n,
                     Err(SyncError::Cancelled) => outcome.cancelled = true,
-                    Err(e) => outcome.error = Some(e.to_string()),
+                    Err(e) => outcome.record(e),
                 }
             }
-            Err(e) => outcome.error = Some(e.to_string()),
+            Err(e) => outcome.record(e),
         }
     }
 
@@ -619,22 +658,21 @@ async fn sync_account(inner: Arc<Inner>, account: Account) -> AccountOutcome {
                 match sync.run().await {
                     Ok(n) => outcome.events_written = n,
                     Err(SyncError::Cancelled) => outcome.cancelled = true,
-                    Err(e) => {
-                        if outcome.error.is_none() {
-                            outcome.error = Some(e.to_string())
-                        }
-                    }
+                    Err(e) => outcome.record(e),
                 }
             }
-            Err(e) => {
-                if outcome.error.is_none() {
-                    outcome.error = Some(e.to_string())
-                }
-            }
+            Err(e) => outcome.record(e),
         }
     }
 
     match (&outcome.error, outcome.cancelled) {
+        // A dead credential and an ordinary failure are both failures, and only
+        // one of them has a recovery the owner can perform. Splitting them here
+        // is what makes "Sign in again" appear beside the account it belongs to
+        // rather than "Sync failed" appearing in the corner of the window.
+        (Some(error), _) if outcome.needs_reauthorization => {
+            report.credential_rejected(error.clone())
+        }
         (Some(error), _) => report.failed(error.clone()),
         (None, true) => report.cancelled(),
         (None, false) => report.succeeded(),

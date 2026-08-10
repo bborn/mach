@@ -108,6 +108,20 @@ pub enum AuthError {
     #[error("Google token endpoint rejected the request: {0}")]
     TokenEndpoint(String),
 
+    /// Google refused the stored refresh token itself, not the request around
+    /// it. Every way a credential dies arrives as `invalid_grant` on a refresh:
+    /// the account's password changed, the grant was withdrawn, "sign out of
+    /// all devices" was used, or the seven-day expiry an unverified External
+    /// OAuth app puts on every token it issues came round.
+    ///
+    /// The distinction from [`Self::TokenEndpoint`] is what the caller does
+    /// next. Retrying this cannot succeed at any interval; a person has to
+    /// authorize the account again. Carries Google's own `error` and
+    /// `error_description`, which is the only text that says which of those
+    /// happened.
+    #[error("Google refused the stored credential: {0}")]
+    CredentialRejected(String),
+
     #[error("could not parse the token response: {0}")]
     MalformedTokenResponse(String),
 
@@ -119,6 +133,21 @@ pub enum AuthError {
 
     #[error("http transport error: {0}")]
     Transport(String),
+}
+
+impl AuthError {
+    /// Whether the stored credential is dead and only a person can revive it.
+    ///
+    /// The one question the sync loop needs answered about an auth failure.
+    /// Everything else it can see — a timeout, a 503, a rate limit, a Keychain
+    /// read that failed — is transient and must be retried on the next pass
+    /// without the account being flagged; this one must be surfaced and never
+    /// retried out of. Getting the two confused in either direction is a bug:
+    /// flagging a network blip asks the owner to sign in for nothing, and not
+    /// flagging this one leaves him with "Sync failed" and no route out.
+    pub fn is_credential_rejected(&self) -> bool {
+        matches!(self, AuthError::CredentialRejected(_))
+    }
 }
 
 /// The Google Cloud OAuth client this app authenticates as.

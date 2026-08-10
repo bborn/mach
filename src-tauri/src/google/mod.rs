@@ -49,6 +49,18 @@ pub enum GoogleError {
     #[error("google auth failed (401): {message}")]
     Auth { message: String },
 
+    /// The refresh itself was refused: Google will not issue an access token
+    /// from the credential we hold, and no interval of retrying changes that.
+    ///
+    /// Distinct from [`Self::Auth`] — which is an expired *access* token, the
+    /// ordinary case the refresh loop absorbs without anyone noticing — because
+    /// only this one needs a person. It is the state behind "Needs
+    /// authorization", and it is reached routinely rather than exceptionally: a
+    /// password change revokes every token the account has, and an unverified
+    /// External OAuth app expires its own after seven days.
+    #[error("google refused the stored credential: {message}")]
+    CredentialRejected { message: String },
+
     /// 429, or a 403 whose reason is a rate/quota limit. Back off and retry.
     #[error("google rate limited ({status}): {message}")]
     RateLimited {
@@ -104,7 +116,18 @@ pub enum GoogleError {
 
 impl GoogleError {
     pub fn is_auth(&self) -> bool {
-        matches!(self, GoogleError::Auth { .. })
+        matches!(
+            self,
+            GoogleError::Auth { .. } | GoogleError::CredentialRejected { .. }
+        )
+    }
+
+    /// The credential is dead and only a fresh authorization revives it.
+    ///
+    /// The sync loop's one question about an auth failure: flag the account and
+    /// offer the sign-in, or say nothing and try again in a minute.
+    pub fn is_credential_rejected(&self) -> bool {
+        matches!(self, GoogleError::CredentialRejected { .. })
     }
 
     pub fn is_rate_limited(&self) -> bool {

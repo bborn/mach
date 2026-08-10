@@ -75,6 +75,22 @@ pub struct AccountStatus {
     /// The most recent failure, cleared when a pass succeeds. A rate-limited or
     /// de-authorised account keeps this set while its four siblings carry on.
     pub last_error: Option<String>,
+    /// This account's credential is dead — Google refused the refresh token —
+    /// and no further pass can fix it. Set by the pass that saw it, cleared by
+    /// the pass that succeeds or by a completed re-authorization.
+    ///
+    /// Separate from `last_error` because the two answer different questions.
+    /// `last_error` is *what happened*, in Google's words, and it is worth
+    /// showing whatever the cause. This is *whose problem it is*, and it is the
+    /// only thing that decides whether the recovery offered is "Sync now" or
+    /// "Sign in again".
+    ///
+    /// It is not persisted. A dead refresh token is still *present* in the
+    /// Keychain, so the startup credential check cannot see it — but the first
+    /// pass after launch asks Google and is told again within seconds, which
+    /// makes rebuilding this cheaper and more honest than storing it.
+    #[serde(default)]
+    pub needs_reauthorization: bool,
     pub last_success_at: Option<i64>,
     pub updated_at: i64,
 }
@@ -90,6 +106,7 @@ impl AccountStatus {
             messages_written: 0,
             events_written: 0,
             last_error: None,
+            needs_reauthorization: false,
             last_success_at: None,
             updated_at: now_ms(),
         }
@@ -126,6 +143,14 @@ impl SyncStatus {
         self.accounts
             .iter()
             .filter_map(|a| a.last_error.as_deref().map(|e| (a.email.as_str(), e)))
+    }
+
+    /// Addresses whose credential Google has refused during this run.
+    pub fn needs_reauthorization(&self) -> impl Iterator<Item = &str> {
+        self.accounts
+            .iter()
+            .filter(|a| a.needs_reauthorization)
+            .map(|a| a.email.as_str())
     }
 }
 
@@ -184,6 +209,23 @@ impl StatusSink {
             sink: self.clone(),
             account_id,
         }
+    }
+
+    /// Forget that an address ever needed authorizing.
+    ///
+    /// Called when a sign-in completes, so the label and the status bar clear in
+    /// the same render rather than at the next pass — the property `73bc4af`
+    /// established for the Keychain-missing case, held to here as well.
+    /// Addressed by email because that is what the authorization knows; the
+    /// account id it belongs to is a detail of a row it may just have created.
+    pub fn clear_reauthorization(&self, email: &str) {
+        self.tx.send_modify(|s| {
+            for account in s.accounts.iter_mut().filter(|a| a.email == email) {
+                account.needs_reauthorization = false;
+                account.last_error = None;
+                account.updated_at = now_ms();
+            }
+        });
     }
 
     fn update(&self, account_id: i64, f: impl FnOnce(&mut AccountStatus)) {
@@ -246,11 +288,32 @@ impl AccountReporter {
         self.sink.update(self.account_id, |a| a.events_written += n);
     }
 
+    /// A pass that stopped on something another pass could get past.
+    ///
+    /// Leaves `needs_reauthorization` alone rather than clearing it: an account
+    /// whose credential is dead will also fail to reach the network, be rate
+    /// limited, and time out, and none of those are evidence that the
+    /// credential came back. Only a success is.
     pub fn failed(&self, message: impl Into<String>) {
         let message = message.into();
         self.sink.update(self.account_id, |a| {
             a.phase = SyncPhase::Failed;
             a.last_error = Some(message);
+        });
+    }
+
+    /// A pass that stopped because Google refused the stored credential.
+    ///
+    /// The message is still recorded — it is Google's own text, and it is the
+    /// only thing that says whether this was a password change or the seven-day
+    /// expiry — but the account is flagged as well, which is what puts "Sign in
+    /// again" next to it.
+    pub fn credential_rejected(&self, message: impl Into<String>) {
+        let message = message.into();
+        self.sink.update(self.account_id, |a| {
+            a.phase = SyncPhase::Failed;
+            a.last_error = Some(message);
+            a.needs_reauthorization = true;
         });
     }
 
@@ -263,6 +326,11 @@ impl AccountReporter {
         self.sink.update(self.account_id, |a| {
             a.phase = SyncPhase::Done;
             a.last_error = None;
+            // A pass that reached Google and came back proves the credential is
+            // alive, whatever the last one concluded. This is the ordinary way
+            // the flag clears after a re-authorization the app did not perform
+            // itself — a token minted on the phone, say.
+            a.needs_reauthorization = false;
             a.last_success_at = Some(now_ms());
         });
     }

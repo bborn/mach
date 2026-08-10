@@ -761,8 +761,16 @@ async fn a_qa_instance_with_no_credentials_returns_rather_than_blocking() {
     assert_eq!(manager.http().call_count(), 0);
 }
 
+/// The failure the owner actually hit: he changed a Google account's password,
+/// which revoked every refresh token issued for it.
+///
+/// A revoked credential must arrive as its own kind of error, because it is the
+/// only one whose recovery is a person rather than another attempt. It used to
+/// come back as a plain `TokenEndpoint`, indistinguishable from any other 400,
+/// and nothing downstream could act on it — the account was never flagged, and
+/// "Sync failed" was the whole of what he was told.
 #[tokio::test]
-async fn a_token_endpoint_error_is_surfaced_not_swallowed() {
+async fn a_revoked_refresh_token_is_reported_as_a_dead_credential() {
     let http = FakeHttp::new(vec![oauth::HttpResponse {
         status: 400,
         body: r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#
@@ -775,6 +783,76 @@ async fn a_token_endpoint_error_is_surfaced_not_swallowed() {
     let manager = TokenManager::new(test_config(), http, store);
 
     let err = manager.access_token("a@x.com").await.unwrap_err();
+    assert!(err.is_credential_rejected(), "got {err:?}");
+    match &err {
+        // Google's own words, carried through: this is the only text that says
+        // whether the password changed or the seven-day expiry came round.
+        AuthError::CredentialRejected(detail) => {
+            assert!(detail.contains("invalid_grant"), "got {detail}");
+            assert!(
+                detail.contains("Token has been expired or revoked."),
+                "the description Google sent must survive verbatim: {detail}"
+            );
+        }
+        other => panic!("expected CredentialRejected, got {other:?}"),
+    }
+
+    // The credential is not deleted. "Sign in again" overwrites the Keychain
+    // entry; throwing it away here would leave nothing to overwrite and would
+    // make a transient misclassification unrecoverable.
+    assert!(manager.store().load_refresh_token("a@x.com").unwrap().is_some());
+}
+
+/// Everything else the token endpoint can say stays what it was, and — this is
+/// the half that matters — is *not* treated as a dead credential. A 503 that
+/// flagged the account would ask the owner to sign in for a Google outage.
+#[tokio::test]
+async fn a_transient_token_failure_does_not_condemn_the_credential() {
+    for body in [
+        r#"{"error":"internal_failure","error_description":"Backend Error"}"#,
+        "<html>503 Service Unavailable</html>",
+    ] {
+        let http = FakeHttp::new(vec![oauth::HttpResponse {
+            status: 503,
+            body: body.to_string(),
+        }]);
+        let store = MemoryTokenStore::default();
+        store
+            .save_refresh_token("a@x.com", &Secret::new("1//good"))
+            .unwrap();
+        let manager = TokenManager::new(test_config(), http, store);
+
+        let err = manager.access_token("a@x.com").await.unwrap_err();
+        assert!(
+            !err.is_credential_rejected(),
+            "{body} must stay retriable, got {err:?}"
+        );
+        assert!(matches!(err, AuthError::TokenEndpoint(_)), "got {err:?}");
+    }
+}
+
+/// `invalid_grant` on a *code exchange* is a stale or already-spent
+/// authorization code. It says nothing about any stored credential, and must
+/// not flag an account for a sign-in that never completed.
+#[tokio::test]
+async fn a_spent_authorization_code_is_not_a_dead_credential() {
+    let http = FakeHttp::new(vec![oauth::HttpResponse {
+        status: 400,
+        body: r#"{"error":"invalid_grant","error_description":"Bad Request"}"#.to_string(),
+    }]);
+    let manager = TokenManager::new(test_config(), http, MemoryTokenStore::default());
+
+    let err = manager
+        .exchange_code(
+            "a@x.com",
+            "4/stale",
+            "verifier-verifier-verifier-verifier-verifier",
+            "http://127.0.0.1:5/oauth/callback",
+        )
+        .await
+        .unwrap_err();
+
+    assert!(!err.is_credential_rejected(), "got {err:?}");
     match err {
         AuthError::TokenEndpoint(msg) => assert!(msg.contains("invalid_grant"), "got {msg}"),
         other => panic!("expected TokenEndpoint, got {other:?}"),

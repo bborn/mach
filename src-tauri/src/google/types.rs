@@ -198,8 +198,9 @@ pub struct AttachmentMeta {
     /// `Content-ID` with the angle brackets stripped, for resolving `cid:` URLs
     /// in the HTML body.
     pub content_id: Option<String>,
-    /// True for `Content-Disposition: inline` or anything carrying a Content-ID
-    /// — these belong in the rendered body, not the attachment chip row.
+    /// This part belongs in the rendered body rather than in the attachment
+    /// row. See [`walk`] for how the two are told apart, and why a Content-ID
+    /// alone is not enough to decide it.
     pub inline: bool,
     /// Decoded bytes, when Gmail inlined them instead of handing out an
     /// attachment id.
@@ -313,10 +314,39 @@ fn walk(part: &MessagePart, out: &mut ExtractedBody) {
         filename,
         mime_type: mime,
         size: body.size,
-        inline: disposition.starts_with("inline") || content_id.is_some(),
+        inline: is_inline(&disposition, content_id.is_some()),
         content_id,
         data: body.data.as_deref().and_then(|d| decode_base64url(d).ok()),
     });
+}
+
+/// Is this part part of the body, or a file hanging off the message?
+///
+/// The distinction is not cosmetic: only a non-inline part becomes a row in
+/// `attachments`, which is the only thing the reading pane offers to open or
+/// download. A part that lands on the wrong side of this is not merely styled
+/// differently — it is invisible and unreachable.
+///
+/// The rule this replaced was `disposition is inline OR there is a Content-ID`,
+/// and the second half of it was wrong. **Gmail's own web composer stamps a
+/// `Content-ID: <f_…>` on every file it attaches**, alongside
+/// `Content-Disposition: attachment`. So a PDF sent from Gmail arrived carrying
+/// both, was classified as part of the body, was written to no `attachments`
+/// row, and — since a Gmail-composed message with an empty body has no `cid:`
+/// reference to it either — appeared nowhere at all. The owner's report was
+/// exactly that: "this email has an attachment but I can't see it at all or
+/// download it".
+///
+/// So an explicit `Content-Disposition: attachment` wins. RFC 2183 makes it a
+/// statement of intent by the sender, and it is a stronger signal than a
+/// Content-ID, which is only an *address* — a name the body may or may not use.
+/// A Content-ID still decides the case where the sender said nothing, which is
+/// the mailer that inlines an image without a disposition header.
+fn is_inline(disposition: &str, has_content_id: bool) -> bool {
+    if disposition.starts_with("attachment") {
+        return false;
+    }
+    disposition.starts_with("inline") || has_content_id
 }
 
 // ---------------------------------------------------------- Gmail responses

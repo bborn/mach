@@ -100,7 +100,7 @@ pub enum FailureKind {
 impl FailureKind {
     pub fn from_google(error: &GoogleError) -> Self {
         match error {
-            GoogleError::Auth { .. } => FailureKind::Auth,
+            GoogleError::Auth { .. } | GoogleError::CredentialRejected { .. } => FailureKind::Auth,
             GoogleError::RateLimited { .. } => FailureKind::RateLimited,
             GoogleError::Forbidden { .. } => FailureKind::Forbidden,
             GoogleError::NotFound { .. }

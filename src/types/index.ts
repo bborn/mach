@@ -376,6 +376,11 @@ export interface AccountSyncStatus {
   eventsWritten: number;
   /** Cleared when a pass succeeds. One rate-limited account, four healthy. */
   lastError: string | null;
+  /**
+   * Google refused this account's stored credential. Retrying cannot fix it;
+   * signing in again can. What tells "Sync now" apart from "Sign in again".
+   */
+  needsReauthorization: boolean;
   lastSuccessAt: number | null;
   updatedAt: number;
 }

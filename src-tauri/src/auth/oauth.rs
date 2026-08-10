@@ -637,11 +637,24 @@ pub fn refresh_form(config: &ClientConfig, refresh_token: &str) -> Vec<(String, 
     form
 }
 
-/// Turns a non-2xx token-endpoint response into an error, preserving Google's
-/// `error`/`error_description` (`invalid_grant` is how a 7-day External refresh
-/// token expiry shows up, so the text matters).
-pub fn token_error(response: &HttpResponse) -> AuthError {
-    let detail = serde_json::from_str::<serde_json::Value>(&response.body)
+/// The OAuth 2.0 `error` code from a token-endpoint failure body, if it sent
+/// one. `invalid_grant`, `invalid_client`, `unauthorized_client`, …
+fn error_code(response: &HttpResponse) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&response.body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Google's `error` and `error_description`, verbatim, or the first 200
+/// characters of whatever it sent instead of a JSON envelope.
+///
+/// Verbatim because this is the only text that distinguishes a password change
+/// from a withdrawn grant from a seven-day expiry, and the owner is the one who
+/// has to tell them apart. Paraphrasing it would throw away the answer.
+fn error_detail(response: &HttpResponse) -> String {
+    serde_json::from_str::<serde_json::Value>(&response.body)
         .ok()
         .and_then(|v| {
             let error = v.get("error")?.as_str()?.to_string();
@@ -652,8 +665,32 @@ pub fn token_error(response: &HttpResponse) -> AuthError {
                 .unwrap_or_default();
             Some(format!("{error}{description}"))
         })
-        .unwrap_or_else(|| response.body.chars().take(200).collect());
-    AuthError::TokenEndpoint(format!("HTTP {}: {detail}", response.status))
+        .unwrap_or_else(|| response.body.chars().take(200).collect())
+}
+
+/// Turns a non-2xx token-endpoint response into an error, preserving Google's
+/// `error`/`error_description`.
+pub fn token_error(response: &HttpResponse) -> AuthError {
+    AuthError::TokenEndpoint(format!("HTTP {}: {}", response.status, error_detail(response)))
+}
+
+/// The same, for a *refresh* rather than a code exchange.
+///
+/// On this endpoint `invalid_grant` has exactly one meaning: the refresh token
+/// presented is no longer a grant. Google says so for a revoked token, a
+/// password change, a withdrawn consent, and the seven-day expiry it puts on
+/// tokens issued by an unverified External app — all of which need a person and
+/// none of which need another attempt.
+///
+/// It is deliberately *not* folded into [`token_error`], which also serves the
+/// authorization-code exchange. There `invalid_grant` means the code was stale
+/// or already spent, which says nothing about any stored credential; treating
+/// the two alike would flag an account for a failed sign-in it never had.
+pub fn refresh_error(response: &HttpResponse) -> AuthError {
+    match error_code(response).as_deref() {
+        Some("invalid_grant") => AuthError::CredentialRejected(error_detail(response)),
+        _ => token_error(response),
+    }
 }
 
 /// Convenience for callers that already hold a verifier as a [`Secret`].

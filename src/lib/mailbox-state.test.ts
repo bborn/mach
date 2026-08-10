@@ -12,6 +12,7 @@ function account(overrides: Partial<AccountSyncStatus> = {}): AccountSyncStatus 
     messagesWritten: 0,
     eventsWritten: 0,
     lastError: null,
+    needsReauthorization: false,
     lastSuccessAt: null,
     updatedAt: 0,
     ...overrides,
@@ -185,7 +186,14 @@ describe("sync progress", () => {
       ]),
     );
     expect(progress.active).toBe(true);
-    expect(progress.errors).toEqual([{ email: "alex@example.com", message: "401" }]);
+    expect(progress.errors).toEqual([
+      {
+        email: "alex@example.com",
+        message: "401",
+        needsReauthorization: false,
+        lastSuccessAt: null,
+      },
+    ]);
   });
 
   it("names a dead Keychain entry as its own kind of trouble", () => {
@@ -195,14 +203,85 @@ describe("sync progress", () => {
         needsReauthorization: ["alex@lumen.example"],
       }),
     );
+    // No remote text, because nothing was ever sent: the credential is missing
+    // rather than refused.
     expect(progress.errors).toEqual([
-      { email: "alex@lumen.example", message: "alex@lumen.example needs signing in again" },
+      {
+        email: "alex@lumen.example",
+        message: "Not signed in",
+        needsReauthorization: true,
+        lastSuccessAt: null,
+      },
     ]);
     expect(progress.label).toBe("One account needs signing in again");
     // Same sentence as a sync error, different next action: syncing again never
     // produces a refresh token. The status bar reads this to decide whether its
     // button means "Sync now" or "open Preferences → Accounts".
     expect(progress.reauthorize).toEqual(["alex@lumen.example"]);
+  });
+
+  /**
+   * The failure the owner hit. He changed one account's Google password, every
+   * refresh for it came back `invalid_grant`, and all he was told was "Sync
+   * failed" — no account, no reason, nothing to press.
+   */
+  it("carries a refused credential with the account, the reason and the recovery", () => {
+    const progress = syncProgress(
+      status(
+        [
+          account({
+            accountId: 1,
+            email: "bruno@clickfunnels.example",
+            phase: "failed",
+            lastError:
+              "google refused the stored credential: Google refused the stored credential: " +
+              "invalid_grant (Token has been expired or revoked.)",
+            needsReauthorization: true,
+            lastSuccessAt: 1_700_000_000_000,
+          }),
+          account({ accountId: 2, email: "bruno@example.com", phase: "done", lastSuccessAt: 2 }),
+        ],
+        {
+          lastPassFinishedAt: 3,
+          // The startup Keychain check never sees this one: a revoked token is
+          // still *present*, so only the sync loop can discover it.
+          needsReauthorization: [],
+        },
+      ),
+    );
+
+    expect(progress.errors).toHaveLength(1);
+    const failure = progress.errors[0]!;
+    expect(failure.email).toBe("bruno@clickfunnels.example");
+    expect(failure.needsReauthorization).toBe(true);
+    // Google's words, verbatim. They are the only thing that says which of the
+    // several ways a credential dies this one was.
+    expect(failure.message).toContain("invalid_grant");
+    expect(failure.message).toContain("Token has been expired or revoked.");
+    expect(failure.lastSuccessAt).toBe(1_700_000_000_000);
+    expect(progress.reauthorize).toEqual(["bruno@clickfunnels.example"]);
+    expect(progress.label).toBe("One account needs signing in again");
+  });
+
+  it("does not ask for a sign-in when the failure is one another pass could clear", () => {
+    const progress = syncProgress(
+      status(
+        [
+          account({
+            email: "bruno@example.com",
+            phase: "failed",
+            lastError: "google rate limited (429): rate limit exceeded",
+            needsReauthorization: false,
+            lastSuccessAt: 9,
+          }),
+        ],
+        { lastPassFinishedAt: 10 },
+      ),
+    );
+    expect(progress.reauthorize).toEqual([]);
+    expect(progress.errors[0]!.needsReauthorization).toBe(false);
+    expect(progress.errors[0]!.message).toContain("429");
+    expect(progress.label).toBe("Sync failed");
   });
 
   it("stops asking for a sign-in the moment the address leaves the status", () => {
@@ -235,8 +314,11 @@ describe("sync progress", () => {
       "alex@lumen.example",
       "bruno@example.com",
     ]);
-    // A real sync failure is still the louder of the two, and still retryable.
-    expect(progress.label).toBe("Sync failed");
+    expect(progress.errors.map((e) => e.needsReauthorization)).toEqual([false, true]);
+    // Two accounts are not syncing, and only one of them is retryable, so the
+    // rail counts them and the detail says which is which. "Sync failed" alone
+    // would under-report by one.
+    expect(progress.label).toBe("Sync failed on 2 accounts");
   });
 
   it("says up to date once a pass has finished with nothing running", () => {

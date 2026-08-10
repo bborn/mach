@@ -1,0 +1,126 @@
+{
+  "id": "19a1f0c3d4e5b6a7",
+  "threadId": "19a1f0c3d4e5b600",
+  "labelIds": [
+    "UNREAD",
+    "CATEGORY_PERSONAL",
+    "INBOX"
+  ],
+  "snippet": "",
+  "historyId": "991204",
+  "internalDate": "1754912160000",
+  "sizeEstimate": 96412,
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [
+      {
+        "name": "From",
+        "value": "Dana Whitfield <dana@example.com>"
+      },
+      {
+        "name": "To",
+        "value": "Bruno Bornsztein <bruno@example.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Signed"
+      },
+      {
+        "name": "Date",
+        "value": "Mon, 11 Aug 2026 13:36:00 -0500"
+      },
+      {
+        "name": "Message-ID",
+        "value": "<CA+signed001@mail.gmail.com>"
+      },
+      {
+        "name": "Content-Type",
+        "value": "multipart/mixed; boundary=\"000000000000gmailmixed\""
+      }
+    ],
+    "body": {
+      "size": 0
+    },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "multipart/alternative",
+        "filename": "",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "multipart/alternative; boundary=\"000000000000gmailalt\""
+          }
+        ],
+        "body": {
+          "size": 0
+        },
+        "parts": [
+          {
+            "partId": "0.0",
+            "mimeType": "text/plain",
+            "filename": "",
+            "headers": [
+              {
+                "name": "Content-Type",
+                "value": "text/plain; charset=\"UTF-8\""
+              }
+            ],
+            "body": {
+              "size": 2,
+              "data": "DQo="
+            }
+          },
+          {
+            "partId": "0.1",
+            "mimeType": "text/html",
+            "filename": "",
+            "headers": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=\"UTF-8\""
+              }
+            ],
+            "body": {
+              "size": 27,
+              "data": "PGRpdiBkaXI9Imx0ciI-PGJyPjwvZGl2Pg0K"
+            }
+          }
+        ]
+      },
+      {
+        "partId": "1",
+        "mimeType": "application/pdf",
+        "filename": "Agreement-signed.pdf",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/pdf; name=\"Agreement-signed.pdf\""
+          },
+          {
+            "name": "Content-Disposition",
+            "value": "attachment; filename=\"Agreement-signed.pdf\""
+          },
+          {
+            "name": "Content-Transfer-Encoding",
+            "value": "base64"
+          },
+          {
+            "name": "Content-ID",
+            "value": "<f_mdz1k9rt0>"
+          },
+          {
+            "name": "X-Attachment-Id",
+            "value": "f_mdz1k9rt0"
+          }
+        ],
+        "body": {
+          "attachmentId": "ANGjdJ_signed_001",
+          "size": 94218
+        }
+      }
+    ]
+  }
+}

@@ -684,6 +684,66 @@ fn new_engine(db: &Db, google: Arc<FakeGoogle>, config: SyncConfig) -> SyncEngin
     SyncEngine::new(db.clone(), Arc::new(clients), config).expect("engine")
 }
 
+/// A token provider that answers the way `TokenManager` does once Google has
+/// refused the stored refresh token: an error, on every request, forever.
+///
+/// `RejectingTokenProvider` rather than a scripted 401 from the fake server,
+/// because the failure being tested happens *before* a request is made — the
+/// refresh is its own round trip to `oauth2.googleapis.com`, and a mailbox that
+/// answers 401 is a different thing entirely (an expired access token, which
+/// the refresh loop replaces without anyone noticing).
+struct RejectingTokenProvider {
+    /// Flipped by the test to simulate a completed "Sign in again".
+    live: Arc<Mutex<bool>>,
+    token: String,
+}
+
+impl TokenProvider for RejectingTokenProvider {
+    fn access_token(&self) -> BoxFuture<'_, Result<String, mach_lib::google::GoogleError>> {
+        let live = *self.live.lock().unwrap();
+        let token = self.token.clone();
+        Box::pin(async move {
+            if live {
+                return Ok(token);
+            }
+            Err(mach_lib::google::GoogleError::CredentialRejected {
+                message: "Google refused the stored credential: invalid_grant \
+                          (Token has been expired or revoked.)"
+                    .into(),
+            })
+        })
+    }
+}
+
+/// An engine whose named account has a dead credential, and a switch to revive
+/// it the way a completed authorization would.
+fn engine_with_dead_credential(
+    db: &Db,
+    google: Arc<FakeGoogle>,
+    dead: &str,
+) -> (SyncEngine, Arc<Mutex<bool>>) {
+    let live = Arc::new(Mutex::new(false));
+    let dead = dead.to_string();
+    let flag = Arc::clone(&live);
+    let clients = TransportClients::new(google, move |account| {
+        let token = format!("tok-{}", account.id);
+        if account.email == dead {
+            Arc::new(RejectingTokenProvider {
+                live: Arc::clone(&flag),
+                token,
+            }) as Arc<dyn TokenProvider>
+        } else {
+            Arc::new(StaticTokenProvider::new(token)) as Arc<dyn TokenProvider>
+        }
+    })
+    .with_base_urls(GMAIL_BASE, CALENDAR_BASE)
+    .with_retry_policy(RetryPolicy::none());
+    (
+        SyncEngine::new(db.clone(), Arc::new(clients), mail_config()).expect("engine"),
+        live,
+    )
+}
+
 fn add_account(db: &Db, email: &str) -> i64 {
     db.write(|conn| {
         queries::upsert_account(
@@ -1503,6 +1563,157 @@ async fn an_expired_history_id_triggers_a_full_resync_rather_than_an_error() {
         .is_some());
     assert!(history_id(&db, account_id).is_some(), "a fresh watermark was stored");
     assert_store_is_consistent(&db);
+}
+
+// ===========================================================================
+// a credential that died while the app was running
+// ===========================================================================
+
+/// The failure the owner hit: he changed one account's Google password, which
+/// revoked its refresh token, and every pass for that account failed at the
+/// refresh from then on.
+///
+/// Nothing acted on it. `mark_needs_reauthorization` had exactly one caller —
+/// the startup check for a *missing* Keychain entry — and a revoked token is
+/// present in the Keychain, so the one state the app has for this was
+/// unreachable. He got "Sync failed", with no account named and no route out.
+#[tokio::test]
+async fn a_refused_credential_flags_the_account_for_signing_in_again() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+
+    let healthy = add_account(&db, "healthy@example.com");
+    let revoked = add_account(&db, "revoked@example.com");
+
+    let mut mailbox = Mailbox::new("healthy@example.com");
+    mailbox.seed(FakeMessage::new("m1", "t1").at(1_000));
+    google.install(&format!("tok-{healthy}"), mailbox);
+
+    let (engine, live) =
+        engine_with_dead_credential(&db, Arc::clone(&google), "revoked@example.com");
+    let pass = engine.sync_once().await;
+
+    assert!(pass.account(revoked).unwrap().needs_reauthorization);
+    assert!(!pass.account(healthy).unwrap().needs_reauthorization);
+
+    let status = engine.status_snapshot();
+    let broken = status.account(revoked).unwrap();
+    assert!(
+        broken.needs_reauthorization,
+        "the account has to be named, or the recovery has nowhere to sit"
+    );
+    // Google's own text, all the way through. It is what says whether this was a
+    // password change or the seven-day expiry, and only he can tell.
+    let reason = broken.last_error.as_deref().unwrap();
+    assert!(reason.contains("invalid_grant"), "got {reason}");
+    assert!(
+        reason.contains("Token has been expired or revoked."),
+        "got {reason}"
+    );
+
+    assert_eq!(
+        status.needs_reauthorization().collect::<Vec<_>>(),
+        vec!["revoked@example.com"],
+        "one account is broken, not the mailbox"
+    );
+    assert!(!status.account(healthy).unwrap().needs_reauthorization);
+    assert_eq!(status.account(healthy).unwrap().last_error, None);
+    assert_eq!(message_count(&db), 1, "the other three accounts carry on");
+
+    // This happens again every seven days on an unverified External OAuth app,
+    // so it has to be a state the app comes back from on its own.
+    *live.lock().unwrap() = true;
+    let mut recovered = Mailbox::new("revoked@example.com");
+    recovered.seed(FakeMessage::new("m2", "t2").at(2_000));
+    google.install(&format!("tok-{revoked}"), recovered);
+
+    engine.sync_once().await;
+    let status = engine.status_snapshot();
+    assert!(!status.account(revoked).unwrap().needs_reauthorization);
+    assert_eq!(status.account(revoked).unwrap().last_error, None);
+    assert_eq!(status.needs_reauthorization().count(), 0);
+}
+
+/// The other half, and the one that would make this worse than it was: a
+/// failure that another pass could get past must never ask him to sign in.
+#[tokio::test]
+async fn a_transient_failure_does_not_ask_for_a_new_sign_in() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+
+    let limited = add_account(&db, "limited@example.com");
+    let offline = add_account(&db, "offline@example.com");
+
+    let mut throttled = Mailbox::new("limited@example.com");
+    throttled.fail_with = Some((429, "rate limit exceeded".into()));
+    google.install(&format!("tok-{limited}"), throttled);
+
+    let mut down = Mailbox::new("offline@example.com");
+    down.fail_with = Some((503, "backend error".into()));
+    google.install(&format!("tok-{offline}"), down);
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    let pass = engine.sync_once().await;
+
+    for id in [limited, offline] {
+        assert!(pass.account(id).unwrap().error.is_some());
+        assert!(!pass.account(id).unwrap().needs_reauthorization);
+    }
+    assert_eq!(engine.status_snapshot().needs_reauthorization().count(), 0);
+}
+
+/// A dead credential also fails to reach the network, gets rate limited, and
+/// times out. None of that is evidence the credential came back, so a later
+/// transient failure must not quietly un-flag the account — only a pass that
+/// actually reached Google can.
+#[tokio::test]
+async fn a_later_transient_failure_does_not_clear_the_flag() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+    let revoked = add_account(&db, "revoked@example.com");
+
+    let (engine, live) =
+        engine_with_dead_credential(&db, Arc::clone(&google), "revoked@example.com");
+    engine.sync_once().await;
+    assert!(engine.status_snapshot().account(revoked).unwrap().needs_reauthorization);
+
+    // The token is honoured again, but the mailbox is now unreachable.
+    *live.lock().unwrap() = true;
+    let mut down = Mailbox::new("revoked@example.com");
+    down.fail_with = Some((503, "backend error".into()));
+    google.install(&format!("tok-{revoked}"), down);
+
+    engine.sync_once().await;
+    let status = engine.status_snapshot();
+    assert!(
+        status.account(revoked).unwrap().needs_reauthorization,
+        "a 503 says nothing about whether the credential is alive"
+    );
+}
+
+/// Completing a sign-in clears the flag in the same render, rather than leaving
+/// the label up until the next pass proves it wrong. `73bc4af` established that
+/// for the Keychain-missing case; the engine's own verdict has to follow it.
+#[tokio::test]
+async fn a_completed_sign_in_clears_the_flag_without_waiting_for_a_pass() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+    let revoked = add_account(&db, "revoked@example.com");
+
+    let (engine, _live) =
+        engine_with_dead_credential(&db, Arc::clone(&google), "revoked@example.com");
+    engine.sync_once().await;
+    assert!(engine.status_snapshot().account(revoked).unwrap().needs_reauthorization);
+
+    engine.clear_reauthorization("revoked@example.com");
+
+    let status = engine.status_snapshot();
+    assert!(!status.account(revoked).unwrap().needs_reauthorization);
+    assert_eq!(
+        status.account(revoked).unwrap().last_error,
+        None,
+        "the reason goes with the flag; leaving it would keep 'Sync failed' up"
+    );
 }
 
 // ===========================================================================

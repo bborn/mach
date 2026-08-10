@@ -394,6 +394,14 @@ export function PreferencesDialog() {
                 <Accounts
                   accounts={accounts}
                   needsAuthorization={sync?.needsReauthorization ?? []}
+                  // Google's own words, next to the button that acts on them.
+                  // Arriving here from the status bar, the reason must not be
+                  // left behind in the panel that sent him.
+                  reasons={Object.fromEntries(
+                    (sync?.accounts ?? [])
+                      .filter((a) => a.needsReauthorization && a.lastError)
+                      .map((a) => [a.email, a.lastError!]),
+                  )}
                   confirming={confirmRemove}
                   onConfirm={setConfirmRemove}
                   onRemoved={() => actions.reload()}
@@ -690,6 +698,7 @@ export function PreferencesDialog() {
 export function Accounts({
   accounts,
   needsAuthorization,
+  reasons = {},
   confirming,
   onConfirm,
   onRemoved,
@@ -697,8 +706,13 @@ export function Accounts({
   onReauthorize,
 }: {
   accounts: readonly Account[];
-  /** Emails whose refresh token is gone from the Keychain. */
+  /** Emails whose credential is gone from the Keychain or dead at Google. */
   needsAuthorization: readonly string[];
+  /**
+   * What Google said, by address, where it said anything. Absent for the
+   * Keychain-missing case, which never reached Google to be refused.
+   */
+  reasons?: Readonly<Record<string, string>>;
   confirming: number | null;
   onConfirm: (accountId: number | null) => void;
   onRemoved: () => void;
@@ -761,6 +775,12 @@ export function Accounts({
                 Remove
               </Button>
             </div>
+
+            {needsAuthorization.includes(account.email) && reasons[account.email] && (
+              <p className="break-words pl-[11px] text-micro leading-snug text-danger">
+                {reasons[account.email]}
+              </p>
+            )}
 
             {confirming === account.id && (
               <div className="flex flex-col gap-2 rounded-[var(--radius)] border border-border bg-surface-raised p-2">

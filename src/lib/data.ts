@@ -597,6 +597,7 @@ export const fixtureSource: MachDataSource = {
         messagesWritten: 0,
         eventsWritten: 0,
         lastError: null,
+        needsReauthorization: false,
         lastSuccessAt: Date.now(),
         updatedAt: Date.now(),
       })),

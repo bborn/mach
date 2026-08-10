@@ -549,9 +549,11 @@ where
         let response = self.http.post_form(oauth::TOKEN_ENDPOINT, &form).await?;
         if !response.is_success() {
             // `invalid_grant` here is how a revoked token — or the 7-day expiry
-            // on an unverified External app — surfaces. The caller decides
-            // whether to re-authorize; we do not silently delete the credential.
-            return Err(oauth::token_error(&response));
+            // on an unverified External app — surfaces, and
+            // [`oauth::refresh_error`] is what tells it apart from a transient
+            // refusal. The credential is not deleted either way: the account
+            // row keeps its Keychain entry, and "Sign in again" overwrites it.
+            return Err(oauth::refresh_error(&response));
         }
 
         let tokens = TokenSet::from_json(

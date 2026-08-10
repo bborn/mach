@@ -24,11 +24,12 @@ function account(id: number, email: string, colorIndex: ColorIndex): Account {
 const BROKEN = account(1, "bruno.bornsztein@gmail.com", 1);
 const HEALTHY = account(2, "alex@lumen.example", 2);
 
-function render(needsAuthorization: string[]) {
+function render(needsAuthorization: string[], reasons: Record<string, string> = {}) {
   return renderToStaticMarkup(
     <Accounts
       accounts={[BROKEN, HEALTHY]}
       needsAuthorization={needsAuthorization}
+      reasons={reasons}
       confirming={null}
       onConfirm={() => {}}
       onRemoved={() => {}}
@@ -65,6 +66,25 @@ describe("the account row", () => {
     // Which is also what a successful sign-in looks like from here: the address
     // leaves `needsReauthorization`, Rust emits the sync status, and the label
     // and its button go with it. No restart, no reload of the surface.
+  });
+
+  it("says what Google said, beside the button that acts on it", () => {
+    // The status bar sends him here. The reason must not be left behind in the
+    // panel that did the sending — this is where the recovery is, so this is
+    // where the reason for it belongs.
+    const markup = render([BROKEN.email], {
+      [BROKEN.email]: "invalid_grant (Token has been expired or revoked.)",
+    });
+    expect(markup).toContain("invalid_grant");
+    expect(markup).toContain("Token has been expired or revoked.");
+  });
+
+  it("says nothing extra when Google was never asked", () => {
+    // A Keychain entry that is simply gone was never refused by anybody, so
+    // there is no remote text and the row does not invent one.
+    const markup = render([BROKEN.email]);
+    expect(markup).toContain("Needs authorization");
+    expect(markup).not.toContain("invalid_grant");
   });
 
   it("does not disturb Remove, which is still offered on every row", () => {
