@@ -777,8 +777,13 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
       await call<void>("sync_now");
     },
 
-    async beginAddAccount(): Promise<PendingAuthorization> {
-      const pending = await call<PendingAuthorization>("begin_add_account");
+    async beginAddAccount(email?: string): Promise<PendingAuthorization> {
+      // `email` is the address a "Sign in again" started from. Rust turns it
+      // into Google's `login_hint` and holds it against the identity that comes
+      // back, so repairing one account cannot connect another.
+      const pending = await call<PendingAuthorization>("begin_add_account", {
+        email: email ?? null,
+      });
       return { url: text(pending?.url), pendingId: text(pending?.pendingId) };
     },
 

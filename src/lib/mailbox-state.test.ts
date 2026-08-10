@@ -199,6 +199,44 @@ describe("sync progress", () => {
       { email: "alex@lumen.example", message: "alex@lumen.example needs signing in again" },
     ]);
     expect(progress.label).toBe("One account needs signing in again");
+    // Same sentence as a sync error, different next action: syncing again never
+    // produces a refresh token. The status bar reads this to decide whether its
+    // button means "Sync now" or "open Preferences → Accounts".
+    expect(progress.reauthorize).toEqual(["alex@lumen.example"]);
+  });
+
+  it("stops asking for a sign-in the moment the address leaves the status", () => {
+    // What a completed "Sign in again" looks like from here. Rust clears the
+    // address in `mark_reauthorized` and emits the sync status from the same
+    // command, so the label and the status bar both go without a restart.
+    const progress = syncProgress(
+      status([account({ phase: "done", lastSuccessAt: 3 })], {
+        lastPassFinishedAt: 4,
+        needsReauthorization: [],
+      }),
+    );
+    expect(progress.reauthorize).toEqual([]);
+    expect(progress.errors).toEqual([]);
+    expect(progress.label).toBe("Up to date");
+  });
+
+  it("keeps a sync error and a dead credential apart", () => {
+    const progress = syncProgress(
+      status(
+        [
+          account({ email: "alex@lumen.example", phase: "done", lastError: "429" }),
+          account({ email: "bruno@example.com", phase: "done", lastSuccessAt: 1 }),
+        ],
+        { lastPassFinishedAt: 2, needsReauthorization: ["bruno@example.com"] },
+      ),
+    );
+    expect(progress.reauthorize).toEqual(["bruno@example.com"]);
+    expect(progress.errors.map((e) => e.email)).toEqual([
+      "alex@lumen.example",
+      "bruno@example.com",
+    ]);
+    // A real sync failure is still the louder of the two, and still retryable.
+    expect(progress.label).toBe("Sync failed");
   });
 
   it("says up to date once a pass has finished with nothing running", () => {

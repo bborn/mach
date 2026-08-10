@@ -1095,6 +1095,65 @@ async fn booting_with_credentials_runs_migrations_and_reports_configured() {
 }
 
 // ---------------------------------------------------------------------------
+// re-authorizing an address already in the store
+// ---------------------------------------------------------------------------
+
+/// What "Sign in again" costs: nothing.
+///
+/// The row is upserted on `email`, which is `UNIQUE`, so the account keeps its
+/// primary key and every thread, message and event still points at it. The
+/// upsert also names the three columns it writes, so the Gmail history
+/// watermark and the calendar sync token survive — a re-authorized account
+/// picks up incrementally instead of backfilling from scratch.
+#[test]
+fn re_authorizing_an_address_keeps_the_row_its_mail_and_its_watermarks() {
+    let db = TempDb::new("reauth-persist");
+    let id = account(&db, "bruno@example.com", 3);
+    let thread_id = thread(&db, id, "t1", "Lunch", 1_700_000_000_000);
+    message(&db, thread_id, id, "m1", "Lunch", "one");
+    {
+        let conn = db.db.writer();
+        q::set_history_id(&conn, id, Some("99")).expect("history id");
+        q::set_calendar_sync_token(&conn, id, Some("cal-token")).expect("calendar token");
+    }
+
+    let again = mach_lib::ipc::state::persist_account(&db.db, "bruno@example.com")
+        .expect("persist an address already in the store");
+
+    assert_eq!(again.id, id, "the account keeps its primary key");
+    assert_eq!(again.colour_index, 3, "and its place in the palette");
+    assert_eq!(again.display_name.as_deref(), Some("bruno@example.com"));
+    assert_eq!(again.history_id.as_deref(), Some("99"));
+    assert_eq!(again.calendar_sync_token.as_deref(), Some("cal-token"));
+
+    let accounts = db.db.read(q::list_accounts).expect("list accounts");
+    assert_eq!(accounts.len(), 1, "no second row for the same address");
+
+    let threads = db
+        .db
+        .read(|conn| q::list_threads(conn, &Default::default()))
+        .expect("list threads");
+    assert_eq!(threads.len(), 1, "the stored mail is still there");
+
+    remove_db_files(&db.path);
+}
+
+/// The address is remembered so the identity that comes back can be checked
+/// against it — see `complete_add_account`.
+#[test]
+fn a_sign_in_started_for_an_address_reports_a_different_one_as_a_failure() {
+    let error = IpcError::WrongAccount {
+        expected: "bruno@example.com".to_string(),
+        got: "someone.else@example.com".to_string(),
+    };
+    assert_eq!(error.kind(), "wrongAccount");
+    assert_eq!(
+        error.to_string(),
+        "signed in as someone.else@example.com, not bruno@example.com"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // restoring accounts
 // ---------------------------------------------------------------------------
 

@@ -165,14 +165,24 @@ pub async fn sync_now(state: State<'_, AppState>) -> Result<(), IpcError> {
 // accounts
 // ---------------------------------------------------------------------------
 
+/// Start a sign-in. `email` names the account being repaired, if any.
+///
+/// With an address it becomes Google's `login_hint`, so the consent page opens
+/// on the account the user pointed at rather than on whichever one the browser
+/// happens to be signed into — and `complete_add_account` holds the same
+/// address against what comes back.
 #[tauri::command]
 pub fn begin_add_account(
     state: State<'_, AppState>,
+    email: Option<String>,
 ) -> Result<PendingAuthorizationHandle, IpcError> {
     let config = state.client_config()?;
-    let pending = crate::auth::flow::begin_authorization(config, None)?;
+    let pending = crate::auth::flow::begin_authorization(config, email.as_deref())?;
     let url = pending.url.clone();
-    let pending_id = state.store_pending(pending)?;
+    let pending_id = state.store_pending(state::Handshake {
+        authorization: pending,
+        email,
+    })?;
     Ok(PendingAuthorizationHandle { url, pending_id })
 }
 
@@ -183,9 +193,32 @@ pub async fn complete_add_account(
     pending_id: String,
 ) -> Result<Account, IpcError> {
     let config = state.client_config()?.clone();
-    let pending = state.take_pending(&pending_id)?;
+    let handshake = state.take_pending(&pending_id)?;
+    let expected = handshake.email.clone();
 
-    let authorized = state::await_authorization(pending, config).await?;
+    let authorized = state::await_authorization(handshake.authorization, config).await?;
+
+    // A sign-in started from one row must not connect a different account. The
+    // `login_hint` is a suggestion Google is free to ignore, and the browser may
+    // already be holding a different session, so the identity is checked rather
+    // than assumed. Nothing has been written to the store yet; the refresh token
+    // the exchange saved is the only trace, and it goes too unless it belongs to
+    // an account Mach already has.
+    if let Some(expected) = expected {
+        if !expected.eq_ignore_ascii_case(&authorized.email) {
+            let known = reads::account_by_email(&state.db, &authorized.email)?.is_some();
+            if !known {
+                if let Some(tokens) = state.tokens() {
+                    let _ = tokens.sign_out(&authorized.email);
+                }
+            }
+            return Err(IpcError::WrongAccount {
+                expected,
+                got: authorized.email,
+            });
+        }
+    }
+
     let account = state::persist_account(&state.db, &authorized.email)?;
 
     // Seed the access token so the first sync does not have to spend a refresh

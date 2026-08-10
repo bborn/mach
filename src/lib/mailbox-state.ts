@@ -94,6 +94,14 @@ export interface SyncProgress {
   /** The accounts doing work right now. */
   working: AccountSyncStatus[];
   errors: { email: string; message: string }[];
+  /**
+   * Addresses that need signing in again, separated out from `errors`.
+   *
+   * Same sentence in the status bar, different next action: a sync error is
+   * something to retry, and a dead Keychain entry is something to fix in
+   * Preferences → Accounts. The indicator branches on this.
+   */
+  reauthorize: string[];
 }
 
 const PHASE_RANK: Record<string, number> = {
@@ -144,6 +152,7 @@ export function syncProgress(status: SyncStatus | null): SyncProgress {
     label: progressLabel(status, working, done, total, errors.length - reauth.length, reauth.length),
     working,
     errors,
+    reauthorize: reauth,
   };
 }
 

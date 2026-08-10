@@ -34,6 +34,11 @@ pub enum IpcError {
     #[error("no pending sign-in with id {0}")]
     UnknownPending(String),
 
+    /// A sign-in started for one address came back holding another. Nothing was
+    /// written; the row that asked to be repaired is still broken.
+    #[error("signed in as {got}, not {expected}")]
+    WrongAccount { expected: String, got: String },
+
     #[error("{0}")]
     Auth(#[from] AuthError),
 
@@ -60,6 +65,7 @@ impl IpcError {
             IpcError::NotConfigured(_) => "notConfigured",
             IpcError::NotFound { .. } => "notFound",
             IpcError::UnknownPending(_) => "unknownPending",
+            IpcError::WrongAccount { .. } => "wrongAccount",
             IpcError::Auth(_) => "auth",
             // The command layer's own tag is more specific than anything this
             // enum could invent, so it wins.

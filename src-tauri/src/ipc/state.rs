@@ -188,7 +188,19 @@ pub struct AppState {
     needs_reauthorization: Mutex<Vec<String>>,
     /// Authorization handshakes waiting for their loopback callback, keyed by
     /// the opaque id handed to the frontend.
-    pending: Mutex<HashMap<String, PendingAuthorization>>,
+    pending: Mutex<HashMap<String, Handshake>>,
+}
+
+/// A sign-in in flight, plus the address it was started for.
+///
+/// "Add account" has no address in mind and leaves `email` empty. "Sign in
+/// again", next to a row that has lost its Keychain entry, names one — which is
+/// both a `login_hint` for Google and the thing `complete_add_account` checks
+/// the returned identity against, so that fixing one account cannot quietly
+/// connect a different one.
+pub struct Handshake {
+    pub authorization: PendingAuthorization,
+    pub email: Option<String>,
 }
 
 impl AppState {
@@ -251,7 +263,7 @@ impl AppState {
     }
 
     /// Park a handshake and return the opaque id that reclaims it.
-    pub fn store_pending(&self, pending: PendingAuthorization) -> Result<String, IpcError> {
+    pub fn store_pending(&self, pending: Handshake) -> Result<String, IpcError> {
         // The id is the same kind of value as an OAuth `state`: unguessable and
         // meaningless. It never reaches Google — it exists so the frontend can
         // name one of several in-flight sign-ins.
@@ -260,7 +272,7 @@ impl AppState {
         Ok(id)
     }
 
-    pub fn take_pending(&self, pending_id: &str) -> Result<PendingAuthorization, IpcError> {
+    pub fn take_pending(&self, pending_id: &str) -> Result<Handshake, IpcError> {
         lock(&self.pending)
             .remove(pending_id)
             .ok_or_else(|| IpcError::UnknownPending(pending_id.to_string()))

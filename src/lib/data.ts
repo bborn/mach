@@ -386,7 +386,11 @@ export interface MachDataSource {
   syncStatus(): Promise<SyncStatus>;
   syncNow(): Promise<void>;
 
-  beginAddAccount(): Promise<PendingAuthorization>;
+  /**
+   * Start an authorization. `email` names the account being repaired, and the
+   * flow refuses to finish as anyone else.
+   */
+  beginAddAccount(email?: string): Promise<PendingAuthorization>;
   completeAddAccount(pendingId: string): Promise<Account>;
   removeAccount(accountId: AccountId): Promise<void>;
   /** Hand the URL to the system browser; Google's consent screen is not ours. */

@@ -194,6 +194,16 @@ interface UiState {
   overlays: number;
   addAccountOpen: boolean;
   /**
+   * The address `<AddAccountDialog/>` is signing in, when it was opened to
+   * repair one rather than to connect a new account.
+   *
+   * Null for "Add account", which has nobody in mind. Set by "Sign in again"
+   * beside a row that has lost its Keychain entry, and it is what makes that
+   * button target *that* address: it becomes Google's `login_hint`, and Rust
+   * refuses the handshake if a different account comes back.
+   */
+  addAccountEmail: string | null;
+  /**
    * Whether the snooze picker is asking for a wake time.
    *
    * It has to be here rather than inside the picker because two other surfaces
@@ -242,7 +252,7 @@ type UiAction =
   | { type: "railIndex"; index: number }
   | { type: "event"; eventId: EventId | null }
   | { type: "palette"; open: boolean }
-  | { type: "addAccount"; open: boolean }
+  | { type: "addAccount"; open: boolean; email?: string | null }
   | { type: "snooze"; open: boolean }
   | { type: "listWidth"; width: number }
   | { type: "toggleCalendar"; calendarId: CalendarId }
@@ -271,6 +281,7 @@ export const initialUi: UiState = {
   paletteOpen: false,
   overlays: 0,
   addAccountOpen: false,
+  addAccountEmail: null,
   snoozeOpen: false,
   listWidth: 520,
   hiddenCalendars: [],
@@ -331,7 +342,14 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
     case "palette":
       return { ...state, paletteOpen: action.open };
     case "addAccount":
-      return { ...state, addAccountOpen: action.open, paletteOpen: false };
+      return {
+        ...state,
+        addAccountOpen: action.open,
+        // Cleared on close, so the next "Add account" cannot inherit the
+        // address the last repair was for.
+        addAccountEmail: action.open ? (action.email ?? null) : null,
+        paletteOpen: false,
+      };
     // Closing the palette on the way, for the same reason `addAccount` does:
     // the ⌘K command that opens this is chosen *from* the palette, and two
     // overlays stacked on each other is a surface nobody asked for.
@@ -521,7 +539,8 @@ export interface MachActions {
   shiftPeriod: (delta: number) => void;
   goToday: () => void;
   setPalette: (open: boolean) => void;
-  setAddAccount: (open: boolean) => void;
+  /** `email` repairs that address; without one, it connects a new account. */
+  setAddAccount: (open: boolean, email?: string | null) => void;
   /** Open or shut the snooze picker. `b`, the clock button and ⌘K all call it. */
   setSnooze: (open: boolean) => void;
   setStatus: (message: string, tone?: StatusMessage["tone"]) => void;
@@ -1398,7 +1417,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
       },
       goToday: () => dispatch({ type: "anchor", anchor: Date.now() }),
       setPalette: (open) => dispatch({ type: "palette", open }),
-      setAddAccount: (open) => dispatch({ type: "addAccount", open }),
+      setAddAccount: (open, email) => dispatch({ type: "addAccount", open, email }),
       setSnooze: (open) => dispatch({ type: "snooze", open }),
       setStatus: (message, tone = "info") =>
         dispatch({ type: "status", status: { message, tone } }),

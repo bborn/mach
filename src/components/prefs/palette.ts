@@ -41,8 +41,22 @@ interface Entry {
 /** Opened from ⌘K and from ⌘,, so the dialog does not have to be a route. */
 export const PREFERENCES_EVENT = "mach:preferences";
 
-export function openPreferences(): void {
-  window.dispatchEvent(new CustomEvent(PREFERENCES_EVENT));
+/** Which section to land on. `SectionId` in the dialog; a string on the wire. */
+export interface PreferencesRequest {
+  section?: string;
+}
+
+/**
+ * Open Preferences, optionally on a named section.
+ *
+ * The section matters because the dialog remembers the last one looked at, so a
+ * caller sending the user somewhere specific — the status bar saying an account
+ * needs signing in again — cannot rely on where it happens to be.
+ */
+export function openPreferences(section?: string): void {
+  window.dispatchEvent(
+    new CustomEvent<PreferencesRequest>(PREFERENCES_EVENT, { detail: { section } }),
+  );
 }
 
 function theme(value: Preferences["theme"], title: string): Entry {
@@ -61,7 +75,19 @@ const ENTRIES: Entry[] = [
     title: "Preferences…",
     meta: "⌘,",
     keywords: "preferences settings options configure signature theme undo sync calendar",
-    run: openPreferences,
+    run: () => openPreferences(),
+  },
+  {
+    // The keyboard route to the accounts list, and the one the status bar's
+    // "One account needs signing in again" points at with the mouse. Tab in the
+    // main window moves between the rail and the list — it is claimed by the
+    // mail keymap — so a footer button is not on its own a way in.
+    id: "prefs-accounts",
+    title: "Accounts…",
+    meta: "⌘,",
+    keywords:
+      "account accounts sign in again signin authorize authorization reauthorize google add remove connect keychain",
+    run: () => openPreferences("accounts"),
   },
   theme("dark", "Change theme: dark"),
   theme("light", "Change theme: light"),

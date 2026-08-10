@@ -1,19 +1,56 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
-import { getDataSource } from "@/lib/data";
+import { getDataSource, type MachDataSource } from "@/lib/data";
 import { toMailboxError } from "@/hooks/useThreadStream";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Overlay } from "@/components/ui/dialog";
 
-type Phase =
+export type Phase =
   | { step: "idle" }
   | { step: "opening" }
   /** The browser is open and Rust is holding the loopback listener. */
   | { step: "waiting"; url: string }
   | { step: "done"; email: string }
   | { step: "failed"; message: string };
+
+/** What `authorize` needs from the data source, and nothing more. */
+type AuthorizationSource = Pick<
+  MachDataSource,
+  "beginAddAccount" | "completeAddAccount" | "openExternal"
+>;
+
+/**
+ * One sign-in, start to finish, as a value rather than a sequence of setState.
+ *
+ * A React component is the wrong place to keep the one rule that matters here —
+ * that a refused authorization ends as a message on screen and never as a
+ * silently unchanged dialog — so the run lives out here where a test can drive
+ * it. `email` is the address a repair is for; without one this is a new
+ * account. `onWaiting` is called once the consent URL exists, because the
+ * dialog has something to say while the browser has the user.
+ *
+ * It resolves rather than throws: every outcome is a phase to render.
+ */
+export async function authorize(
+  source: AuthorizationSource,
+  email?: string,
+  onWaiting?: (url: string) => void,
+): Promise<Phase> {
+  try {
+    const pending = await source.beginAddAccount(email);
+    onWaiting?.(pending.url);
+    await source.openExternal(pending.url);
+    const account = await source.completeAddAccount(pending.pendingId);
+    return { step: "done", email: account.email };
+  } catch (caught) {
+    // Silent failure is the thing this project has paid most for. A sign-in
+    // Google refused, or one that came back as a different account, says so
+    // where it was started.
+    return { step: "failed", message: toMailboxError(caught).message };
+  }
+}
 
 /**
  * Authorizing an account.
@@ -24,10 +61,21 @@ type Phase =
  * interstitial is not decoration: Mach uses a restricted Gmail scope on an
  * unverified client, so Google shows a full-page warning that reads exactly
  * like a failure unless you were told to expect it.
+ *
+ * # Repairing an account is the same flow
+ *
+ * When an account loses its Keychain entry, Preferences → Accounts marks the
+ * row and offers "Sign in again", which opens this with `ui.addAccountEmail`
+ * set. The only differences are the title, the address going to Google as a
+ * `login_hint`, and Rust refusing to finish if a different account comes back —
+ * the handshake, the loopback listener and the token write are the same code.
+ * `persist_account` upserts on the address, so the row keeps its id, its
+ * colour, its mail and its sync watermarks.
  */
 export function AddAccountDialog() {
   const { ui, actions, accounts } = useMach();
   const open = ui.addAccountOpen;
+  const repairing = ui.addAccountEmail;
   const [phase, setPhase] = useState<Phase>({ step: "idle" });
   const live = useRef(true);
 
@@ -44,22 +92,16 @@ export function AddAccountDialog() {
 
   const start = useCallback(async () => {
     setPhase({ step: "opening" });
-    const source = getDataSource();
-    try {
-      const pending = await source.beginAddAccount();
-      if (!live.current) return;
-      setPhase({ step: "waiting", url: pending.url });
-      await source.openExternal(pending.url);
-      const account = await source.completeAddAccount(pending.pendingId);
-      if (!live.current) return;
-      setPhase({ step: "done", email: account.email });
-      // A new account changes every list in the window.
-      actions.reload();
-    } catch (caught) {
-      if (!live.current) return;
-      setPhase({ step: "failed", message: toMailboxError(caught).message });
-    }
-  }, [actions]);
+    const next = await authorize(getDataSource(), repairing ?? undefined, (url) => {
+      if (live.current) setPhase({ step: "waiting", url });
+    });
+    if (!live.current) return;
+    setPhase(next);
+    // A new account changes every list in the window. A repaired one clears its
+    // own "Needs authorization" the moment Rust emits the sync status that
+    // `complete_add_account` sends after `mark_reauthorized`.
+    if (next.step === "done") actions.reload();
+  }, [actions, repairing]);
 
   const busy = phase.step === "opening" || phase.step === "waiting";
 
@@ -97,7 +139,7 @@ export function AddAccountDialog() {
       <div className="flex flex-col gap-3 p-4">
         <div>
           <h2 id="add-account-title" className="text-body font-medium text-foreground">
-            Add a Google account
+            {repairing ? "Sign in again" : "Add a Google account"}
           </h2>
           {/*
             This carried a paragraph about Mach never seeing the password and
@@ -105,8 +147,17 @@ export function AddAccountDialog() {
             and reassurance nobody asked for reads as a reason to worry. What
             is left is the only part that changes what you do next: the window
             will sit there while a browser tab does the work.
+
+            A repair adds the address, because this surface is reached from the
+            status bar as well as from the row, and "which account" is then the
+            one thing the title cannot say.
           */}
           <p className="mt-1 text-list leading-[1.5] text-muted-foreground">
+            {repairing && (
+              <>
+                <span className="text-foreground">{repairing}</span>.{" "}
+              </>
+            )}
             Consent opens in your browser.
           </p>
         </div>
@@ -127,12 +178,17 @@ export function AddAccountDialog() {
           </p>
         )}
 
-        {phase.step === "done" && (
-          <p className="text-list text-foreground">
-            Added <span className="font-medium">{phase.email}</span>. First sync takes a few
-            minutes.
-          </p>
-        )}
+        {phase.step === "done" &&
+          (repairing ? (
+            <p className="text-list text-foreground">
+              Signed in as <span className="font-medium">{phase.email}</span>.
+            </p>
+          ) : (
+            <p className="text-list text-foreground">
+              Added <span className="font-medium">{phase.email}</span>. First sync takes a few
+              minutes.
+            </p>
+          ))}
 
         {phase.step === "failed" && (
           <p className="max-w-full break-words font-mono text-micro leading-[1.5] text-danger">

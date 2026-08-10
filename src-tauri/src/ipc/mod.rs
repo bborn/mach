@@ -15,7 +15,7 @@
 //! | `command_catalogue` | — | `CommandSpec[]` |
 //! | `sync_status` | — | `SyncStatus` |
 //! | `sync_now` | — | `void` |
-//! | `begin_add_account` | — | `{ url, pendingId }` |
+//! | `begin_add_account` | `email?` | `{ url, pendingId }` |
 //! | `complete_add_account` | `pendingId` | `Account` |
 //! | `remove_account` | `accountId` | `void` |
 //! | `plugin_*` | see [`plugins`] | the plugin surface |

@@ -201,6 +201,24 @@ describe("requests", () => {
     expect(events.map((e) => e.title)).toEqual(["Earlier", "Later"]);
   });
 
+  it("names the address a sign-in is repairing, and sends null when adding", async () => {
+    const { transport, calls } = fakeTransport({
+      begin_add_account: { url: "https://accounts.google.com/o/oauth2/v2/auth", pendingId: "p1" },
+    });
+    const source = createIpcSource(transport);
+
+    await source.beginAddAccount("bruno.bornsztein@gmail.com");
+    // Rust turns this into Google's `login_hint` and holds it against whatever
+    // identity comes back, so "Sign in again" cannot connect a second account.
+    expect(calls[0]).toEqual({
+      command: "begin_add_account",
+      args: { email: "bruno.bornsztein@gmail.com" },
+    });
+
+    await source.beginAddAccount();
+    expect(calls[1]?.args).toEqual({ email: null });
+  });
+
   it("carries recurringEventId and htmlLink, which the grid has to have", async () => {
     const { transport } = fakeTransport({
       list_events: [

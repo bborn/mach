@@ -106,3 +106,46 @@ describe("who owns the keyboard", () => {
     expect(overlayOwnsKeyboard({ ...inner, overlays: 1 })).toBe(true);
   });
 });
+
+/**
+ * Which account the sign-in dialog is signing in.
+ *
+ * "Add account" has nobody in mind; "Sign in again", beside a row that has lost
+ * its Keychain entry, names an address. That address is the whole difference
+ * between the two — it becomes Google's `login_hint` and the identity Rust
+ * checks what comes back against — so a stale one is not cosmetic: it would
+ * point the next sign-in at the wrong account.
+ */
+describe("who the sign-in dialog is for", () => {
+  it("has nobody in mind to begin with", () => {
+    expect(initialUi.addAccountEmail).toBeNull();
+  });
+
+  it("remembers the address a repair was started for", () => {
+    const state = uiReducer(initialUi, {
+      type: "addAccount",
+      open: true,
+      email: "bruno.bornsztein@gmail.com",
+    });
+    expect(state.addAccountOpen).toBe(true);
+    expect(state.addAccountEmail).toBe("bruno.bornsztein@gmail.com");
+  });
+
+  it("opens for nobody in particular when adding an account", () => {
+    const state = uiReducer(initialUi, { type: "addAccount", open: true });
+    expect(state.addAccountEmail).toBeNull();
+  });
+
+  it("forgets the address on close, so the next sign-in cannot inherit it", () => {
+    const repairing = uiReducer(initialUi, {
+      type: "addAccount",
+      open: true,
+      email: "bruno.bornsztein@gmail.com",
+    });
+    const closed = uiReducer(repairing, { type: "addAccount", open: false });
+    expect(closed.addAccountEmail).toBeNull();
+
+    const adding = uiReducer(closed, { type: "addAccount", open: true });
+    expect(adding.addAccountEmail).toBeNull();
+  });
+});

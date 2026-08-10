@@ -1,5 +1,6 @@
 import { useMach } from "@/hooks/useMach";
 import type { SyncProgress } from "@/lib/mailbox-state";
+import { openPreferences } from "@/components/prefs/palette";
 import { cn } from "@/lib/utils";
 
 /**
@@ -9,11 +10,24 @@ import { cn } from "@/lib/utils";
  * long enough that "spinner" is not an acceptable answer — it has to say what
  * it is doing and how far through it is. Progress comes from the `sync-status`
  * event; nothing here polls.
+ *
+ * # Where it takes you
+ *
+ * Normally "Sync now", which is the only thing a stalled or failed pass wants.
+ * "One account needs signing in again" is the exception: no number of syncs
+ * produces a refresh token, so it opens Preferences → Accounts, where the row
+ * offers "Sign in again". Tab in the main window belongs to the mail keymap, so
+ * this button is not a keyboard route on its own — ⌘K → "Accounts…" is, and it
+ * lands in the same place.
  */
 export function SyncIndicator() {
   const { progress, sync, actions } = useMach();
 
   if (!progress.active && progress.errors.length === 0) return null;
+
+  // A pass in flight still has something to say about itself; only a settled
+  // status that is *only* waiting on authorization changes what the button does.
+  const authorization = !progress.active && progress.reauthorize.length > 0;
 
   const title = sync
     ? sync.accounts
@@ -32,7 +46,8 @@ export function SyncIndicator() {
     <button
       type="button"
       title={title}
-      onClick={actions.syncNow}
+      aria-label={authorization ? `${progress.label} — open Accounts` : undefined}
+      onClick={authorization ? () => openPreferences("accounts") : actions.syncNow}
       className="flex min-w-0 shrink items-center gap-2 text-micro text-faint-foreground hover:text-foreground"
     >
       {progress.active ? (

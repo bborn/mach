@@ -41,7 +41,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { PREFERENCES_EVENT, preferencesResolver } from "./palette";
+import { PREFERENCES_EVENT, preferencesResolver, type PreferencesRequest } from "./palette";
 import { usePreferencesStore } from "./PreferencesProvider";
 
 /**
@@ -248,7 +248,16 @@ export function PreferencesDialog() {
   }, [open]);
 
   useEffect(() => {
-    const show = () => setOpen(true);
+    // The surface remembers the last section looked at, so a caller sending the
+    // user to a particular one has to say which — otherwise "one account needs
+    // signing in again" opens on whatever was read last.
+    const show = (event: Event) => {
+      const asked = (event as CustomEvent<PreferencesRequest | undefined>).detail?.section;
+      if (asked && SECTIONS.some((entry) => entry.id === asked)) {
+        setSection(asked as SectionId);
+      }
+      setOpen(true);
+    };
     window.addEventListener(PREFERENCES_EVENT, show);
     return () => window.removeEventListener(PREFERENCES_EVENT, show);
   }, []);
@@ -396,6 +405,10 @@ export function PreferencesDialog() {
                     // to the mail is the right place to land.
                     setOpen(false);
                     actions.setAddAccount(true);
+                  }}
+                  onReauthorize={(account) => {
+                    setOpen(false);
+                    actions.setAddAccount(true, account.email);
                   }}
                 />
               )}
@@ -638,8 +651,8 @@ export function PreferencesDialog() {
 /* -------------------------------------------------------------------------- */
 
 /**
- * The connected accounts: which they are, what colour each one is, and the two
- * things you can do to the list.
+ * The connected accounts: which they are, what colour each one is, and what you
+ * can do to the list.
  *
  * This is where adding an account lives now. It was a row at the bottom of the
  * mail rail, next to the mailboxes — which made it navigation, and made a
@@ -663,14 +676,25 @@ export function PreferencesDialog() {
  * The confirmation is inline rather than a second dialog, because a modal over
  * a modal is two focus traps arguing, and because the sentence belongs beside
  * the row it is about.
+ *
+ * # Needs authorization
+ *
+ * That label used to be the end of the road: the account was broken, the row
+ * said so, and the only button on it deleted the mail. "Sign in again" now sits
+ * beside the label and runs the same authorization "Add account" runs, named to
+ * that address — `persist_account` upserts on the email, so the row keeps its
+ * id, its colour, its mail and its sync watermarks. Success clears the label
+ * and the status bar together, because `complete_add_account` emits the sync
+ * status after clearing the address from `needs_reauthorization`.
  */
-function Accounts({
+export function Accounts({
   accounts,
   needsAuthorization,
   confirming,
   onConfirm,
   onRemoved,
   onAdd,
+  onReauthorize,
 }: {
   accounts: readonly Account[];
   /** Emails whose refresh token is gone from the Keychain. */
@@ -679,6 +703,8 @@ function Accounts({
   onConfirm: (accountId: number | null) => void;
   onRemoved: () => void;
   onAdd: () => void;
+  /** Re-run authorization for one address, rather than for a new account. */
+  onReauthorize: (account: Account) => void;
 }) {
   const [failed, setFailed] = useState<string | null>(null);
 
@@ -714,7 +740,17 @@ function Accounts({
                 {account.email}
               </span>
               {needsAuthorization.includes(account.email) && (
-                <span className="shrink-0 text-micro text-danger">Needs authorization</span>
+                <>
+                  <span className="shrink-0 text-micro text-danger">Needs authorization</span>
+                  <Button
+                    size="sm"
+                    variant="subtle"
+                    aria-label={`Sign in again as ${account.email}`}
+                    onClick={() => onReauthorize(account)}
+                  >
+                    Sign in again
+                  </Button>
+                </>
               )}
               <Button
                 size="sm"

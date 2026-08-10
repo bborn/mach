@@ -29,6 +29,11 @@ pub fn account(db: &Db, account_id: i64) -> Result<Account, IpcError> {
     found.ok_or_else(|| IpcError::not_found("account", account_id))
 }
 
+/// One account by address, or `None`. Absence is an answer here, not an error.
+pub fn account_by_email(db: &Db, email: &str) -> Result<Option<Account>, IpcError> {
+    Ok(db.read(|conn| queries::account_by_email(conn, email))?)
+}
+
 fn find_account(conn: &Connection, account_id: i64) -> crate::db::Result<Option<Account>> {
     Ok(queries::list_accounts(conn)?
         .into_iter()
