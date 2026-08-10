@@ -1,12 +1,15 @@
 import { ChevronDown, ChevronRight, X } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ThreadId } from "@/types";
-import { useMach } from "@/hooks/useMach";
+import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useUiSession } from "@/components/prefs/PreferencesProvider";
 import { railMailboxes } from "@/lib/mailboxes";
+import { RAIL_WIDTH_BOUNDS } from "@/lib/prefs";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { RESIZE_STEP, Resizer } from "@/components/ui/split";
+import { DEFAULT_RAIL_WIDTH, clampRailWidth } from "./rail-layout";
 import { railItems, railStep, type RailItem, type RailSection } from "./rail-model";
 import { useInboxUnread } from "./use-inbox-unread";
 
@@ -22,6 +25,13 @@ import { useInboxUnread } from "./use-inbox-unread";
  * other gesture, "that account's inbox", which is what nesting them promises.
  *
  * The rows themselves are built in `rail-model.tsx`; this is the wiring.
+ *
+ * The handle on its right edge is the same `Resizer` the conversation-list
+ * divider, the agent drawer and the composer use, sized by the same shape:
+ * an unclamped choice in state, `rail-layout.ts` deciding what it means, and
+ * `uiSession` remembering it. It is returned as a sibling of the rail rather
+ * than drawn inside it, so it lands between the two columns of `MailMode`'s
+ * flex row.
  */
 export function AccountRail() {
   const { accounts, labels, ui, favorites, dispatch, actions } = useMach();
@@ -42,6 +52,53 @@ export function AccountRail() {
         ? collapsed.filter((id) => id !== section)
         : [...collapsed, section],
     });
+
+  /* ------------------------------------------------------------- the width */
+
+  const [chosenWidth, setChosenWidth] = useState(DEFAULT_RAIL_WIDTH);
+  const restoredWidth = useRef(false);
+
+  // The stored width lands a tick after mount, like the rest of the session,
+  // and only the first one counts: `remember` writes back into the same object,
+  // so a second restore would fight every drag.
+  const storedWidth = session.railWidth;
+  useEffect(() => {
+    if (restoredWidth.current || storedWidth === undefined) return;
+    restoredWidth.current = true;
+    setChosenWidth(storedWidth);
+  }, [storedWidth]);
+
+  const width = clampRailWidth(chosenWidth);
+
+  /*
+   * `--rail-width` is the rail's width, so the rail is what sets it.
+   *
+   * The token was a constant in `globals.css` and is now the live value, which
+   * is what keeps the toast where it belongs: it is `fixed`, mounted in `App`
+   * outside this tree, and parks itself where the rail ends. A prop could not
+   * reach it. `w-rail` on the scroller below reads the same token, so this is
+   * also what paints the rail, and there is one copy of the number rather than
+   * two that can disagree.
+   */
+  useLayoutEffect(() => {
+    document.documentElement.style.setProperty("--rail-width", `${width}px`);
+  }, [width]);
+
+  /** Mid-drag: move it, and leave the store alone until the pointer is up. */
+  const resize = useCallback((next: number) => setChosenWidth(clampRailWidth(next)), []);
+
+  /**
+   * A width somebody has finished choosing — the pointer released, a key
+   * pressed, the divider double-clicked. The only one of the two that writes.
+   */
+  const setWidth = useCallback(
+    (next: number) => {
+      const clamped = clampRailWidth(next);
+      setChosenWidth(clamped);
+      remember({ railWidth: clamped });
+    },
+    [remember],
+  );
 
   /*
    * Anything the UI has already taken out of the inbox or marked read, but that
@@ -106,6 +163,9 @@ export function AccountRail() {
   );
 
   const railActive = ui.mode === "mail" && !ui.paletteOpen && ui.focus === "rail";
+  // Wider than `railActive`: the rail's width is a property of the mail
+  // surface, not of where the cursor happens to be standing in it.
+  const railVisible = ui.mode === "mail" && !overlayOwnsKeyboard(ui);
 
   // `-1` in state means "wherever the current mailbox is", so arriving in the
   // rail puts the cursor on the row you are already looking at rather than on
@@ -224,31 +284,71 @@ export function AccountRail() {
       when: () => railActive,
       handler: () => actions.setFocus("list"),
     },
+    /*
+     * The keyboard's own route to the divider.
+     *
+     * The handle is a focus stop and answers ← → once it has focus, but ⇥ is
+     * spent on the rail-and-list loop, so focus is not a keystroke away from
+     * most places in mail. These are the same two keys the agent drawer and
+     * the composer use for their own dividers, turned through ninety degrees —
+     * one gesture for "give this pane more room", learned once. `←`/`→` on
+     * their own already fold and step the tree and cannot be spent twice.
+     */
+    {
+      keys: "mod+alt+right",
+      group: "Sidebar",
+      description: "Wider",
+      allowInInput: true,
+      when: () => railVisible,
+      handler: () => setWidth(width + RESIZE_STEP),
+    },
+    {
+      keys: "mod+alt+left",
+      group: "Sidebar",
+      description: "Narrower",
+      allowInInput: true,
+      when: () => railVisible,
+      handler: () => setWidth(width - RESIZE_STEP),
+    },
   ]);
 
-  // `flex-none` overrides ScrollArea's own `flex-1`: the rail is a fixed
-  // column, not a stretching one.
+  // `flex-none` overrides ScrollArea's own `flex-1`: the rail is a column of a
+  // width somebody chose, not a stretching one. `w-rail` reads `--rail-width`,
+  // which the layout effect above keeps at that width.
   return (
-    <ScrollArea
-      ref={scroller}
-      role="tree"
-      aria-label="Mailboxes"
-      className="w-rail flex-none border-r border-border bg-surface py-1"
-    >
-      {items.map((item, index) => {
-        const section = item.section;
-        return (
-          <RailRow
-            key={item.key}
-            item={item}
-            index={index}
-            focused={index === focusedIndex}
-            onToggle={section ? () => toggleSection(section) : undefined}
-          />
-        );
-      })}
-      <div className="h-3" />
-    </ScrollArea>
+    <>
+      <ScrollArea
+        ref={scroller}
+        role="tree"
+        aria-label="Mailboxes"
+        className="w-rail flex-none border-r border-border bg-surface py-1"
+      >
+        {items.map((item, index) => {
+          const section = item.section;
+          return (
+            <RailRow
+              key={item.key}
+              item={item}
+              index={index}
+              focused={index === focusedIndex}
+              onToggle={section ? () => toggleSection(section) : undefined}
+            />
+          );
+        })}
+        <div className="h-3" />
+      </ScrollArea>
+      {/* The pane is to its left, so it straddles the border the rail already
+          draws rather than adding a second line beside it. */}
+      <Resizer
+        size={width}
+        onResize={resize}
+        onCommit={setWidth}
+        onReset={() => setWidth(DEFAULT_RAIL_WIDTH)}
+        min={RAIL_WIDTH_BOUNDS.min}
+        max={RAIL_WIDTH_BOUNDS.max}
+        label="Sidebar width"
+      />
+    </>
   );
 }
 

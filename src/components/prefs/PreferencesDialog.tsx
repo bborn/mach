@@ -337,9 +337,12 @@ export function PreferencesDialog() {
       </header>
 
       <div className="flex min-h-0 flex-1">
+        {/* 13rem, which is what `w-rail` used to mean here. It is spelled out
+            now because `--rail-width` follows the mail rail's divider, and
+            this list of sections has nothing to do with that drag. */}
         <nav
           aria-label="Sections"
-          className="w-rail shrink-0 overflow-y-auto border-r border-border p-2"
+          className="w-52 shrink-0 overflow-y-auto border-r border-border p-2"
         >
           {SECTIONS.map((entry) => (
             <button

@@ -90,7 +90,13 @@
   --account-4: oklch(0.62 0.22 350);
   --account-5: oklch(0.62 0.18 300);
 
-  /* Layout */
+  /* Layout.
+
+     `--rail-width` is where the mail rail starts and what a double-click on
+     its divider returns to; `AccountRail` overwrites it on this element for as
+     long as a window is open, so anything reading the token follows the drag.
+     `DEFAULT_RAIL_WIDTH` in `components/mail/rail-layout.ts` is the same 208px
+     said in the units the geometry is done in. */
   --rail-width: 13rem;
   --list-width: 24rem;
 

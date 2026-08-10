@@ -576,6 +576,14 @@ export interface UiSession {
   labelId: string;
   listWidth: number;
   /**
+   * How wide the mail rail stands, in pixels.
+   *
+   * The same kind of value as `listWidth`: a divider somebody dragged. What
+   * the width has to be able to show is decided in
+   * `components/mail/rail-layout.ts`, which is also where the default lives.
+   */
+  railWidth: number;
+  /**
    * How tall the agent drawer stands, in pixels.
    *
    * The same kind of value as `listWidth` and remembered the same way: a
@@ -611,6 +619,25 @@ export const SESSION_KEY = "uiSession";
  * paint one pane at full width before the first drag corrected it.
  */
 export const LIST_WIDTH_BOUNDS: Bounds = { min: 280, max: 640 };
+
+/**
+ * The width bounds the mail rail is held to, on the same terms.
+ *
+ * The floor is set by what a rail row has to be able to say. An account row is
+ * nested one level, so 60 of its pixels are chrome — the disclosure column, the
+ * indent, the icon, the gaps — before any of the address is drawn. At 176 that
+ * leaves about fourteen characters of a 13px address, which is the point at
+ * which two accounts at the same host stop being distinguishable from each
+ * other. It is also comfortably past the 88px macOS reserves for the traffic
+ * lights, so no rail the user can produce ends underneath them.
+ *
+ * The ceiling is where the rail stops paying for itself. At 320 a full
+ * `name@example.com` and its unread count both fit without truncating, and
+ * every pixel past that comes out of the conversation list, which is the column
+ * the window is actually for. 320 also fits beside the list at its own 280
+ * minimum inside the 960px the window will not go below.
+ */
+export const RAIL_WIDTH_BOUNDS: Bounds = { min: 176, max: 320 };
 
 /**
  * The height bounds the agent drawer is held to, for the same reason.
@@ -659,6 +686,9 @@ export function parseSession(raw: unknown): Partial<UiSession> {
   if (typeof raw.labelId === "string" && raw.labelId.length > 0) out.labelId = raw.labelId;
   if (typeof raw.listWidth === "number" && Number.isFinite(raw.listWidth)) {
     out.listWidth = clamp(Math.round(raw.listWidth), LIST_WIDTH_BOUNDS);
+  }
+  if (typeof raw.railWidth === "number" && Number.isFinite(raw.railWidth)) {
+    out.railWidth = clamp(Math.round(raw.railWidth), RAIL_WIDTH_BOUNDS);
   }
   if (typeof raw.agentDrawerHeight === "number" && Number.isFinite(raw.agentDrawerHeight)) {
     out.agentDrawerHeight = clamp(Math.round(raw.agentDrawerHeight), AGENT_DRAWER_HEIGHT_BOUNDS);

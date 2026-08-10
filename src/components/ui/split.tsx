@@ -9,6 +9,20 @@ interface ResizerProps {
   /** Current size of the pane this handle sizes, in pixels. */
   size: number;
   onResize: (size: number) => void;
+  /**
+   * The end of a gesture: the pointer released, an arrow pressed, Home or End.
+   *
+   * Separate from `onResize` because a drag fires that a few hundred times and
+   * only the last of them is worth writing to the store. A handle whose
+   * consumer is happy to persist every intermediate value simply omits this and
+   * does its remembering in `onResize`.
+   */
+  onCommit?: (size: number) => void;
+  /**
+   * What a double-click on the divider does. Omitted, it does nothing — which
+   * is the right answer for a divider with no default worth going back to.
+   */
+  onReset?: () => void;
   /** The range the handle may produce. Also what it reports to the reader. */
   min: number;
   max: number;
@@ -41,22 +55,61 @@ interface ResizerProps {
  * listens in the capture phase: a local handler would never see an arrow key
  * that the mail list had already claimed. They are live only while the handle
  * has focus, and carry no description, so they cost the `?` sheet nothing.
+ *
+ * Focus is not always a keystroke away, though — both modes spend ⇥ on their
+ * own rail-and-list loop — so a divider that matters also wants a binding of
+ * its own from its consumer. `AgentDock`, `ComposerDock` and `AccountRail` each
+ * register one.
+ *
+ * # Double-click goes back to the default
+ *
+ * Only where the consumer passes `onReset`. The handle knows the range it may
+ * produce; it does not know which value in that range is the one the app was
+ * designed around.
  */
-export function Resizer({ size, onResize, min, max, label, axis = "x", className }: ResizerProps) {
+export function Resizer({
+  size,
+  onResize,
+  onCommit,
+  onReset,
+  min,
+  max,
+  label,
+  axis = "x",
+  className,
+}: ResizerProps) {
   const [dragging, setDragging] = useState(false);
   const [focused, setFocused] = useState(false);
   const origin = useRef({ point: 0, size: 0 });
+  /*
+   * The last size this handle produced, so `pointerup` has something to commit.
+   *
+   * A ref rather than reading `size` back: the consumer may hold the value in
+   * state that has not re-rendered this component yet when the pointer comes
+   * up, and committing a stale number would write the second-to-last frame of
+   * the drag.
+   */
+  const latest = useRef(size);
 
   // Every route in — drag, arrow, Home, End — comes through here, so the range
   // is enforced once. The consumer clamps too, against limits this cannot know.
   const resize = useCallback(
-    (next: number) => onResize(Math.min(max, Math.max(min, Math.round(next)))),
+    (next: number) => {
+      const clamped = Math.min(max, Math.max(min, Math.round(next)));
+      latest.current = clamped;
+      onResize(clamped);
+      return clamped;
+    },
     [onResize, min, max],
   );
+
+  /** Move it and call the gesture over — what a keystroke is. */
+  const step = useCallback((next: number) => void onCommit?.(resize(next)), [resize, onCommit]);
 
   const onPointerDown = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
       origin.current = { point: axis === "x" ? event.clientX : event.clientY, size };
+      latest.current = size;
       setDragging(true);
       event.currentTarget.setPointerCapture(event.pointerId);
     },
@@ -71,30 +124,33 @@ export function Resizer({ size, onResize, min, max, label, axis = "x", className
       // the drawer grows as the pointer goes up.
       resize(origin.current.size + (axis === "x" ? moved : -moved));
     };
-    const onUp = () => setDragging(false);
+    const onUp = () => {
+      setDragging(false);
+      onCommit?.(latest.current);
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     return () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [dragging, resize, axis]);
+  }, [dragging, resize, axis, onCommit]);
 
   useKeyBindings([
     {
       keys: axis === "x" ? "right" : "up",
       priority: 250,
       when: () => focused,
-      handler: () => resize(size + RESIZE_STEP),
+      handler: () => step(size + RESIZE_STEP),
     },
     {
       keys: axis === "x" ? "left" : "down",
       priority: 250,
       when: () => focused,
-      handler: () => resize(size - RESIZE_STEP),
+      handler: () => step(size - RESIZE_STEP),
     },
-    { keys: "home", priority: 250, when: () => focused, handler: () => resize(min) },
-    { keys: "end", priority: 250, when: () => focused, handler: () => resize(max) },
+    { keys: "home", priority: 250, when: () => focused, handler: () => step(min) },
+    { keys: "end", priority: 250, when: () => focused, handler: () => step(max) },
   ]);
 
   return (
@@ -107,6 +163,7 @@ export function Resizer({ size, onResize, min, max, label, axis = "x", className
       aria-valuemax={max}
       tabIndex={0}
       onPointerDown={onPointerDown}
+      onDoubleClick={onReset}
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
       className={cn(
