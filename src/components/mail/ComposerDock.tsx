@@ -107,7 +107,6 @@ export function ComposerDock() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pending, setPending] = useState<OutboxEntry | null>(null);
-  const [now, setNow] = useState(() => Date.now());
   const [confirming, setConfirming] = useState<string | null>(null);
   const [dropping, setDropping] = useState(false);
 
@@ -632,7 +631,6 @@ export function ComposerDock() {
       recalled.current = draft;
       setPending(optimistic);
       close(id);
-      setNow(Date.now());
 
       /*
        * Undo has to work during the gap. The pill is on screen before the row
@@ -702,26 +700,29 @@ export function ComposerDock() {
       .catch(() => {});
   }, []);
 
-  // Tick only while there is something to count down.
-  useEffect(() => {
-    if (!pending || pending.state !== "holding") return;
-    const timer = window.setInterval(() => setNow(Date.now()), 250);
-    return () => window.clearInterval(timer);
-  }, [pending]);
-
   // When the window closes, ask Rust to send.
   useEffect(() => {
     if (!pending || pending.state !== "holding") return;
     const delay = Math.max(pending.sendAfter - Date.now() + 150, 0);
     const timer = window.setTimeout(() => {
+      /*
+       * The strip goes now, not when Rust answers.
+       *
+       * It used to be cleared after `flushOutbox()` resolved, and that call
+       * waits on the same single SQLite writer the sync loop holds — so on a
+       * large store the strip sat there reading "Sending in 0s" with an Undo
+       * that no longer meant anything, for as long as the lock was held. The
+       * window is over at this instant by definition; nothing about the flush
+       * changes that.
+       */
+      recalled.current = null;
+      setPending(null);
       void (async () => {
         const { outcomes } = await flushOutbox().catch(() => ({ outcomes: [] }));
         const mine = outcomes.find((o) => o.id === pending.id);
         if (mine && !mine.sent) {
           actions.setStatus(mine.error ?? "That message could not be sent", "error");
         }
-        recalled.current = null;
-        setPending(null);
         actions.reload();
       })();
     }, delay);
@@ -766,12 +767,15 @@ export function ComposerDock() {
   if (!hasThread && drafts.length === 0 && !holding) return null;
 
   if (pending && pending.state === "holding") {
-    const remaining = Math.max(0, Math.ceil((pending.sendAfter - now) / 1000));
     /*
      * Scheduled, or just waiting out its window?
      *
-     * The difference is what the strip says — a clock time versus a countdown —
-     * and it is decided by comparing the wait against the send delay in force.
+     * A schedule is worth a clock time: it is minutes or hours away and the
+     * instant is the information. An ordinary send is not. Counting ten down
+     * to zero puts a timer on screen for something the person has already
+     * finished thinking about, and the number is never the reason they look —
+     * Undo is. So the strip says what happened and offers the one action.
+     *
      * The second of slack matters: the delay is applied to a `Date.now()` read
      * a few milliseconds before Rust reads its own, so an exact comparison
      * would call every ordinary send a schedule. An entry recovered from a
@@ -796,10 +800,7 @@ export function ComposerDock() {
                 </span>
               </>
             ) : (
-              <>
-                Sending in{" "}
-                <span className="font-mono tabular-nums text-foreground">{remaining}s</span>
-              </>
+              <span className="text-foreground">Sent</span>
             )}
             <span className="text-faint-foreground"> · {pending.subject}</span>
           </span>
