@@ -13,6 +13,7 @@ import {
   MAX_FRAME_HEIGHT,
   MIN_FRAME_HEIGHT,
   SCROLL_ATTR,
+  type BodyFormat,
   type FrameTokens,
   type WideCandidate,
 } from "@/lib/message-body";
@@ -21,6 +22,8 @@ export interface MessageFrameProps {
   /** Sanitizer output. Never raw sender HTML — see `ipc::render`. */
   html: string;
   allowRemoteImages: boolean;
+  /** Decides whether the frame follows the app theme; see [`frameGround`]. */
+  format: BodyFormat;
   /** Screen-reader name; iframes without one are announced as "frame". */
   title: string;
 }
@@ -46,14 +49,14 @@ export interface MessageFrameProps {
  * message, and the measurement is clamped so a hostile body cannot claim a
  * height that breaks the layout.
  */
-export function MessageFrame({ html, allowRemoteImages, title }: MessageFrameProps) {
+export function MessageFrame({ html, allowRemoteImages, format, title }: MessageFrameProps) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(MIN_FRAME_HEIGHT);
   const tokens = useThemeTokens();
 
   const srcDoc = useMemo(
-    () => frameDocument({ html, allowRemoteImages, tokens }),
-    [html, allowRemoteImages, tokens],
+    () => frameDocument({ html, allowRemoteImages, format, tokens }),
+    [html, allowRemoteImages, format, tokens],
   );
 
   // The tallest height applied to the document currently in the frame, and the

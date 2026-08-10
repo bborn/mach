@@ -17,6 +17,7 @@ import {
   externalUrl,
   frameCsp,
   frameDocument,
+  frameGround,
   isEffectivelyEmpty,
   localTextRender,
   mapRenderedMessage,
@@ -31,6 +32,7 @@ import {
   MAX_FRAME_HEIGHT,
   MIN_FRAME_HEIGHT,
   type BlockedImage,
+  type FrameTokens,
   type RenderedMessage,
   type WideCandidate,
 } from "@/lib/message-body";
@@ -94,7 +96,12 @@ function attribute(markup: string, name: string): string | null {
 
 describe("the message frame's sandbox", () => {
   const markup = renderToStaticMarkup(
-    <MessageFrame html="<p>hi</p>" allowRemoteImages={false} title="Message from Tawny" />,
+    <MessageFrame
+      html="<p>hi</p>"
+      allowRemoteImages={false}
+      format="html"
+      title="Message from Tawny"
+    />,
   );
 
   it("is exactly allow-same-origin allow-popups", () => {
@@ -162,7 +169,7 @@ describe("the message frame's CSP", () => {
   });
 
   it("reaches the frame as a meta policy, since srcdoc has no headers", () => {
-    const doc = frameDocument({ html: "<p>hi</p>", allowRemoteImages: false });
+    const doc = frameDocument({ html: "<p>hi</p>", allowRemoteImages: false, format: "html" });
     expect(doc).toContain(
       `<meta http-equiv="Content-Security-Policy" content="${frameCsp(false)}">`,
     );
@@ -171,7 +178,7 @@ describe("the message frame's CSP", () => {
 
   it("is carried in the srcdoc the component actually renders", () => {
     const markup = renderToStaticMarkup(
-      <MessageFrame html="<p>hi</p>" allowRemoteImages={false} title="t" />,
+      <MessageFrame html="<p>hi</p>" allowRemoteImages={false} format="html" title="t" />,
     );
     const srcdoc = attribute(markup, "srcdoc") ?? "";
     expect(srcdoc).toContain("Content-Security-Policy");
@@ -182,8 +189,10 @@ describe("the message frame's CSP", () => {
 
   it("cannot have a stylesheet broken out of by a malformed token", () => {
     const doc = frameDocument({
+      // Plain text, because that is the ground the app's tokens reach at all.
       html: "",
       allowRemoteImages: false,
+      format: "text",
       tokens: { "--foreground": "red}body{display:none", "--accent": "oklch(0.55 0.18 255)" },
     });
     // The claim is that the token did not escape its declaration and start a
@@ -674,7 +683,7 @@ describe("containing content too wide for the pane", () => {
 // ---------------------------------------------------------------------------
 
 describe("the frame stylesheet", () => {
-  const css = frameDocument({ html: "", allowRemoteImages: false });
+  const css = frameDocument({ html: "", allowRemoteImages: false, format: "html" });
 
   it("gives the frame nothing to scroll vertically", () => {
     // The reading pane is the only vertical scroll. A frame that can scroll
@@ -714,6 +723,97 @@ describe("the frame stylesheet", () => {
   it("does not make one character the narrowest a table column can be", () => {
     expect(css).toContain("overflow-wrap:break-word");
     expect(css).not.toContain("word-break");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the ground
+// ---------------------------------------------------------------------------
+
+/*
+ * Dark mode used to make remote mail unreadable.
+ *
+ * The app's `--foreground` was injected into the sender's document, so
+ * everything the sender did not colour itself inherited near-white — on
+ * backgrounds that still came from the sender's CSS, which is white. A GitHub
+ * Actions notification arrived with its heading, its "All jobs have failed"
+ * line and its "Status / Job / Annotations" table header invisible, while the
+ * footer and the links, which that mail colours explicitly, were fine.
+ */
+describe("the frame's ground", () => {
+  const DARK: FrameTokens = {
+    "--foreground": "oklch(0.985 0 0)",
+    "--muted-foreground": "oklch(0.708 0 0)",
+    "--faint-foreground": "oklch(0.556 0 0)",
+    "--background": "oklch(0.145 0 0)",
+    "--border": "oklch(0.269 0 0)",
+    "--accent": "oklch(0.62 0.19 255)",
+  };
+
+  const html = frameDocument({
+    html: "<p>hi</p>",
+    allowRemoteImages: false,
+    format: "html",
+    tokens: DARK,
+  });
+  const text = frameDocument({
+    html: "<div>hi</div>",
+    allowRemoteImages: false,
+    format: "text",
+    tokens: DARK,
+  });
+
+  it("never puts the app's dark ink into a sender's document", () => {
+    // By declaration rather than by value: two of the dark values are also
+    // light values, under different names.
+    for (const [name, value] of Object.entries(DARK)) {
+      expect(html).not.toContain(`${name}:${value}`);
+    }
+  });
+
+  it("gives a sender's document the light palette and an opaque light page", () => {
+    expect(html).toContain("--foreground:oklch(0.145 0 0)");
+    expect(html).toContain("--background:oklch(1 0 0)");
+    expect(html).toContain("background:var(--background,#fff)");
+    expect(html).not.toContain("background:transparent");
+  });
+
+  it("fixes a sender's document to the colour scheme the mail was written for", () => {
+    expect(html).toContain("color-scheme:light}");
+    expect(html).not.toContain("color-scheme:light dark");
+  });
+
+  it("leaves plain text following the app theme", () => {
+    // This half is our own document, not the sender's: text we turned into
+    // HTML, with no colour of its own to conflict with.
+    expect(text).toContain("--foreground:oklch(0.985 0 0)");
+    expect(text).toContain("--background:oklch(0.145 0 0)");
+    expect(text).toContain("color-scheme:light dark");
+    expect(text).toContain("background:transparent");
+  });
+
+  it("treats a snippet as text and an empty body as text", () => {
+    expect(frameGround("html")).toBe("light");
+    expect(frameGround("text")).toBe("theme");
+    expect(frameGround("snippet")).toBe("theme");
+    expect(frameGround("empty")).toBe("theme");
+  });
+
+  it("reaches the frame the reading pane actually renders", () => {
+    const asHtml = attribute(view({ format: "html" }), "srcdoc") ?? "";
+    const asText = attribute(view({ format: "text" }), "srcdoc") ?? "";
+    expect(asHtml).toContain("color-scheme:light}");
+    expect(asText).toContain("color-scheme:light dark");
+  });
+
+  it("gives the quoted history the same ground as the message it came from", () => {
+    const markup = view(
+      { format: "html", hasQuoted: true, quotedHtml: "<p>older</p>" },
+      { quotedOpen: true },
+    );
+    const frames = [...markup.matchAll(/srcdoc="([^"]*)"/gi)].map((m) => m[1]!);
+    expect(frames).toHaveLength(2);
+    for (const frame of frames) expect(frame).toContain("color-scheme:light}");
   });
 });
 

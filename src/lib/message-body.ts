@@ -241,6 +241,63 @@ export const FRAME_TOKENS = [
 
 export type FrameTokens = Partial<Record<(typeof FRAME_TOKENS)[number], string>>;
 
+/* -------------------------------------------------------------------------- */
+/* Ground                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What the frame's own colours come from.
+ *
+ * - `theme` — the app's tokens, on a transparent background. The document is
+ *   ours: plain text we turned into HTML ourselves, with no colour of its own.
+ *   It should follow the app the way the rest of the window does.
+ * - `light` — a fixed light palette, on an opaque light background. The
+ *   document is the sender's.
+ */
+export type FrameGround = "light" | "theme";
+
+/**
+ * Remote HTML is not ours to re-theme.
+ *
+ * A sender writes their mail against a white page: they set `color` on the
+ * things they mean to stand out and leave the rest to inherit. Copying the
+ * app's `--foreground` into that document changes only half of the pair —
+ * every element without a colour of its own turns near-white, while the
+ * backgrounds stay whatever the sender's CSS says, which is white. That is
+ * exactly what a GitHub Actions notification looked like in dark mode: the
+ * heading, the "All jobs have failed" line and the table header were invisible,
+ * and the footer and links — the parts the sender coloured explicitly — were
+ * fine.
+ *
+ * The fix is to stop injecting half a theme. An HTML body gets a light ground
+ * and `color-scheme: light`, so its own CSS lands on the page it was written
+ * for, and the engine's own defaults for anything it does not style are dark
+ * ink rather than pale. Nothing in the sender's content is restyled, and no
+ * selector is special-cased; the only lever is what the document inherits.
+ *
+ * Plain text keeps the app theme, because there the document *is* ours.
+ */
+export function frameGround(format: BodyFormat): FrameGround {
+  return format === "html" ? "light" : "theme";
+}
+
+/**
+ * The light theme's own values, as literals.
+ *
+ * They cannot be read off the app: when the window is dark, `.dark` has already
+ * replaced them, and the light values are not in the cascade to be found. These
+ * are the `:root` block of `src/styles/globals.css`, so a message in dark mode
+ * is rendered by the same palette a message in light mode is.
+ */
+const LIGHT_GROUND: FrameTokens = {
+  "--foreground": "oklch(0.145 0 0)",
+  "--muted-foreground": "oklch(0.556 0 0)",
+  "--faint-foreground": "oklch(0.708 0 0)",
+  "--background": "oklch(1 0 0)",
+  "--border": "oklch(0.922 0 0)",
+  "--accent": "oklch(0.55 0.18 255)",
+};
+
 /**
  * Invariant 2, the message-frame CSP. Stricter than the app-level policy in
  * `tauri.conf.json` — this one starts from `'none'` and adds back two things.
@@ -314,9 +371,21 @@ function tokenBlock(tokens: FrameTokens): string {
  * that URL. Where it leaves a table genuinely too wide, [`containWideContent`]
  * gives that table its own scroller, which is the behaviour we want anyway.
  */
-function frameStyles(tokens: FrameTokens): string {
-  return `:root{${tokenBlock(tokens)};color-scheme:light dark}
-html,body{margin:0;padding:0;background:transparent}
+function frameStyles(tokens: FrameTokens, ground: FrameGround): string {
+  /*
+   * One stylesheet, two palettes. Everything below reads its colours through a
+   * token, so choosing the token block chooses the ground — see [frameGround]
+   * for why the sender's HTML never gets the app's.
+   *
+   * `color-scheme: light` on a sender's document is the other half of it: it
+   * fixes the engine's own colours — form controls, scrollbars, and the initial
+   * `color` for anything a missing token would fall through to — to the page
+   * the mail was written for. The plain-text ground keeps `light dark`, because
+   * there the tokens are the app's and the app is what it should follow.
+   */
+  const light = ground === "light";
+  return `:root{${tokenBlock(light ? LIGHT_GROUND : tokens)};color-scheme:${light ? "light" : "light dark"}}
+html,body{margin:0;padding:0;background:${light ? "var(--background,#fff)" : "transparent"}}
 /* Nothing nests. A message grows to its natural height and the reading pane is
    the only thing that scrolls, so the frame's own viewport must never have
    anything to scroll:
@@ -372,6 +441,9 @@ export interface FrameDocumentOptions {
   /** Sanitizer output. Never raw sender HTML. */
   html: string;
   allowRemoteImages: boolean;
+  /** Whose document this is, and therefore whose colours it gets. */
+  format: BodyFormat;
+  /** Only consulted for a `theme` ground; see [`frameGround`]. */
   tokens?: FrameTokens;
 }
 
@@ -392,11 +464,16 @@ export interface FrameDocumentOptions {
  * until `https:` is added to that list. `tauri.conf.json` is outside this
  * unit's ownership, so the change is not made here.
  */
-export function frameDocument({ html, allowRemoteImages, tokens = {} }: FrameDocumentOptions): string {
+export function frameDocument({
+  html,
+  allowRemoteImages,
+  format,
+  tokens = {},
+}: FrameDocumentOptions): string {
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${frameCsp(allowRemoteImages)}">
 <meta name="referrer" content="no-referrer">
-<style>${frameStyles(tokens)}</style>
+<style>${frameStyles(tokens, frameGround(format))}</style>
 </head><body>${html}</body></html>`;
 }
 

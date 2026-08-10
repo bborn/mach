@@ -234,6 +234,7 @@ export function MessageBodyView({
         <MessageFrame
           html={rendered.html}
           allowRemoteImages={allowRemoteImages}
+          format={rendered.format}
           title={`Message from ${subject}`}
         />
       )}
@@ -261,6 +262,7 @@ export function MessageBodyView({
               <MessageFrame
                 html={rendered.quotedHtml}
                 allowRemoteImages={allowRemoteImages}
+                format={rendered.format}
                 title={`Quoted history in the message from ${subject}`}
               />
             </div>
