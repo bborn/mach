@@ -51,6 +51,19 @@ export interface RichTextEditorHandle {
   /** The current HTML, read straight out of the editor rather than from state. */
   html(): string;
   /**
+   * Put markup in at the caret. Used for one thing: an image being placed in
+   * the body rather than attached beside it.
+   */
+  insert(html: string): void;
+  /**
+   * Take an inline image back out — the other half of the same choice.
+   *
+   * Removes the node rather than replacing the document, so the caret and the
+   * undo stack survive. The image is identified by its content id, which is
+   * what the chip and the part both carry.
+   */
+  removeInline(contentId: string): void;
+  /**
    * Where the caret is, as a character offset into the message.
    *
    * Read before the composer is moved between the dock and the window, which
@@ -96,6 +109,15 @@ interface RichTextEditorProps {
    * element exactly once, at mount, and Squire owns everything inside it.
    */
   bodyRef?: RefObject<HTMLElement | null>;
+  /**
+   * `cid:` → `data:` URL, for the images that are part of this message.
+   *
+   * Applied to the editor's DOM directly rather than through `initialHtml`,
+   * because the bytes arrive from SQLite after the document is already in and
+   * being typed into. Replacing the document to show a picture would take the
+   * caret and the undo stack with it.
+   */
+  inlineImages?: ReadonlyMap<string, string>;
 }
 
 export function RichTextEditor({
@@ -109,6 +131,7 @@ export function RichTextEditor({
   handle,
   active = true,
   bodyRef,
+  inlineImages,
 }: RichTextEditorProps) {
   const root = useRef<HTMLDivElement>(null);
   const editor = useRef<Squire | null>(null);
@@ -182,11 +205,70 @@ export function RichTextEditor({
     if (node) node.contentEditable = disabled ? "false" : "true";
   }, [disabled]);
 
+  /*
+   * Draw the images that are parts of this message.
+   *
+   * An attribute on nodes Squire already owns, rather than a document replace:
+   * `src` is not something the editor tracks, so setting it neither disturbs
+   * the caret nor pushes anything onto the undo stack. Nothing is reported
+   * upward either — the body has not changed, only what it is showing, and the
+   * `cid:` form is what `changeBody` puts back on the draft in any case.
+   *
+   * Runs after `docKey` has replaced the document, whenever the bytes of one
+   * more image arrive, and — the one that is not obvious — whenever the body
+   * changes. That last dependency is what draws an image the *moment* it is
+   * placed: `insert` reports the new HTML upward, the draft's body comes back
+   * down as `initialHtml`, and this runs against a document that now has an
+   * `<img>` in it. Without it the picture would appear only on the next thing
+   * that happened to change the map.
+   */
+  useEffect(() => {
+    const node = root.current;
+    if (!node || !inlineImages || inlineImages.size === 0) return;
+    for (const image of node.querySelectorAll("img")) {
+      const src = image.getAttribute("src") ?? "";
+      const contentId =
+        image.getAttribute("data-mach-cid") ||
+        (src.toLowerCase().startsWith("cid:") ? src.slice(4) : "");
+      if (!contentId) continue;
+      const url = inlineImages.get(contentId);
+      if (!url || src === url) continue;
+      image.setAttribute("data-mach-cid", contentId);
+      image.setAttribute("src", url);
+    }
+  }, [inlineImages, docKey, initialHtml]);
+
   useImperativeHandle(
     handle,
     () => ({
       focus: () => editor.current?.focus(),
       html: () => editor.current?.getHTML() ?? "",
+      insert: (html: string) => {
+        const instance = editor.current;
+        if (!instance) return;
+        instance.focus();
+        instance.insertHTML(html);
+        setEmpty(isBlankHtml(instance.getHTML()));
+        latest.current(instance.getHTML());
+      },
+      removeInline: (contentId: string) => {
+        const node = root.current;
+        const instance = editor.current;
+        if (!node || !instance) return;
+        let removed = false;
+        for (const image of node.querySelectorAll("img")) {
+          const src = image.getAttribute("src") ?? "";
+          const owned =
+            image.getAttribute("data-mach-cid") === contentId ||
+            src.toLowerCase() === `cid:${contentId}`.toLowerCase();
+          if (!owned) continue;
+          image.remove();
+          removed = true;
+        }
+        if (!removed) return;
+        setEmpty(isBlankHtml(instance.getHTML()));
+        latest.current(instance.getHTML());
+      },
       caret: () => {
         const node = root.current;
         if (!node) return null;

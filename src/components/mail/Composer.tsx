@@ -6,7 +6,7 @@ import {
   useState,
   type RefObject,
 } from "react";
-import { Paperclip, X } from "lucide-react";
+import { Image as ImageIcon, Paperclip, X } from "lucide-react";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useGhostText } from "@/hooks/useGhostText";
 import { Kbd } from "@/components/ui/kbd";
@@ -24,6 +24,7 @@ import {
   COMPOSER_KEYS,
   formatRecipients,
   humanSize,
+  isInlinableImage,
   isLocalOnly,
   parseRecipients,
   scheduleOptions,
@@ -53,8 +54,11 @@ interface ComposerProps {
   onSend: (scheduleAt?: number) => void;
   onClose: () => void;
   onDiscard: () => void;
-  onAttach: () => void;
+  /** Open the file panel. `inline` asks for the images to go in the body. */
+  onAttach: (inline?: boolean) => void;
   onRemoveAttachment: (attachmentId: string) => void;
+  /** Move one image between the body and the list under the message. */
+  onSetInline?: (attachmentId: string, inline: boolean) => void;
   /**
    * Move this draft between the dock and the window, carrying the caret.
    *
@@ -75,8 +79,27 @@ interface ComposerProps {
   presentation?: ComposerPresentation;
   /** False for a composer sitting behind another one: its keys are not live. */
   active?: boolean;
-  /** Files are being dragged over this composer. */
+  /** Files are being dragged over this composer, and letting go would attach. */
   dropping?: boolean;
+  /**
+   * Files are being dragged over the window, wherever the pointer is.
+   *
+   * Separate from `dropping` so the composer can say where the files have to
+   * land *before* the pointer is there. Without it the only feedback is at the
+   * moment of release, by which time the choice has been made.
+   */
+  dragging?: boolean;
+  /** `cid:` → `data:` URL for the images that are part of this message. */
+  inlineImages?: ReadonlyMap<string, string>;
+  /**
+   * The editor itself, for the dock.
+   *
+   * Placing an image in the body is an edit at the caret, and the caret is
+   * inside a document only this editor owns — so the act cannot be expressed as
+   * a new `body` string handed down. Shared the same way `toRef` is: given, the
+   * composer uses it in place of its own.
+   */
+  editorRef?: RefObject<RichTextEditorHandle | null>;
   /**
    * Somewhere for the surface around this to hold on to the To field.
    *
@@ -155,6 +178,7 @@ export function Composer({
   onDiscard,
   onAttach,
   onRemoveAttachment,
+  onSetInline,
   onPopOut,
   poppedOut = false,
   bodyHeight,
@@ -163,12 +187,16 @@ export function Composer({
   presentation = "dock",
   active = true,
   dropping = false,
+  dragging = false,
+  inlineImages,
+  editorRef,
   toRef,
   bodyRef,
   contacts = [],
   ghostContext,
 }: ComposerProps) {
-  const editor = useRef<RichTextEditorHandle>(null);
+  const ownEditor = useRef<RichTextEditorHandle>(null);
+  const editor = editorRef ?? ownEditor;
   const subjectField = useRef<HTMLInputElement>(null);
   const ownToField = useRef<HTMLInputElement>(null);
   const toField = toRef ?? ownToField;
@@ -348,6 +376,7 @@ export function Composer({
       // Says "the keyboard is in a composer" to the shell — see
       // `keyboardInComposer`. Nothing styles off it.
       data-mach-composer=""
+      data-mach-drop-target=""
       className={cn(
         !overlay && "shrink-0 border-t border-border bg-surface",
         // A drop target has to say so before the file is let go, or the only
@@ -445,7 +474,28 @@ export function Composer({
           height={bodyHeight}
           initialCaret={initialCaret}
           bodyRef={bodyRef}
+          inlineImages={inlineImages}
         />
+
+        {/*
+          Where the files have to land.
+          Drawn while anything is being dragged over the window, not only while
+          it is over the composer: a target that appears once the pointer is
+          already on it has told the user nothing they could act on. The ring on
+          the composer's own edge is the second half — see `dropping` above.
+        */}
+        {dragging && (
+          <div
+            className={cn(
+              "mt-2 rounded-[var(--radius)] border border-dashed px-3 py-2 text-micro",
+              dropping
+                ? "border-accent text-foreground"
+                : "border-border text-faint-foreground",
+            )}
+          >
+            Drop to attach
+          </div>
+        )}
 
         {attachments.length > 0 && (
           <ul className="mt-2 flex flex-wrap gap-1.5">
@@ -455,6 +505,7 @@ export function Composer({
                 file={file}
                 disabled={busy}
                 onRemove={() => onRemoveAttachment(file.id)}
+                onSetInline={onSetInline}
               />
             ))}
           </ul>
@@ -486,10 +537,11 @@ export function Composer({
           <span className="inline-flex items-center gap-1">
             <Kbd keys={COMPOSER_KEYS.schedule} /> later
           </span>
+          {/* Not `onClick={onAttach}`: that hands the click event to `inline`. */}
           <button
             type="button"
             disabled={busy}
-            onClick={onAttach}
+            onClick={() => onAttach()}
             className="inline-flex items-center gap-1 hover:text-foreground"
           >
             <Paperclip className="size-3" /> attach
@@ -543,27 +595,62 @@ export function Composer({
   );
 }
 
+/**
+ * One file, with the two things that can be done to it.
+ *
+ * The inline control is drawn only on images, because it is the only file type
+ * where the choice exists — see `compose::attach::Attachment::inline`. It is a
+ * button rather than a menu so it is one ⇥ and one ⏎ away, which is the whole
+ * requirement: a message with a picture in it cannot be assembled by mouse
+ * alone.
+ */
 function AttachmentChip({
   file,
   disabled,
   onRemove,
+  onSetInline,
 }: {
   file: DraftAttachment;
   disabled?: boolean;
   onRemove: () => void;
+  onSetInline?: (attachmentId: string, inline: boolean) => void;
 }) {
+  const inline = file.inline === true;
+  const choosable = onSetInline !== undefined && isInlinableImage(file);
   return (
     <li
       className={cn(
-        "inline-flex max-w-[22ch] items-center gap-1.5 rounded-[var(--radius)]",
+        // Wide enough for a real filename next to a size and two controls.
+        // Below this the name is the thing that gives way, and a chip reading
+        // "scree…" is a chip that has stopped saying which file it is.
+        "inline-flex max-w-[40ch] items-center gap-1.5 rounded-[var(--radius)]",
         "border border-border px-2 py-0.5 text-micro text-muted-foreground",
       )}
     >
-      <Paperclip className="size-3 shrink-0" />
+      {inline ? (
+        <ImageIcon className="size-3 shrink-0" />
+      ) : (
+        <Paperclip className="size-3 shrink-0" />
+      )}
       <span className="min-w-0 truncate" title={file.filename}>
         {file.filename}
       </span>
       <span className="shrink-0 text-faint-foreground">{humanSize(file.sizeBytes)}</span>
+      {choosable && (
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => onSetInline?.(file.id, !inline)}
+          aria-label={
+            inline
+              ? `Attach ${file.filename} as a file`
+              : `Show ${file.filename} in the message`
+          }
+          className="shrink-0 text-faint-foreground hover:text-foreground"
+        >
+          {inline ? "inline" : "attached"}
+        </button>
+      )}
       <button
         type="button"
         disabled={disabled}

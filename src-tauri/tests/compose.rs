@@ -2794,7 +2794,7 @@ fn an_attached_file_makes_the_message_multipart_mixed_around_the_alternative() {
     let (db, _a, thread, _m) = seeded();
     let mut draft = reply_draft(&db, thread, DraftKind::Reply, "<div>Numbers attached.</div>");
     draft = draft::save_draft(&db, &draft, NOW).unwrap();
-    attach::add_bytes(&db, &draft.id, "q3 numbers.csv", b"a,b\n1,2\n", NOW).unwrap();
+    attach::add_bytes(&db, &draft.id, "q3 numbers.csv", b"a,b\n1,2\n", false, NOW).unwrap();
     let draft = draft::load_draft(&db, &draft.id).unwrap().unwrap();
 
     let bytes = built_bytes(&db, &draft);
@@ -2824,7 +2824,7 @@ fn a_file_larger_than_gmail_will_send_is_refused_when_it_is_chosen() {
     )
     .unwrap();
     let huge = vec![0u8; (attach::MAX_ATTACHMENT_BYTES + 1) as usize];
-    let refused = attach::add_bytes(&db, &draft.id, "huge.bin", &huge, NOW);
+    let refused = attach::add_bytes(&db, &draft.id, "huge.bin", &huge, false, NOW);
     assert!(refused.is_err(), "a 25 MB ceiling is Gmail's, not ours to ignore");
     assert!(attach::list(&db, &draft.id).unwrap().is_empty());
 }
@@ -2839,9 +2839,9 @@ fn several_files_are_refused_as_a_total_rather_than_one_at_a_time() {
     )
     .unwrap();
     let chunk = vec![0u8; 10 * 1024 * 1024];
-    attach::add_bytes(&db, &draft.id, "one.bin", &chunk, NOW).unwrap();
-    attach::add_bytes(&db, &draft.id, "two.bin", &chunk, NOW).unwrap();
-    let third = attach::add_bytes(&db, &draft.id, "three.bin", &chunk, NOW);
+    attach::add_bytes(&db, &draft.id, "one.bin", &chunk, false, NOW).unwrap();
+    attach::add_bytes(&db, &draft.id, "two.bin", &chunk, false, NOW).unwrap();
+    let third = attach::add_bytes(&db, &draft.id, "three.bin", &chunk, false, NOW);
     assert!(third.is_err(), "30 MB is past what Gmail will take");
     assert_eq!(attach::list(&db, &draft.id).unwrap().len(), 2);
 }
@@ -2855,7 +2855,7 @@ fn a_senders_filename_is_sanitized_before_it_is_ever_stored() {
         NOW,
     )
     .unwrap();
-    let stored = attach::add_bytes(&db, &draft.id, "../../etc/passwd", b"x", NOW).unwrap();
+    let stored = attach::add_bytes(&db, &draft.id, "../../etc/passwd", b"x", false, NOW).unwrap();
     assert!(!stored.filename.contains('/'), "{}", stored.filename);
     assert!(!stored.filename.contains(".."), "{}", stored.filename);
 }
@@ -2869,9 +2869,235 @@ fn forgetting_a_draft_takes_its_files_with_it() {
         NOW,
     )
     .unwrap();
-    attach::add_bytes(&db, &draft.id, "note.txt", b"hello", NOW).unwrap();
+    attach::add_bytes(&db, &draft.id, "note.txt", b"hello", false, NOW).unwrap();
     draft::delete_draft(&db, &draft.id, NOW).unwrap();
     assert!(attach::list(&db, &draft.id).unwrap().is_empty());
+}
+
+/// The whole point of the draft row and the `compose_attachments` table: a
+/// message written on Tuesday and sent on Thursday still has its files.
+#[test]
+fn a_file_survives_the_draft_being_saved_closed_and_reopened() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>Attached.</div>"),
+        NOW,
+    )
+    .unwrap();
+    let stored = attach::add_bytes(&db, &draft.id, "terms.pdf", b"%PDF-1.4", false, NOW).unwrap();
+
+    // Closing a composer keeps the row; only a discard or a send takes it out.
+    // Reopening is a fresh read, which is what this asserts on.
+    let reopened = draft::load_draft(&db, &draft.id).unwrap().expect("the draft");
+    assert_eq!(reopened.attachments.len(), 1);
+    assert_eq!(reopened.attachments[0].filename, "terms.pdf");
+    assert_eq!(reopened.attachments[0].id, stored.id);
+
+    // And it is still there in the bytes, not merely in the list.
+    let bytes = built_bytes(&db, &reopened);
+    let parsed = MessageParser::new().parse(&bytes).unwrap();
+    let file = parsed.attachments().next().expect("one attachment");
+    assert_eq!(file.contents(), b"%PDF-1.4");
+}
+
+// ============================================================ inline images
+
+/// `Content-ID`, `Content-Disposition: inline`, and a body that addresses the
+/// part by `cid:` — the three halves of an image that draws where it sits.
+#[test]
+fn an_inline_image_is_a_related_part_the_body_addresses_by_cid() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let image =
+        attach::add_bytes(&db, &draft.id, "chart.png", b"\x89PNG\r\n\x1a\n", true, NOW).unwrap();
+    assert!(image.inline);
+    assert!(!image.content_id.is_empty());
+
+    // The body points at it, the way the composer writes it.
+    let mut draft = draft::load_draft(&db, &draft.id).unwrap().unwrap();
+    draft.body = format!(
+        "<div>Here it is:</div><div><img src=\"cid:{}\" alt=\"chart.png\"></div>",
+        image.content_id
+    );
+
+    let bytes = built_bytes(&db, &draft);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+
+    // RFC 2387: a `cid:` resolves inside a `multipart/related`, and the `type`
+    // parameter names which part is the one to display.
+    assert!(text.contains("multipart/related"), "{text}");
+    assert!(text.contains("type=\"multipart/alternative\""), "{text}");
+    assert!(
+        text.contains(&format!("Content-ID: <{}>", image.content_id)),
+        "{text}"
+    );
+    assert!(text.contains("Content-Disposition: inline"), "{text}");
+
+    let parsed = MessageParser::new().parse(&bytes).unwrap();
+    let html = parsed.body_html(0).expect("an html part").into_owned();
+    assert!(
+        html.contains(&format!("cid:{}", image.content_id)),
+        "the body must address the part it ships: {html}"
+    );
+
+    // The image is a part of the message, not a file offered beside it. The
+    // disposition is the whole difference, and it is what a recipient's client
+    // reads to decide whether to draw it or list it.
+    let dispositions = dispositions_of(&bytes);
+    assert_eq!(dispositions, vec!["inline"], "{dispositions:?}");
+}
+
+/// Every `Content-Disposition` in a message, in order, by type alone.
+fn dispositions_of(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| line.strip_prefix("Content-Disposition:"))
+        .map(|rest| {
+            rest.trim()
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// One of each. The nesting is what Outlook needs: an inline image flattened
+/// alongside the attachments renders a second time at the bottom, unnamed.
+#[test]
+fn an_image_in_the_body_and_a_file_beside_it_nest_related_inside_mixed() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let image =
+        attach::add_bytes(&db, &draft.id, "chart.png", b"\x89PNG\r\n\x1a\n", true, NOW).unwrap();
+    attach::add_bytes(&db, &draft.id, "terms.pdf", b"%PDF-1.4", false, NOW).unwrap();
+
+    let mut draft = draft::load_draft(&db, &draft.id).unwrap().unwrap();
+    draft.body = format!("<div><img src=\"cid:{}\"></div>", image.content_id);
+    let bytes = built_bytes(&db, &draft);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+
+    let mixed = text.find("multipart/mixed").expect("a mixed wrapper");
+    let related = text.find("multipart/related").expect("a related part");
+    assert!(mixed < related, "related belongs inside mixed:\n{text}");
+
+    // The image is drawn where it sits; only the PDF is offered as a file. The
+    // order is the nesting: the inline part is inside the related, which comes
+    // before the attachment inside the mixed.
+    assert_eq!(dispositions_of(&bytes), vec!["inline", "attachment"]);
+
+    let parsed = MessageParser::new().parse(&bytes).unwrap();
+    assert!(parsed.body_text(0).is_some(), "the alternative survives");
+    assert!(parsed.body_html(0).is_some(), "the alternative survives");
+}
+
+/// A message with nothing inline must come out byte-identical in structure to
+/// the one this codebase has always produced.
+#[test]
+fn a_message_with_nothing_inline_keeps_the_shape_it_always_had() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>Numbers.</div>"),
+        NOW,
+    )
+    .unwrap();
+    attach::add_bytes(&db, &draft.id, "q3.csv", b"a,b\n", false, NOW).unwrap();
+    let draft = draft::load_draft(&db, &draft.id).unwrap().unwrap();
+    let text = String::from_utf8_lossy(&built_bytes(&db, &draft)).into_owned();
+    assert!(!text.contains("multipart/related"), "{text}");
+    assert!(text.contains("multipart/mixed"), "{text}");
+}
+
+#[test]
+fn an_image_moves_between_the_body_and_the_list_without_being_re_read() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let image =
+        attach::add_bytes(&db, &draft.id, "chart.png", b"\x89PNG\r\n\x1a\n", false, NOW).unwrap();
+    assert!(!image.inline, "attached is the default");
+
+    let inlined = attach::set_inline(&db, &image.id, true).unwrap().unwrap();
+    assert!(inlined.inline);
+    // The id it is addressed by does not change with the flag, which is why
+    // moving it back and forth cannot break a body that already points at it.
+    assert_eq!(inlined.content_id, image.content_id);
+
+    let back = attach::set_inline(&db, &image.id, false).unwrap().unwrap();
+    assert!(!back.inline);
+    assert_eq!(back.content_id, image.content_id);
+}
+
+/// The choice is only offered on images, and Rust does not take somebody's word
+/// for it: `attachAdd` carries one `inline` flag for every path in the drop.
+#[test]
+fn a_file_that_is_not_an_image_is_attached_however_it_was_asked_for() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let pdf = attach::add_bytes(&db, &draft.id, "terms.pdf", b"%PDF", true, NOW).unwrap();
+    assert!(!pdf.inline, "a PDF has nowhere to render inside a body");
+    assert!(attach::set_inline(&db, &pdf.id, true).is_err());
+}
+
+/// An image can be too large to *draw* long before it is too large to *send*.
+/// The ceiling is the receive side's, and being past it costs the picture in
+/// the body, not the file.
+#[test]
+fn an_image_too_large_to_draw_is_attached_rather_than_placed_in_the_body() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let huge = vec![0u8; (attach::MAX_INLINE_IMAGE_BYTES + 1) as usize];
+    let stored = attach::add_bytes(&db, &draft.id, "raw.png", &huge, true, NOW).unwrap();
+    assert!(!stored.inline, "too big for a data URL, small enough to send");
+    assert_eq!(attach::list(&db, &draft.id).unwrap().len(), 1);
+
+    // And asking for it again says why rather than doing it quietly.
+    let refused = attach::set_inline(&db, &stored.id, true);
+    assert!(refused.is_err());
+    assert!(refused.unwrap_err().to_string().contains("raw.png"));
+}
+
+/// An SVG is an image to a browser and a script host to everything that draws
+/// it. It can be attached; it cannot go in a body.
+#[test]
+fn an_svg_is_attachable_but_never_inline() {
+    let (db, _a, thread, _m) = seeded();
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+    let svg = attach::add_bytes(&db, &draft.id, "logo.svg", b"<svg/>", true, NOW).unwrap();
+    assert!(!svg.inline);
+    assert_eq!(attach::list(&db, &draft.id).unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -2887,7 +3113,7 @@ async fn a_message_over_the_json_limit_goes_to_the_upload_host_instead() {
     )
     .unwrap();
     let big = vec![7u8; 6 * 1024 * 1024];
-    attach::add_bytes(&db, &draft.id, "photo.jpg", &big, NOW).unwrap();
+    attach::add_bytes(&db, &draft.id, "photo.jpg", &big, false, NOW).unwrap();
     let draft = draft::load_draft(&db, &draft.id).unwrap().unwrap();
 
     let built = draft::build(&db, &draft, NOW, 1).unwrap();
@@ -3050,7 +3276,7 @@ async fn a_draft_backed_send_with_a_file_on_it_still_takes_the_upload_host() {
     let saved = pushed_draft(&db, &out, &transport, thread, "<div>Photos.</div>").await;
     let draft_id = saved["id"].as_str().unwrap().to_string();
     let big = vec![7u8; 6 * 1024 * 1024];
-    attach::add_bytes(&db, &draft_id, "photo.jpg", &big, NOW).unwrap();
+    attach::add_bytes(&db, &draft_id, "photo.jpg", &big, false, NOW).unwrap();
 
     let stored = draft::load_draft(&db, &draft_id).unwrap().unwrap();
     let built = draft::build(&db, &stored, NOW, 1).unwrap();
@@ -3484,4 +3710,238 @@ fn delete_draft_row(db: &Db, id: &str) {
         Ok(())
     })
     .unwrap();
+}
+
+// ============================================== attaching, through the router
+
+/// A drop hands the webview's paths straight to `attachAdd`.
+///
+/// The same call the file panel makes — the panel route only differs in who
+/// produced the list — so this covers both. Driven through `dispatch` rather
+/// than `attach::add_bytes` because the part being tested is the one in
+/// between: reading the file off disk, and naming it from its path.
+#[tokio::test]
+async fn a_dropped_path_is_read_off_disk_and_attached() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let dir = std::env::temp_dir().join(format!("mach-drop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("board deck.pdf");
+    std::fs::write(&path, b"%PDF-1.7 deck").unwrap();
+
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>Deck attached.</div>"),
+        NOW,
+    )
+    .unwrap();
+
+    let result = dispatch(
+        &db,
+        &out,
+        json!({
+            "op": "attachAdd",
+            "draftId": draft.id,
+            "paths": [path.to_string_lossy()],
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["refused"].as_array().unwrap().len(), 0);
+    let attachments = result["attachments"].as_array().unwrap();
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0]["filename"], "board deck.pdf");
+    assert_eq!(attachments[0]["sizeBytes"], 13);
+    assert_eq!(attachments[0]["inline"], false);
+
+    // And it is on the draft the composer will reload, not only in the answer.
+    let reopened = draft::load_draft(&db, &draft.id).unwrap().unwrap();
+    assert_eq!(reopened.attachments.len(), 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A file that cannot be read says so by name, and does not stop the ones that
+/// can. Silently attaching three of four is the failure this project has paid
+/// most for.
+#[tokio::test]
+async fn a_file_that_cannot_be_read_is_named_and_the_rest_still_attach() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let dir = std::env::temp_dir().join(format!("mach-drop-half-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("notes.txt");
+    std::fs::write(&good, b"there").unwrap();
+    let gone = dir.join("deleted.txt");
+
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+
+    let result = dispatch(
+        &db,
+        &out,
+        json!({
+            "op": "attachAdd",
+            "draftId": draft.id,
+            "paths": [gone.to_string_lossy(), good.to_string_lossy()],
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let refused = result["refused"].as_array().unwrap();
+    assert_eq!(refused.len(), 1);
+    assert!(
+        refused[0].as_str().unwrap().contains("deleted.txt"),
+        "the refusal has to name the file: {refused:?}"
+    );
+    assert_eq!(result["attachments"].as_array().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The 25 MB ceiling is reported at the moment the file is chosen, which is the
+/// only moment anything can be done about it — not after `⌘⏎`, from the outbox.
+#[tokio::test]
+async fn a_file_past_the_ceiling_is_refused_where_it_was_chosen() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let dir = std::env::temp_dir().join(format!("mach-drop-big-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("raw.dng");
+    std::fs::write(&path, vec![0u8; (attach::MAX_ATTACHMENT_BYTES + 1) as usize]).unwrap();
+
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+
+    let result = dispatch(
+        &db,
+        &out,
+        json!({
+            "op": "attachAdd",
+            "draftId": draft.id,
+            "paths": [path.to_string_lossy()],
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let refused = result["refused"].as_array().unwrap();
+    assert_eq!(refused.len(), 1);
+    let said = refused[0].as_str().unwrap();
+    assert!(said.contains("raw.dng"), "{said}");
+    assert!(said.contains("25 MB"), "{said}");
+    assert!(result["attachments"].as_array().unwrap().is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Dropping an image with `inline` set puts it in the body rather than beside
+/// it, and hands back the `Content-ID` the composer writes into the `<img>`.
+#[tokio::test]
+async fn an_image_dropped_for_the_body_comes_back_with_the_cid_to_point_at() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let dir = std::env::temp_dir().join(format!("mach-drop-inline-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("chart.png");
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>hi</div>"),
+        NOW,
+    )
+    .unwrap();
+
+    let added = dispatch(
+        &db,
+        &out,
+        json!({
+            "op": "attachAdd",
+            "draftId": draft.id,
+            "paths": [path.to_string_lossy()],
+            "inline": true,
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let file = &added["added"][0];
+    assert_eq!(file["inline"], true);
+    let content_id = file["contentId"].as_str().unwrap().to_string();
+    assert!(!content_id.is_empty());
+
+    // The bytes come back for drawing it, and only for the inline ones.
+    let images = dispatch(&db, &out, json!({ "op": "attachImages", "draftId": draft.id }))
+        .await
+        .unwrap();
+    let images = images["images"].as_array().unwrap();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0]["contentId"].as_str().unwrap(), content_id);
+    assert_eq!(images[0]["mimeType"], "image/png");
+    assert!(!images[0]["base64"].as_str().unwrap().is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The draft Gmail holds is rebuilt from the same `draft::build`, so it carries
+/// the files. A draft that syncs to his phone without them is a draft he cannot
+/// finish anywhere else, which is the whole reason the push exists.
+#[tokio::test]
+async fn the_draft_pushed_to_gmail_carries_its_attachments() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"gdraft-1","message":{"id":"gm-1","threadId":"gt-1"}}"#,
+    ))]);
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let draft = draft::save_draft(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>Deck attached.</div>"),
+        NOW,
+    )
+    .unwrap();
+    attach::add_bytes(&db, &draft.id, "deck.pdf", b"%PDF-1.7 deck", false, NOW).unwrap();
+
+    compose::remote::DraftRemoteSync::new(db.clone(), out.clients())
+        .push(&draft.id, NOW)
+        .await
+        .unwrap();
+
+    // `drafts.create` nests the message, so the `raw` is one level in.
+    let create = transport
+        .draft_requests()
+        .pop()
+        .expect("a drafts.create went out");
+    let body: serde_json::Value =
+        serde_json::from_slice(&create.body.expect("a body")).expect("json");
+    let raw = body["message"]["raw"].as_str().expect("a raw message");
+    let rfc822 = decode_base64url(raw).expect("base64url");
+
+    let parsed = MessageParser::new().parse(&rfc822).unwrap();
+    let file = parsed.attachments().next().expect("the file went too");
+    assert_eq!(
+        mail_parser::MimeHeaders::attachment_name(file),
+        Some("deck.pdf")
+    );
+    assert_eq!(file.contents(), b"%PDF-1.7 deck");
 }

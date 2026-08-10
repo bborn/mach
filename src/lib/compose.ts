@@ -87,6 +87,10 @@ export interface DraftAttachment {
   mimeType: string;
   sizeBytes: number;
   addedAt?: number;
+  /** Drawn in the body, addressed by `contentId`, rather than listed under it. */
+  inline?: boolean;
+  /** The `Content-ID`, bare. The body points at it as `cid:<contentId>`. */
+  contentId?: string;
 }
 
 export interface Draft {
@@ -321,15 +325,22 @@ export interface AttachResult {
  * permission, so the only thing this side can ask for is "let him pick files
  * for *this* draft".
  */
-export async function chooseAttachments(draftId: string): Promise<AttachResult> {
+export async function chooseAttachments(
+  draftId: string,
+  inline = false,
+): Promise<AttachResult> {
   if (!isTauri()) return { attachments: localAttachments(draftId), added: [], refused: [] };
-  return call<AttachResult>({ op: "attachChoose", draftId });
+  return call<AttachResult>({ op: "attachChoose", draftId, inline });
 }
 
 /** Attach files already named — what a drop on the composer produces. */
-export async function attachPaths(draftId: string, paths: string[]): Promise<AttachResult> {
+export async function attachPaths(
+  draftId: string,
+  paths: string[],
+  inline = false,
+): Promise<AttachResult> {
   if (!isTauri()) return { attachments: localAttachments(draftId), added: [], refused: [] };
-  return call<AttachResult>({ op: "attachAdd", draftId, paths });
+  return call<AttachResult>({ op: "attachAdd", draftId, paths, inline });
 }
 
 export async function removeAttachment(attachmentId: string): Promise<DraftAttachment[]> {
@@ -341,8 +352,54 @@ export async function removeAttachment(attachmentId: string): Promise<DraftAttac
   return result.attachments ?? [];
 }
 
+/** Move one image between the body and the list under the message. */
+export async function setAttachmentInline(
+  attachmentId: string,
+  inline: boolean,
+): Promise<DraftAttachment[]> {
+  if (!isTauri()) return [];
+  const result = await call<{ attachments: DraftAttachment[] }>({
+    op: "attachInline",
+    attachmentId,
+    inline,
+  });
+  return result.attachments ?? [];
+}
+
+/** One inline image, with its bytes, for drawing the body as it will arrive. */
+export interface InlineImageData {
+  attachmentId: string;
+  contentId: string;
+  mimeType: string;
+  filename: string;
+  base64: string;
+}
+
+/**
+ * The bytes of every inline image on a draft.
+ *
+ * Only the inline ones come back — an attached file is a name and a size in
+ * the composer, and there is nothing to draw.
+ */
+export async function inlineImages(draftId: string): Promise<InlineImageData[]> {
+  if (!isTauri()) return [];
+  const result = await call<{ images: InlineImageData[] }>({ op: "attachImages", draftId });
+  return result.images ?? [];
+}
+
 /** Gmail's ceiling on a message, which is the only limit worth having. */
 export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/**
+ * The largest image that can go *in* a body rather than beside it.
+ *
+ * Mirrors `compose::attach::MAX_INLINE_IMAGE_BYTES`, which is in turn the
+ * number the receive side uses for an inline `cid:` image. Drawing one costs
+ * base64 over IPC and a `data:` URL in the document; a 20 MB photograph is a
+ * 27 MB string. Anything past this is attached, and the chip does not offer a
+ * choice that Rust would refuse.
+ */
+export const MAX_INLINE_IMAGE_BYTES = 4 * 1024 * 1024;
 
 export function humanSize(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -350,8 +407,147 @@ export function humanSize(bytes: number): string {
   return `${bytes} bytes`;
 }
 
+/**
+ * Whether this file could be drawn in the body.
+ *
+ * Mirrors `compose::attach::can_be_inline`: a raster image, small enough to
+ * carry as a `data:` URL. SVG is excluded on both sides — an inline SVG asks
+ * the recipient's client to render a document from this Mac. An image already
+ * in the body keeps its control whatever its size, or a picture placed by some
+ * other route could never be taken back out.
+ */
+export function isInlinableImage(file: DraftAttachment): boolean {
+  if (file.inline === true) return true;
+  const base = (file.mimeType ?? "").split(";")[0].trim().toLowerCase();
+  if (!base.startsWith("image/") || base === "image/svg+xml") return false;
+  return file.sizeBytes <= MAX_INLINE_IMAGE_BYTES;
+}
+
 function localAttachments(draftId: string): DraftAttachment[] {
   return localLookup(draftId)?.attachments ?? [];
+}
+
+/* -------------------------------------------------------------------------- */
+/* Inline images in the body                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What the draft body holds, and what the editor holds, are not the same string.
+ *
+ * The body that is saved, pushed to Gmail and eventually sent carries
+ * `<img src="cid:…">` — a reference to a part of the message, which is the only
+ * form that means anything to a recipient. A `cid:` resolves to nothing in a
+ * webview, so the editor is handed the same markup with the `src` swapped for a
+ * `data:` URL built from the bytes Rust holds. That is the whole of "renders in
+ * the composer as it will in the sent mail".
+ *
+ * `MARKER` is what survives the swap in both directions. It is not on
+ * `email-html`'s outgoing allowlist and is not on Rust's, so it is stripped at
+ * send — it exists only between the draft row and the editor. The read side
+ * uses the same attribute for the same job; see `lib/attachments.ts`.
+ */
+const MARKER = "data-mach-cid";
+
+/** The `<img>` inserted at the caret when an image is placed in the body. */
+export function inlineImageMarkup(contentId: string, filename: string): string {
+  return `<img ${MARKER}="${escapeAttribute(contentId)}" src="cid:${escapeAttribute(
+    contentId,
+  )}" alt="${escapeAttribute(filename)}">`;
+}
+
+/**
+ * A `data:` URL for one inline image, or null when there is nothing to draw.
+ *
+ * The read side has a function of the same shape in `lib/attachments.ts`. They
+ * are not shared: that one takes an image out of a message somebody else sent
+ * and sniffs the bytes before trusting the declared type, which is the right
+ * caution there and pointless here, where the file came off this Mac.
+ */
+export function inlineImageDataUrl(image: InlineImageData): string | null {
+  if (!image.base64) return null;
+  const type = (image.mimeType || "application/octet-stream").split(";")[0].trim();
+  return `data:${type};base64,${image.base64}`;
+}
+
+/**
+ * The body as the editor should hold it: every `cid:` resolved to its bytes.
+ *
+ * An image whose bytes are not in `urls` keeps its `cid:` src and draws as a
+ * broken image, which is honest — the alternative is a body that silently
+ * differs from the one that will be sent.
+ */
+export function withInlineImages(html: string, urls: ReadonlyMap<string, string>): string {
+  return rewriteImages(html, (contentId) => urls.get(contentId) ?? null);
+}
+
+/**
+ * The body as it must be stored: every resolved image back to its `cid:`.
+ *
+ * The inverse of [`withInlineImages`], and the reason the marker exists. Run on
+ * the way out of the editor, so a `data:` URL never reaches SQLite — a 4 MB
+ * photograph would otherwise be re-encoded into the draft row on every autosave
+ * and pushed to Gmail inside the HTML part as well as beside it.
+ */
+export function withCidReferences(html: string): string {
+  return rewriteImages(html, (contentId) => `cid:${contentId}`);
+}
+
+/** Every content id the body refers to, in order, without repeats. */
+export function inlineCidsIn(html: string): string[] {
+  if (!html.includes("<img") || typeof DOMParser === "undefined") return [];
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const seen = new Set<string>();
+  for (const image of doc.querySelectorAll("img")) {
+    const id = contentIdOf(image);
+    if (id) seen.add(id);
+  }
+  return [...seen];
+}
+
+/**
+ * Walk the images, ask for a `src`, and hand the document back.
+ *
+ * Parsed rather than matched with a regular expression. Attribute order,
+ * quoting and spacing are all the editor's to choose and it changes them as it
+ * normalizes — an expression that agreed with today's output would come apart
+ * on the day Squire wrote `src` before the marker.
+ */
+function rewriteImages(html: string, src: (contentId: string) => string | null): string {
+  if (!html.includes("<img") || typeof DOMParser === "undefined") return html;
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  let touched = false;
+  for (const image of doc.querySelectorAll("img")) {
+    const contentId = contentIdOf(image);
+    if (!contentId) continue;
+    const next = src(contentId);
+    if (next === null) continue;
+    // The marker is re-stamped rather than assumed: an image pasted from
+    // elsewhere in the same message arrives through the editor's sanitizer,
+    // which keeps the marker and drops the `data:` src it cannot allow.
+    image.setAttribute(MARKER, contentId);
+    image.setAttribute("src", next);
+    touched = true;
+  }
+  // Untouched documents come back as they arrived. Re-serializing every body
+  // that happens to contain an `<img>` would rewrite quoting and spacing on
+  // every keystroke, and the diff would land in the draft row.
+  return touched ? doc.body.innerHTML : html;
+}
+
+/** The content id an image is standing for, from the marker or from its src. */
+function contentIdOf(image: Element): string | null {
+  const marked = image.getAttribute(MARKER);
+  if (marked) return marked;
+  const src = image.getAttribute("src") ?? "";
+  return src.toLowerCase().startsWith("cid:") ? src.slice(4) : null;
+}
+
+function escapeAttribute(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 export interface SendResult {

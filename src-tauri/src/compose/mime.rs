@@ -22,9 +22,11 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use mail_builder::headers::content_type::ContentType;
 use mail_builder::headers::date::Date;
 use mail_builder::headers::message_id::MessageId;
 use mail_builder::headers::raw::Raw;
+use mail_builder::mime::MimePart;
 use mail_builder::MessageBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +91,31 @@ pub struct OutgoingAttachment {
     pub filename: String,
     pub mime_type: String,
     pub bytes: Vec<u8>,
+    /// Drawn in the body, addressed by [`content_id`](Self::content_id).
+    pub inline: bool,
+    /// Bare — no angle brackets and no `cid:`. Both are added on write.
+    pub content_id: String,
+}
+
+impl OutgoingAttachment {
+    /// The part, with the disposition its role calls for.
+    ///
+    /// An inline part keeps its filename in the `Content-Disposition` as well as
+    /// carrying a `Content-ID`. Nothing in the rendering needs it — the body
+    /// addresses the part by id — but "Save image" in the recipient's client
+    /// offers `image.png` without it, for every image in the message.
+    fn part(&self) -> MimePart<'static> {
+        let body = MimePart::new(self.mime_type.clone(), self.bytes.clone());
+        if self.inline {
+            body.header(
+                "Content-Disposition",
+                ContentType::new("inline").attribute("filename", self.filename.clone()),
+            )
+            .cid(self.content_id.clone())
+        } else {
+            body.attachment(self.filename.clone())
+        }
+    }
 }
 
 /// Everything needed to produce one RFC822 message. No clock, no database, no
@@ -174,23 +201,86 @@ pub fn build_rfc822(msg: &Outgoing) -> Result<Vec<u8>> {
     // Both parts, always. A text-only reply reads as plain in every client; an
     // html-only reply is unreadable in the ones that refuse HTML, and lands in
     // more spam filters.
-    builder = builder.text_body(msg.text.clone()).html_body(msg.html.clone());
+    let (inline, attached): (Vec<_>, Vec<_>) =
+        msg.attachments.iter().partition(|file| file.inline);
 
-    // With files, the shape becomes `multipart/mixed` wrapping that same
-    // `multipart/alternative` — the nesting order every mail client expects, and
-    // the reason the alternative is built first rather than being flattened
-    // alongside the attachments.
-    for file in &msg.attachments {
-        builder = builder.attachment(
-            file.mime_type.clone(),
-            file.filename.clone(),
-            file.bytes.clone(),
-        );
+    if inline.is_empty() {
+        // The shape this has always produced, kept verbatim rather than routed
+        // through the builder below: no message without an inline image should
+        // change structure because this feature was added.
+        //
+        // With files, it becomes `multipart/mixed` wrapping the same
+        // `multipart/alternative` — the nesting every mail client expects, and
+        // the reason the alternative is built first rather than being flattened
+        // alongside the attachments.
+        builder = builder.text_body(msg.text.clone()).html_body(msg.html.clone());
+        for file in &attached {
+            builder = builder.attachment(
+                file.mime_type.clone(),
+                file.filename.clone(),
+                file.bytes.clone(),
+            );
+        }
+    } else {
+        builder = builder.body(related_body(msg, &inline, &attached));
     }
 
     builder
         .write_to_vec()
         .map_err(|e| ComposeError::Mime(e.to_string()))
+}
+
+/// The structure an inline image needs, which `mail-builder` will not produce
+/// on its own.
+///
+/// Its [`inline`](MessageBuilder::inline) helper puts the image *beside* the
+/// alternative inside `multipart/mixed`, and RFC 2387 says a `cid:` reference
+/// resolves within a `multipart/related`. Gmail and Apple Mail both resolve it
+/// from the flat shape anyway; Outlook and several webmails do not, and show the
+/// image a second time at the bottom as an unnamed attachment. So the nesting is
+/// built by hand:
+///
+/// ```text
+/// multipart/mixed                                (only when files are attached too)
+/// ├── multipart/related; type="multipart/alternative"
+/// │   ├── multipart/alternative
+/// │   │   ├── text/plain
+/// │   │   └── text/html                          ← <img src="cid:…">
+/// │   └── image/png; Content-ID: <…>             ← Content-Disposition: inline
+/// └── application/pdf                            ← Content-Disposition: attachment
+/// ```
+///
+/// The `type` parameter on the related part names the root — which client is
+/// meant to be displayed rather than resolved — and is what stops a reader that
+/// takes the first part literally from rendering the image alone.
+fn related_body(
+    msg: &Outgoing,
+    inline: &[&OutgoingAttachment],
+    attached: &[&OutgoingAttachment],
+) -> MimePart<'static> {
+    let alternative = MimePart::new(
+        "multipart/alternative",
+        vec![
+            MimePart::new("text/plain", msg.text.clone()),
+            MimePart::new("text/html", msg.html.clone()),
+        ],
+    );
+
+    let mut related_parts = Vec::with_capacity(inline.len() + 1);
+    related_parts.push(alternative);
+    related_parts.extend(inline.iter().map(|file| file.part()));
+    let related = MimePart::new(
+        ContentType::new("multipart/related").attribute("type", "multipart/alternative"),
+        related_parts,
+    );
+
+    if attached.is_empty() {
+        return related;
+    }
+    let mut mixed_parts = Vec::with_capacity(attached.len() + 1);
+    mixed_parts.push(related);
+    mixed_parts.extend(attached.iter().map(|file| file.part()));
+    MimePart::new("multipart/mixed", mixed_parts)
 }
 
 // ---------------------------------------------------------------------------

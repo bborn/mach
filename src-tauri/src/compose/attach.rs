@@ -48,6 +48,18 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// 25 MB file and five 5 MB ones are the same message to Gmail.
 pub const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 
+/// The largest image Mach will put *in* a body rather than beside it.
+///
+/// Much tighter than the send limit, and the same number the receive side uses
+/// for a `cid:` image ([`crate::render::sanitize::MAX_DATA_URI_BYTES`]) —
+/// because it is the same cost. Showing an inline image in the composer means
+/// base64 over IPC and a `data:` URL in the document, which base64 inflates by
+/// a third: a 20 MB photograph is a 27 MB string built, copied and parsed
+/// before the picture appears. An image past this is still attached and still
+/// sent; it is the *placing in the body* that is refused, and refused where the
+/// file is chosen rather than by drawing a picture that never loads.
+pub const MAX_INLINE_IMAGE_BYTES: u64 = crate::render::sanitize::MAX_DATA_URI_BYTES as u64;
+
 /// One file attached to a draft. Metadata only — the bytes are fetched by id
 /// when the message is built, because a draft round-trips through the editor on
 /// every keystroke and 25 MB has no business making that trip.
@@ -63,6 +75,50 @@ pub struct Attachment {
     pub size_bytes: i64,
     #[serde(default)]
     pub added_at: i64,
+    /// In the body rather than beside it: `Content-Disposition: inline`, a
+    /// `Content-ID`, and an `<img src="cid:…">` in the HTML pointing at it.
+    ///
+    /// Only ever true for an image. A `Content-Disposition: inline` PDF is
+    /// legal and means "render this where it sits", which no mail client does —
+    /// so it arrives as an attachment with a header saying otherwise.
+    #[serde(default)]
+    pub inline: bool,
+    /// The `Content-ID`, bare — no angle brackets, which are added on write, and
+    /// no `cid:` prefix, which belongs to the URL and not to the header.
+    ///
+    /// Allocated for every attachment, image or not, so that turning one inline
+    /// later is a flag and not a rename. It is only written into the message
+    /// when [`inline`](Self::inline) is set.
+    #[serde(default)]
+    pub content_id: String,
+}
+
+impl Attachment {
+    /// Whether this file *could* go in the body. The composer offers the choice
+    /// on exactly these, and [`set_inline`] refuses it on anything else.
+    pub fn is_image(&self) -> bool {
+        is_image_mime(&self.mime_type)
+    }
+}
+
+/// An image small enough to be worth drawing where it sits.
+fn can_be_inline(mime_type: &str, size: u64) -> bool {
+    is_image_mime(mime_type) && size <= MAX_INLINE_IMAGE_BYTES
+}
+
+/// An image by its Content-Type, ignoring parameters.
+///
+/// SVG is excluded. It is an image to a browser and a script host to everything
+/// that renders it, and an inline SVG in a message is asking a recipient's
+/// client to run a document from this Mac. It can still be attached.
+pub fn is_image_mime(mime_type: &str) -> bool {
+    let base = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    base.starts_with("image/") && base != "image/svg+xml"
 }
 
 /// Attach a file already read into memory.
@@ -70,11 +126,16 @@ pub struct Attachment {
 /// Reading is the caller's job so that this function is testable without a
 /// filesystem, and so the one place that turns a user-chosen path into bytes is
 /// the IPC layer, where the choice was made.
+///
+/// `inline` is a *request*, not an instruction: a file that is not an image
+/// lands as an ordinary attachment whatever was asked for, because the
+/// alternative is a message whose body references a `cid:` no client will draw.
 pub fn add_bytes(
     db: &Db,
     draft_id: &str,
     raw_name: &str,
     bytes: &[u8],
+    inline: bool,
     now_ms: i64,
 ) -> Result<Attachment> {
     db.write(ensure_compose_schema)?;
@@ -91,7 +152,7 @@ pub fn add_bytes(
     let already = total_bytes(db, draft_id)? as u64;
     if already + size > MAX_TOTAL_ATTACHMENT_BYTES {
         return Err(ComposeError::invalid(format!(
-            "that would take this message past the {} MB Gmail will send",
+            "{filename} would take this message past the {} MB Gmail will send",
             MAX_TOTAL_ATTACHMENT_BYTES / (1024 * 1024)
         )));
     }
@@ -99,6 +160,8 @@ pub fn add_bytes(
     let mime_type = mime_for(&filename);
     let id = format!("att-{now_ms:x}-{:x}", entropy(now_ms));
     let attachment = Attachment {
+        content_id: content_id_for(&id),
+        inline: inline && can_be_inline(&mime_type, size),
         id: id.clone(),
         draft_id: draft_id.to_string(),
         filename,
@@ -110,8 +173,9 @@ pub fn add_bytes(
     db.write(|conn| {
         conn.execute(
             "INSERT INTO compose_attachments
-                 (id, draft_id, filename, mime_type, size_bytes, bytes, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (id, draft_id, filename, mime_type, size_bytes, bytes, added_at,
+                  inline, content_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 attachment.id,
                 attachment.draft_id,
@@ -120,6 +184,8 @@ pub fn add_bytes(
                 attachment.size_bytes,
                 bytes,
                 attachment.added_at,
+                attachment.inline as i64,
+                attachment.content_id,
             ],
         )?;
         Ok(())
@@ -128,13 +194,81 @@ pub fn add_bytes(
     Ok(attachment)
 }
 
+/// Move one file between the body and the attachment list.
+///
+/// Returns the row as it now stands, or `None` when there is no such file — a
+/// second press of the same key on a chip that has already gone.
+///
+/// Refused on anything that is not an image, for the reason on
+/// [`Attachment::inline`]. The refusal is an error rather than a silent no-op
+/// because the control that produced it is only ever drawn on images: reaching
+/// this arm means something else is wrong.
+pub fn set_inline(db: &Db, attachment_id: &str, inline: bool) -> Result<Option<Attachment>> {
+    let Some(existing) = get(db, attachment_id)? else {
+        return Ok(None);
+    };
+    if inline && !existing.is_image() {
+        return Err(ComposeError::invalid(format!(
+            "{} is not an image, so it cannot go in the body",
+            existing.filename
+        )));
+    }
+    if inline && existing.size_bytes as u64 > MAX_INLINE_IMAGE_BYTES {
+        return Err(ComposeError::invalid(format!(
+            "{} is {} — too large to draw in the message. It is attached instead.",
+            existing.filename,
+            human_size(existing.size_bytes)
+        )));
+    }
+    if existing.inline == inline {
+        return Ok(Some(existing));
+    }
+    db.write(|conn| {
+        conn.execute(
+            "UPDATE compose_attachments SET inline = ?2 WHERE id = ?1",
+            params![attachment_id, inline as i64],
+        )?;
+        Ok(())
+    })?;
+    get(db, attachment_id)
+}
+
+/// The bytes of one file, for showing an inline image in the composer as the
+/// recipient will see it. Metadata comes back with it so the caller does not
+/// need a second lookup to build a `data:` URL.
+pub fn bytes_of(db: &Db, attachment_id: &str) -> Result<Option<(Attachment, Vec<u8>)>> {
+    db.write(ensure_compose_schema)?;
+    Ok(db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT id, draft_id, filename, mime_type, size_bytes, added_at,
+                        inline, content_id, bytes
+                   FROM compose_attachments WHERE id = ?1",
+                [attachment_id],
+                |row| Ok((map_attachment(row)?, row.get::<_, Vec<u8>>(8)?)),
+            )
+            .optional()?)
+    })?)
+}
+
+/// A `Content-ID` for a new attachment.
+///
+/// The local part is the row's own id, so the header, the `cid:` in the body
+/// and the row are one string apart and a mismatch is impossible to introduce.
+/// The domain is `mach.invalid` rather than the sender's: RFC 2392 addresses a
+/// part *within this message*, nothing dereferences it, and a real domain in a
+/// `cid:` is what makes some scanners try to fetch it.
+fn content_id_for(attachment_id: &str) -> String {
+    format!("{attachment_id}@mach.invalid")
+}
+
 /// What a draft is carrying, oldest first — the order they were chosen in, which
 /// is the order the composer lists them and the order they ride in the message.
 pub fn list(db: &Db, draft_id: &str) -> Result<Vec<Attachment>> {
     db.write(ensure_compose_schema)?;
     Ok(db.read(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, draft_id, filename, mime_type, size_bytes, added_at
+            "SELECT id, draft_id, filename, mime_type, size_bytes, added_at, inline, content_id
                FROM compose_attachments WHERE draft_id = ?1 ORDER BY added_at, id",
         )?;
         let rows = stmt.query_map([draft_id], map_attachment)?;
@@ -147,11 +281,12 @@ pub fn list_with_bytes(db: &Db, draft_id: &str) -> Result<Vec<(Attachment, Vec<u
     db.write(ensure_compose_schema)?;
     Ok(db.read(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, draft_id, filename, mime_type, size_bytes, added_at, bytes
+            "SELECT id, draft_id, filename, mime_type, size_bytes, added_at, inline, content_id,
+                    bytes
                FROM compose_attachments WHERE draft_id = ?1 ORDER BY added_at, id",
         )?;
         let rows = stmt.query_map([draft_id], |row| {
-            Ok((map_attachment(row)?, row.get::<_, Vec<u8>>(6)?))
+            Ok((map_attachment(row)?, row.get::<_, Vec<u8>>(8)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     })?)
@@ -220,7 +355,7 @@ pub fn get(db: &Db, attachment_id: &str) -> Result<Option<Attachment>> {
     Ok(db.read(|conn| {
         Ok(conn
             .query_row(
-                "SELECT id, draft_id, filename, mime_type, size_bytes, added_at
+                "SELECT id, draft_id, filename, mime_type, size_bytes, added_at, inline, content_id
                    FROM compose_attachments WHERE id = ?1",
                 [attachment_id],
                 map_attachment,
@@ -230,13 +365,25 @@ pub fn get(db: &Db, attachment_id: &str) -> Result<Option<Attachment>> {
 }
 
 fn map_attachment(row: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
+    let id: String = row.get(0)?;
+    // A row written before this column existed has neither flag nor id. The
+    // fallback derives the same string `content_id_for` would have: an old
+    // attachment turned inline is then addressable without a backfill.
+    let content_id: String = row.get::<_, Option<String>>(7)?.unwrap_or_default();
+    let content_id = if content_id.is_empty() {
+        content_id_for(&id)
+    } else {
+        content_id
+    };
     Ok(Attachment {
-        id: row.get(0)?,
         draft_id: row.get(1)?,
         filename: row.get(2)?,
         mime_type: row.get(3)?,
         size_bytes: row.get(4)?,
         added_at: row.get(5)?,
+        inline: row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+        content_id,
+        id,
     })
 }
 

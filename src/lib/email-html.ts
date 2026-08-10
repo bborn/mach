@@ -71,9 +71,20 @@ const UNSAFE_VALUE_MARKERS: readonly string[] = [
   "color-mix(", "color(", "url(", "expression(", "javascript:", "!important", "@",
 ];
 
+/**
+ * `data-mach-cid` is the one attribute here that does not go on the wire.
+ *
+ * It names which part of the message an inline image is, and the composer
+ * needs it to survive the editor's own cleaning: a `data:` src is not on
+ * `SAFE_SCHEMES` and never will be, so an inline image that is copied and
+ * pasted within a message loses its src and would have nothing left to say
+ * which image it was. Rust's `compose::html::sanitize` does not allow the
+ * attribute, so it is gone by the time the message is built — see
+ * `withInlineImages` in `lib/compose.ts`.
+ */
 const TAG_ATTRIBUTES: Record<string, readonly string[]> = {
   a: ["href", "title"],
-  img: ["src", "alt", "width", "height"],
+  img: ["src", "alt", "width", "height", "data-mach-cid"],
   td: ["colspan", "rowspan"],
   th: ["colspan", "rowspan"],
   ol: ["start"],

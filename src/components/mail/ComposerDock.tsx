@@ -15,12 +15,14 @@ import { Kbd } from "@/components/ui/kbd";
 import { Overlay } from "@/components/ui/dialog";
 import { RESIZE_STEP, Resizer } from "@/components/ui/split";
 import { Composer, type ComposerPresentation } from "./Composer";
+import type { RichTextEditorHandle } from "./RichTextEditor";
 import {
   DEFAULT_COMPOSER_HEIGHT,
   canPopOut,
   clampComposerHeight,
   composerPlacement,
   forgetPopOut,
+  isOverDropTarget,
   isPoppedOut,
   popOutComposerHeight,
   togglePopOut,
@@ -37,6 +39,9 @@ import {
   discardDraft,
   flushOutbox,
   hasWrittenBody,
+  inlineImageDataUrl,
+  inlineImageMarkup,
+  inlineImages as loadInlineImages,
   isDraftEmpty,
   loadDraft,
   loadDraftForThread,
@@ -45,7 +50,9 @@ import {
   removeAttachment,
   saveDraft,
   sendDraft,
+  setAttachmentInline,
   undoSend,
+  withCidReferences,
   type Autosave,
   type Draft,
   type DraftKind,
@@ -150,7 +157,20 @@ export function ComposerDock() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pending, setPending] = useState<OutboxEntry | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
+  /** A file is over the composer, and letting go would attach it. */
   const [dropping, setDropping] = useState(false);
+  /** A file is over the window at all, wherever the pointer is. */
+  const [dragging, setDragging] = useState(false);
+  /**
+   * `cid:` → `data:` URL for the inline images of every open draft.
+   *
+   * One map for all of them rather than one per draft: content ids are unique
+   * across drafts (they are the attachment row's own id), and a single map
+   * survives switching between composers without a refetch.
+   */
+  const [inlineUrls, setInlineUrls] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
   /** Draft ids currently over the window rather than under a conversation. */
   const [popped, setPopped] = useState<string[]>([]);
 
@@ -164,6 +184,15 @@ export function ComposerDock() {
   const toField = useRef<HTMLInputElement>(null);
   // And where it starts in the popped-out one: the message, not its address.
   const bodyField = useRef<HTMLElement>(null);
+  /*
+   * The editor of whichever composer is on screen.
+   *
+   * Held here because placing an image in the body is an edit *at the caret*,
+   * and the caret lives in a document only the editor owns — it cannot be
+   * expressed as a new `body` string handed down as a prop. Shared with the
+   * composer the same way `toField` is.
+   */
+  const bodyEditor = useRef<RichTextEditorHandle>(null);
   /*
    * Where the caret was in the composer that is being replaced, and whose.
    *
@@ -217,12 +246,20 @@ export function ComposerDock() {
     [autosaveFor],
   );
 
-  /** The editor's own channel: HTML in, straight onto the active draft. */
+  /**
+   * The editor's own channel: HTML in, straight onto the active draft.
+   *
+   * With one substitution on the way through. The editor is showing inline
+   * images as `data:` URLs, because a `cid:` resolves to nothing in a webview;
+   * the draft has to hold the `cid:` form, which is what a recipient can
+   * resolve and what keeps a four-megabyte photograph out of a text column that
+   * is rewritten on every autosave. See `withCidReferences`.
+   */
   const changeBody = useCallback(
     (html: string) => {
       const current = drafts.find((entry) => entry.id === activeId);
       if (!current) return;
-      change({ ...current, body: html, bodyFormat: "html" });
+      change({ ...current, body: withCidReferences(html), bodyFormat: "html" });
     },
     [drafts, activeId, change],
   );
@@ -511,24 +548,51 @@ export function ComposerDock() {
     [],
   );
 
+  /**
+   * Fetch the bytes of a draft's inline images, so the composer can draw them.
+   *
+   * Merged into the existing map rather than replacing it: another composer's
+   * images are still on screen behind this one, and a draft that has none must
+   * not take them away.
+   */
+  const loadImages = useCallback(async (draftId: string) => {
+    const images = await loadInlineImages(draftId).catch(() => []);
+    if (images.length === 0) return;
+    setInlineUrls((current) => {
+      const next = new Map(current);
+      for (const image of images) {
+        const url = inlineImageDataUrl(image);
+        if (url) next.set(image.contentId, url);
+      }
+      return next;
+    });
+  }, []);
+
   const attach = useCallback(
-    (id: string) => {
+    (id: string, inline = false) => {
       const target = drafts.find((entry) => entry.id === id);
       if (!target) return;
       void (async () => {
         await ensureSaved(target);
-        const result = await chooseAttachments(id).catch((error: unknown) => {
+        const result = await chooseAttachments(id, inline).catch((error: unknown) => {
           actions.setStatus(errorMessage(error), "error");
           return null;
         });
         if (!result) return;
         applyAttachments(id, result.attachments);
+        const placed = result.added.filter((file) => file.inline && file.contentId);
+        if (placed.length > 0) {
+          await loadImages(id);
+          for (const file of placed) {
+            bodyEditor.current?.insert(inlineImageMarkup(file.contentId!, file.filename));
+          }
+        }
         // A file that was refused must say so by name. Silently attaching three
         // of four is the failure this project has paid most for.
         if (result.refused.length > 0) actions.setStatus(result.refused[0], "error");
       })();
     },
-    [drafts, ensureSaved, applyAttachments, actions],
+    [drafts, ensureSaved, applyAttachments, actions, loadImages],
   );
 
   const drop = useCallback(
@@ -559,11 +623,96 @@ export function ComposerDock() {
   );
 
   /**
-   * Files dropped on the window.
+   * Move one image between the body and the list under the message.
+   *
+   * Both halves are here, because the flag and the `<img>` are one act: an
+   * attachment marked inline that nothing in the body points at is a part
+   * Gmail sends and no client ever draws, and an `<img src="cid:…">` with no
+   * inline part behind it is a broken image in the recipient's message.
+   */
+  const setInline = useCallback(
+    (draftId: string, attachmentId: string, inline: boolean) => {
+      void (async () => {
+        const attachments = await setAttachmentInline(attachmentId, inline).catch(
+          (error: unknown) => {
+            actions.setStatus(errorMessage(error), "error");
+            return null;
+          },
+        );
+        if (!attachments) return;
+        applyAttachments(draftId, attachments);
+        const changed = attachments.find((file) => file.id === attachmentId);
+        if (!changed?.contentId) return;
+        if (inline) {
+          await loadImages(draftId);
+          bodyEditor.current?.insert(inlineImageMarkup(changed.contentId, changed.filename));
+        } else {
+          bodyEditor.current?.removeInline(changed.contentId);
+        }
+      })();
+    },
+    [applyAttachments, actions, loadImages],
+  );
+
+  /**
+   * Fetch the bytes of anything inline that is not drawn yet.
+   *
+   * Keyed on the ids rather than on the drafts, so this runs when a draft is
+   * opened or an image is placed and not on every keystroke. An image already
+   * in the map is not fetched again: `loadImages` merges, and the bytes of a
+   * file in SQLite do not change.
+   */
+  const unresolved = drafts
+    .flatMap((entry) => entry.attachments ?? [])
+    .filter((file) => file.inline && file.contentId && !inlineUrls.has(file.contentId))
+    .map((file) => file.draftId);
+  const pendingDrafts = [...new Set(unresolved)].join(",");
+  useEffect(() => {
+    if (!pendingDrafts) return;
+    for (const id of pendingDrafts.split(",")) void loadImages(id);
+  }, [pendingDrafts, loadImages]);
+
+  /**
+   * A file let go anywhere in the window must not navigate away from the app.
+   *
+   * The classic webview failure: the browser's default action for a dropped
+   * file is to *open* it, which replaces the page — and the page is the
+   * application, so the half-written draft in it goes too. In the real window
+   * this cannot happen, because `dragDropEnabled` defaults to true and Tauri
+   * takes the drop at the OS level before the DOM sees it. This guard is here
+   * for the two cases where that is not true: the app running in a browser tab
+   * against Vite, which is how most of the composer is developed, and the day
+   * somebody sets `dragDropEnabled: false` to get `File` objects.
+   *
+   * Registered unconditionally and never removed while the dock is mounted. A
+   * guard that only exists while a composer is open is a guard that is absent
+   * at the moment the user drags a file at the app to *start* one.
+   */
+  useEffect(() => {
+    const swallow = (event: DragEvent) => {
+      // `dragover` has to be cancelled too, or the drop never fires as a drop —
+      // cancelling only `drop` leaves the default action in place.
+      if (event.dataTransfer?.types?.includes("Files")) event.preventDefault();
+    };
+    window.addEventListener("dragover", swallow);
+    window.addEventListener("drop", swallow);
+    return () => {
+      window.removeEventListener("dragover", swallow);
+      window.removeEventListener("drop", swallow);
+    };
+  }, []);
+
+  /**
+   * Files dropped on the composer.
    *
    * Tauri reports the drop with the paths, not with a `File`: the webview never
-   * sees the bytes, and Rust reads them from disk. That is also why there is no
-   * `preventDefault` dance here — the browser's own drop handling is off.
+   * sees the bytes, and Rust reads them from disk.
+   *
+   * The position decides whether it lands. A drop over the thread list is not a
+   * drop on the message being written, and attaching from there would be the
+   * app guessing — so the composer draws a target while anything is being
+   * dragged (`dragging`), lights it while the pointer is on it (`dropping`),
+   * and a release anywhere else does nothing.
    */
   useEffect(() => {
     if (!drafts.length) return;
@@ -574,12 +723,21 @@ export function ComposerDock() {
         const { getCurrentWebview } = await import("@tauri-apps/api/webview");
         const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
           if (cancelled) return;
-          if (event.payload.type === "over") setDropping(true);
-          else if (event.payload.type === "leave") setDropping(false);
-          else if (event.payload.type === "drop") {
+          const payload = event.payload;
+          if (payload.type === "leave") {
+            setDragging(false);
             setDropping(false);
-            drop(event.payload.paths);
+            return;
           }
+          if (payload.type === "enter" || payload.type === "over") {
+            setDragging(true);
+            setDropping(isOverDropTarget(payload.position));
+            return;
+          }
+          const onTarget = isOverDropTarget(payload.position);
+          setDragging(false);
+          setDropping(false);
+          if (onTarget) drop(payload.paths);
         });
         stop.push(unlisten);
       } catch {
@@ -1108,8 +1266,11 @@ export function ComposerDock() {
       // nothing for the model to finish from.
       ghostContext={visible.kind === "new" ? undefined : ghostContext}
       dropping={dropping}
+      dragging={dragging}
+      inlineImages={inlineUrls}
       toRef={toField}
       bodyRef={bodyField}
+      editorRef={bodyEditor}
       bodyHeight={presentation === "dock" ? dockedHeight : popOutComposerHeight(viewport)}
       // Only the composer this caret was taken from may have it back.
       initialCaret={caret.current?.id === visible.id ? caret.current.offset : null}
@@ -1120,8 +1281,9 @@ export function ComposerDock() {
       onSend={send}
       onClose={dismiss}
       onDiscard={() => discard(visible.id)}
-      onAttach={() => attach(visible.id)}
+      onAttach={(inline) => attach(visible.id, inline)}
       onRemoveAttachment={(attachmentId) => unattach(visible.id, attachmentId)}
+      onSetInline={(attachmentId, inline) => setInline(visible.id, attachmentId, inline)}
     />
   );
 

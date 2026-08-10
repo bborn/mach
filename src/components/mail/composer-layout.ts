@@ -120,3 +120,50 @@ export function togglePopOut(popped: readonly string[], id: string): string[] {
 export function forgetPopOut(popped: readonly string[], id: string): string[] {
   return popped.filter((entry) => entry !== id);
 }
+
+/* -------------------------------------------------------------------------- */
+/* Where a dropped file lands                                                  */
+/* -------------------------------------------------------------------------- */
+
+/** The attribute the composer's root carries so a drop can find it. */
+export const DROP_TARGET = "data-mach-drop-target";
+
+/**
+ * A point, in the units Tauri reports a drag in.
+ *
+ * `PhysicalPosition` — device pixels, relative to the window's content area.
+ * The DOM measures in CSS pixels, which on this machine are two device pixels
+ * to one. Converting is [`isOverDropTarget`]'s first job and the reason a
+ * drop over the composer on a Retina display was landing in the header.
+ */
+export interface DragPoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * Is this drag over a composer?
+ *
+ * Asked of the document rather than of React state, for the same reason
+ * `keyboardInComposer` is: the composer's rectangle is a fact about what is
+ * currently laid out — the reading pane's scroll position, the height the
+ * owner dragged the top edge to, whether the overlay is up — and none of that
+ * is in the store at this resolution.
+ *
+ * More than one composer can be on screen; any of them counts, because
+ * dropping on the one in front is the only thing the pointer can be over.
+ */
+export function isOverDropTarget(
+  point: DragPoint,
+  doc: Document = document,
+  scale: number = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
+): boolean {
+  const x = point.x / scale;
+  const y = point.y / scale;
+  for (const target of doc.querySelectorAll(`[${DROP_TARGET}]`)) {
+    const box = target.getBoundingClientRect();
+    if (box.width === 0 && box.height === 0) continue;
+    if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) return true;
+  }
+  return false;
+}

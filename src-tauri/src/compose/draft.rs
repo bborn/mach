@@ -517,6 +517,8 @@ pub fn build(db: &Db, draft: &Draft, now_ms: i64, entropy: u64) -> Result<Built>
         .map(|(meta, bytes)| OutgoingAttachment {
             filename: meta.filename,
             mime_type: meta.mime_type,
+            inline: meta.inline,
+            content_id: meta.content_id,
             bytes,
         })
         .collect();

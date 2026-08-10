@@ -14,10 +14,12 @@
 //! | `loadDraft` | `draftId`, `messageId` or `threadId` | `{ draft \| null }` |
 //! | `saveDraft` | `draft` | `{ draft }` |
 //! | `discardDraft` | `draftId` | `{ ok, remote }` |
-//! | `attachChoose` | `draftId` | `{ attachments, added, refused }` |
-//! | `attachAdd` | `draftId`, `paths` | `{ attachments, added, refused }` |
+//! | `attachChoose` | `draftId`, `inline?` | `{ attachments, added, refused }` |
+//! | `attachAdd` | `draftId`, `paths`, `inline?` | `{ attachments, added, refused }` |
 //! | `attachRemove` | `attachmentId` | `{ ok, attachments }` |
 //! | `attachList` | `draftId` | `{ attachments }` |
+//! | `attachInline` | `attachmentId`, `inline` | `{ attachment, attachments }` |
+//! | `attachImages` | `draftId` | `{ images }` |
 //! | `preview` | `draft` | `{ rfc822, headers }` |
 //! | `send` | `draft`, `scheduleAt?` | `{ entry, undoUntil }` |
 //! | `undo` | `outboxId` | `{ cancelled }` |
@@ -43,6 +45,8 @@ pub mod engine;
 
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde_json::{json, Value};
 
 use engine::draft::{self, Draft, DraftKind};
@@ -73,8 +77,10 @@ pub async fn send_message(
     // through `dispatch`, which is a plain function so the tests can drive it.
     if payload_op(&draft) == "attachChoose" {
         let draft_id = required_str(&draft, "draftId")?;
+        let inline = draft.get("inline").and_then(Value::as_bool).unwrap_or(false);
         let paths = open_panel(&app).await?;
-        return attach_paths(&state.db, &draft_id, &paths, now_ms())
+        return attach_paths(&state.db, &draft_id, &paths, inline, now_ms())
+            .await
             .map_err(Into::into);
     }
     dispatch(&state.db, &outbox, draft).await.map_err(Into::into)
@@ -89,31 +95,43 @@ fn payload_op(payload: &Value) -> &str {
 /// Shared by the panel and by drag-and-drop, which arrives from the webview as
 /// a list of paths and must not be a second, subtly different implementation of
 /// "attach these files".
-fn attach_paths(
+///
+/// **The read happens off the runtime.** A 25 MB file off a slow volume is tens
+/// of milliseconds of a thread that is not allowed to block: every other IPC
+/// call — the keystroke that autosaves the draft this file is going on — is
+/// waiting behind it on the same executor. `spawn_blocking` is the whole fix,
+/// and it is why this function is async for one `std::fs::read`.
+async fn attach_paths(
     db: &crate::db::Db,
     draft_id: &str,
     paths: &[String],
+    inline: bool,
     now: i64,
 ) -> Result<Value, ComposeError> {
     let mut added = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     for path in paths {
-        let path = std::path::Path::new(path);
-        let name = path
+        let owned = path.clone();
+        let name = std::path::Path::new(path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "attachment".to_string());
         // Read first, then cap on what was actually read: the metadata size is
         // a claim about a file that could change between the two calls, and the
         // number that matters is the number of bytes now in memory.
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        let read = tauri::async_runtime::spawn_blocking(move || std::fs::read(&owned)).await;
+        let bytes = match read {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
                 refused.push(format!("{name}: {error}"));
                 continue;
             }
+            Err(error) => {
+                refused.push(format!("{name} could not be read: {error}"));
+                continue;
+            }
         };
-        match engine::attach::add_bytes(db, draft_id, &name, &bytes, now) {
+        match engine::attach::add_bytes(db, draft_id, &name, &bytes, inline, now) {
             Ok(attachment) => added.push(attachment),
             Err(error) => refused.push(error.to_string()),
         }
@@ -288,7 +306,71 @@ pub async fn dispatch(
                         .collect()
                 })
                 .unwrap_or_default();
-            attach_paths(db, &draft_id, &paths, now)
+            let inline = payload
+                .get("inline")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            attach_paths(db, &draft_id, &paths, inline, now).await
+        }
+
+        // Move one file between the body and the list under the message.
+        //
+        // The whole list comes back, not just the one row: the composer draws
+        // the chips from it, and reconciling one changed member into an array
+        // it already holds is a second place for the two to disagree.
+        "attachInline" => {
+            let id = required_str(&payload, "attachmentId")?;
+            let inline = payload
+                .get("inline")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| ComposeError::invalid("inline is required"))?;
+            let attachment = engine::attach::set_inline(db, &id, inline)?;
+            let draft_id = attachment
+                .as_ref()
+                .map(|a| a.draft_id.clone())
+                .unwrap_or_default();
+            Ok(json!({
+                "attachment": attachment,
+                "attachments": engine::attach::list(db, &draft_id)?,
+            }))
+        }
+
+        // The bytes of every inline image on a draft, so the composer can draw
+        // the message the way it will arrive.
+        //
+        // Only the inline ones. An attached file is a name and a size in the
+        // composer, and shipping 25 MB of base64 over IPC to render a chip that
+        // says "invoice.pdf" would be the same mistake as putting the bytes on
+        // the draft object.
+        //
+        // The encoding is off the runtime for the reason `attach_paths` reads
+        // its files off it: base64 inflates by a third, and turning several
+        // megabytes into a string is CPU that every other IPC call would be
+        // queued behind — including the autosave of the draft being looked at.
+        // `MAX_INLINE_IMAGE_BYTES` caps what can arrive here at 4 MB an image.
+        "attachImages" => {
+            let draft_id = required_str(&payload, "draftId")?;
+            let inline: Vec<_> = engine::attach::list_with_bytes(db, &draft_id)?
+                .into_iter()
+                .filter(|(meta, _)| meta.inline)
+                .collect();
+            let images = tauri::async_runtime::spawn_blocking(move || {
+                inline
+                    .into_iter()
+                    .map(|(meta, bytes)| {
+                        json!({
+                            "attachmentId": meta.id,
+                            "contentId": meta.content_id,
+                            "mimeType": meta.mime_type,
+                            "filename": meta.filename,
+                            "base64": BASE64.encode(&bytes),
+                        })
+                    })
+                    .collect::<Vec<Value>>()
+            })
+            .await
+            .map_err(|e| ComposeError::invalid(format!("the images could not be read: {e}")))?;
+            Ok(json!({ "images": images }))
         }
 
         "attachRemove" => {

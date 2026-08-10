@@ -30,8 +30,27 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { KeymapProvider } from "@/hooks/useKeymap";
-import { COMPOSER_ROOT, keyboardInComposer, type Draft, type DraftKind } from "@/lib/compose";
+import {
+  COMPOSER_ROOT,
+  keyboardInComposer,
+  type Draft,
+  type DraftAttachment,
+  type DraftKind,
+} from "@/lib/compose";
 import { Composer } from "./Composer";
+
+function file(over: Partial<DraftAttachment> = {}): DraftAttachment {
+  return {
+    id: "att-1",
+    draftId: "d1",
+    filename: "terms.pdf",
+    mimeType: "application/pdf",
+    sizeBytes: 4096,
+    inline: false,
+    contentId: "att-1@mach.invalid",
+    ...over,
+  };
+}
 
 function draft(over: Partial<Draft> = {}): Draft {
   return {
@@ -133,6 +152,84 @@ describe("the composer's tab order", () => {
       "cc / bcc",
       "To",
       "Message",
+      "attach",
+      "discard",
+    ]);
+  });
+
+  /*
+   * The files sit between the message and the footer, which is where they are
+   * drawn — the sequence is the visual order or it is not a tab order.
+   *
+   * Each file is one stop, and an image is two: an image can be a file beside
+   * the message or a picture inside it, and that choice must be reachable
+   * without a mouse. Drag and drop cannot be the only way to attach and the
+   * chip cannot be the only way to choose; the toggle is a real button, one ⇥
+   * and one ⏎ away.
+   */
+  it("puts each file between the message and the footer", () => {
+    expect(stops({ attachments: [file()] })).toEqual([
+      "Subject",
+      "cc / bcc",
+      "To",
+      "Message",
+      "Remove terms.pdf",
+      "attach",
+      "discard",
+    ]);
+  });
+
+  it("gives an image the inline choice as well, ahead of its remove", () => {
+    expect(
+      stops(
+        { attachments: [file({ filename: "chart.png", mimeType: "image/png" })] },
+        { onSetInline: () => {} },
+      ),
+    ).toEqual([
+      "Subject",
+      "cc / bcc",
+      "To",
+      "Message",
+      "Show chart.png in the message",
+      "Remove chart.png",
+      "attach",
+      "discard",
+    ]);
+  });
+
+  it("names the inline control for what pressing it would do", () => {
+    expect(
+      stops(
+        {
+          attachments: [
+            file({ filename: "chart.png", mimeType: "image/png", inline: true }),
+          ],
+        },
+        { onSetInline: () => {} },
+      ),
+    ).toContain("Attach chart.png as a file");
+  });
+
+  // An SVG is an image to a browser and a script host to everything that draws
+  // it, so it can be attached and never placed in a body — and a control that
+  // cannot do anything should not be a stop on the way to one that can.
+  it("offers no inline choice on a file that cannot go in the body", () => {
+    const listed = stops(
+      {
+        attachments: [
+          file({ filename: "logo.svg", mimeType: "image/svg+xml" }),
+          file({ id: "att-2", filename: "terms.pdf" }),
+        ],
+      },
+      { onSetInline: () => {} },
+    );
+    expect(listed).toEqual([
+      "Subject",
+      "cc / bcc",
+      "To",
+      "Message",
+      "Remove logo.svg",
+      "Remove terms.pdf",
       "attach",
       "discard",
     ]);

@@ -166,7 +166,11 @@ CREATE TABLE IF NOT EXISTS compose_attachments (
     mime_type  TEXT    NOT NULL DEFAULT 'application/octet-stream',
     size_bytes INTEGER NOT NULL DEFAULT 0,
     bytes      BLOB    NOT NULL,
-    added_at   INTEGER NOT NULL DEFAULT 0
+    added_at   INTEGER NOT NULL DEFAULT 0,
+    -- In the body rather than beside it. See `ATTACHMENT_INLINE_COLUMNS`, which
+    -- adds both of these to a table written before they existed.
+    inline     INTEGER NOT NULL DEFAULT 0,
+    content_id TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_compose_attachments_draft ON compose_attachments (draft_id);
 "#;
@@ -224,12 +228,29 @@ const OUTBOX_DRAFT_COLUMNS: &[(&str, &str)] = &[
     ("gmail_draft_message_id", "TEXT"),
 ];
 
+/// What tells a file in the body from a file beside it.
+///
+/// Added the same way as the two lists above. Both default to the shape every
+/// row written before them had — not inline, no `Content-ID` — so a store from
+/// yesterday's build sends exactly the messages it did yesterday.
+///
+///  * `inline` — `Content-Disposition: inline` and an `<img src="cid:…">` in
+///    the body, rather than a file listed under the message.
+///  * `content_id` — the `cid:` the body points at. Allocated for every
+///    attachment so that turning one inline is a flag rather than a rename;
+///    see [`attach::Attachment::content_id`].
+const ATTACHMENT_INLINE_COLUMNS: &[(&str, &str)] = &[
+    ("inline", "INTEGER NOT NULL DEFAULT 0"),
+    ("content_id", "TEXT NOT NULL DEFAULT ''"),
+];
+
 /// Idempotent. Called by every entry point into this module, so no caller has
 /// to remember it.
 pub fn ensure_compose_schema(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(COMPOSE_SCHEMA)?;
     add_missing_columns(conn, "compose_drafts", DRAFT_REMOTE_COLUMNS)?;
     add_missing_columns(conn, "compose_outbox", OUTBOX_DRAFT_COLUMNS)?;
+    add_missing_columns(conn, "compose_attachments", ATTACHMENT_INLINE_COLUMNS)?;
     Ok(())
 }
 
