@@ -22,6 +22,8 @@ import {
   loadBackendStatus,
   type AgentBackendStatus,
 } from "@/lib/agent";
+import { errorMessage } from "@/lib/ipc";
+import { openExternal } from "@/lib/message-body";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Overlay } from "@/components/ui/dialog";
@@ -41,7 +43,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { Filters } from "./Filters";
 import { PREFERENCES_EVENT, preferencesResolver, type PreferencesRequest } from "./palette";
 import { usePreferencesStore } from "./PreferencesProvider";
 
@@ -220,9 +221,12 @@ type SectionId = (typeof SECTIONS)[number]["id"];
 /* The surface                                                                 */
 /* -------------------------------------------------------------------------- */
 
+/** Gmail's own filter settings. Mach does not keep a copy of this page. */
+const GMAIL_FILTER_SETTINGS = "https://mail.google.com/mail/u/0/#settings/filters";
+
 export function PreferencesDialog() {
   const { prefs, set } = usePreferencesStore();
-  const { accounts, labels, actions, sync } = useMach();
+  const { accounts, actions, sync } = useMach();
   const [open, setOpen] = useState(false);
   const [section, setSection] = useState<SectionId>("accounts");
   // Which account is one keystroke from being deleted, if any. Held here rather
@@ -231,6 +235,8 @@ export function PreferencesDialog() {
   const [confirmRemove, setConfirmRemove] = useState<number | null>(null);
   const ids = useIds();
   const [notifications, setNotifications] = useState<NotificationStatus>(NO_NOTIFICATIONS);
+  // A link that does nothing is the failure this project has paid most for.
+  const [linkFailed, setLinkFailed] = useState<string | null>(null);
   // The section the surface opens focused on — see `Overlay`'s `initialFocus`.
   const current = useRef<HTMLButtonElement>(null);
 
@@ -520,15 +526,30 @@ export function PreferencesDialog() {
                     onChange={(next) => set("signatures", next)}
                   />
 
-                  {/* The one surface here that is not a preference: a filter
-                      lives in Gmail. It is here because this is where somebody
-                      looking for it would look, and because the alternative
-                      was telling them to open Gmail's web settings. */}
-                  <Filters
-                    accounts={accounts}
-                    labels={labels}
-                    missingScope={sync?.missingScope ?? []}
-                  />
+                  {/* A filter lives in Gmail, and so does the place to make one
+                      by hand. Mach had a panel for it; it was a second, worse
+                      copy of a settings page that already exists, kept in step
+                      by nobody. The agent can still create and delete them —
+                      that is the part Gmail's page cannot do from here. */}
+                  <Field orientation="row">
+                    <FieldLabel>Filters</FieldLabel>
+                    <FieldContent>
+                      <Button
+                        size="sm"
+                        variant="subtle"
+                        onClick={() => {
+                          void openExternal(GMAIL_FILTER_SETTINGS).catch((error) =>
+                            setLinkFailed(errorMessage(error)),
+                          );
+                        }}
+                      >
+                        Open in Gmail
+                      </Button>
+                      {linkFailed && (
+                        <p className="text-micro text-danger">{linkFailed}</p>
+                      )}
+                    </FieldContent>
+                  </Field>
                 </>
               )}
 

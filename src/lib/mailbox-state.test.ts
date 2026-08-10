@@ -341,8 +341,15 @@ describe("sync progress", () => {
       {
         email: "alex@lumen.example",
         message: "alex@lumen.example has not granted a permission Mach now needs",
+        needsReauthorization: true,
+        lastSuccessAt: null,
       },
-      { email: "gone@lumen.example", message: "gone@lumen.example needs signing in again" },
+      {
+        email: "gone@lumen.example",
+        message: "Not signed in",
+        needsReauthorization: true,
+        lastSuccessAt: null,
+      },
     ]);
   });
 
