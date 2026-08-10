@@ -9,6 +9,7 @@
  * WebView, no eyeballing.
  */
 
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
@@ -814,6 +815,45 @@ describe("the frame's ground", () => {
     const frames = [...markup.matchAll(/srcdoc="([^"]*)"/gi)].map((m) => m[1]!);
     expect(frames).toHaveLength(2);
     for (const frame of frames) expect(frame).toContain("color-scheme:light}");
+  });
+
+  /*
+   * LIGHT_GROUND is a hand copy of :root in globals.css, made by hand because
+   * it cannot be read off the app: when the window is dark, `.dark` has
+   * already replaced those tokens, and the light values are no longer in the
+   * cascade to find. Nothing keeps a hand copy honest but a test — retune
+   * `--foreground` or `--border` in globals.css and this is what would
+   * otherwise stay silently wrong, forever, in every HTML message.
+   *
+   * The stylesheet declares far more tokens than the frame uses, so this only
+   * walks LIGHT_GROUND's own keys against `:root` — never the reverse — and
+   * it parses `:root` specifically. `.dark` redefines several of the same
+   * names to different values, so finding one by name alone, anywhere in the
+   * file, would risk a match that happens to pass while proving nothing.
+   */
+  it("keeps LIGHT_GROUND pinned to :root in globals.css", () => {
+    const source = readFileSync(new URL("../../lib/message-body.ts", import.meta.url), "utf8");
+    const literal = source.match(/const LIGHT_GROUND: FrameTokens = \{([\s\S]*?)\n\};/);
+    expect(literal, "LIGHT_GROUND not found in src/lib/message-body.ts").not.toBeNull();
+    const declared = [...literal![1].matchAll(/"(--[\w-]+)":\s*"([^"]+)"/g)].map(
+      ([, name, value]) => [name, value] as const,
+    );
+    expect(declared.length).toBeGreaterThan(0);
+
+    const css = readFileSync(new URL("../../styles/globals.css", import.meta.url), "utf8");
+    const root = css.match(/:root\s*\{([\s\S]*?)\n\}/);
+    expect(root, ":root block not found in src/styles/globals.css").not.toBeNull();
+
+    for (const [name, litValue] of declared) {
+      const declaration = root![1].match(new RegExp(`${name}:\\s*([^;]+);`));
+      expect(declaration, `${name} is in LIGHT_GROUND but not declared in :root`).not.toBeNull();
+      const cssValue = declaration![1].trim();
+      expect(
+        litValue,
+        `${name} has drifted: LIGHT_GROUND in src/lib/message-body.ts has "${litValue}", ` +
+          `:root in src/styles/globals.css has "${cssValue}". Update LIGHT_GROUND to match.`,
+      ).toBe(cssValue);
+    }
   });
 });
 
