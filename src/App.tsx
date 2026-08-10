@@ -136,11 +136,20 @@ function Shell() {
      * It is a reference card, not a mode you act from — and without this,
      * reading it with `j` would walk the list underneath it. Escape sits
      * above this at 120 and closes.
+     *
+     * Not `allowInInput`: the sheet has its own filter field and is the one
+     * focusable thing in its panel, so the overlay's focus trap always puts
+     * focus there while the sheet is open. Swallowing keys while a typing
+     * target is focused used to be how a stray keystroke was kept from
+     * leaking into whatever had focus *before* the sheet opened — a compose
+     * draft with no field of its own to steal focus into. The filter field
+     * closes that gap by giving the trap somewhere to put focus, so the
+     * catch-all no longer needs to cover the input case, and letting it type
+     * normally is the point.
      */
     {
       keys: "*",
       priority: 119,
-      allowInInput: true,
       when: () => shortcuts !== null,
       handler: () => {},
     },

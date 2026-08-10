@@ -1,7 +1,9 @@
-import { useMemo } from "react";
+import { Search } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { Overlay } from "@/components/ui/dialog";
+import { BareInput } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
-import type { KeyBinding } from "@/lib/keymap";
+import { formatBinding, type KeyBinding } from "@/lib/keymap";
 
 /**
  * `?` — the bindings that were live at the moment it was pressed.
@@ -35,6 +37,14 @@ import type { KeyBinding } from "@/lib/keymap";
  *   * **Nothing is truncated.** A description too long for the column wraps
  *     under itself. Truncation on a reference card hides the one word you
  *     opened it for.
+ *   * **Filtering matches what is drawn, not what is registered.** The field
+ *     tests each row's description and its formatted key label — "G then I",
+ *     not "g i" — because that is what is on screen to search for.
+ *   * **Escape always closes, even with text in the field.** `App.tsx` binds
+ *     it unconditionally to `setShortcuts(null)`. Finding the row is the
+ *     terminal action here, not the filter text — a first Escape that only
+ *     cleared the field would leave the corner's "Esc to close" needing a
+ *     second press to be true.
  */
 
 /**
@@ -59,9 +69,70 @@ const GROUP_ORDER = [
   "Calendars",
 ];
 
-interface SheetRow {
+export interface SheetRow {
   keys: string;
   description: string;
+  /**
+   * What `Kbd` actually draws — "G then I", "⌘⌥→" — as opposed to `keys`,
+   * which is the registry's internal token ("g i", "mod+alt+right"). The
+   * filter matches against this, not against `keys`: matching the token
+   * would mean a search that finds things the row never displayed.
+   */
+  keyLabel: string;
+}
+
+export type SheetGroup = readonly [group: string, rows: SheetRow[]];
+
+/** Registration order, deduped, grouped — nothing filtered yet. */
+export function buildGroups(bindings: readonly KeyBinding[]): SheetGroup[] {
+  const byGroup = new Map<string, SheetRow[]>();
+
+  // Registration order, not precedence order. `order` is stamped by the
+  // registry; a binding without one sorts last rather than sorting randomly.
+  const declared = [...bindings].sort(
+    (a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER),
+  );
+
+  for (const binding of declared) {
+    if (!binding.description) continue;
+    const group = binding.group ?? "Other";
+    const list = byGroup.get(group) ?? [];
+    if (!list.some((item) => item.keys === binding.keys)) {
+      list.push({
+        keys: binding.keys,
+        description: binding.description,
+        keyLabel: formatBinding(binding.keys),
+      });
+    }
+    byGroup.set(group, list);
+  }
+
+  const rank = (name: string) => {
+    const index = GROUP_ORDER.indexOf(name);
+    return index === -1 ? GROUP_ORDER.length : index;
+  };
+  return [...byGroup.entries()].sort(([a], [b]) => rank(a) - rank(b) || a.localeCompare(b));
+}
+
+/**
+ * Rows whose description or displayed key contains `query`. A group left
+ * with nothing is dropped rather than printed with an empty body — an
+ * uppercase heading over nothing is exactly the noise the filter exists to
+ * cut.
+ */
+export function filterGroups(groups: readonly SheetGroup[], query: string): SheetGroup[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return groups.slice();
+
+  const result: SheetGroup[] = [];
+  for (const [group, rows] of groups) {
+    const matched = rows.filter(
+      (row) =>
+        row.description.toLowerCase().includes(q) || row.keyLabel.toLowerCase().includes(q),
+    );
+    if (matched.length > 0) result.push([group, matched]);
+  }
+  return result;
 }
 
 export function ShortcutSheet({
@@ -73,39 +144,38 @@ export function ShortcutSheet({
   bindings: readonly KeyBinding[];
   onClose: () => void;
 }) {
-  const groups = useMemo(() => {
-    const byGroup = new Map<string, SheetRow[]>();
+  const [query, setQuery] = useState("");
 
-    // Registration order, not precedence order. `order` is stamped by the
-    // registry; a binding without one sorts last rather than sorting randomly.
-    const declared = [...bindings].sort(
-      (a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER),
-    );
+  // A reference card starts blank every time it's opened — a leftover filter
+  // from the last visit would hide rows for no reason visible on screen.
+  useEffect(() => {
+    if (!open) setQuery("");
+  }, [open]);
 
-    for (const binding of declared) {
-      if (!binding.description) continue;
-      const group = binding.group ?? "Other";
-      const list = byGroup.get(group) ?? [];
-      if (!list.some((item) => item.keys === binding.keys)) {
-        list.push({ keys: binding.keys, description: binding.description });
-      }
-      byGroup.set(group, list);
-    }
-
-    const rank = (name: string) => {
-      const index = GROUP_ORDER.indexOf(name);
-      return index === -1 ? GROUP_ORDER.length : index;
-    };
-    return [...byGroup.entries()].sort(
-      ([a], [b]) => rank(a) - rank(b) || a.localeCompare(b),
-    );
-  }, [bindings]);
+  const groups = useMemo(() => buildGroups(bindings), [bindings]);
+  const filtered = useMemo(() => filterGroups(groups, query), [groups, query]);
 
   return (
     <Overlay open={open} onClose={onClose} align="center" className="max-w-[42rem] max-h-[84vh]">
       <div className="flex items-baseline justify-between border-b border-border px-4 py-2.5">
         <h2 className="text-list font-medium text-foreground">Keyboard</h2>
         <span className="text-micro text-faint-foreground">Esc to close</span>
+      </div>
+
+      {/*
+        The one field in the sheet, so it is also where the overlay's focus
+        trap lands on open — no `autoFocus`, no `initialFocus` ref, just being
+        the first focusable element in the panel. Typing filters immediately
+        because nothing else here takes text.
+      */}
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-4">
+        <Search size={13} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
+        <BareInput
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Filter shortcuts"
+          aria-label="Filter shortcuts"
+        />
       </div>
 
       {/*
@@ -116,33 +186,37 @@ export function ShortcutSheet({
         wide enough to read.
       */}
       <div className="overflow-y-auto px-4 py-3">
-        <div className="columns-1 gap-x-8 min-[36rem]:columns-2">
-          {groups.map(([group, list]) => (
-            <section key={group} className="mb-4 break-inside-avoid last:mb-0">
-              <h3 className="mb-1.5 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
-                {group}
-              </h3>
-              <ul className="flex flex-col gap-1">
-                {list.map((row) => (
-                  <li key={row.keys} className="flex items-baseline gap-2.5">
-                    {/*
-                      Fixed width, right-set. The chip hugs the gutter and every
-                      description below it starts on the same line, which is the
-                      whole reason the column exists. `G then I` is the widest
-                      thing `formatBinding` produces and it fits.
-                    */}
-                    <span className="flex w-[4.75rem] shrink-0 justify-end">
-                      <Kbd keys={row.keys} />
-                    </span>
-                    <span className="min-w-0 flex-1 text-micro leading-[1.45] text-muted-foreground">
-                      {row.description}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ))}
-        </div>
+        {filtered.length === 0 ? (
+          <div className="px-1 py-6 text-center text-list text-faint-foreground">No matches</div>
+        ) : (
+          <div className="columns-1 gap-x-8 min-[36rem]:columns-2">
+            {filtered.map(([group, list]) => (
+              <section key={group} className="mb-4 break-inside-avoid last:mb-0">
+                <h3 className="mb-1.5 text-micro font-medium uppercase tracking-[0.08em] text-faint-foreground">
+                  {group}
+                </h3>
+                <ul className="flex flex-col gap-1">
+                  {list.map((row) => (
+                    <li key={row.keys} className="flex items-baseline gap-2.5">
+                      {/*
+                        Fixed width, right-set. The chip hugs the gutter and every
+                        description below it starts on the same line, which is the
+                        whole reason the column exists. `G then I` is the widest
+                        thing `formatBinding` produces and it fits.
+                      */}
+                      <span className="flex w-[4.75rem] shrink-0 justify-end">
+                        <Kbd keys={row.keys} />
+                      </span>
+                      <span className="min-w-0 flex-1 text-micro leading-[1.45] text-muted-foreground">
+                        {row.description}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ))}
+          </div>
+        )}
       </div>
     </Overlay>
   );
