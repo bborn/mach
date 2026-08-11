@@ -39,6 +39,34 @@ State the fact and stop. The facts here are good enough to carry themselves;
 none of them needs a frame, a reveal, or a sentence telling the reader what to
 conclude.
 
+### The site and the README are Bruno writing, in the first person
+
+Read `~/Projects/gms/bruno/brain/writing-voice.md` before touching either. It is
+his real voice, drawn from his own email and essays, and it outranks the list
+below wherever the two disagree.
+
+The rules under this heading were written to stop *smugness*, and they
+overshot into flatness. A stranger read the site and said, in public, "this is
+awesome but the claude copy is terrible" — and he was right. What gave it away
+was not a banned phrase. It was:
+
+- **Third person about himself.** The site said "the author uses it every day"
+  about its own author. Nothing else marks a page as ghostwritten so fast.
+- **One sentence rhythm all the way down.** Every sentence the same length and
+  shape, no fragment, no aside, no joke.
+- **Precision as performance.** "single-digit to low-tens of milliseconds
+  against a 61,000-message store" is a benchmark, not a sentence a person says.
+
+So: **first person, and let it sound like a person.** A fragment is allowed. A
+parenthetical aside is allowed. A dry, undercutting joke about the parts that
+are bad is not just allowed, it is the register — "marketing mail still renders
+like a ransom note", "this is the worst part, and there's no way around it".
+Prefer the exact homely detail to the impressive number.
+
+What still holds, and always will: no self-satisfaction, no aphorisms, no
+telling the reader what to conclude, no "deliberately" worn as a badge. Being
+warm is not the same as being pleased with yourself.
+
 Never write these:
 
 | Pattern | Example that shipped |

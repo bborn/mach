@@ -5,18 +5,18 @@
 
 # Mach
 
-A fast, keyboard-driven Gmail and Google Calendar desktop client for macOS, with
-an agent that has real tools over your mail and calendar.
+A fast, keyboard-driven Gmail and Google Calendar client for macOS, with an
+agent that can act on your mail and calendar rather than just describe them.
 
 Tauri v2 shell, Rust core, React + TypeScript UI, SQLite + FTS5 store. It talks
-to the Gmail and Google Calendar REST APIs directly over OAuth. Several accounts
-are unified into one stream.
+to the Gmail and Google Calendar REST APIs directly over OAuth, and puts all
+your accounts in one list.
 
 ## What this is, and is not
 
-This is one person's mail client, built for their own use and published in case
-someone else finds it useful. It is not a product, there is no support, and
-there are no releases. You build it from source.
+This is my mail client. I built it for me and put it up here in case it's useful
+to anybody else. It isn't a product, there's no support, and there are no
+releases. You build it from source.
 
 Not in scope, and not planned:
 
@@ -24,7 +24,7 @@ Not in scope, and not planned:
 - **No other providers.** No Outlook, Fastmail, iCloud, or generic mail.
 - **No mobile, no web, no Windows, no Linux.** macOS desktop only. Refresh
   tokens live in the macOS Keychain and the UI is WKWebView.
-- **No teams and no sharing.** It is a single-user client.
+- **No teams and no sharing.** One user, and it's me.
 
 Design records, which explain why the architecture is what it is:
 [`docs/superpowers/specs/2026-08-07-mail-calendar-client-design.md`](docs/superpowers/specs/2026-08-07-mail-calendar-client-design.md)
@@ -32,7 +32,7 @@ and [`docs/calendar-ux-brief.md`](docs/calendar-ux-brief.md).
 
 ## State
 
-Working, and in daily use by its author:
+Working, and what I read my mail in every day:
 
 - Multi-account sync into one unified thread list, with a reading pane over
   sanitized HTML bodies.
@@ -54,10 +54,10 @@ Working, and in daily use by its author:
   key. See [`docs/agent-backends.md`](docs/agent-backends.md).
 - A sandboxed plugin runtime. See [`PLUGINS.md`](PLUGINS.md).
 
-Rough edges you should expect: no packaged build or auto-update, no first-run
-onboarding beyond "add an account", and marketing-email HTML that renders
-imperfectly. `cargo test` and `bunx vitest run` are the safety net; there is no
-end-to-end suite.
+Expect rough edges: nothing packaged, nothing that updates itself, no onboarding
+past "add an account", and marketing mail that renders like a ransom note more
+often than I'd like. `cargo test` and `bunx vitest run` are the whole safety net
+— there is no end-to-end suite.
 
 One feature will not work for you out of the box. `⌘K → Send feedback` captures
 the window, lets you annotate it, and files the result as a task for a coding
