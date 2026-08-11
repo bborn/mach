@@ -203,6 +203,36 @@ describe("the composer's bindings", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it("leaves ⌘⌫ to the editor, and discards on ⇧⌘⌫", () => {
+    /*
+     * The message this test is named after is gone. Discard was `mod+backspace`
+     * with `allowInInput: true`, and on macOS ⌘⌫ deletes to the beginning of
+     * the line — so pressing it twice in the editor, which is what deleting two
+     * lines *is*, asked and then confirmed the discard.
+     *
+     * Both halves matter. The handler must not run, and the event must not be
+     * prevented, or the key stops deleting the line without destroying anything
+     * and the composer eats a system editing command for nothing.
+     */
+    const keymap = createKeymap("meta");
+    const discard = vi.fn();
+    keymap.register({
+      keys: COMPOSER_KEYS.discard,
+      allowInInput: true,
+      priority: 100,
+      handler: discard,
+    });
+
+    const prevented = vi.fn();
+    const bare = press({ key: "Backspace", metaKey: true, preventDefault: prevented });
+    expect(keymap.handle(bare)).toBe(false);
+    expect(discard).not.toHaveBeenCalled();
+    expect(prevented).not.toHaveBeenCalled();
+
+    expect(keymap.handle(press({ key: "Backspace", metaKey: true, shiftKey: true }))).toBe(true);
+    expect(discard).toHaveBeenCalledTimes(1);
+  });
+
   it("opens the composer on r, a and f from the list", () => {
     const keymap = createKeymap("meta");
     const opened: string[] = [];
@@ -473,10 +503,11 @@ describe("humanSize", () => {
 
 describe("the composer's keys", () => {
   it("does not claim a key another live binding already has", () => {
-    // `mod+backspace` is the calendar's "delete this event" as well, and both
-    // are registered — but the calendar's only lives while its modal is up, so
-    // the two can never be offered at once. `conflicts` reports same-priority
-    // ties among *live* bindings, which is the question that matters.
+    // The calendar deletes an event with `mod+backspace`, which discard used to
+    // answer too. It is ⇧⌘⌫ now, so the two are different keys — and the third
+    // registration below still stands in for the modal, because `conflicts`
+    // reports same-priority ties among *live* bindings and that is the question
+    // that matters whatever the tokens are.
     const keymap = createKeymap("meta");
     keymap.register({
       keys: COMPOSER_KEYS.discard,

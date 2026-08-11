@@ -1200,11 +1200,26 @@ export const COMPOSER_KEYS = {
   schedule: "ctrl+s",
   close: "escape",
   /**
-   * Throw the draft away. Apple Mail's key for the same act, and free here —
-   * the calendar's `mod+backspace` deletes an event and is only live while the
-   * event modal is up, so the two can never both be offered.
+   * Throw the draft away.
+   *
+   * This was ⌘⌫, Apple Mail's key for the same act, and it cost a message. On
+   * macOS ⌘⌫ is a text-editing key: delete to the beginning of the line, which
+   * is a thing you press several times in a row while writing. The binding
+   * carries `allowInInput: true`, so it answered in the editor, and the two
+   * presses that discard a draft — one to ask, one to mean it — threw a
+   * half-written message away instead of deleting two lines of it. Reported
+   * from inside the app as "command+delete should delete a line, but instead it
+   * deletes the whole draft".
+   *
+   * ⇧⌘⌫ is not a system editing command, so there is nothing for it to collide
+   * with, and it joins the composer's other shifted keys — `attach`, `popOut`,
+   * `composeAnother` — which are shifted for the same reason: every one of them
+   * is pressed while the cursor is in a field.
+   *
+   * The calendar's `mod+backspace` deletes an event and is untouched. It is
+   * live only while the event modal is up, and the two keys no longer overlap.
    */
-  discard: "mod+backspace",
+  discard: "shift+mod+backspace",
   /** Attach files. Gmail has no key for this; ⇧⌘A is free and reads as "attach". */
   attach: "shift+mod+a",
   /** Recall a message inside its window. */
