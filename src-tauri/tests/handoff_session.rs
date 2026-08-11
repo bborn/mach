@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mach_lib::ipc::handoff::engine::context::HandoffSource;
+use mach_lib::ipc::handoff::engine::context::{HandoffSource, MailMessage, MailSource};
 use mach_lib::ipc::handoff::engine::plan::LaunchPlan;
 use mach_lib::ipc::handoff::engine::session::{
     SessionResource, SessionSink, Sessions, MAX_PENDING_BYTES, MAX_SESSIONS,
@@ -202,6 +202,99 @@ fn the_pty_spawns_with_the_targets_resolved_argv_cwd_and_environment() {
     );
 
     sessions.close(&id);
+}
+
+/// The instruction the owner typed, byte for byte, at the far end of the pty.
+///
+/// The report that produced this test was a receiving session reading its task
+/// out as `hando` — five characters of a word — above a thread that had arrived
+/// whole. That turned out to be what ⌘K sent (see `lib/handoff.ts`), but the
+/// half nobody could rule out was this one: a prompt assembled here and pushed
+/// through a pty as argv, where a short write or a stray newline would look
+/// exactly the same from the outside. So the claim is made where it can be
+/// checked — the program writes its last argument to a file, and the file is
+/// compared with what the owner typed.
+#[test]
+fn the_whole_instruction_reaches_the_program_however_it_was_typed() {
+    let dir = std::env::temp_dir().join(format!("mach-instruction-{}", new_tag()));
+    std::fs::create_dir_all(&dir).expect("a directory to run in");
+    let received = dir.join("argument.txt");
+    let program = dir.join("dump");
+    std::fs::write(
+        &program,
+        format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", received.display()),
+    )
+    .expect("the stand-in program");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the stand-in program");
+    }
+
+    // Spaces, two newlines, an em dash, an accent, an emoji, and long enough
+    // that a fixed-size buffer anywhere would show.
+    let instruction = format!(
+        "réponds à Katie — merci 🙏\nand then implement the CSV export she asked for\n\n{}",
+        "keep going ".repeat(400).trim_end()
+    );
+
+    for source in [HandoffSource::None, mail_thread()] {
+        let tag = new_tag();
+        let context = context::build(&source, &tag);
+        let target = HandoffTarget {
+            id: "t1".into(),
+            name: "Session".into(),
+            dir: dir.to_string_lossy().into_owned(),
+            run: format!("'{}' \"{{{{prompt}}}}\"", program.display()),
+            mode: HandoffMode::Session,
+            last_run_at: None,
+        };
+        let plan = LaunchPlan::prepare(&target, &instruction, &context, &tag).expect("plan");
+
+        let sessions = Sessions::new();
+        let sink = Arc::new(Recorder::default());
+        let id = sessions
+            .open(&plan, 80, 24, Arc::clone(&sink), Vec::new())
+            .expect("the session must start")
+            .session_id;
+        sink.wait_for_exit(Duration::from_secs(10))
+            .expect("the stand-in program must finish");
+        sessions.close(&id);
+
+        let argument = std::fs::read_to_string(&received).expect("the argument it was given");
+        assert!(
+            argument.starts_with(&instruction),
+            "the instruction arrived cut to {:?}",
+            argument.chars().take(80).collect::<String>()
+        );
+        if !context.is_empty() {
+            assert!(
+                argument[instruction.len()..].contains("⟧"),
+                "and the quoted thread must still be fenced below it"
+            );
+        }
+        std::fs::remove_file(&received).expect("clear it for the next case");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A one-message thread, so the instruction has something quoted under it.
+fn mail_thread() -> HandoffSource {
+    HandoffSource::Mail(Box::new(MailSource {
+        subject: "CSV export".into(),
+        account_email: "bruno@example.com".into(),
+        gmail_thread_id: "abc123".into(),
+        messages: vec![MailMessage {
+            from: "Katie Ross <katie@example.com>".into(),
+            to: "bruno@example.com".into(),
+            date_ms: 1_700_000_000_000,
+            body_text: Some("Could you add a CSV export?".into()),
+            body_html: None,
+            snippet: "Could you add a CSV export?".into(),
+            attachments: Vec::new(),
+        }],
+    }))
 }
 
 #[test]
