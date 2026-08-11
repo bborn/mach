@@ -14,6 +14,7 @@ function dom(overrides: Partial<QaDom> = {}): QaDom {
     click: () => true,
     count: () => 0,
     overlay: () => null,
+    focused: () => null,
     ...overrides,
   };
 }
@@ -89,6 +90,43 @@ describe("key", () => {
     const result = runVerb({ verb: "key", argument: "q" }, env());
     expect(result).toMatchObject({ ok: true, handled: false });
   });
+
+  /**
+   * The bug this is here to stop coming back.
+   *
+   * A synthetic event with no target is never "typing", so every binding that
+   * exists to stay out of the way of a text field fired through this port and
+   * passed. The composer's keys were called fine by a QA run on the same day
+   * the person using the app reported that r did not reply and the letters he
+   * typed were being read as commands. The port has to press the key where the
+   * caret is, or it is testing a state the app is never in.
+   */
+  it("presses the key at whatever has the caret", () => {
+    const keymap = createKeymap("meta");
+    const reply = vi.fn();
+    keymap.register({ keys: "r", handler: reply });
+
+    const writing = dom({
+      focused: () => ({ tagName: "DIV", isContentEditable: true, name: "Message" }),
+    });
+    const result = runVerb({ verb: "key", argument: "r" }, env({ keymap, dom: writing }));
+
+    expect(reply).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ handled: false, focused: "DIV[Message]" });
+  });
+
+  it("still runs a binding that asked to stay live in a text field", () => {
+    const keymap = createKeymap("meta");
+    const send = vi.fn();
+    keymap.register({ keys: "mod+enter", allowInInput: true, handler: send });
+
+    const writing = dom({
+      focused: () => ({ tagName: "DIV", isContentEditable: true, name: "Message" }),
+    });
+    runVerb({ verb: "key", argument: "mod+enter" }, env({ keymap, dom: writing }));
+
+    expect(send).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("click", () => {
@@ -123,7 +161,11 @@ describe("ui", () => {
   it("reports enough to assert against without reading pixels", () => {
     const report = describeUi(
       ui({ mode: "calendar", threadId: 7, selection: { ids: [7, 8, 9] }, overlays: 1 }),
-      dom({ count: () => 42, overlay: () => "Preferences" }),
+      dom({
+        count: () => 42,
+        overlay: () => "Preferences",
+        focused: () => ({ tagName: "INPUT", name: "Search" }),
+      }),
     );
 
     expect(report).toEqual({
@@ -138,6 +180,7 @@ describe("ui", () => {
       overlays: 1,
       overlay: "Preferences",
       rows: 42,
+      focused: "INPUT[Search]",
     });
   });
 });
@@ -183,7 +226,7 @@ describe("connectQaBridge", () => {
 
     ch.fire({ id: 17, verb: "key", argument: "mod+2" });
     expect(answers).toEqual([
-      { id: 17, ok: true, verb: "key", binding: "mod+2", handled: true },
+      { id: 17, ok: true, verb: "key", binding: "mod+2", handled: true, focused: null },
     ]);
   });
 

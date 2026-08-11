@@ -26,6 +26,15 @@
  * replayed a token at a time and the keymap's own timer stitches it back
  * together, exactly as the menu bridge does.
  *
+ * The event carries whatever currently has DOM focus as its `target`, because
+ * half of what the keymap decides is decided from there: `allowInInput` exists
+ * precisely so that `r` means "reply" in the list and the letter r inside a
+ * composer. A synthetic event with `target: null` is always in the first world
+ * and never the second, so every binding tested through this port passed while
+ * the same key, pressed by a hand, was being filtered out. Composer keys were
+ * reported broken by the one person using the app after a QA run had called
+ * them fine — the port could not see the state they break in.
+ *
  * **`click`** dispatches a real event sequence — pointerdown, mousedown,
  * pointerup, mouseup, click — on the first element matching a CSS selector.
  * `element.click()` alone would miss every handler written against mousedown,
@@ -50,6 +59,7 @@ import { isTauri } from "./ipc";
 import {
   detectModKey,
   normalizeToken,
+  type EventTargetLike,
   type Keymap,
   type ModKey,
 } from "./keymap";
@@ -106,6 +116,16 @@ export interface QaUiReport {
   overlay: string | null;
   /** Thread rows currently rendered. */
   rows: number;
+  /**
+   * What has DOM focus, as `TAG` or `TAG[name]` — "the caret is here".
+   *
+   * Distinct from `focus` above, which is the app's own idea of which mail pane
+   * the keyboard belongs to. The two disagree exactly when a bug is present:
+   * a composer that opened without taking the caret leaves `focus` reading
+   * "list" and this reading `BODY`, and every keystroke meant for the message
+   * goes to the thread list instead.
+   */
+  focused: string | null;
 }
 
 /**
@@ -122,6 +142,14 @@ export interface QaDom {
   count(selector: string): number;
   /** The topmost open overlay's accessible name, or null. */
   overlay(): string | null;
+  /**
+   * Whatever has the caret, in the shape the keymap reads a target in.
+   *
+   * `name` is for the report; `tagName` and `isContentEditable` are what
+   * `isTypingTarget` asks, and they are the reason a QA keystroke can be
+   * filtered the same way a real one is.
+   */
+  focused(): (EventTargetLike & { name?: string }) | null;
 }
 
 export interface QaBridgeOptions {
@@ -154,6 +182,7 @@ export function runVerb(
   switch (request.verb) {
     case "key": {
       const tokens = request.argument.trim().split(/\s+/).filter(Boolean);
+      const target = env.dom.focused();
       let handled = false;
       for (const token of tokens) {
         /*
@@ -162,9 +191,19 @@ export function runVerb(
          * reads canonical modifier names, so an unnormalised "mod+2" becomes a
          * bare "2" with no ⌘ held and matches nothing.
          */
-        handled = env.keymap.handle(keyEventFromToken(normalizeToken(token, mod))) || handled;
+        const event = { ...keyEventFromToken(normalizeToken(token, mod)), target };
+        handled = env.keymap.handle(event) || handled;
       }
-      return { ok: true, verb: "key", binding: request.argument, handled };
+      return {
+        ok: true,
+        verb: "key",
+        binding: request.argument,
+        handled,
+        // Which world the key was pressed in. A binding that "did nothing" and
+        // a binding that was filtered because the caret is in a text field are
+        // different findings, and this is the difference.
+        focused: describeFocus(target),
+      };
     }
 
     case "click": {
@@ -204,7 +243,17 @@ export function describeUi(ui: QaUiSource, dom: QaDom): QaUiReport {
     overlays: ui.overlays,
     overlay: dom.overlay(),
     rows: dom.count("[data-thread-id]"),
+    focused: describeFocus(dom.focused()),
   };
+}
+
+/** `TAG`, or `TAG[accessible name]` when the element carries one. */
+export function describeFocus(
+  target: (EventTargetLike & { name?: string }) | null,
+): string | null {
+  if (!target) return null;
+  const tag = (target.tagName ?? "?").toUpperCase();
+  return target.name ? `${tag}[${target.name}]` : tag;
 }
 
 // ===========================================================================
@@ -240,6 +289,19 @@ export function browserDom(doc: Document): QaDom {
       const named = labelledBy ? doc.getElementById(labelledBy) : null;
       const name = named?.textContent ?? top.getAttribute("aria-label") ?? "";
       return name.trim() || "dialog";
+    },
+
+    focused() {
+      const element = doc.activeElement as HTMLElement | null;
+      // No focus at all reads as `<body>` in every engine. Reporting that as a
+      // target would be a lie of a different shape — `isTypingTarget` would say
+      // "not typing", which is true, but the caret being nowhere is the finding.
+      if (!element || element === doc.body) return null;
+      return {
+        tagName: element.tagName,
+        isContentEditable: element.isContentEditable,
+        name: element.getAttribute("aria-label") ?? undefined,
+      };
     },
   };
 }
@@ -302,7 +364,7 @@ export function connectQaBridge(options: QaBridgeOptions): () => void {
 }
 
 function emptyDom(): QaDom {
-  return { click: () => false, count: () => 0, overlay: () => null };
+  return { click: () => false, count: () => 0, overlay: () => null, focused: () => null };
 }
 
 async function defaultSubscribe(

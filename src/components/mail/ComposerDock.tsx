@@ -52,6 +52,7 @@ import {
   sendDraft,
   setAttachmentInline,
   undoSend,
+  visibleComposer,
   withCidReferences,
   type Autosave,
   type Draft,
@@ -764,12 +765,23 @@ export function ComposerDock() {
    * Derived here rather than at the render because the resize keys are gated on
    * it: they belong to a composer that is actually in the dock.
    */
-  const visible =
-    draft && (draft.kind === "new" || draft.threadId == null || draft.threadId === threadId)
-      ? draft
-      : null;
+  const visible = visibleComposer(draft, threadId);
   const poppedOut = visible !== null && isPoppedOut(popped, visible.id);
   const docked = visible !== null && composerPlacement(visible.kind, poppedOut) === "dock";
+
+  /**
+   * Put the caret back where the message is being written.
+   *
+   * The same choice the composer makes when it opens — the address field while
+   * there is nobody to send to, the message once there is — because arriving
+   * from `r` should land in the same place either way. Read from the refs the
+   * dock already holds rather than through a prop, since which one is on screen
+   * is this component's own question.
+   */
+  const focusComposer = useCallback(() => {
+    if (visible && visible.to.length === 0 && toField.current) toField.current.focus();
+    else bodyEditor.current?.focus();
+  }, [visible]);
 
   useKeyBindings([
     /*
@@ -820,29 +832,51 @@ export function ComposerDock() {
       when: () => active,
       handler: () => openNew(),
     },
+    /*
+     * `r`, `a`, `f` — and what they mean when a composer is already up.
+     *
+     * These were gated on `draft === null`: no composer open anywhere. That was
+     * true when there could only be one, and it stopped being true when the
+     * strip arrived. A reply left open on one conversation made all three keys
+     * dead on *every other* conversation, silently, with the footer under the
+     * message still offering them by name — and the composer causing it was not
+     * even on screen, because the dock only draws the one belonging to the
+     * thread being read.
+     *
+     * So the gate is now about this thread rather than about drafts in general.
+     * `openDraft` is what makes that safe: it refuses a second composer for a
+     * thread that already has one, so `r` here can never produce two editors
+     * over one draft row.
+     *
+     * When this thread's composer *is* on screen, the key stops being "reply"
+     * and becomes the way back into it. That is the only keyboard route there
+     * is: ⇥ deliberately steps between the rail and the list rather than into
+     * a half-written message, so a caret that has left the composer — one click
+     * in the list does it — could otherwise only be put back with the mouse.
+     */
     {
       keys: COMPOSER_KEYS.reply,
       group: "Write",
       description: "Reply",
       priority: 5,
-      when: () => active && draft === null,
-      handler: () => open("reply"),
+      when: () => active,
+      handler: () => (visible ? focusComposer() : open("reply")),
     },
     {
       keys: COMPOSER_KEYS.replyAll,
       group: "Write",
       description: "Reply all",
       priority: 5,
-      when: () => active && draft === null,
-      handler: () => open("replyAll"),
+      when: () => active,
+      handler: () => (visible ? focusComposer() : open("replyAll")),
     },
     {
       keys: COMPOSER_KEYS.forward,
       group: "Write",
       description: "Forward",
       priority: 5,
-      when: () => active && draft === null,
-      handler: () => open("forward"),
+      when: () => active,
+      handler: () => (visible ? focusComposer() : open("forward")),
     },
     {
       keys: COMPOSER_KEYS.undoSend,
@@ -867,7 +901,9 @@ export function ComposerDock() {
       group: "Write",
       description: "Discard the draft in this conversation",
       priority: 5,
-      when: () => active && draft === null && threadDraft,
+      // Same correction as `r` above: about this conversation's composer, not
+      // about whether any composer anywhere happens to be open.
+      when: () => active && visible === null && threadDraft,
       handler: () => void discardThreadDraft(),
     },
   ]);

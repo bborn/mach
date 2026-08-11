@@ -297,6 +297,65 @@ try {
       break;
     }
 
+    /*
+     * Typing, as the engine understands it.
+     *
+     * `key` above dispatches a KeyboardEvent from script, which every listener
+     * sees and which edits nothing: a synthetic event is not trusted, so no
+     * character is inserted, no character is deleted, and Enter makes no line.
+     * That is fine for asking what a *binding* does and useless for asking
+     * whether the composer can be written in — the question that arrived as "I
+     * can't even use it, backspace doesn't work" and that no harness here could
+     * answer.
+     *
+     * `Input.dispatchKeyEvent` goes in at the browser's own input layer, so the
+     * editor is edited for real. Text goes in through `Input.insertText`, which
+     * is what the IME path does and is far faster than a keystroke per letter.
+     *
+     *   bun scripts/webqa.ts type 'hello'
+     *   bun scripts/webqa.ts press Enter
+     *   bun scripts/webqa.ts press Backspace
+     */
+    case "type": {
+      const text = rest.join(" ");
+      if (!text) throw new Error("usage: webqa type '<text>'");
+      await cdp("Input.insertText", { text });
+      await Bun.sleep(150);
+      console.log(`typed ${JSON.stringify(text)}`);
+      break;
+    }
+
+    case "press": {
+      const name = rest[0];
+      if (!name) throw new Error("usage: webqa press <Enter|Backspace|Tab|…>");
+      // The pairs Blink needs to treat a key as pressed. `text` is what makes
+      // Enter insert a line rather than merely being observed.
+      const known: Record<string, { code: string; vk: number; text?: string }> = {
+        Enter: { code: "Enter", vk: 13, text: "\r" },
+        Backspace: { code: "Backspace", vk: 8 },
+        Tab: { code: "Tab", vk: 9 },
+        Delete: { code: "Delete", vk: 46 },
+        Escape: { code: "Escape", vk: 27 },
+        ArrowLeft: { code: "ArrowLeft", vk: 37 },
+        ArrowRight: { code: "ArrowRight", vk: 39 },
+      };
+      const spec = known[name];
+      if (!spec) throw new Error(`press does not know ${name}`);
+      for (const type of ["keyDown", "keyUp"] as const) {
+        await cdp("Input.dispatchKeyEvent", {
+          type,
+          key: name,
+          code: spec.code,
+          windowsVirtualKeyCode: spec.vk,
+          nativeVirtualKeyCode: spec.vk,
+          ...(type === "keyDown" && spec.text ? { text: spec.text } : {}),
+        });
+      }
+      await Bun.sleep(150);
+      console.log(`pressed ${name}`);
+      break;
+    }
+
     case "reload": {
       // Reload holds one socket open across the navigation, because that is
       // the only way to hear the load itself. Every other command opens a

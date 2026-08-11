@@ -14,8 +14,10 @@ import {
   markdownToHtml,
   parseRecipients,
   prepareDraft,
+  replyKeyAim,
   replyRecipients,
   replySubject,
+  visibleComposer,
   forwardRecipients,
   forwardSubject,
   scheduleOptions,
@@ -680,5 +682,60 @@ describe("prepare, against the fixture source", () => {
     expect(draft.to).toEqual([]);
     expect(draft.cc).toEqual([]);
     expect(draft.subject).toBe("Fwd: Re: Series A data room — a few gaps");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Which composer the reply keys are asking about                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The bug this is here to stop coming back.
+ *
+ * `r`, `a` and `f` were gated on "no composer is open anywhere". That held while
+ * there could only be one; the tab strip made it false. A reply left open on one
+ * conversation made all three dead on *every other* conversation — and the
+ * composer responsible was not on screen to explain itself, because a reply is
+ * only ever drawn inside its own thread. The footer under the message went on
+ * offering "R reply · A reply all · F forward" the whole time.
+ *
+ * Reproduced in the real window before it was fixed: open a reply on one thread,
+ * click another in the list, press r — the key reported itself unhandled and
+ * nothing happened.
+ */
+describe("the composer a reply key is asking about", () => {
+  const reply = (threadId: number | null) => ({ kind: "reply" as DraftKind, threadId });
+
+  it("is nothing when the open reply belongs to another conversation", () => {
+    expect(visibleComposer(reply(41774), 28594)).toBeNull();
+  });
+
+  it("so r on that conversation opens its own reply", () => {
+    expect(replyKeyAim(visibleComposer(reply(41774), 28594))).toBe("open");
+  });
+
+  it("is the reply when it belongs to the conversation being read", () => {
+    expect(visibleComposer(reply(28594), 28594)).not.toBeNull();
+  });
+
+  /*
+   * The other half of the fix: with this thread's composer up, `r` is the way
+   * back into it. ⇥ steps between the rail and the list rather than into a
+   * half-written message, so a caret knocked out of the composer by a click in
+   * the list had no keyboard route home at all.
+   */
+  it("so r there puts the caret back in it", () => {
+    expect(replyKeyAim(visibleComposer(reply(28594), 28594))).toBe("focus");
+  });
+
+  it("shows a new message wherever you are", () => {
+    const fresh = { kind: "new" as DraftKind, threadId: null };
+    expect(visibleComposer(fresh, 28594)).not.toBeNull();
+    expect(visibleComposer(fresh, null)).not.toBeNull();
+  });
+
+  it("is nothing when no composer is open", () => {
+    expect(visibleComposer(null, 28594)).toBeNull();
+    expect(replyKeyAim(null)).toBe("open");
   });
 });

@@ -1236,6 +1236,42 @@ export const COMPOSER_KEYS = {
 } as const;
 
 /**
+ * Which of the open composers belongs on screen beside this conversation.
+ *
+ * A new message floats over the window and is shown wherever you are. A reply
+ * is drawn only inside its own thread: under somebody else's it would read as a
+ * reply to *that*.
+ *
+ * Lives here rather than inline in the dock because `r`, `a` and `f` are gated
+ * on it, and the gate is where this went wrong. They used to ask whether *any*
+ * composer was open — which meant a reply left on one conversation killed all
+ * three keys on every other one, silently, while the footer under the message
+ * went on offering them by name. The question a reply key has to ask is about
+ * the conversation in front of it, and this is that question.
+ */
+export function visibleComposer<T extends { kind: DraftKind; threadId?: number | null }>(
+  draft: T | null,
+  threadId: number | null,
+): T | null {
+  if (!draft) return null;
+  const belongs =
+    draft.kind === "new" || draft.threadId == null || draft.threadId === threadId;
+  return belongs ? draft : null;
+}
+
+/**
+ * What `r` does, given what is already on screen.
+ *
+ * `focus` rather than nothing when this conversation's composer is up: it is
+ * the only keyboard route back into a half-written message. ⇥ steps between the
+ * rail and the list on purpose, so a caret knocked out of the composer by one
+ * click in the list had no way home.
+ */
+export function replyKeyAim(visible: unknown): "focus" | "open" {
+  return visible ? "focus" : "open";
+}
+
+/**
  * The marker the composer's root carries, so the shell can tell where the
  * keyboard is.
  */
