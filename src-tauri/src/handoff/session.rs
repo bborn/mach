@@ -8,13 +8,23 @@
 //! return. This is the third answer — the same [`LaunchPlan`], run on a
 //! pseudo-terminal Mach owns, with a pane in the window as its screen.
 //!
-//! # One at a time
+//! # Several at a time
 //!
-//! [`Sessions`] holds an `Option`, not a map. The pane is a place rather than a
-//! tab strip: there is one of it, and starting a second session while one is
-//! running is refused with the name of the one that is in the way rather than
-//! silently backgrounding it. That is the whole concurrency model, and keeping
-//! it that small is what makes the reaping below provable.
+//! [`Sessions`] holds a list, capped at [`MAX_SESSIONS`]. The pane is a tab
+//! strip: each session has its own pty, its own scrollback, its own resolved
+//! prompt and its own reaping, and the ceiling is refused by number rather than
+//! by silently backgrounding anything. The reaping guarantees below are stated
+//! per session and hold for all of them at once — [`Sessions::close_all`] reaps
+//! every one, and the third guarantee never involved Mach running code anyway.
+//!
+//! # What a session was given
+//!
+//! A session can be handed things it must not outlive — the tool server in
+//! [`crate::ipc::agent::engine::mcp`] is one, and its bearer token is why. Those arrive as
+//! [`SessionResource`]s, are held in [`Live`], and are dropped by [`reap`] after
+//! the process is dead. There is no other way to release one, which is what
+//! makes "the token dies with the pane" a property of the type rather than of
+//! remembering to call something.
 //!
 //! # How the process dies
 //!
@@ -45,16 +55,24 @@
 //!   at [`MAX_PENDING_BYTES`]. Past the cap the *oldest* bytes go, because the
 //!   newest are the ones still on screen, and the count of what was dropped
 //!   travels with the next chunk so the pane can say so;
-//! * the **flusher** wakes every [`FLUSH_INTERVAL`] and emits whatever is
-//!   there, once. So the webview sees at most one event per frame, of at most
-//!   64 KiB, whatever the process does.
+//! * the **flusher** wakes every [`FLUSH_INTERVAL`] and emits at most this
+//!   session's *share* of the budget, once.
+//!
+//! The share is the second half, and it is what stops four tabs being four
+//! floods. The budget is [`MAX_PENDING_BYTES`] per frame for the window, not per
+//! session, so a session's share is that divided by however many are live: one
+//! session may emit 64 KiB per frame, four may emit 16 KiB each, and the number
+//! of bytes the webview is asked to decode and paint in a frame is the same
+//! either way. What a share does not cover stays in the buffer, ages, and is
+//! dropped from the front by the cap above — which is the same rule as before:
+//! the newest bytes are the ones on screen.
 //!
 //! Backpressure does the rest: a process that outruns the reader fills the
 //! kernel's pty buffer and blocks in `write`, which is exactly what happens to
 //! `yes` in a real terminal that is not being read fast enough.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,9 +96,18 @@ pub const MAX_ROWS: u16 = 400;
 /// One frame. The pane is redrawn at most this often however loud the process.
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 
-/// The most output that can be waiting for the next flush. Past this the oldest
-/// bytes are dropped — see the module doc.
+/// The most output that can be waiting for the next flush, per session, and the
+/// whole window's budget for one frame. Past this the oldest bytes are dropped —
+/// see the module doc.
 pub const MAX_PENDING_BYTES: usize = 64 * 1024;
+
+/// How many sessions the pane will hold.
+///
+/// Four, because that is how many tabs fit across the strip at a readable width
+/// and because every one of them is a pty, a reader thread, a flusher thread and
+/// a share of one frame's budget. A fifth is refused by number; nothing is
+/// closed to make room for it.
+pub const MAX_SESSIONS: usize = 4;
 
 /// The most one keystroke or paste may carry into the pty.
 pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
@@ -101,6 +128,17 @@ pub trait SessionSink: Send + Sync + 'static {
     fn exited(&self, session_id: &str, status: Option<i32>);
 }
 
+/// Something a session was given that must not outlive it.
+///
+/// The one implementation that matters holds the MCP listener and the file its
+/// bearer token is written to; dropping it closes the port and deletes the file.
+/// Held in [`Live`] and dropped by [`reap`], so the only way to release it is the
+/// same three-guarantee path the process itself dies on.
+pub trait SessionResource: Send + Sync {
+    /// One word for the pane's header. Never more than a label.
+    fn label(&self) -> String;
+}
+
 /// What starting one costs the caller to know about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Started {
@@ -112,6 +150,9 @@ pub struct Started {
     /// The prompt the process was started with, exactly as it was passed.
     pub prompt: String,
     pub context_file: String,
+    /// What this session was handed of Mach itself, by label. Empty for a
+    /// target that was given nothing.
+    pub resources: Vec<String>,
 }
 
 /// The buffer between the reader and the flusher.
@@ -132,7 +173,6 @@ struct Live {
     /// with nothing on screen pointing at it.
     started: Started,
     id: String,
-    target_name: String,
     /// Kept so the pane can be resized, and — more importantly — so that
     /// dropping this struct closes the master and hangs the process up.
     master: Box<dyn MasterPty + Send>,
@@ -142,12 +182,19 @@ struct Live {
     /// calls `setsid` before `exec`, so the child leads both.
     pid: Option<u32>,
     stop: Arc<AtomicBool>,
+    /// What this session was given. Dropped by [`reap`], after the process is
+    /// gone, and never anywhere else.
+    resources: Vec<Box<dyn SessionResource>>,
 }
 
-/// The one session there can be, and the operations on it.
+/// Every session there is, and the operations on them.
 #[derive(Default)]
 pub struct Sessions {
-    live: Mutex<Option<Live>>,
+    live: Mutex<Vec<Live>>,
+    /// How many are running, read by every flusher to work out its share of one
+    /// frame. An atomic rather than a lock because it is read on a timer by one
+    /// thread per session and written twice per session lifetime.
+    count: Arc<AtomicUsize>,
 }
 
 impl Sessions {
@@ -160,18 +207,22 @@ impl Sessions {
     /// The plan is the same one terminal and inline mode use, so argv, the
     /// working directory, the environment and the prompt are resolved in
     /// exactly one place for all three modes.
+    ///
+    /// `resources` is whatever this session was given that must die with it. It
+    /// is taken by value and never handed back, so a caller cannot hold a copy.
     pub fn open<S: SessionSink>(
         &self,
         plan: &LaunchPlan,
         cols: u16,
         rows: u16,
         sink: Arc<S>,
+        resources: Vec<Box<dyn SessionResource>>,
     ) -> Result<Started, HandoffError> {
         let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = slot.as_ref() {
+        if slot.len() >= MAX_SESSIONS {
             return Err(HandoffError::Io(format!(
-                "{} is already running in the session pane — close it first",
-                existing.target_name
+                "{MAX_SESSIONS} sessions are open, which is as many as the pane holds — \
+                 close one before starting another"
             )));
         }
 
@@ -234,6 +285,7 @@ impl Sessions {
             Arc::clone(&pending),
             Arc::clone(&stop),
             Arc::clone(&sink),
+            Arc::clone(&self.count),
         );
 
         let started = Started {
@@ -243,30 +295,41 @@ impl Sessions {
             dir: plan.dir.to_string_lossy().into_owned(),
             prompt: plan.prompt.clone(),
             context_file: plan.context_file.to_string_lossy().into_owned(),
+            resources: resources.iter().map(|r| r.label()).collect(),
         };
 
-        *slot = Some(Live {
+        slot.push(Live {
             started: started.clone(),
             id,
-            target_name: plan.target_name.clone(),
             master: pair.master,
             writer,
             killer,
             pid,
             stop,
+            resources,
         });
+        self.count.store(slot.len(), Ordering::Relaxed);
 
         Ok(started)
     }
 
-    /// The session that is running, if there is one.
+    /// Every session that is running, in the order they were started.
     ///
-    /// For a webview that has just loaded and does not know whether it is the
-    /// first one. Push, not poll: this is asked once on mount, exactly as
+    /// For a webview that has just loaded and does not know what it is looking
+    /// at. Push, not poll: this is asked once on mount, exactly as
     /// `agent_sessions` is, and everything after it arrives on the event.
-    pub fn current(&self) -> Option<Started> {
+    pub fn list(&self) -> Vec<Started> {
         let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        slot.as_ref().map(|live| live.started.clone())
+        slot.iter().map(|live| live.started.clone()).collect()
+    }
+
+    /// How many are running.
+    pub fn len(&self) -> usize {
+        self.live.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Keystrokes, or a paste. Bytes, verbatim, with no interpretation.
@@ -278,7 +341,10 @@ impl Sessions {
             )));
         }
         let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        let live = slot.as_mut().filter(|live| live.id == session_id).ok_or_else(no_session)?;
+        let live = slot
+            .iter_mut()
+            .find(|live| live.id == session_id)
+            .ok_or_else(no_session)?;
         live.writer
             .write_all(data)
             .and_then(|()| live.writer.flush())
@@ -289,7 +355,10 @@ impl Sessions {
     /// and the `SIGWINCH` that the ioctl produces is how they find out.
     pub fn resize(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), HandoffError> {
         let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        let live = slot.as_ref().filter(|live| live.id == session_id).ok_or_else(no_session)?;
+        let live = slot
+            .iter()
+            .find(|live| live.id == session_id)
+            .ok_or_else(no_session)?;
         live.master
             .resize(PtySize {
                 cols: clamp(cols, MIN_COLS, MAX_COLS, DEFAULT_COLS),
@@ -300,34 +369,39 @@ impl Sessions {
             .map_err(|e| HandoffError::Io(format!("could not resize the session: {e}")))
     }
 
-    /// Whether this id is the session that is running.
+    /// Whether this id names a session that is running.
     pub fn is_live(&self, session_id: &str) -> bool {
         let slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        slot.as_ref().is_some_and(|live| live.id == session_id)
+        slot.iter().any(|live| live.id == session_id)
     }
 
-    /// End it. Idempotent, and safe to call for a session that has already
-    /// exited on its own.
+    /// End one. Idempotent, and safe to call for a session that has already
+    /// exited on its own. The others carry on.
     pub fn close(&self, session_id: &str) {
         let taken = {
             let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-            match slot.as_ref() {
-                Some(live) if live.id == session_id => slot.take(),
-                _ => None,
-            }
+            let taken = slot
+                .iter()
+                .position(|live| live.id == session_id)
+                .map(|index| slot.remove(index));
+            self.count.store(slot.len(), Ordering::Relaxed);
+            taken
         };
         if let Some(live) = taken {
             reap(live);
         }
     }
 
-    /// Everything, for the app going away. See guarantee 2 in the module doc.
+    /// Every one of them, for the app going away. See guarantee 2 in the module
+    /// doc — it is the same path, run once per session.
     pub fn close_all(&self) {
         let taken = {
             let mut slot = self.live.lock().unwrap_or_else(|e| e.into_inner());
-            slot.take()
+            let taken = std::mem::take(&mut *slot);
+            self.count.store(0, Ordering::Relaxed);
+            taken
         };
-        if let Some(live) = taken {
+        for live in taken {
             reap(live);
         }
     }
@@ -337,17 +411,18 @@ fn no_session() -> HandoffError {
     HandoffError::Io("that session is no longer running".into())
 }
 
-/// `SIGHUP` the group, close the pty, and `SIGKILL` anything still there.
+/// `SIGHUP` the group, close the pty, `SIGKILL` anything still there, and only
+/// then let go of what the session was holding.
 fn reap(live: Live) {
     let Live {
         started: _,
         id: _,
-        target_name: _,
         master,
         writer,
         mut killer,
         pid,
         stop,
+        resources,
     } = live;
 
     // The flusher stops emitting for a pane that is gone. Doing this first
@@ -364,15 +439,24 @@ fn reap(live: Live) {
     drop(writer);
     drop(master);
 
-    let Some(pid) = pid else { return };
-    let deadline = Instant::now() + KILL_GRACE;
-    while Instant::now() < deadline {
-        if !group_exists(pid) {
-            return;
+    if let Some(pid) = pid {
+        let deadline = Instant::now() + KILL_GRACE;
+        loop {
+            if !group_exists(pid) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                signal_group(Some(pid), libc::SIGKILL);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        std::thread::sleep(Duration::from_millis(25));
     }
-    signal_group(Some(pid), libc::SIGKILL);
+
+    // Last, and only here. A token that could still be used by something the
+    // pty was holding open would not have died with the pane; by this line
+    // there is nothing left in the process group to use it.
+    drop(resources);
 }
 
 /// `kill(-pid, signal)` — the process group the child leads.
@@ -435,12 +519,18 @@ fn spawn_reader(
     });
 }
 
-/// Emit at most one chunk per frame, and the ending after the last of them.
+/// Emit at most this session's share of one frame, and the ending after the last
+/// of them.
+///
+/// `live` is how many sessions are running, which is what the share is divided
+/// by. It is read every tick rather than captured, so closing three tabs gives
+/// the fourth the whole budget back without anything being rebuilt.
 fn spawn_flusher<S: SessionSink>(
     id: String,
     pending: Arc<Mutex<Pending>>,
     stop: Arc<AtomicBool>,
     sink: Arc<S>,
+    live: Arc<AtomicUsize>,
 ) {
     std::thread::spawn(move || loop {
         std::thread::sleep(FLUSH_INTERVAL);
@@ -448,12 +538,15 @@ fn spawn_flusher<S: SessionSink>(
             return;
         }
 
-        let (bytes, dropped, done, status) = {
+        let share = share_of_budget(live.load(Ordering::Relaxed));
+        let (bytes, dropped, drained, status) = {
             let mut slot = pending.lock().unwrap_or_else(|e| e.into_inner());
+            let take = slot.bytes.len().min(share);
+            let bytes: Vec<u8> = slot.bytes.drain(..take).collect();
             (
-                std::mem::take(&mut slot.bytes),
+                bytes,
                 std::mem::take(&mut slot.dropped),
-                slot.done,
+                slot.done && slot.bytes.is_empty(),
                 slot.status,
             )
         };
@@ -461,14 +554,20 @@ fn spawn_flusher<S: SessionSink>(
         if !bytes.is_empty() || dropped > 0 {
             sink.output(&id, bytes, dropped);
         }
-        if done {
-            // The reader sets `done` after its last append, and this drained
-            // that append above, so the pane has seen everything the process
-            // wrote before it is told the process is gone.
+        if drained {
+            // The reader sets `done` after its last append, and this drains the
+            // buffer before reporting it, so the pane has seen everything the
+            // process wrote before it is told the process is gone.
             sink.exited(&id, status);
             return;
         }
     });
+}
+
+/// One session's slice of one frame. Never zero, or a lone session with a full
+/// buffer would never drain.
+fn share_of_budget(live: usize) -> usize {
+    MAX_PENDING_BYTES / live.max(1)
 }
 
 fn clamp(value: u16, min: u16, max: u16, fallback: u16) -> u16 {
@@ -498,6 +597,16 @@ mod tests {
         assert_eq!(clamp(1, MIN_COLS, MAX_COLS, DEFAULT_COLS), MIN_COLS);
         assert_eq!(clamp(9999, MIN_COLS, MAX_COLS, DEFAULT_COLS), MAX_COLS);
         assert_eq!(clamp(80, MIN_COLS, MAX_COLS, DEFAULT_COLS), 80);
+    }
+
+    #[test]
+    fn the_frame_budget_is_the_windows_rather_than_each_sessions() {
+        // Four tabs must not be four floods: whatever is live, the bytes handed
+        // to the webview in one frame add up to the same number.
+        assert_eq!(share_of_budget(0), MAX_PENDING_BYTES);
+        assert_eq!(share_of_budget(1), MAX_PENDING_BYTES);
+        assert_eq!(share_of_budget(4) * 4, MAX_PENDING_BYTES);
+        assert!(share_of_budget(MAX_SESSIONS) > 0);
     }
 
     #[test]

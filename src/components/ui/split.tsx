@@ -199,21 +199,7 @@ export function Pane({ children, className, width }: PaneProps) {
   );
 }
 
-/**
- * The pane that takes whatever is left.
- *
- * Takes the rest of a div's attributes so a consumer can mark it — the mail
- * column carries `data-mach-reading-column`, which is how the composer inside it
- * measures the room it actually has. See `composer-layout`.
- */
-export function FlexPane({
-  children,
-  className,
-  ...rest
-}: React.HTMLAttributes<HTMLDivElement>) {
-  return (
-    <div className={cn("flex min-h-0 min-w-0 flex-1 flex-col", className)} {...rest}>
-      {children}
-    </div>
-  );
+/** The pane that takes whatever is left. */
+export function FlexPane({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <div className={cn("flex min-h-0 min-w-0 flex-1 flex-col", className)}>{children}</div>;
 }

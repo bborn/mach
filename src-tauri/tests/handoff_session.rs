@@ -16,14 +16,21 @@
 //! * [`a_flood_of_output_stays_bounded`] runs `yes` and counts what came out
 //!   the other end. The pane is a webview; a process that can write a gigabyte
 //!   a second must not be able to send a gigabyte a second of Tauri events.
+//!   [`several_floods_share_one_windows_worth_of_budget`] is the same claim with
+//!   the tab strip full, which is the one that would otherwise multiply.
+//!
+//! And [`what_a_session_was_given_dies_with_it`] is the property the tool server
+//! rests on: a resource handed to a session is dropped by the same three paths
+//! the process dies on, and by nothing else.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mach_lib::ipc::handoff::engine::context::HandoffSource;
 use mach_lib::ipc::handoff::engine::plan::LaunchPlan;
 use mach_lib::ipc::handoff::engine::session::{
-    SessionSink, Sessions, MAX_PENDING_BYTES,
+    SessionResource, SessionSink, Sessions, MAX_PENDING_BYTES, MAX_SESSIONS,
 };
 use mach_lib::ipc::handoff::engine::target::{HandoffMode, HandoffTarget};
 use mach_lib::ipc::handoff::engine::{context, new_tag};
@@ -57,6 +64,12 @@ impl Recorder {
             out.extend_from_slice(bytes);
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Forget everything so far. For a measurement that must start after the
+    /// thing being measured has settled.
+    fn clear(&self) {
+        self.chunks.lock().unwrap().clear();
     }
 
     fn dropped(&self) -> u64 {
@@ -117,11 +130,31 @@ fn plan(run: &str, note: &str) -> LaunchPlan {
 fn open(run: &str, note: &str) -> (Sessions, Arc<Recorder>, String) {
     let sessions = Sessions::new();
     let sink = Arc::new(Recorder::default());
-    let plan = plan(run, note);
-    let started = sessions
-        .open(&plan, 80, 24, Arc::clone(&sink))
-        .expect("the session must start");
-    (sessions, sink, started.session_id)
+    let id = start(&sessions, run, note, Arc::clone(&sink));
+    (sessions, sink, id)
+}
+
+/// Another session in an existing registry — a second tab.
+fn start(sessions: &Sessions, run: &str, note: &str, sink: Arc<Recorder>) -> String {
+    sessions
+        .open(&plan(run, note), 80, 24, sink, Vec::new())
+        .expect("the session must start")
+        .session_id
+}
+
+/// Something a session was given. Says so when it is dropped.
+struct Held(Arc<AtomicUsize>);
+
+impl SessionResource for Held {
+    fn label(&self) -> String {
+        "Mach's tools".to_string()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// Whether any process is left in the group `pid` leads.
@@ -357,49 +390,266 @@ fn a_paste_larger_than_the_limit_is_refused_rather_than_forwarded() {
     sessions.close(&id);
 }
 
+#[test]
+fn several_floods_share_one_windows_worth_of_budget() {
+    // The whole reason a tab strip is not four times the flood. Three `yes`
+    // processes, all shouting; the number of bytes the webview is handed per
+    // frame is the window's budget, divided, not multiplied.
+    let sessions = Sessions::new();
+    let sinks: Vec<Arc<Recorder>> = (0..3).map(|_| Arc::new(Recorder::default())).collect();
+    let ids: Vec<String> = sinks
+        .iter()
+        .map(|sink| {
+            start(
+                &sessions,
+                r#"/usr/bin/yes 0123456789abcdefghijklmnopqrstuvwxyz"#,
+                "flood",
+                Arc::clone(sink),
+            )
+        })
+        .collect();
+
+    // The share is read per tick, so a session that is alone for the first
+    // millisecond of its life legitimately gets the whole budget for it. The
+    // claim is about three sessions running, so the measurement starts once
+    // three are.
+    std::thread::sleep(Duration::from_millis(150));
+    for sink in &sinks {
+        sink.clear();
+    }
+
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Read before closing, for the same reason: closing the first two puts the
+    // third back on the whole budget, which is correct and is not what is being
+    // measured.
+    let measured: Vec<Vec<usize>> = sinks
+        .iter()
+        .map(|sink| {
+            let chunks = sink.chunks.lock().unwrap();
+            chunks.iter().map(|(bytes, _)| bytes.len()).collect()
+        })
+        .collect();
+    for id in &ids {
+        sessions.close(id);
+    }
+
+    let mut total = 0usize;
+    for sizes in &measured {
+        assert!(!sizes.is_empty(), "each session must produce something");
+        for size in sizes {
+            assert!(
+                *size <= MAX_PENDING_BYTES / 3,
+                "a chunk of {size} bytes is more than this session's share of a frame"
+            );
+        }
+        total += sizes.iter().sum::<usize>();
+    }
+
+    // 400ms is 25 frames; three sessions at 64 KiB per frame between them is
+    // about 1.6 MB. Doubled for a loaded machine — the assertion that matters
+    // is that this is not three times the single-session number, which `yes`
+    // would otherwise make hundreds of megabytes.
+    assert!(
+        total <= 4 * 1024 * 1024,
+        "{total} bytes in 400ms across three sessions is a firehose aimed at the webview"
+    );
+}
+
 // ---------------------------------------------------------------------------
-// One at a time
+// Several at a time
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_second_session_is_refused_by_name() {
-    let (sessions, _sink, id) = open(r#"/bin/sh -c "sleep 30""#, "hold the pane");
+fn the_ceiling_is_refused_by_number_and_freed_by_closing_one() {
+    let sessions = Sessions::new();
+    let mut ids = Vec::new();
+    for _ in 0..MAX_SESSIONS {
+        ids.push(start(
+            &sessions,
+            r#"/bin/sh -c "sleep 30""#,
+            "hold a tab",
+            Arc::new(Recorder::default()),
+        ));
+    }
+    assert_eq!(sessions.list().len(), MAX_SESSIONS);
 
-    let second = sessions.open(
-        &plan(r#"/bin/sh -c "sleep 30""#, "and another"),
+    let past = sessions.open(
+        &plan(r#"/bin/sh -c "sleep 30""#, "one too many"),
         80,
         24,
         Arc::new(Recorder::default()),
+        Vec::new(),
     );
-    let message = second.expect_err("a second session must be refused").to_string();
+    let message = past.expect_err("the ceiling must refuse").to_string();
     assert!(
-        message.contains("Session") && message.contains("already running"),
-        "the refusal must name what is in the way: {message}"
+        message.contains(&MAX_SESSIONS.to_string()) && message.contains("close one"),
+        "the refusal must say how many and what to do: {message}"
     );
 
-    sessions.close(&id);
-    // And the pane is free again once it is closed.
-    let third = sessions.open(
-        &plan(r#"/bin/echo done"#, "after"),
-        80,
-        24,
-        Arc::new(Recorder::default()),
-    );
-    assert!(third.is_ok(), "closing must free the pane");
+    // Nothing was closed to make room, and closing one makes room.
+    assert_eq!(sessions.list().len(), MAX_SESSIONS);
+    sessions.close(&ids[0]);
+    assert!(sessions
+        .open(
+            &plan(r#"/bin/echo done"#, "after"),
+            80,
+            24,
+            Arc::new(Recorder::default()),
+            Vec::new(),
+        )
+        .is_ok());
+
     sessions.close_all();
 }
 
 #[test]
-fn writing_to_a_session_that_is_not_the_live_one_is_refused() {
-    let (sessions, _sink, id) = open(r#"/bin/sh -c "sleep 30""#, "hold the pane");
+fn each_session_has_its_own_pty_and_closing_one_leaves_the_others() {
+    let sessions = Sessions::new();
+    let first = Arc::new(Recorder::default());
+    let second = Arc::new(Recorder::default());
+    let a = start(
+        &sessions,
+        r#"/bin/sh -c "while read line; do echo a=$line; done""#,
+        "first",
+        Arc::clone(&first),
+    );
+    let b = start(
+        &sessions,
+        r#"/bin/sh -c "while read line; do echo b=$line; done""#,
+        "second",
+        Arc::clone(&second),
+    );
+
+    sessions.write(&a, b"one\n").expect("write to the first");
+    first.wait_for("a=one", Duration::from_secs(5));
+    assert!(first.text().contains("a=one"));
+    assert!(
+        !second.text().contains("one"),
+        "a keystroke must reach the tab it was typed in and no other"
+    );
+
+    sessions.write(&b, b"two\n").expect("write to the second");
+    second.wait_for("b=two", Duration::from_secs(5));
+    assert!(second.text().contains("b=two"));
+
+    // Closing one leaves the other running and writable.
+    sessions.close(&a);
+    assert!(!sessions.is_live(&a));
+    assert!(sessions.is_live(&b), "closing one tab must not close the rest");
+    sessions.write(&b, b"three\n").expect("the survivor still takes keystrokes");
+    second.wait_for("b=three", Duration::from_secs(5));
+    assert!(second.text().contains("b=three"));
+
+    sessions.close_all();
+}
+
+#[test]
+fn the_app_going_away_reaps_every_session_at_once() {
+    let sessions = Sessions::new();
+    let mut pids = Vec::new();
+    for _ in 0..3 {
+        let sink = Arc::new(Recorder::default());
+        start(
+            &sessions,
+            r#"/bin/sh -c "sleep 120 & echo leader=$$; wait""#,
+            "outlive me",
+            Arc::clone(&sink),
+        );
+        let text = sink.wait_for("leader=", Duration::from_secs(5));
+        pids.push(
+            text.split("leader=")
+                .nth(1)
+                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty()))
+                .and_then(|digits| digits.parse::<i32>().ok())
+                .unwrap_or_else(|| panic!("no pid in {text:?}")),
+        );
+    }
+
+    sessions.close_all();
+    for pid in pids {
+        assert!(
+            wait_until_gone(pid, Duration::from_secs(5)),
+            "the app going away must take every session's process group with it"
+        );
+    }
+    assert!(sessions.is_empty());
+}
+
+#[test]
+fn writing_to_a_session_that_is_not_running_is_refused() {
+    let (sessions, _sink, id) = open(r#"/bin/sh -c "sleep 30""#, "hold a tab");
 
     assert!(sessions.is_live(&id));
     assert!(!sessions.is_live("not-a-session"));
     assert!(sessions.write("not-a-session", b"x").is_err());
     assert!(sessions.resize("not-a-session", 80, 24).is_err());
-    // Closing an id that is not the live one must not close the live one.
+    // Closing an id that is not live must not close one that is.
     sessions.close("not-a-session");
     assert!(sessions.is_live(&id));
 
+    sessions.close(&id);
+}
+
+// ---------------------------------------------------------------------------
+// What a session was given
+// ---------------------------------------------------------------------------
+
+#[test]
+fn what_a_session_was_given_dies_with_it() {
+    // The tool server's bearer token is one of these. It must not be releasable
+    // by anything except the paths the process itself dies on, and it must go
+    // for every session when the app quits.
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let sessions = Sessions::new();
+
+    let started = sessions
+        .open(
+            &plan(r#"/bin/sh -c "sleep 30""#, "hold a tab"),
+            80,
+            24,
+            Arc::new(Recorder::default()),
+            vec![Box::new(Held(Arc::clone(&dropped)))],
+        )
+        .expect("the session must start");
+
+    // On the wire, so the tab can say what this session can reach.
+    assert_eq!(started.resources, vec!["Mach's tools".to_string()]);
+    assert_eq!(sessions.list()[0].resources, started.resources);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0, "still running, still held");
+
+    sessions.close(&started.session_id);
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "closing the pane must release what the session was given"
+    );
+
+    // And the other path: the app quitting, with the pane never closed.
+    let second = sessions
+        .open(
+            &plan(r#"/bin/sh -c "sleep 30""#, "and another"),
+            80,
+            24,
+            Arc::new(Recorder::default()),
+            vec![Box::new(Held(Arc::clone(&dropped)))],
+        )
+        .expect("the session must start");
+    assert!(!second.resources.is_empty());
+    sessions.close_all();
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        2,
+        "the app going away must release it too"
+    );
+}
+
+#[test]
+fn a_session_that_was_given_nothing_says_so() {
+    let (sessions, _sink, id) = open(r#"/bin/sh -c "sleep 30""#, "no tools here");
+    assert!(
+        sessions.list()[0].resources.is_empty(),
+        "a target Mach gives nothing to must report nothing"
+    );
     sessions.close(&id);
 }

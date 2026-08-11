@@ -1130,3 +1130,207 @@ async fn a_backend_that_fails_fails_the_session_visibly() {
     let error = engine.session(&session.id).unwrap().error.expect("error");
     assert!(error.contains("no model configured"), "{error}");
 }
+
+// ===========================================================================
+// the handoff session pane
+// ===========================================================================
+
+/// Everything the pane's process says, thrown away. The claim under test is
+/// about the tool port, not the pty.
+struct Silence;
+
+impl mach_lib::ipc::handoff::engine::session::SessionSink for Silence {
+    fn output(&self, _session_id: &str, _bytes: Vec<u8>, _dropped: u64) {}
+    fn exited(&self, _session_id: &str, _status: Option<i32>) {}
+}
+
+/// A session target running something harmless and long-lived.
+fn pane_plan(run: &str) -> mach_lib::ipc::handoff::engine::plan::LaunchPlan {
+    use mach_lib::ipc::handoff::engine::context::HandoffSource;
+    use mach_lib::ipc::handoff::engine::target::{HandoffMode, HandoffTarget};
+
+    let tag = mach_lib::ipc::handoff::engine::new_tag();
+    let context = mach_lib::ipc::handoff::engine::context::build(&HandoffSource::None, &tag);
+    mach_lib::ipc::handoff::engine::plan::LaunchPlan::prepare(
+        &HandoffTarget {
+            id: "pane".into(),
+            name: "OfferLab".into(),
+            dir: std::env::temp_dir().to_string_lossy().into_owned(),
+            run: run.into(),
+            mode: HandoffMode::Session,
+            last_run_at: None,
+        },
+        "read the thread and reply",
+        &context,
+        &tag,
+    )
+    .expect("plan")
+}
+
+/// The pane's whole tool story, without spawning `claude`.
+///
+/// The three claims, in one test because they are one mechanism:
+///
+///  1. what the CLI would be handed — the `--mcp-config` path in its argv —
+///     names a file whose URL and token reach *this* process's tool server;
+///  2. a `send_draft` arriving over that server parks on the owner and sends
+///     nothing, exactly as it does for every other backend. The pane is a
+///     terminal holding mail written by strangers; if this were not true it
+///     would be the most important fact about the feature;
+///  3. closing the pane takes the token with it. The file goes, the port stops
+///     answering, and the parked call comes back refused rather than hanging on
+///     for a click that is never coming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_in_the_pane_gets_the_tools_and_still_cannot_send_alone() {
+    use mach_lib::ipc::handoff::engine::session::Sessions;
+    use mach_lib::ipc::handoff::engine::tools as handoff_tools;
+
+    let harness = Harness::new("pane");
+    let (_account, thread_id) = seed(&harness.db.db);
+
+    // A real draft, so the approval line names a real message.
+    let draft = tools::execute(
+        &harness.tool_context(),
+        "draft_reply",
+        &json!({ "threadId": thread_id, "body": "sending it over now" }),
+    )
+    .await
+    .expect("drafted");
+    let draft_id = draft.payload["draft"]["id"].as_str().unwrap().to_string();
+
+    let engine = Arc::new(
+        AgentEngine::new(
+            harness.db.db.clone(),
+            Arc::clone(&harness.dispatcher),
+            Arc::clone(&harness.outbox),
+            Arc::clone(&harness.plugins),
+            Arc::new(NoModel),
+            Arc::clone(&harness.recorder) as Arc<dyn SessionEmitter>,
+        )
+        .with_workspace(harness.workspace.clone()),
+    );
+
+    // Exactly what `ipc::handoff::attach_tools` builds.
+    let attached = engine.attach("OfferLab (session pane)".into(), "Claude Code".into());
+    let server = McpServer::start(
+        Arc::clone(&attached.gate),
+        tokio::runtime::Handle::current(),
+        &harness.workspace,
+        &attached.snapshot.id,
+    )
+    .expect("tool server");
+    let endpoint = server.endpoint().clone();
+    let attachment =
+        handoff_tools::Attachment::new(server, Arc::clone(&engine), attached.snapshot.id.clone());
+
+    let mut plan = pane_plan(r#"claude "{{prompt}}""#);
+    handoff_tools::wire(
+        &mut plan.argv,
+        attachment.config_path(),
+        &handoff_tools::guidance("OfferLab"),
+    );
+
+    // 1. The config named in argv is the config for the server that is
+    //    listening, in this process, right now.
+    let config_path = plan.argv[2].clone();
+    assert_eq!(plan.argv[1], "--mcp-config");
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config file"))
+            .expect("json");
+    assert_eq!(config["mcpServers"]["mach"]["url"], endpoint.url);
+    assert_eq!(
+        config["mcpServers"]["mach"]["headers"]["Authorization"],
+        format!("Bearer {}", endpoint.token)
+    );
+    let listed = call_tool(&endpoint.url, &endpoint.token, "list_labels", json!({})).await;
+    assert_eq!(listed["result"]["isError"], false, "the server must answer");
+
+    // The session is what holds it, so it dies where the process does. Nothing
+    // here runs `claude` — `sh` stands in for anything on a pty.
+    let sessions = Sessions::new();
+    let started = sessions
+        .open(
+            &pane_plan(r#"/bin/sh -c "sleep 120""#),
+            80,
+            24,
+            Arc::new(Silence),
+            vec![Box::new(attachment)],
+        )
+        .expect("the session must start");
+    assert_eq!(started.resources, vec!["Mach's tools".to_string()]);
+
+    // 2. Send, over MCP, from the pane's own endpoint. Drafting already talked
+    //    to Google, so the claim is that *this* adds nothing to that.
+    let before = harness.google.requests().len();
+    let parked = {
+        let url = endpoint.url.clone();
+        let token = endpoint.token.clone();
+        let draft_id = draft_id.clone();
+        tokio::spawn(async move {
+            call_tool(&url, &token, "send_draft", json!({ "draftId": draft_id })).await
+        })
+    };
+
+    // It parks. Long enough that a send would certainly have gone out.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!parked.is_finished(), "send_draft answered without asking anybody");
+
+    let pending = harness
+        .recorder
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| match event {
+            SessionEvent::Approval { pending, .. } => Some(pending.clone()),
+            _ => None,
+        })
+        .expect("the pane's send must reach the owner as an approval");
+    assert_eq!(pending.name, "send_draft");
+    assert!(
+        pending.summary.contains("Send"),
+        "the prompt must name the consequence: {}",
+        pending.summary
+    );
+    assert_eq!(
+        harness.google.requests().len(),
+        before,
+        "nothing may reach Google before the owner has answered"
+    );
+
+    // 3. Close the pane. The reaping happens off the runtime, as it does in the
+    //    app — `handoff_session_close` is a synchronous command.
+    let id = started.session_id.clone();
+    let closing = tokio::task::spawn_blocking(move || {
+        let at = std::time::Instant::now();
+        sessions.close(&id);
+        (sessions, at.elapsed())
+    });
+    let (sessions, took) = tokio::time::timeout(Duration::from_secs(10), closing)
+        .await
+        .expect("closing the pane must not wait for a click that is never coming")
+        .expect("close");
+    assert!(
+        took < Duration::from_secs(5),
+        "closing took {took:?}; a parked approval must not hold the pane shut"
+    );
+    assert!(sessions.is_empty());
+
+    // The parked call came back refused, and still nothing was sent.
+    let answer = tokio::time::timeout(Duration::from_secs(5), parked)
+        .await
+        .expect("the parked call must be released")
+        .expect("join");
+    assert_eq!(answer["result"]["isError"], true);
+    assert_eq!(
+        harness.google.requests().len(),
+        before,
+        "closing a pane with a send parked in it must not send"
+    );
+
+    // And the token is off the disk.
+    assert!(
+        !std::path::Path::new(&config_path).exists(),
+        "the token outlived the pane"
+    );
+}

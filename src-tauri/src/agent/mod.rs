@@ -85,8 +85,8 @@ pub use context::ContextItem;
 pub use error::AgentError;
 pub use gate::{GateResult, ToolGate};
 pub use session::{
-    AgentEngine, ApprovalDesk, ApprovalOutcome, Entry, Input, PendingApproval, SessionEmitter,
-    SessionEvent, SessionSnapshot, SessionStatus, SessionUi, ToolState,
+    AgentEngine, ApprovalDesk, ApprovalOutcome, Attached, Entry, Input, PendingApproval,
+    SessionEmitter, SessionEvent, SessionSnapshot, SessionStatus, SessionUi, ToolState,
 };
 pub use tools::{Tool, ToolPolicy};
 pub use wire::{ModelCall, ModelTransport, ToolDefinition};

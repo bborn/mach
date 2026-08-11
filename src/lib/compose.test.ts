@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createKeymap, formatBinding, type KeyEventLike } from "./keymap";
+import { createKeymap, type KeyEventLike } from "./keymap";
 import { withHtmlSignature } from "./email-html";
 import {
   bodyAsHtml,
@@ -443,21 +443,6 @@ describe("isDraftEmpty", () => {
     expect(hasWrittenBody(signed)).toBe(false);
   });
 
-  /*
-   * The predicate `ComposerDock.open` resumes a stored reply on.
-   *
-   * It used to ask `hasWrittenBody`, which is a question about prose, and
-   * everything a reply can have done to it before the first sentence is typed
-   * was thrown away on reopen — a retitled subject most of all, now that a
-   * reply has a subject field. A row only exists because something was changed:
-   * autosave queues on change and on nothing else.
-   */
-  it("counts a reply retitled and not yet written as started", () => {
-    const retitled = { ...html("<div><br></div>"), kind: "reply" as const, subject: "Q3 pricing" };
-    expect(hasWrittenBody(retitled)).toBe(false);
-    expect(isDraftEmpty(retitled)).toBe(false);
-  });
-
   it("counts a recipient, a subject or a file as content on their own", () => {
     expect(isDraftEmpty({ ...html(""), to: [{ email: "a@b.c" }] })).toBe(false);
     expect(isDraftEmpty({ ...html(""), subject: "Numbers" })).toBe(false);
@@ -512,17 +497,7 @@ describe("the composer's keys", () => {
     expect(keymap.conflicts()).toEqual([]);
   });
 
-  /*
-   * ⌘K belongs to the palette, including inside a composer.
-   *
-   * The editor used to register the link on ⌘K at priority 210 — above the
-   * palette's 200 — so search, every command and the agent handoff were
-   * unreachable for as long as a draft was open. `conflicts()` never said a
-   * word about it, and could not: it reports same-priority *ties*, and a
-   * priority is a decision. So the guard has to be this, a key pressed with the
-   * caret in the body and an assertion about where it lands.
-   */
-  it("gives ⌘K to the palette with the caret in the message", () => {
+  it("keeps ⌘K for the editor's link only while a composer has it", () => {
     const keymap = createKeymap("meta");
     let palette = 0;
     let link = 0;
@@ -536,47 +511,30 @@ describe("the composer's keys", () => {
     });
     let composing = false;
     keymap.register({
-      keys: COMPOSER_KEYS.link,
+      keys: "mod+k",
       allowInInput: true,
-      priority: 100,
+      priority: 210,
       when: () => composing,
       handler: () => {
         link += 1;
       },
     });
 
-    // The body: a contenteditable, which is what makes every binding without
-    // `allowInInput` stand down.
-    const body = { isContentEditable: true };
-    const cmdK = (): KeyEventLike => ({
+    const press = (): KeyEventLike => ({
       key: "k",
       code: "KeyK",
       metaKey: true,
       ctrlKey: false,
       altKey: false,
       shiftKey: false,
-      target: body,
     });
-    const shiftCmdK = (): KeyEventLike => ({ ...cmdK(), shiftKey: true });
-
-    keymap.handle(cmdK());
+    keymap.handle(press());
     expect([palette, link]).toEqual([1, 0]);
 
     composing = true;
-    keymap.handle(cmdK());
-    expect([palette, link]).toEqual([2, 0]);
-
-    keymap.handle(shiftCmdK());
-    expect([palette, link]).toEqual([2, 1]);
+    keymap.handle(press());
+    expect([palette, link]).toEqual([1, 1]);
     expect(keymap.conflicts()).toEqual([]);
-  });
-
-  // The button is out of the tab sequence on the grounds that every action in
-  // the toolbar has a key and says so, so the tooltip is the only place the
-  // link's key is written down. It is a literal string there; this is what
-  // stops it drifting from the binding it names.
-  it("labels the link button with the key it actually registers", () => {
-    expect(formatBinding(COMPOSER_KEYS.link, "meta")).toBe("⌘⇧K");
   });
 });
 

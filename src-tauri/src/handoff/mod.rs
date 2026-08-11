@@ -59,6 +59,7 @@
 //! | [`context`] | a thread or an event as fenced, untrusted text |
 //! | [`plan`] | argv + environment + files, and the two ways to launch |
 //! | [`session`] | the same plan on a pty Mach owns, and how it is reaped |
+//! | [`tools`] | which session gets Mach's own tools, and what it is told |
 //! | [`terminal`] | which terminal application the terminal path opens |
 //!
 //! Everything that decides anything is a plain function over plain data, so
@@ -70,6 +71,7 @@ pub mod session;
 pub mod target;
 pub mod template;
 pub mod terminal;
+pub mod tools;
 
 pub use context::{HandoffContext, HandoffSource};
 pub use plan::{LaunchPlan, Launched};

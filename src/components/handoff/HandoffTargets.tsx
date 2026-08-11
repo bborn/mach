@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/select";
 
 const MODES: { value: HandoffMode; label: string }[] = [
+  { value: "session", label: "Session" },
   { value: "terminal", label: "Terminal" },
   { value: "inline", label: "Inline" },
 ];
@@ -390,9 +391,11 @@ function TargetRow({
 
       <p className={cn("text-micro", problem ? "text-danger" : "text-faint-foreground")}>
         {problem ??
-          (target.mode === "terminal"
-            ? "Opens a session in your terminal"
-            : "Runs and shows what it printed")}
+          (target.mode === "session"
+            ? "Opens a session in a pane here"
+            : target.mode === "terminal"
+              ? "Opens a session in your terminal"
+              : "Runs and shows what it printed")}
       </p>
     </div>
   );

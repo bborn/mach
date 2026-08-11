@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import {
   closeHandoff,
+  decodeChunk,
   describeTarget,
   draftTarget,
   handoffRequest,
@@ -10,7 +11,13 @@ import {
   noteFromQuery,
   openHandoff,
   rankTargets,
+  activeSessionId,
+  selectSession,
+  sessionsSnapshot,
+  setSessions,
   setTargets,
+  stepSession,
+  subscribeSession,
   targetProblem,
   terminalFromSelection,
   terminalItems,
@@ -248,5 +255,118 @@ describe("the terminal a handoff opens in", () => {
     // "Other" opens a field; what is already there stays there to be edited.
     expect(terminalFromSelection(OTHER_TERMINAL, "iTerm")).toBe("iTerm");
     expect(terminalFromSelection(OTHER_TERMINAL, "")).toBe("");
+  });
+});
+
+/**
+ * The session pane's half of this module.
+ *
+ * The pty, the reaping and the flood cap are Rust's, and
+ * `src-tauri/tests/handoff_session.rs` drives those against real processes.
+ * What is testable here is the wire: the store the dialog writes and the pane
+ * reads, and the decode that turns a chunk back into bytes.
+ */
+describe("the session store", () => {
+  beforeEach(() => setSessions([]));
+  afterAll(() => setSessions([]));
+
+  function session(id: string, name = "Mach") {
+    return {
+      sessionId: id,
+      targetName: name,
+      command: `claude "fix the calendar header"`,
+      dir: "/Users/x/Projects/mach",
+      prompt: "fix the calendar header",
+      contextFile: "/tmp/mach-handoff-abc/context.txt",
+      resources: [] as string[],
+    };
+  }
+
+  it("holds the tabs and tells its subscribers", () => {
+    const seen: (string | null)[] = [];
+    const unsubscribe = subscribeSession(() => seen.push(activeSessionId()));
+
+    setSessions([session("s1")], "s1");
+    expect(sessionsSnapshot()).toHaveLength(1);
+    expect(activeSessionId()).toBe("s1");
+
+    setSessions([session("s1"), session("s2", "OfferLab")], "s2");
+    expect(sessionsSnapshot().map((s) => s.sessionId)).toEqual(["s1", "s2"]);
+    expect(activeSessionId()).toBe("s2");
+
+    unsubscribe();
+    setSessions([]);
+    expect(seen).toEqual(["s1", "s2"]);
+  });
+
+  it("keeps the prompt each tab was handed, so the pane can go on showing it", () => {
+    setSessions([session("s1"), session("s2")]);
+    expect(sessionsSnapshot()[0].prompt).toBe("fix the calendar header");
+  });
+
+  it("says what a tab was given, because a session that can send mail is not the same thing", () => {
+    const withTools = { ...session("s1"), resources: ["Mach's tools"] };
+    setSessions([withTools, session("s2")]);
+    expect(sessionsSnapshot()[0].resources).toEqual(["Mach's tools"]);
+    expect(sessionsSnapshot()[1].resources).toEqual([]);
+  });
+
+  it("steps through the tabs, wrapping at both ends", () => {
+    setSessions([session("s1"), session("s2"), session("s3")], "s1");
+
+    stepSession(1);
+    expect(activeSessionId()).toBe("s2");
+    stepSession(1);
+    stepSession(1);
+    // The end wraps round to the start, and the start back round to the end.
+    expect(activeSessionId()).toBe("s1");
+    stepSession(-1);
+    expect(activeSessionId()).toBe("s3");
+  });
+
+  it("does nothing on a step with one tab, so the key can belong to the sidebar", () => {
+    setSessions([session("s1")], "s1");
+    stepSession(1);
+    expect(activeSessionId()).toBe("s1");
+  });
+
+  it("hands the front to a neighbour when the front tab goes, and leaves the rest alone", () => {
+    setSessions([session("s1"), session("s2"), session("s3")], "s2");
+
+    // The list arriving without s2 is what closing it looks like from here.
+    setSessions([session("s1"), session("s3")]);
+    expect(activeSessionId()).toBe("s3");
+    expect(sessionsSnapshot().map((s) => s.sessionId)).toEqual(["s1", "s3"]);
+  });
+
+  it("keeps the front tab in front when the list is refreshed around it", () => {
+    setSessions([session("s1"), session("s2")], "s1");
+    setSessions([session("s1"), session("s2"), session("s3")]);
+    expect(activeSessionId()).toBe("s1");
+  });
+
+  it("ignores a request to select something that is not a tab", () => {
+    setSessions([session("s1")], "s1");
+    selectSession("s9");
+    expect(activeSessionId()).toBe("s1");
+  });
+
+  it("has no front tab when there are none", () => {
+    setSessions([]);
+    expect(activeSessionId()).toBeNull();
+    expect(sessionsSnapshot()).toEqual([]);
+  });
+});
+
+describe("decodeChunk", () => {
+  it("returns bytes rather than a string", () => {
+    // Output crosses as base64 because a pty carries bytes: escape sequences,
+    // and characters that a chunk boundary can land in the middle of. The
+    // second case below is the first byte of a three-byte character — decoding
+    // it as text here would corrupt it, and handing the emulator the byte lets
+    // it wait for the rest.
+    expect([...decodeChunk("G1swbQ==")]).toEqual([0x1b, 0x5b, 0x30, 0x6d]);
+    expect([...decodeChunk("4g==")]).toEqual([0xe2]);
+    expect([...decodeChunk("")]).toEqual([]);
   });
 });

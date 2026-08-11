@@ -31,7 +31,7 @@ import { isTauri, tauriTransport, toMachError } from "./ipc";
 /* Shapes                                                                      */
 /* -------------------------------------------------------------------------- */
 
-export type HandoffMode = "terminal" | "inline";
+export type HandoffMode = "terminal" | "inline" | "session";
 
 export interface HandoffTarget {
   id: string;
@@ -65,6 +65,29 @@ export interface HandoffPreview {
   contextFile: string;
   unproven: boolean;
 }
+
+/** A session that is running in the pane. One tab. */
+export interface HandoffSession {
+  sessionId: string;
+  targetName: string;
+  /** argv, joined for reading. Nothing runs this string. */
+  command: string;
+  dir: string;
+  /** What the process was started with, exactly. Stays on screen. */
+  prompt: string;
+  contextFile: string;
+  /**
+   * What this session was given of Mach itself — `["Mach's tools"]`, or
+   * nothing. A session that can read and send mail and one that cannot are not
+   * the same thing to have open, so the tab says which.
+   */
+  resources: string[];
+}
+
+/** One thing the running session said. */
+export type HandoffSessionEvent =
+  | { type: "output"; sessionId: string; base64: string; dropped: number }
+  | { type: "exited"; sessionId: string; status: number | null };
 
 /** What a launch is willing to say afterwards. Never an outcome. */
 export interface HandoffReceipt {
@@ -460,6 +483,256 @@ export async function runHandoff(input: {
   // changed on the Rust side. Refresh rather than guess.
   void loadTargets().catch(() => undefined);
   return receipt;
+}
+
+/* -------------------------------------------------------------------------- */
+/* The session pane                                                            */
+/* -------------------------------------------------------------------------- */
+
+/** The one channel a running session speaks on. Mirrors `ipc::handoff`. */
+export const HANDOFF_SESSION_EVENT = "handoff-session";
+
+/**
+ * The tabs, and which one is in front.
+ *
+ * A module store rather than React state for the same reason the target list is
+ * one: the thing that starts a session is the handoff dialog and the thing that
+ * renders it is the pane, and neither is inside the other.
+ *
+ * Rust caps the list; this side never refuses one, it just holds what came
+ * back. Both arrays are replaced rather than mutated, because
+ * `useSyncExternalStore` compares snapshots by identity and a mutated array is
+ * a render that never happens.
+ */
+let sessions: HandoffSession[] = [];
+let activeId: string | null = null;
+const sessionListeners = new Set<() => void>();
+
+export function sessionsSnapshot(): HandoffSession[] {
+  return sessions;
+}
+
+/** The tab in front, or `null` when the pane is empty. */
+export function activeSessionId(): string | null {
+  return activeId;
+}
+
+export function subscribeSession(listener: () => void): () => void {
+  sessionListeners.add(listener);
+  return () => void sessionListeners.delete(listener);
+}
+
+function emitSessions() {
+  for (const listener of [...sessionListeners]) listener();
+}
+
+/**
+ * Replace the list, keeping the front tab in front where it still exists.
+ *
+ * `active` names one explicitly — a session that has just started puts itself
+ * in front. Otherwise the current one stays selected if it survived, and the
+ * last tab takes over if it did not, which is what a browser does.
+ */
+export function setSessions(next: HandoffSession[], active?: string | null): void {
+  sessions = next;
+  const wanted = active === undefined ? activeId : active;
+  activeId =
+    (wanted && next.some((s) => s.sessionId === wanted) ? wanted : null) ??
+    next[next.length - 1]?.sessionId ??
+    null;
+  emitSessions();
+}
+
+/** Bring one tab to the front. A id that is not a tab is ignored. */
+export function selectSession(id: string): void {
+  if (id === activeId || !sessions.some((s) => s.sessionId === id)) return;
+  activeId = id;
+  emitSessions();
+}
+
+/**
+ * The next tab along, wrapping.
+ *
+ * Wrapping rather than stopping at the ends because there are at most four of
+ * them: ⌥⌘→ four times should come back to where it started rather than leave
+ * you wondering whether the key is broken.
+ */
+export function stepSession(delta: number): void {
+  if (sessions.length < 2) return;
+  const at = sessions.findIndex((s) => s.sessionId === activeId);
+  const next = (((at < 0 ? 0 : at) + delta) % sessions.length + sessions.length) % sessions.length;
+  selectSession(sessions[next].sessionId);
+}
+
+/**
+ * Everything the session said before anything was ready to draw it.
+ *
+ * Three things have to happen before the first byte can be painted: the Tauri
+ * listener has to attach, the pane has to mount, and 300 kB of emulator has to
+ * arrive over a dynamic import. The process does not wait for any of them — a
+ * command that prints its banner and exits can be finished before the second
+ * one — and the first time this ran in the real app, the whole of the banner
+ * was gone. So the stream is attached *before* the process is started and
+ * everything it says is kept here until a consumer takes it.
+ */
+let sessionQueue: HandoffSessionEvent[] = [];
+const sessionConsumers = new Map<string, (event: HandoffSessionEvent) => void>();
+let sessionStream: Promise<() => void> | null = null;
+
+/**
+ * How many events may wait for a tab that has not mounted yet.
+ *
+ * Rust caps a chunk at a share of one frame and sends at most one per frame per
+ * session, so an ordinary wait — a mount and one dynamic import — is a handful
+ * of these. The number is here for the tab that never arrives: without it, a
+ * process talking to a pane that failed to render would grow this array
+ * forever.
+ */
+const MAX_QUEUED_EVENTS = 256;
+
+/**
+ * Attach the one listener, once.
+ *
+ * Idempotent and never detached: there is one channel for the life of the
+ * window, whatever is open on it. Every event carries its `sessionId`, which is
+ * how one channel serves four tabs.
+ */
+function ensureSessionStream(): Promise<() => void> {
+  sessionStream ??= listenToSession((event) => {
+    const consumer = sessionConsumers.get(event.sessionId);
+    if (consumer) {
+      consumer(event);
+      return;
+    }
+    sessionQueue.push(event);
+    if (sessionQueue.length > MAX_QUEUED_EVENTS) sessionQueue.shift();
+  });
+  return sessionStream;
+}
+
+/**
+ * Take one session's stream, and everything it has been holding.
+ *
+ * A tab calls this when its emulator exists. Whatever arrived for *that*
+ * session in the meantime is delivered first, in order, before anything live —
+ * a command that prints a banner and exits can be finished before its tab has
+ * mounted, and the first time this ran the whole banner was gone.
+ */
+export function consumeSession(
+  sessionId: string,
+  handler: (event: HandoffSessionEvent) => void,
+): () => void {
+  const waiting = sessionQueue.filter((event) => event.sessionId === sessionId);
+  sessionQueue = sessionQueue.filter((event) => event.sessionId !== sessionId);
+  sessionConsumers.set(sessionId, handler);
+  for (const event of waiting) handler(event);
+  return () => {
+    if (sessionConsumers.get(sessionId) === handler) sessionConsumers.delete(sessionId);
+  };
+}
+
+/** Start the target's command on a pty and give the pane a tab for it. */
+export async function openSession(input: {
+  targetId: string;
+  note: string;
+  source: HandoffSourceRef;
+  cols: number;
+  rows: number;
+}): Promise<HandoffSession> {
+  // Before the process, not after it. See `sessionQueue`.
+  await ensureSessionStream();
+  const started = await call<HandoffSession>("handoff_session_open", {
+    targetId: input.targetId,
+    note: input.note,
+    source: input.source,
+    cols: input.cols,
+    rows: input.rows,
+  });
+  // A new tab goes in front, which is the only thing that could be meant by
+  // starting one.
+  setSessions([...sessions, started], started.sessionId);
+  // `lastRunAt` moved on the Rust side; the palette's rows read it.
+  void loadTargets().catch(() => undefined);
+  return started;
+}
+
+/**
+ * Adopt the sessions that are already running.
+ *
+ * A webview that reloaded — hot module replacement, a renderer that crashed —
+ * comes back with an empty store while the processes are still on their ptys.
+ * Asked once, on mount, exactly as the agent dock asks for its sessions. What
+ * was printed before the reload is gone with the emulators that held it.
+ */
+export async function adoptSessions(): Promise<HandoffSession[]> {
+  if (!isTauri()) return [];
+  try {
+    await ensureSessionStream();
+    const running = await call<HandoffSession[]>("handoff_sessions");
+    if (Array.isArray(running) && running.length > 0) setSessions(running);
+    return running ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function writeSession(sessionId: string, data: string): Promise<void> {
+  await call<void>("handoff_session_write", { sessionId, data });
+}
+
+export async function resizeSession(
+  sessionId: string,
+  cols: number,
+  rows: number,
+): Promise<void> {
+  await call<void>("handoff_session_resize", { sessionId, cols, rows });
+}
+
+/**
+ * End one tab, and forget it. The others carry on.
+ *
+ * Never rejects. Closing a session whose process has already exited is the
+ * ordinary case — the tab stays up after the exit so the last lines can be
+ * read — and a pane that refused to close because the thing it was closing was
+ * already gone would be worse than useless.
+ */
+export async function closeSession(sessionId: string): Promise<void> {
+  const next = sessions.filter((s) => s.sessionId !== sessionId);
+  if (next.length !== sessions.length) {
+    // Closing the front tab hands the front to its left-hand neighbour, or to
+    // whatever is left when it was the first.
+    const at = sessions.findIndex((s) => s.sessionId === sessionId);
+    const heir = sessionId === activeId ? next[Math.max(0, at - 1)]?.sessionId ?? null : activeId;
+    setSessions(next, heir);
+  }
+  try {
+    await call<void>("handoff_session_close", { sessionId });
+  } catch {
+    /* nothing to close */
+  }
+}
+
+async function listenToSession(
+  handler: (event: HandoffSessionEvent) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => undefined;
+  return tauriTransport.listen<HandoffSessionEvent>(HANDOFF_SESSION_EVENT, handler);
+}
+
+/**
+ * The wire's base64 back to the bytes the emulator wants.
+ *
+ * Output crosses as base64 because a pty carries bytes: escape sequences, and
+ * multi-byte characters that a chunk boundary can land in the middle of.
+ * Decoding to a string on this side would corrupt exactly those, so the bytes
+ * stay bytes until the emulator — the one thing that knows where a character
+ * ends — takes them.
+ */
+export function decodeChunk(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 /* -------------------------------------------------------------------------- */

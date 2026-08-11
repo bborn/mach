@@ -31,7 +31,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { KeymapProvider } from "@/hooks/useKeymap";
 import type { Draft, DraftKind } from "@/lib/compose";
-import { COMPOSER_BODY, COMPOSER_COLUMN, COMPOSER_FIXED_ROW } from "./composer-layout";
+import { COMPOSER_BODY, COMPOSER_FIXED_ROW } from "./composer-layout";
 import { Composer, type ComposerPresentation } from "./Composer";
 
 function draft(over: Partial<Draft> = {}): Draft {
@@ -199,38 +199,14 @@ describe("the message, which is what gives way", () => {
 });
 
 /*
- * The docked composer is the same component under the same rule.
- *
- * It was `shrink-0` in the mail column, on the reading that the reading pane
- * above it is what gives way. That holds while there is room to give: the
- * composer asks for a height and the conversation keeps the rest. It stops
- * holding when the column is shorter than the composer asked for — the agent
- * drawer standing at the bottom of the window takes its height out of this
- * column — and a `shrink-0` box in a column too short for it does not shrink,
- * it overflows. Nothing between the composer and the window clips, so the
- * surplus was drawn outside the pane, over the drawer, footer and all: measured
- * at 1440×757 with the drawer open, a 352px composer in a 336px column, hanging
- * 87px out of the bottom.
- *
- * So the docked root is a column that may shrink, and the body is the row
- * inside it that gives way — the same arrangement the overlay has, for the same
- * reason. `clampComposerHeight` is what keeps it from coming to that in the
- * first place; this is what the shape costs when it does.
+ * The docked composer is the same component and must not have moved. It is
+ * `shrink-0` inside the mail column — the reading pane above it is what gives
+ * way there — and `clampComposerHeight` already keeps it inside the window.
  */
 describe("the docked composer", () => {
-  it("is a column that can give way, so its rows can never leave the pane", () => {
+  it("still keeps its whole height, and the conversation gives way instead", () => {
     const host = render("dock", { kind: "reply" as DraftKind });
-    for (const token of COMPOSER_COLUMN.split(" ")) {
-      expect(has(root(host), token)).toBe(true);
-    }
-    expect(has(root(host), COMPOSER_FIXED_ROW)).toBe(false);
-  });
-
-  it("gives that space up out of the message and nothing else", () => {
-    const host = render("dock", { kind: "reply" as DraftKind });
-    const sized = host.querySelector<HTMLElement>("[style*='height']")!;
-    expect(has(sized, COMPOSER_BODY)).toBe(true);
-    expect(has(sized, COMPOSER_FIXED_ROW)).toBe(false);
+    expect(has(root(host), COMPOSER_FIXED_ROW)).toBe(true);
   });
 
   it("has its footer under the same rule", () => {

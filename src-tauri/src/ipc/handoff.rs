@@ -9,7 +9,7 @@
 //! | `handoff_preview` | `targetId?`, `note`, `source` | [`HandoffPreview`] |
 //! | `handoff_run` | `targetId`, `note`, `source` | [`Launched`] |
 //! | `handoff_session_open` | `targetId`, `note`, `source`, `cols`, `rows` | [`SessionStarted`] |
-//! | `handoff_session_current` | — | [`SessionStarted`]`?` — what a reloaded window adopts |
+//! | `handoff_sessions` | — | [`SessionStarted`]`[]` — the tabs a reloaded window adopts |
 //! | `handoff_session_write` | `sessionId`, `data` | — |
 //! | `handoff_session_resize` | `sessionId`, `cols`, `rows` | — |
 //! | `handoff_session_close` | `sessionId` | — |
@@ -17,6 +17,24 @@
 //! The last four are the pane. Output goes the other way, on the
 //! [`HANDOFF_SESSION_EVENT`] Tauri event — push, never poll, like every other
 //! stream in the app.
+//!
+//! # A session that can use Mach
+//!
+//! A target whose program is `claude` is started against Mach's own tool server
+//! — the one [`super::agent::engine::mcp`] already serves for the in-app agent — so the
+//! session in the pane can search, read, label, archive, snooze, draft and send.
+//! [`engine::tools`] decides which targets those are and what the CLI is told;
+//! [`attach_tools`] here is the wiring, and the two properties it owes are:
+//!
+//! * **the token dies with the pane.** The [`McpServer`] is a
+//!   [`SessionResource`] held by the session, and `handoff::session::reap` drops
+//!   it after the process is dead. Dropping it closes the listener and deletes
+//!   the `0600` file the token lives in. There is no other handle to it.
+//! * **the approval is answerable.** A `send_draft` from the pane parks on
+//!   [`ApprovalDesk`](super::agent::engine::ApprovalDesk), which needs somebody to click.
+//!   So the session is also registered with [`AgentEngine::attach`], which gives
+//!   it a pill and a drawer — the same Approve and Deny the ⌘K agent uses, for
+//!   the same reason and through the same code.
 //!
 //! The engine is `src-tauri/src/handoff/`, declared below with `#[path]` rather
 //! than in `lib.rs` — the same arrangement [`super::compose`] and
@@ -45,11 +63,12 @@ use tauri::{AppHandle, Emitter, State};
 
 use engine::context::{AttachmentRef, EventSource, HandoffSource, MailMessage, MailSource};
 use engine::plan::{self, LaunchPlan, Launched};
-use engine::session::{SessionSink, Sessions};
+use engine::session::{SessionResource, SessionSink, Sessions};
 use engine::target::{self, HandoffTarget};
 use engine::terminal::{self, Terminal};
 use engine::{context, HandoffError};
 
+use crate::ipc::agent::engine::mcp::McpServer;
 use crate::db::{command_queries, queries, Db};
 
 use super::error::IpcError;
@@ -129,6 +148,24 @@ pub struct SessionStarted {
     pub dir: String,
     pub prompt: String,
     pub context_file: String,
+    /// What this session was given of Mach itself, by label — "Mach's tools",
+    /// or nothing. On the wire so the tab can say so: a session that can send
+    /// mail and a session that cannot are not the same thing to have open.
+    pub resources: Vec<String>,
+}
+
+impl From<engine::session::Started> for SessionStarted {
+    fn from(started: engine::session::Started) -> SessionStarted {
+        SessionStarted {
+            session_id: started.session_id,
+            target_name: started.target_name,
+            command: started.command,
+            dir: started.dir,
+            prompt: started.prompt,
+            context_file: started.context_file,
+            resources: started.resources,
+        }
+    }
 }
 
 // ===========================================================================
@@ -364,7 +401,7 @@ pub async fn handoff_session_open(
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> Result<SessionStarted, IpcError> {
-    let (target, plan) = prepare(&state.db, &target_id, &note, source.as_ref())?;
+    let (target, mut plan) = prepare(&state.db, &target_id, &note, source.as_ref())?;
     if target.mode != target::HandoffMode::Session {
         return Err(IpcError::internal(format!(
             "{} is not a session target",
@@ -372,11 +409,17 @@ pub async fn handoff_session_open(
         )));
     }
 
+    // Before the pty, because it rewrites argv. A failure here is fatal rather
+    // than a session that quietly came up without the tools it was promised —
+    // silent degradation is the failure mode this project keeps paying for.
+    let resources = attach_tools(&app, &state, &target, &mut plan)?;
+
     let started = sessions().open(
         &plan,
         cols.unwrap_or(engine::session::DEFAULT_COLS),
         rows.unwrap_or(engine::session::DEFAULT_ROWS),
         Arc::new(TauriSessionSink { app }),
+        resources,
     )?;
 
     let now = now_ms();
@@ -389,34 +432,107 @@ pub async fn handoff_session_open(
         target::save(conn, &targets, now)
     })?;
 
-    Ok(SessionStarted {
-        session_id: started.session_id,
-        target_name: started.target_name,
-        command: started.command,
-        dir: started.dir,
-        prompt: started.prompt,
-        context_file: started.context_file,
-    })
+    Ok(started.into())
 }
 
-/// The session that is running, for a webview that has just loaded.
+/// Every session that is running, for a webview that has just loaded.
 ///
 /// A reload — hot module replacement, a renderer that crashed — leaves the
-/// process running with nothing on screen pointing at it. This is how the pane
-/// finds it again. What was printed before the reload is gone: the scrollback
-/// lived in the emulator that went away with the page, and keeping a copy of it
-/// on this side would mean holding a session's entire output in memory for a
-/// case that is already rare.
+/// processes running with nothing on screen pointing at them. This is how the
+/// pane finds them again, and it is where the tab strip comes back from. What
+/// was printed before the reload is gone: the scrollback lived in the emulators
+/// that went away with the page, and keeping a copy of it on this side would
+/// mean holding every session's entire output in memory for a case that is
+/// already rare.
 #[tauri::command]
-pub fn handoff_session_current() -> Option<SessionStarted> {
-    sessions().current().map(|started| SessionStarted {
-        session_id: started.session_id,
-        target_name: started.target_name,
-        command: started.command,
-        dir: started.dir,
-        prompt: started.prompt,
-        context_file: started.context_file,
-    })
+pub fn handoff_sessions() -> Vec<SessionStarted> {
+    sessions().list().into_iter().map(SessionStarted::from).collect()
+}
+
+// ===========================================================================
+// Mach, as something the session can use
+// ===========================================================================
+
+/// Give the session Mach's tools, when the session is one Mach gives them to.
+///
+/// Returns an empty vector for every other target, having started nothing and
+/// written nothing. See [`engine::tools`] for why that is one program rather
+/// than a preference.
+fn attach_tools(
+    app: &AppHandle,
+    state: &AppState,
+    target: &HandoffTarget,
+    plan: &mut LaunchPlan,
+) -> Result<Vec<Box<dyn SessionResource>>, IpcError> {
+    if !engine::tools::wants_tools(&plan.argv[0]) {
+        return Ok(Vec::new());
+    }
+
+    let dir = tool_config_dir(state);
+    sweep_stale_configs(&dir);
+
+    let agent = super::agent::engine(app, state)?;
+    let attached = agent.attach(
+        format!("{} (session pane)", target.name),
+        "Claude Code (session pane)".to_string(),
+    );
+
+    let server = McpServer::start(
+        Arc::clone(&attached.gate),
+        tokio::runtime::Handle::current(),
+        &dir,
+        &attached.snapshot.id,
+    )
+    .map_err(|error| {
+        // The session was registered a moment ago and nothing is going to drive
+        // it, so it must not be left in the dock as a pill that never ends.
+        let _ = agent.close(&attached.snapshot.id);
+        IpcError::internal(error.to_string())
+    })?;
+
+    let attachment = engine::tools::Attachment::new(server, agent, attached.snapshot.id.clone());
+    engine::tools::wire(
+        &mut plan.argv,
+        attachment.config_path(),
+        &engine::tools::guidance(&target.name),
+    );
+
+    Ok(vec![Box::new(attachment)])
+}
+
+/// Where a session's `--mcp-config` is written: beside the database, not in
+/// `/tmp`, so it inherits the data directory's ownership and a QA instance
+/// writes its own.
+fn tool_config_dir(state: &AppState) -> std::path::PathBuf {
+    state
+        .config
+        .database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("handoff")
+}
+
+/// Take last run's token files off the disk, once per launch.
+///
+/// A crash is guarantee 3: the process dies, the listener dies with it, and the
+/// file it wrote is left behind holding a token for a port that no longer
+/// exists. Harmless, and still a secret on a disk that gets backed up. Nothing
+/// in this directory can belong to a live session at the moment the first one of
+/// this run starts, because the listeners live in this process.
+fn sweep_stale_configs(dir: &std::path::Path) {
+    static SWEPT: OnceLock<()> = OnceLock::new();
+    SWEPT.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("mcp-") && name.ends_with(".json") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    });
 }
 
 /// Keystrokes, exactly as the emulator encoded them.

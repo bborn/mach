@@ -140,14 +140,10 @@ const SUBJECT_TYPE = "text-list font-medium";
  *    replaced it; the `text/plain` part is now read back out of the HTML. The
  *    toolbar is four formats and a link, all of which have keys — it is there so
  *    the formatting is *visible*, which is the half a keyboard cannot do.
- *  * **The header is the subject, and it is editable on every kind of draft.**
- *    A reply's subject is derived to begin with, and for most replies the
- *    derived answer is the right one — which is why the field carries no border,
- *    no background and the type it had as a heading. It is still a field,
- *    because a conversation that has drifted off its own title can be renamed
- *    from nowhere else. Retitling does not move the message: `In-Reply-To` and
- *    `References` are what thread it, and `compose::draft::build` reads those
- *    from the parent message rather than from anything typed here.
+ *  * **The header is the subject, and for a reply it is not editable.** A
+ *    reply's subject is derived, not chosen; offering the field is how the
+ *    "Re: Re: Re:" chains this codebase goes out of its way to prevent get
+ *    typed back in by hand.
  *  * **Cc and Bcc stay hidden until they have content or are asked for.**
  *    Reply-all fills Cc, so the row appears exactly when it means something.
  *  * **The address fields hold text, not a parsed list.** Parsing on every
@@ -274,10 +270,6 @@ export function Composer({
     enabled: !busy,
   });
 
-  // Still off for a reply, now that a reply has the field. A reply's subject
-  // arrives already written and is edited to say something the model does not
-  // know — that the conversation has moved on — so a grey continuation of
-  // "Re: the data room" would be in the way of the one edit being made.
   const subjectGhost = useGhostText({
     kind: "emailSubject",
     value: draft.subject,
@@ -387,24 +379,10 @@ export function Composer({
       data-mach-composer=""
       data-mach-drop-target=""
       className={cn(
-        /*
-         * A column that can shrink, both ways round.
-         *
-         * In the overlay the panel above this one has a maximum height and
-         * clips what does not fit — see COMPOSER_COLUMN for what was cut off
-         * when this was not a column.
-         *
-         * Docked it was `shrink-0`, on the reading of "the message gives up
-         * space and nothing else does" that made the composer immovable rather
-         * than the footer. Nothing between here and the window clips, so when
-         * the column was shorter than the composer asked for — the agent drawer
-         * open at the bottom of it — the surplus was simply drawn outside the
-         * pane, footer and all, over the drawer. The rule was always about the
-         * composer's own rows: the body is the row that gives way, and it can
-         * only do that if the box around it is allowed to.
-         */
-        COMPOSER_COLUMN,
-        !overlay && "border-t border-border bg-surface",
+        // In the overlay the panel above this one has a maximum height and
+        // clips what does not fit, so this has to be a column that can
+        // shrink — see COMPOSER_COLUMN for what was cut off when it wasn't.
+        overlay ? COMPOSER_COLUMN : "shrink-0 border-t border-border bg-surface",
         // A drop target has to say so before the file is let go, or the only
         // feedback is whether it worked.
         dropping && "ring-1 ring-inset ring-accent",
@@ -414,73 +392,55 @@ export function Composer({
         className={cn(
           COMPOSER_COLUMN,
           "flex-1 px-5",
-          // `w-full` because the row above is a flex column now: an item with
-          // `margin-inline: auto` in one of those takes its content's width
-          // rather than stretching, so the measure came out at whatever the
-          // longest line happened to be instead of 72ch.
-          overlay ? "py-4" : "mx-auto w-full max-w-[72ch] py-3",
+          overlay ? "py-4" : "mx-auto max-w-[72ch] py-3",
         )}
       >
         <div className={cn(COMPOSER_FIXED_ROW, "flex items-baseline gap-2")}>
-          {/*
-            One field, reply or not.
-
-            A reply's subject used to be an `<h2>`, on the grounds that it is
-            derived rather than chosen and that a field invites the "Re: Re:
-            Re:" chains this codebase goes out of its way to prevent. What it
-            actually prevented was retitling a conversation that had drifted off
-            what it was called, which is a thing that happens to every long
-            thread and which no other route in the app can do.
-
-            An input rather than a click-to-edit heading, because this input is
-            already a heading: no border, no background, no focus ring, and
-            `SUBJECT_TYPE` is the same type the `<h2>` was set in. So it reads as
-            the title of the message until there is a caret in it, which is the
-            whole requirement, and it costs nothing to get there — where
-            click-to-edit would need an affordance saying it can be clicked, a
-            keyboard route to stand in for the click, and a mode to be in or out
-            of. Three mechanisms to arrive at what an unstyled field does with
-            none.
-          */}
-          <div className="relative min-w-0 flex-1">
-            <GhostText
-              value={draft.subject}
-              suggestion={subjectGhost.suggestion}
-              typography={SUBJECT_TYPE}
-              multiline={false}
-            />
-            <input
-              id="composer-subject"
-              ref={subjectField}
-              value={draft.subject}
-              disabled={busy}
-              onChange={(event) => {
-                onChange({ ...draft, subject: event.target.value });
-                trackCaret(event);
-              }}
-              onSelect={trackCaret}
-              onFocus={(event) => {
-                setFocus("subject");
-                trackCaret(event);
-              }}
-              onBlur={() => setFocus((current) => (current === "subject" ? null : current))}
-              onKeyDown={ghostKeys(
-                subjectGhost.suggestion,
-                subjectGhost.accept,
-                subjectGhost.dismiss,
-                (value) => onChange({ ...draft, subject: value }),
-              )}
-              placeholder="Subject"
-              // The placeholder is the only thing naming this field, and a
-              // placeholder disappears the moment there is a subject.
-              aria-label="Subject"
-              className={cn(
-                "w-full bg-transparent text-foreground",
-                SUBJECT_TYPE,
-                "placeholder:text-faint-foreground focus:outline-none",
-              )}
-            />
-          </div>
+          {isReply ? (
+            <h2 className="min-w-0 flex-1 truncate text-list font-medium text-foreground">
+              {draft.subject}
+            </h2>
+          ) : (
+            <div className="relative min-w-0 flex-1">
+              <GhostText
+                value={draft.subject}
+                suggestion={subjectGhost.suggestion}
+                typography={SUBJECT_TYPE}
+                multiline={false}
+              />
+              <input
+                id="composer-subject"
+                ref={subjectField}
+                value={draft.subject}
+                disabled={busy}
+                onChange={(event) => {
+                  onChange({ ...draft, subject: event.target.value });
+                  trackCaret(event);
+                }}
+                onSelect={trackCaret}
+                onFocus={(event) => {
+                  setFocus("subject");
+                  trackCaret(event);
+                }}
+                onBlur={() => setFocus((current) => (current === "subject" ? null : current))}
+                onKeyDown={ghostKeys(
+                  subjectGhost.suggestion,
+                  subjectGhost.accept,
+                  subjectGhost.dismiss,
+                  (value) => onChange({ ...draft, subject: value }),
+                )}
+                placeholder="Subject"
+                // The placeholder is the only thing naming this field, and a
+                // placeholder disappears the moment there is a subject.
+                aria-label="Subject"
+                className={cn(
+                  "w-full bg-transparent text-foreground",
+                  SUBJECT_TYPE,
+                  "placeholder:text-faint-foreground focus:outline-none",
+                )}
+              />
+            </div>
+          )}
           {!showCc && (
             <button
               type="button"

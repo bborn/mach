@@ -113,7 +113,7 @@ impl SessionEmitter for TauriEmitter {
 
 static ENGINE: OnceLock<Arc<AgentEngine>> = OnceLock::new();
 
-fn engine(app: &AppHandle, state: &AppState) -> Result<Arc<AgentEngine>, IpcError> {
+pub(crate) fn engine(app: &AppHandle, state: &AppState) -> Result<Arc<AgentEngine>, IpcError> {
     if let Some(existing) = ENGINE.get() {
         return Ok(Arc::clone(existing));
     }

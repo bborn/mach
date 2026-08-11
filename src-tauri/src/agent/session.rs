@@ -662,6 +662,82 @@ impl AgentEngine {
         Ok(snapshot)
     }
 
+    /// Register a session whose thinking happens somewhere Mach does not drive.
+    ///
+    /// The handoff pane runs `claude` on a pty. That process is not a
+    /// [`Brain`](super::brain::Brain) — nobody here feeds it messages or reads
+    /// its output; the owner does, by typing at it. What it *does* share with
+    /// every other session is the way its tool calls come back: over MCP, into
+    /// [`ToolGate`], where `send_draft` parks on a human.
+    ///
+    /// Something has to render that prompt and route the answer, and the drawer
+    /// already does both. So an attached session is a real session in this
+    /// registry — a pill, a transcript of the tools it ran, an approval with
+    /// Approve and Deny — with no task spawned to drive it. `agent_send` reaches
+    /// it exactly as it reaches the others, because the pump is the same pump.
+    ///
+    /// The gate comes back so the caller can hand it to a server. Closing is the
+    /// caller's job and [`AgentEngine::close`] is how, which is what the pane's
+    /// reaping does.
+    pub fn attach(&self, title: String, backend: String) -> Attached {
+        let id = new_session_id((self.now)());
+        let snapshot = SessionSnapshot {
+            id: id.clone(),
+            title,
+            status: SessionStatus::Running,
+            created_at: (self.now)(),
+            context: Vec::new(),
+            // Empty on purpose: the conversation is happening in the pane, and
+            // an opening line here would be Mach putting words in its mouth.
+            entries: Vec::new(),
+            pending: None,
+            error: None,
+            backend: Some(backend),
+        };
+
+        let shared = Arc::new(Mutex::new(snapshot.clone()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        lock(&self.sessions).push(Live {
+            id: id.clone(),
+            snapshot: Arc::clone(&shared),
+            tx,
+            cancelled: Arc::clone(&cancelled),
+        });
+
+        self.emitter.session_event(&SessionEvent::Created {
+            session_id: id.clone(),
+            session: snapshot.clone(),
+        });
+
+        let ui = Arc::new(SessionUi::new(
+            id.clone(),
+            shared,
+            Arc::clone(&self.emitter),
+        ));
+        let desk = Arc::new(ApprovalDesk::new(Arc::clone(&ui)));
+        let ctx = ToolContext {
+            db: self.db.clone(),
+            dispatcher: Arc::clone(&self.dispatcher),
+            outbox: Arc::clone(&self.outbox),
+            plugins: Arc::clone(&self.plugins),
+        };
+        let plugins = ctx.plugin_list();
+        let gate = Arc::new(ToolGate::new(
+            ctx,
+            plugins,
+            Arc::clone(&ui),
+            Arc::clone(&desk),
+        ));
+
+        let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+        tokio::spawn(pump(rx, desk, messages_tx, Arc::clone(&cancelled)));
+        tokio::spawn(redirect(messages_rx, ui));
+
+        Attached { snapshot, gate }
+    }
+
     /// Every session, oldest first — the order the pills sit in.
     pub fn sessions(&self) -> Vec<SessionSnapshot> {
         lock(&self.sessions)
@@ -838,6 +914,25 @@ async fn pump(
     }
     cancelled.store(true, Ordering::SeqCst);
     desk.close();
+}
+
+/// A session whose brain is somewhere else, and the door its tools come in by.
+pub struct Attached {
+    pub snapshot: SessionSnapshot,
+    pub gate: Arc<ToolGate>,
+}
+
+/// Say where a message typed at an attached session should have gone.
+///
+/// The drawer offers a text box for every session because every session until
+/// now could take one. This one cannot: the process is on a pty and the only
+/// thing it reads is the pane. Answering is better than dropping the sentence —
+/// it is the one fact he could not otherwise work out from what is on screen.
+async fn redirect(mut rx: mpsc::UnboundedReceiver<String>, ui: Arc<SessionUi>) {
+    while let Some(text) = rx.recv().await {
+        ui.user_text(&text);
+        ui.agent_text("This session is running in the pane. Type there.");
+    }
 }
 
 /// Tool entries replace themselves by id; everything else appends.

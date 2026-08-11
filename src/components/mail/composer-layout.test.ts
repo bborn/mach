@@ -46,34 +46,14 @@ describe("clampComposerHeight", () => {
     expect(clampComposerHeight(700, viewport)).toBeLessThan(viewport);
   });
 
-  it("gives the floor to a column too short for even that", () => {
+  it("gives the floor to a window too short for even that", () => {
     expect(clampComposerHeight(300, 300)).toBe(min);
     expect(clampComposerHeight(10, 300)).toBe(min);
   });
 
-  it("uses the bounds alone when the column has not been measured", () => {
+  it("uses the bounds alone when the window has not been measured", () => {
     expect(clampComposerHeight(400, 0)).toBe(400);
     expect(clampComposerHeight(5000, 0)).toBe(max);
-  });
-
-  /*
-   * The second dock, which is where this argument stopped being the window.
-   *
-   * The agent drawer stands at the bottom of the window and takes its height
-   * off the reading column, so the room the composer has is the column's and
-   * nobody else's. A composer that asked the window instead kept the height it
-   * had when the drawer opened and hung out of the bottom of the pane by
-   * whatever the drawer took — 87px, at 1440×757 with the drawer at its
-   * default. Every pixel the column loses has to come off the ceiling, or the
-   * arithmetic is not the one that keeps the footer on screen.
-   */
-  it("takes a pixel off the ceiling for every pixel the second dock takes", () => {
-    const column = 900;
-    for (const drawer of [0, 160, 320, 480]) {
-      expect(clampComposerHeight(9000, column - drawer)).toBe(
-        Math.max(min, column - drawer - RESERVED_READING_HEIGHT),
-      );
-    }
   });
 
   it("rounds", () => {

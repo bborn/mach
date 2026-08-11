@@ -1207,27 +1207,6 @@ export const COMPOSER_KEYS = {
   discard: "mod+backspace",
   /** Attach files. Gmail has no key for this; ⇧⌘A is free and reads as "attach". */
   attach: "shift+mod+a",
-  /**
-   * Make the selection a link.
-   *
-   * Gmail's key for this is ⌘K, and ⌘K in Mach is the palette — search, every
-   * command, the agent handoff, printed in the title bar. It was registered
-   * here at priority 210 so that a composer took it back, which left the most
-   * used shortcut in the product unreachable for as long as a draft was open.
-   * The palette keeps ⌘K everywhere, so the link is the binding that moves.
-   *
-   * ⇧⌘K, because the mnemonic is the expensive half. K is what a Gmail hand
-   * presses for a link and the shift is the whole change, where ⇧⌘U or ⌥⌘K
-   * would be a second vocabulary. The composer already spells three of its keys
-   * this way — ⇧⌘C is a new message because `c` was taken, ⇧⌘A attaches, ⇧⌘O
-   * pops out — so "the shifted form, because the plain one is spoken for" is a
-   * sentence this keymap already says.
-   *
-   * Free on every side: nothing else in the registry binds it, Squire binds
-   * ⌘B/⌘I/⌘U/⌘D/⌘Y/⌘Z, ⇧⌘Z, ⌘⇧5/6/7/8/9 and ⌘[/⌘] but nothing on K, and WebKit
-   * has no editing command there.
-   */
-  link: "shift+mod+k",
   /** Recall a message inside its window. */
   undoSend: "mod+z",
   /** Gmail's `c`. Mode-scoped: the calendar's `c` creates an event. */
