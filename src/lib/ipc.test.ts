@@ -601,6 +601,49 @@ describe("requests", () => {
     expect(detail?.messages[1]?.isDraft).toBe(true);
   });
 
+  it("keeps the snippet beside the body, because they disagree when it matters", async () => {
+    // The fifth field this mapper has eaten, and the reason it is now its own
+    // property rather than a fallback folded into `bodyText`: some mailers put
+    // the `<style>` block into the `text/plain` alternative, so `bodyText`
+    // opens with hundreds of characters of CSS. 205 messages in the owner's
+    // store do, and a collapsed thread showed four rows of
+    // `body { margin: 0; padding: 0; -webkit-text-size-adjust: 100%…`.
+    // Gmail's snippet is computed from the rendered message and is right for
+    // every one of them.
+    const { transport } = fakeTransport({
+      get_thread: {
+        thread: WIRE_THREAD,
+        messages: [
+          {
+            id: 900,
+            threadId: 41,
+            accountId: 2,
+            from: { email: "hello@influencekit.example" },
+            internalDate: 1_700_000_000_000,
+            bodyText: "body { margin: 0; padding: 0 } Sooner or later every client asks",
+            snippet: "Sooner or later every client asks",
+          },
+          // No snippet at all: a draft Mach mirrored, which Gmail has not seen.
+          {
+            id: 901,
+            threadId: 41,
+            accountId: 2,
+            from: { email: "bruno@example.com" },
+            internalDate: 1_700_000_100_000,
+            bodyText: "half a reply",
+          },
+        ],
+      },
+    });
+
+    const detail = await createIpcSource(transport).getThread(41);
+
+    expect(detail?.messages[0]?.snippet).toBe("Sooner or later every client asks");
+    // The body is still the body — nothing here rewrites what the message said.
+    expect(detail?.messages[0]?.bodyText).toContain("body { margin: 0");
+    expect(detail?.messages[1]?.snippet).toBe("");
+  });
+
   it("treats a message the wire said nothing about as sent, not as a draft", async () => {
     // The permissive direction is the other way round here than it is on a
     // calendar: "the seam did not say" must not mark somebody's sent mail

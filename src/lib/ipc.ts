@@ -505,6 +505,7 @@ export function mapMessage(wire: WireMessage): Message {
     // pane until the sandboxed iframe lands; the snippet is what Gmail shows.
     bodyText: text(wire.bodyText) || text(wire.snippet),
     bodyHtml: optional(wire.bodyHtml),
+    snippet: text(wire.snippet),
     // Named here or it does not exist. Rust has serialized `isDraft` on every
     // message since the mirror shipped; this literal dropped it, so a draft in
     // a thread rendered as an ordinary sent message while the agent went on

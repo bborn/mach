@@ -11,7 +11,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { Attachment, Message } from "@/types";
-import { AttachmentRow, ThreadMessage } from "./ThreadMessage";
+import { AttachmentRow, preview, ThreadMessage } from "./ThreadMessage";
 
 function attachment(over: Partial<Attachment> = {}): Attachment {
   return {
@@ -123,6 +123,7 @@ function message(over: Partial<Message> = {}): Message {
     to: [{ name: "Marcus Oyelaran", email: "marcus@lumen.example" }],
     cc: [],
     timestamp: Date.UTC(2026, 7, 9, 12, 2),
+    snippet: "",
     bodyText: "Numbers look right to me — shipping Thursday.",
     attachments: [],
     isDraft: false,
@@ -188,5 +189,44 @@ describe("a draft inside a conversation", () => {
     const html = threadMessage({ isDraft: true }, true);
     expect(html).toContain("Numbers look right to me");
     expect(html).not.toContain("bruno@example.com");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The line a collapsed row shows.
+ *
+ * The complaint: four rows of a conversation all reading
+ * `body { margin: 0; padding: 0; -webkit-text-size-adjust: 100%…`. The sender's
+ * mailer had put its `<style>` block into the `text/plain` alternative, so the
+ * body genuinely began with 554 characters of CSS — and the preview was a slice
+ * of the body. Gmail's snippet, which Mach was already fetching and throwing
+ * away, described every one of those messages correctly.
+ */
+describe("the collapsed preview", () => {
+  it("uses Gmail's snippet, not a body that opens with a stylesheet", () => {
+    const line = preview(
+      message({
+        bodyText:
+          "body { margin: 0; padding: 0; -webkit-text-size-adjust: 100%; } " +
+          "img { border: 0 } Sooner or later every client asks",
+        snippet: "Sooner or later every client asks whether the campaign paid off.",
+      }),
+    );
+
+    expect(line).toBe("Sooner or later every client asks whether the campaign paid off.");
+    expect(line).not.toContain("margin");
+  });
+
+  it("falls back to the body for a draft Gmail has never seen", () => {
+    expect(preview(message({ bodyText: "half a reply", snippet: "" }))).toBe("half a reply");
+    expect(preview(message({ bodyText: "half a reply", snippet: "   " }))).toBe("half a reply");
+  });
+
+  it("collapses whitespace and stops at 200 characters", () => {
+    const line = preview(message({ snippet: `a${"  \n  "}b`, bodyText: "" }));
+    expect(line).toBe("a b");
+    expect(preview(message({ snippet: "x".repeat(400), bodyText: "" }))).toHaveLength(200);
   });
 });

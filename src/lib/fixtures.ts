@@ -254,6 +254,8 @@ function build(): { threads: Thread[]; messages: Map<number, Message[]> } {
         cc: [],
         timestamp: timestamp - (messageCount - 1 - m) * 47 * MINUTE,
         bodyText: seededBody(i + m, m === messageCount - 1 ? snippet : subject),
+        // Fixture mail comes from Gmail, so it has Gmail's summary of itself.
+        snippet: m === messageCount - 1 ? snippet : subject,
         attachments,
         // Fixture mail is all sent mail. A draft only exists once the composer
         // has written one, and there is no composer store behind `bun run dev`.
@@ -300,6 +302,8 @@ function attachDraft(): void {
     cc: [],
     timestamp: thread.timestamp + 4 * MINUTE,
     bodyText: DRAFT_BODY,
+    // A draft Mach mirrored has no snippet: Gmail has not seen it yet.
+    snippet: "",
     attachments: [],
     isDraft: true,
   });

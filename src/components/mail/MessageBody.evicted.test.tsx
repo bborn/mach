@@ -51,6 +51,7 @@ const message: Message = {
   cc: [],
   timestamp: 1_700_000_000_000,
   bodyText: "The quarterly numbers are attached.",
+  snippet: "The quarterly numbers are attached.",
   attachments: [],
   isDraft: false,
 };

@@ -87,6 +87,21 @@ export interface Message {
   /** Plaintext body. `bodyHtml` renders in a sandboxed iframe — see MessageFrame. */
   bodyText: string;
   bodyHtml?: string;
+  /**
+   * Gmail's own one-line summary of the message.
+   *
+   * Kept beside `bodyText` rather than folded into it, because the two disagree
+   * exactly when it matters. Some mailers put the `<style>` block into the
+   * `text/plain` alternative, so `bodyText` opens with several hundred
+   * characters of `body { margin: 0; padding: 0; -webkit-text-size-adjust…`
+   * before reaching a word of prose — 205 messages in the author's store do.
+   * Gmail computes its snippet from the rendered message and gets it right for
+   * every one of them.
+   *
+   * Empty for a message that never came from Gmail: a draft Mach mirrored into
+   * a thread has no snippet until it has been sent and synced back.
+   */
+  snippet: string;
   attachments: Attachment[];
   /**
    * Your own unsent text, mirrored into the conversation it answers.

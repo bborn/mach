@@ -320,9 +320,24 @@ const ICONS: Record<AttachmentKind, typeof File> = {
   file: File,
 };
 
-/** One line of the body for a collapsed row, from text we already have. */
-function preview(message: Message): string {
-  return message.bodyText.replace(/\s+/g, " ").trim().slice(0, 200);
+/**
+ * One line of the body for a collapsed row, from text we already have.
+ *
+ * Gmail's snippet first, and `bodyText` only when there is none. This used to
+ * read `bodyText` alone, and a collapsed thread from a mailer that dumps its
+ * `<style>` block into the `text/plain` alternative showed four rows of
+ * `body { margin: 0; padding: 0; -webkit-text-size-adjust: 100%…` where the
+ * message should have been. The prose in that particular one began 554
+ * characters in, well past anything a preview would ever slice to.
+ *
+ * The snippet is Gmail's summary of the *rendered* message, so it is the right
+ * source for a summary on its own merits, and it was already being fetched.
+ * `bodyText` stays as the fallback for a draft Mach mirrored itself, which has
+ * no snippet until it has been sent and synced back.
+ */
+export function preview(message: Message): string {
+  const line = message.snippet.trim() || message.bodyText;
+  return line.replace(/\s+/g, " ").trim().slice(0, 200);
 }
 
 /**

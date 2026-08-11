@@ -93,6 +93,7 @@ describe("contactsFrom", () => {
           cc: [{ name: "Cy", email: "cy@z.com" }],
           timestamp: 7,
           bodyText: "",
+          snippet: "",
           attachments: [],
           isDraft: false,
         },
