@@ -325,6 +325,28 @@ try {
       break;
     }
 
+    /*
+     * The same text, one keystroke at a time.
+     *
+     * `type` above is one `Input.insertText`, which is the IME path: fast, and
+     * a single edit. An editor that keeps its own idea of where the caret is —
+     * Squire does — updates that idea from the events a *keystroke* produces,
+     * so a bug that depends on the editor's cached selection will not reproduce
+     * under `insertText` and will under this. Use this one before believing
+     * anything about caret behaviour.
+     */
+    case "keys": {
+      const text = rest.join(" ");
+      if (!text) throw new Error("usage: webqa keys '<text>'");
+      for (const ch of text) {
+        await cdp("Input.dispatchKeyEvent", { type: "keyDown", text: ch, key: ch });
+        await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: ch });
+      }
+      await Bun.sleep(200);
+      console.log(`keyed ${JSON.stringify(text)}`);
+      break;
+    }
+
     case "press": {
       const name = rest[0];
       if (!name) throw new Error("usage: webqa press <Enter|Backspace|Tab|…>");

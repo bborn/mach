@@ -47,6 +47,30 @@ import { COMPOSER_BODY, COMPOSER_COLUMN, COMPOSER_FIXED_ROW } from "./composer-l
  * the message, which is what the user means, and outside them it undoes typing.
  */
 
+/**
+ * Focus the writing area and tell the editor it happened.
+ *
+ * Exported for the test, because the failure it prevents cannot be seen from
+ * the outside: the editor goes on accepting characters either way, and only the
+ * commands go to the wrong place.
+ *
+ * `focus()` on an element that already has focus fires no event, so the second
+ * call is not redundant — it is the only one that can reach a Squire which
+ * attached its listener after the element was already focused. Squire drops the
+ * event unless the root really is the active element and it does not already
+ * believe so, so this is safe to call as often as you like.
+ */
+export function focusAndAnnounce(
+  instance: { focus(): void } | null,
+  node: HTMLElement | null,
+): void {
+  if (!instance || !node) return;
+  instance.focus();
+  if (node.ownerDocument.activeElement === node) {
+    node.dispatchEvent(new FocusEvent("focus"));
+  }
+}
+
 export interface RichTextEditorHandle {
   focus(): void;
   /** The current HTML, read straight out of the editor rather than from state. */
@@ -239,15 +263,48 @@ export function RichTextEditor({
     }
   }, [inlineImages, docKey, initialHtml]);
 
+  /**
+   * Focus the writing area, and make sure Squire *knows* it is focused.
+   *
+   * Squire learns it has the keyboard from a `focus` event on its own root, and
+   * it keeps the answer in a private flag. When that flag is false,
+   * `getSelection` does not read the live caret at all — it quietly returns a
+   * range at the very top of the message. Every block command asks it for the
+   * range, so with the flag wrong:
+   *
+   *   * ⏎ splits the *first* block instead of the one being written in, which
+   *     puts each new line above everything already typed and, from the writer's
+   *     side, looks exactly like Return doing nothing to the line;
+   *   * the linkifier that runs inside the same split is handed the wrong text
+   *     node, so a URL never becomes a link;
+   *   * bold, the lists and the quote button act at the top of the message.
+   *
+   * Focusing an element that already has focus fires no event, and that is the
+   * hole this falls through. `main.tsx` mounts the app in `StrictMode`, which
+   * runs every mount effect twice: the first pass builds a Squire and is then
+   * destroyed — taking its listeners with it — and the composer focuses the
+   * element in between. The second, surviving Squire attaches its listener to an
+   * element that is already focused and never hears a thing. The flag stays
+   * false for the life of the composer, and clicking away and back is the only
+   * thing that repairs it.
+   *
+   * So the event is sent explicitly. Squire drops it unless the root really is
+   * the active element and it does not already believe so, which makes this
+   * safe to call from anywhere, as often as you like.
+   */
+  const takeFocus = useCallback(() => {
+    focusAndAnnounce(editor.current, root.current);
+  }, []);
+
   useImperativeHandle(
     handle,
     () => ({
-      focus: () => editor.current?.focus(),
+      focus: () => takeFocus(),
       html: () => editor.current?.getHTML() ?? "",
       insert: (html: string) => {
         const instance = editor.current;
         if (!instance) return;
-        instance.focus();
+        takeFocus();
         instance.insertHTML(html);
         setEmpty(isBlankHtml(instance.getHTML()));
         latest.current(instance.getHTML());
@@ -282,15 +339,18 @@ export function RichTextEditor({
         }
       },
     }),
-    [],
+    [takeFocus],
   );
 
   /** Run a Squire command and keep the toolbar in step with the result. */
   const apply = useCallback((run: (instance: Squire) => void) => {
     const instance = editor.current;
     if (!instance) return;
+    // Before the command, not after: the command itself reads the selection,
+    // and a Squire that does not know it is focused hands it the top of the
+    // message. See `takeFocus`.
+    takeFocus();
     run(instance);
-    instance.focus();
     setPath(instance.getPath());
     const html = instance.getHTML();
     setEmpty(isBlankHtml(html));
