@@ -80,16 +80,32 @@ impl Recorder {
         *self.exit.lock().unwrap()
     }
 
-    /// Spin until the output contains `needle`, or give up. Sessions are
-    /// threads and a pty is a kernel buffer, so nothing here can assert
-    /// immediately after acting.
+    /// Spin until the output contains `needle`. Sessions are threads and a pty
+    /// is a kernel buffer, so nothing here can assert immediately after acting.
+    ///
+    /// Running out of time is a panic rather than a return, and that is the
+    /// whole point of the signature. It used to hand the caller back whatever
+    /// had arrived so far, which on a machine too busy to have started
+    /// `/bin/echo` yet was the empty string — and the caller then failed with
+    /// `the payload must arrive verbatim: ""`, which reads exactly like the
+    /// process printing the wrong thing. The bug it names does not exist and
+    /// the one it has is not mentioned. Every caller here is waiting for output
+    /// it expects, so there is no case where giving up quietly is right.
+    ///
+    /// `within` is a ceiling, not a wait: this returns the moment the needle
+    /// lands, so a generous one costs nothing except on the way to a failure.
     fn wait_for(&self, needle: &str, within: Duration) -> String {
         let deadline = Instant::now() + within;
         loop {
             let text = self.text();
-            if text.contains(needle) || Instant::now() > deadline {
+            if text.contains(needle) {
                 return text;
             }
+            assert!(
+                Instant::now() <= deadline,
+                "waited {within:?} for {needle:?} and it never arrived; \
+                 the session had printed {text:?}"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -188,7 +204,7 @@ fn the_pty_spawns_with_the_targets_resolved_argv_cwd_and_environment() {
         "reschedule the standups",
     );
 
-    let text = sink.wait_for("prompt=", Duration::from_secs(5));
+    let text = sink.wait_for("prompt=", Duration::from_secs(30));
     let dir = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
 
     assert!(
@@ -304,7 +320,7 @@ fn a_hostile_prompt_is_still_one_argument_on_a_pty() {
     let payload = "\"; touch /tmp/mach-session-pwned; echo \"";
     let (sessions, sink, id) = open(r#"/bin/echo {{prompt}}"#, payload);
 
-    let text = sink.wait_for("touch", Duration::from_secs(5));
+    let text = sink.wait_for("touch", Duration::from_secs(30));
     assert!(text.contains(payload), "the payload must arrive verbatim: {text:?}");
     assert!(
         !std::path::Path::new("/tmp/mach-session-pwned").exists(),
@@ -319,7 +335,7 @@ fn keystrokes_reach_the_process() {
     let (sessions, sink, id) = open(r#"/bin/sh -c "read line; echo got=$line""#, "type at it");
 
     sessions.write(&id, b"hello\n").expect("write");
-    let text = sink.wait_for("got=hello", Duration::from_secs(5));
+    let text = sink.wait_for("got=hello", Duration::from_secs(30));
     assert!(text.contains("got=hello"), "what was typed must arrive: {text:?}");
 
     sessions.close(&id);
@@ -334,13 +350,13 @@ fn a_resize_reaches_the_process() {
         "measure yourself",
     );
 
-    sink.wait_for("24 80", Duration::from_secs(5));
+    sink.wait_for("24 80", Duration::from_secs(30));
     sessions.resize(&id, 132, 43).expect("resize");
     // Give the ioctl a moment to land before the second reading is taken.
     std::thread::sleep(Duration::from_millis(100));
     sessions.write(&id, b"\n").expect("write");
 
-    let text = sink.wait_for("43 132", Duration::from_secs(5));
+    let text = sink.wait_for("43 132", Duration::from_secs(30));
     assert!(
         text.contains("43 132"),
         "the process must see the pane's new size: {text:?}"
@@ -375,7 +391,7 @@ fn closing_the_pane_kills_the_whole_process_group() {
         "start something long",
     );
 
-    let text = sink.wait_for("leader=", Duration::from_secs(5));
+    let text = sink.wait_for("leader=", Duration::from_secs(30));
     let pid: i32 = text
         .split("leader=")
         .nth(1)
@@ -396,7 +412,7 @@ fn closing_everything_reaps_a_session_the_pane_never_closed() {
     // `close_all` is what the app's exit runs, and it must not need the id.
     let (sessions, sink, _id) = open(r#"/bin/sh -c "echo leader=$$; sleep 120""#, "outlive me");
 
-    let text = sink.wait_for("leader=", Duration::from_secs(5));
+    let text = sink.wait_for("leader=", Duration::from_secs(30));
     let pid: i32 = text
         .split("leader=")
         .nth(1)
@@ -421,7 +437,7 @@ fn a_process_that_ignores_the_hangup_is_killed_anyway() {
         "refuse to leave",
     );
 
-    let text = sink.wait_for("leader=", Duration::from_secs(5));
+    let text = sink.wait_for("leader=", Duration::from_secs(30));
     let pid: i32 = text
         .split("leader=")
         .nth(1)
@@ -615,7 +631,7 @@ fn each_session_has_its_own_pty_and_closing_one_leaves_the_others() {
     );
 
     sessions.write(&a, b"one\n").expect("write to the first");
-    first.wait_for("a=one", Duration::from_secs(5));
+    first.wait_for("a=one", Duration::from_secs(30));
     assert!(first.text().contains("a=one"));
     assert!(
         !second.text().contains("one"),
@@ -623,7 +639,7 @@ fn each_session_has_its_own_pty_and_closing_one_leaves_the_others() {
     );
 
     sessions.write(&b, b"two\n").expect("write to the second");
-    second.wait_for("b=two", Duration::from_secs(5));
+    second.wait_for("b=two", Duration::from_secs(30));
     assert!(second.text().contains("b=two"));
 
     // Closing one leaves the other running and writable.
@@ -631,7 +647,7 @@ fn each_session_has_its_own_pty_and_closing_one_leaves_the_others() {
     assert!(!sessions.is_live(&a));
     assert!(sessions.is_live(&b), "closing one tab must not close the rest");
     sessions.write(&b, b"three\n").expect("the survivor still takes keystrokes");
-    second.wait_for("b=three", Duration::from_secs(5));
+    second.wait_for("b=three", Duration::from_secs(30));
     assert!(second.text().contains("b=three"));
 
     sessions.close_all();
@@ -649,7 +665,7 @@ fn the_app_going_away_reaps_every_session_at_once() {
             "outlive me",
             Arc::clone(&sink),
         );
-        let text = sink.wait_for("leader=", Duration::from_secs(5));
+        let text = sink.wait_for("leader=", Duration::from_secs(30));
         pids.push(
             text.split("leader=")
                 .nth(1)
