@@ -143,6 +143,38 @@ describe("the ⌘K entry point", () => {
     expect(noteFromQuery("draft a reply to this thread")).toBe("draft a reply to this thread");
   });
 
+  /*
+   * The row is on top from the first letter, so ⏎ regularly arrives mid-word.
+   * The query at that instant is a fragment of the keyword — "hando" — and it
+   * used to travel as the instruction: an agent with tools was handed a whole
+   * thread under the word "hando" and had to ask what it meant.
+   */
+  it("never hands over the keyword the row was found by", () => {
+    for (const typed of ["hando", "h", "han", "handoff", "hand off", "> handoff", "send to"]) {
+      const row = resolve(context(typed)).find((r) => r.id.startsWith("command:handoff:"));
+      expect(row, typed).toBeDefined();
+      row?.run();
+      const request = handoffRequest();
+      expect(request?.kind === "run" ? request.note : null, typed).toBe("");
+    }
+  });
+
+  it("hands over the sentence whole, whatever is in it", () => {
+    for (const typed of [
+      "reschedule the standups in offerlab",
+      "réponds à Katie — merci 🙏 for the CSV export",
+      "handoff and then implement the feature Katie asked for",
+      `line one
+line two, and a third clause that keeps going`,
+    ]) {
+      const row = resolve(context(typed)).find((r) => r.id.startsWith("command:handoff:"));
+      expect(row, typed).toBeDefined();
+      row?.run();
+      const request = handoffRequest();
+      expect(request?.kind === "run" ? request.note : null, typed).toBe(typed.trim());
+    }
+  });
+
   it("lists every target in > mode with nothing typed", () => {
     expect(handoffScore(">")).toBe(500);
     expect(handoffScore("")).toBe(0);

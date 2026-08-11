@@ -290,15 +290,33 @@ export function stripPrefix(query: string): string {
 }
 
 /**
- * His instruction, as typed. Empty when the query was a search rather than a
- * sentence — seeding a handoff with the word "handoff" would be one more thing
- * to delete.
+ * Whether the query is the keyword and nothing else — including the part of it
+ * that is on screen while it is still being typed.
+ *
+ * A prefix counts, and that is the whole point. {@link handoffScore} puts the
+ * target rows on top from the first letter, because that is what makes ⌘K worth
+ * having: type until the row you want appears, then ⏎. So ⏎ regularly arrives
+ * mid-word, and the query at that instant is `hando` — five characters of the
+ * word he was typing to *find* the row, not a sentence about the mail.
+ */
+export function isKeywordOnly(query: string): boolean {
+  const q = stripPrefix(query).toLowerCase();
+  if (!q) return true;
+  return TRIGGERS.some((trigger) => trigger.startsWith(q) || trigger === q);
+}
+
+/**
+ * His instruction, as typed. Empty when the query is only the word that found
+ * the row.
+ *
+ * The empty case is a refusal, not a default: `LaunchPlan::prepare` says "say
+ * what you want done" and the dialog shows it. That is the correct end for a
+ * handoff with no sentence in it — the alternative, which shipped, was handing
+ * a whole mail thread to an agent with tools under the instruction `hando`, and
+ * the agent on the other end had to stop and ask what that meant.
  */
 export function noteFromQuery(query: string): string {
-  const q = stripPrefix(query);
-  const words = q.split(/\s+/).filter(Boolean);
-  if (words.length < SENTENCE_WORDS) return "";
-  return q;
+  return isKeywordOnly(query) ? "" : stripPrefix(query);
 }
 
 /**
@@ -372,10 +390,12 @@ export const handoffResolver: PaletteResolver = {
             id: `command:handoff:${target.id}`,
             kind: "command",
             title: `Hand off to ${target.name}`,
-            meta: describeTarget(target),
+            // The row is up before there is anything to send, so it says what
+            // is missing rather than describing a target he cannot use yet.
+            meta: note ? describeTarget(target) : "type what you want done",
             // One point apart so the ranking above survives the sort.
             score: score - index,
-            run: () => openHandoff(target.id, note || stripPrefix(ctx.query)),
+            run: () => openHandoff(target.id, note),
           });
         }
       }
