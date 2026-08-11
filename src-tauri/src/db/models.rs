@@ -35,6 +35,36 @@ impl Participant {
     }
 }
 
+/// One address in the address book, folded across every message that mentions
+/// it.
+///
+/// There is no contacts table and there should not be one. Every address worth
+/// completing is already in `messages` — in `from_email` for everyone who has
+/// written to you, and in `to_json`/`cc_json`/`bcc_json` for everyone you have
+/// written to — so the address book is a query, not a copy that can go stale.
+/// See [`crate::db::queries::address_book`].
+///
+/// The field names match `Contact` in `src/lib/contacts.ts`, because the
+/// frontend merges these rows straight into the index it builds from whatever
+/// is on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Contact {
+    /// Lowercased. This is the identity of a contact.
+    pub email: String,
+    /// The most recent non-empty display name seen for this address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// How many messages *you* addressed to them: they appear in to/cc/bcc on
+    /// a message whose sender is one of your accounts.
+    pub sends: i64,
+    /// The most recent moment this address appeared anywhere, unix millis.
+    pub last_seen: i64,
+    /// One of your own accounts. Kept, never dropped, and sorted last.
+    #[serde(rename = "self")]
+    pub is_self: bool,
+}
+
 /// Gmail's two label flavours. Anything unrecognised is treated as a user
 /// label, which is the harmless default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -734,6 +734,39 @@ fn an_unknown_account_id_is_a_typed_error_not_an_empty_list() {
 }
 
 #[test]
+fn the_address_book_crosses_the_boundary_as_camel_case_with_self() {
+    let db = TempDb::new("contacts");
+    let account_id = account(&db, "alex@example.com", 0);
+    let thread_id = thread(&db, account_id, "t1", "Subject", 1_700_000_000_000);
+    // `message` sends from Tawny to alex@example.com, so Tawny is a sighting
+    // and Alex is the owner.
+    message(&db, thread_id, account_id, "m1", "Subject", "body");
+
+    let book = reads::list_contacts(&db).expect("address book");
+    let tawny = book
+        .iter()
+        .find(|c| c.email == "tawny@example.com")
+        .expect("the sender is a contact");
+    assert!(!tawny.is_self);
+
+    // The frontend merges these rows into `Contact` in `src/lib/contacts.ts`,
+    // so the field names are part of the contract — `self` in particular, which
+    // cannot be spelled that way in Rust.
+    let payload = serde_json::to_value(tawny).expect("serialize");
+    assert_eq!(payload["email"], "tawny@example.com");
+    assert_eq!(payload["self"], false);
+    assert!(payload["lastSeen"].is_number());
+    assert!(payload["sends"].is_number());
+    assert!(payload["isSelf"].is_null(), "the wire name is `self`");
+
+    let me = book
+        .iter()
+        .find(|c| c.email == "alex@example.com")
+        .expect("your own address stays in the book");
+    assert!(me.is_self);
+}
+
+#[test]
 fn an_unknown_thread_id_is_a_typed_error() {
     let db = TempDb::new("unknown-thread");
     let error = reads::get_thread(&db, 42).expect_err("unknown thread");

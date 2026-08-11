@@ -201,6 +201,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ipc::commands::list_accounts,
             ipc::commands::list_labels,
+            ipc::commands::list_contacts,
             ipc::commands::list_threads,
             ipc::commands::get_thread,
             ipc::commands::search_threads,

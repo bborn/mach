@@ -146,6 +146,110 @@ describe("contactsFrom", () => {
   });
 });
 
+describe("contactsFrom — merging the store's index with what is on screen", () => {
+  it("keeps everyone the store knows about, not only who is loaded", () => {
+    const contacts = contactsFrom({
+      indexed: [
+        contact({ email: "ada@x.com", name: "Ada", sends: 12, lastSeen: 4 * DAY }),
+        contact({ email: "bob@y.com", name: "Bob", sends: 0, lastSeen: 2 * DAY }),
+      ],
+      threads: [thread({ id: 1, participants: [{ name: "Cy", email: "cy@z.com" }] })],
+    });
+    expect(contacts.map((c) => c.email).sort()).toEqual(["ada@x.com", "bob@y.com", "cy@z.com"]);
+  });
+
+  it("ranks someone you write to often above someone in a loaded thread", () => {
+    const contacts = contactsFrom({
+      // The index is a snapshot from boot, so its recency is behind the list's.
+      indexed: [contact({ email: "often@x.com", name: "Often", sends: 40, lastSeen: 1 * DAY })],
+      threads: [
+        thread({ id: 1, timestamp: 9 * DAY, participants: [{ name: "Seen", email: "seen@x.com" }] }),
+      ],
+    });
+    expect(contacts.map((c) => c.email)).toEqual(["often@x.com", "seen@x.com"]);
+  });
+
+  it("lets a sighting on screen outrank a stale index entry", () => {
+    const contacts = contactsFrom({
+      indexed: [
+        contact({ email: "old@x.com", lastSeen: 1 * DAY }),
+        contact({ email: "ada@x.com", lastSeen: 2 * DAY }),
+      ],
+      // Ada was in the index at two days old; she is in the open conversation
+      // now, and that is the one the next message is most likely going to.
+      threads: [
+        thread({ id: 1, timestamp: 9 * DAY, participants: [{ name: "Ada", email: "ada@x.com" }] }),
+      ],
+    });
+    expect(contacts.map((c) => c.email)).toEqual(["ada@x.com", "old@x.com"]);
+    expect(contacts[0].lastSeen).toBe(9 * DAY);
+  });
+
+  it("does not let a sighting cost someone the sends the store counted", () => {
+    const contacts = contactsFrom({
+      indexed: [contact({ email: "ada@x.com", name: "Ada", sends: 12, lastSeen: 1 })],
+      threads: [thread({ id: 1, timestamp: 5, participants: [{ name: "", email: "ada@x.com" }] })],
+    });
+    expect(contacts).toHaveLength(1);
+    expect(contacts[0].sends).toBe(12);
+    expect(contacts[0].lastSeen).toBe(5);
+  });
+
+  it("takes the higher send count when the index and localStorage disagree", () => {
+    // The store counts every send ever; `mach.contacts.v1` only knows the ones
+    // made from Mach. Neither is wrong, and the larger one is the true one.
+    const contacts = contactsFrom({
+      indexed: [contact({ email: "ada@x.com", sends: 40, lastSeen: 1 })],
+      sent: [
+        { email: "ada@x.com", sends: 3, lastSentAt: 2 },
+        // Sent a minute ago, so the next sync has not filed it yet: this is
+        // the whole reason the localStorage list is still here.
+        { email: "fresh@x.com", sends: 1, lastSentAt: 9 * DAY },
+      ],
+    });
+    expect(contacts.map((c) => [c.email, c.sends])).toEqual([
+      ["ada@x.com", 40],
+      ["fresh@x.com", 1],
+    ]);
+  });
+
+  it("deduplicates the index against the screen, case-insensitively", () => {
+    const contacts = contactsFrom({
+      indexed: [contact({ email: "Ada@X.com", name: "Ada Lovelace", sends: 2, lastSeen: 1 })],
+      threads: [thread({ id: 1, timestamp: 5, participants: [{ name: "", email: "ADA@x.COM" }] })],
+    });
+    expect(contacts).toHaveLength(1);
+    expect(contacts[0]).toMatchObject({ email: "ada@x.com", name: "Ada Lovelace", sends: 2 });
+  });
+
+  it("lets a sighting teach a name the index never saw", () => {
+    const contacts = contactsFrom({
+      indexed: [contact({ email: "ada@x.com", sends: 2, lastSeen: 1 })],
+      threads: [thread({ id: 1, timestamp: 5, participants: [{ name: "Ada", email: "ada@x.com" }] })],
+    });
+    expect(contacts[0].name).toBe("Ada");
+  });
+
+  it("carries the index's self flag, and the accounts still mark their own", () => {
+    const contacts = contactsFrom({
+      indexed: [
+        contact({ email: "me@x.com", name: "Me", self: true, lastSeen: 9 * DAY, sends: 5 }),
+        contact({ email: "ada@x.com", name: "Ada", lastSeen: 1 }),
+      ],
+      accounts: [{ id: 1, email: "me@x.com", name: "Me", colorIndex: 1, kind: "personal" }],
+    });
+    expect(contacts.map((c) => c.email)).toEqual(["ada@x.com", "me@x.com"]);
+    expect(contacts[1].self).toBe(true);
+  });
+
+  it("is the old behaviour when the index has not arrived yet", () => {
+    const sources = {
+      threads: [thread({ id: 1, timestamp: 5, participants: [{ name: "Ada", email: "ada@x.com" }] })],
+    };
+    expect(contactsFrom({ indexed: [], ...sources })).toEqual(contactsFrom(sources));
+  });
+});
+
 describe("matchScore", () => {
   const ada = contact({ email: "ada@northwind.com", name: "Ada Lovelace" });
 

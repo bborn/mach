@@ -43,6 +43,7 @@ import type {
   ThreadQuery,
   TimeRange,
 } from "@/types";
+import { normalizeEmail, type Contact } from "./contacts";
 import {
   MachError,
   type Command,
@@ -109,6 +110,15 @@ interface WireAccount {
   /** British spelling, as in `db::models::Account`. */
   colourIndex?: Nullable<number>;
   colorIndex?: Nullable<number>;
+}
+
+/** `db::models::Contact`. Already lowercased, folded and ranked by SQLite. */
+interface WireContact {
+  email: string;
+  name?: Nullable<string>;
+  sends?: Nullable<number>;
+  lastSeen?: Nullable<number>;
+  self?: Nullable<boolean>;
 }
 
 interface WireLabel {
@@ -320,6 +330,28 @@ function text(value: Nullable<string>, fallback = ""): string {
 
 function optional(value: Nullable<string>): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Wire rows to `Contact`, dropping anything without an address.
+ *
+ * A row with no email cannot be inserted into an address field, so it is not a
+ * suggestion — it is a row that would do nothing under Enter.
+ */
+export function mapContacts(wire: WireContact[]): Contact[] {
+  const out: Contact[] = [];
+  for (const row of wire ?? []) {
+    const email = normalizeEmail(text(row?.email));
+    if (!email) continue;
+    out.push({
+      email,
+      name: optional(row.name),
+      lastSeen: typeof row.lastSeen === "number" ? row.lastSeen : 0,
+      sends: typeof row.sends === "number" ? row.sends : 0,
+      self: row.self === true,
+    });
+  }
+  return out;
 }
 
 function clampColor(value: number): ColorIndex {
@@ -754,6 +786,10 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
         call<WireAccount[]>("list_accounts"),
       ]);
       return mapCalendars(calendars, mapAccounts(accounts));
+    },
+
+    async listContacts() {
+      return mapContacts(await call<WireContact[]>("list_contacts"));
     },
 
     async listThreads(query: ThreadQuery) {

@@ -12,7 +12,7 @@
 
 use rusqlite::Connection;
 
-use crate::db::models::{Account, Calendar as StoredCalendar, Event, Label};
+use crate::db::models::{Account, Calendar as StoredCalendar, Contact, Event, Label};
 use crate::db::{queries, Db};
 
 use super::error::IpcError;
@@ -21,6 +21,15 @@ use super::types::{Calendar, ThreadDetail, ThreadPage, ThreadQuery};
 /// Every authorized account, in rail order.
 pub fn list_accounts(db: &Db) -> Result<Vec<Account>, IpcError> {
     Ok(db.read(queries::list_accounts)?)
+}
+
+/// The address book: every address the store has ever seen, best first.
+///
+/// A scan over every message, so it is a read the UI starts and then forgets
+/// about — see `useContacts` on the frontend. It is never on the path of a
+/// keystroke.
+pub fn list_contacts(db: &Db) -> Result<Vec<Contact>, IpcError> {
+    Ok(db.read(|conn| queries::address_book(conn, queries::MAX_CONTACTS))?)
 }
 
 /// One account by row id, as a typed error when it is not there.

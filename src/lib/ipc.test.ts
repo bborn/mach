@@ -7,6 +7,7 @@ import {
   isTauri,
   mapAccounts,
   mapCalendars,
+  mapContacts,
   mapEvent,
   mapLabels,
   mapMessage,
@@ -147,6 +148,33 @@ describe("label mapping", () => {
       accountId: 1,
       kind: "user",
     });
+  });
+});
+
+describe("contact mapping", () => {
+  it("normalises the address and fills in what an older backend omitted", () => {
+    expect(
+      mapContacts([
+        { email: "  Ada@X.com ", name: "Ada", sends: 4, lastSeen: 900, self: false },
+        { email: "me@x.com", self: true },
+      ]),
+    ).toEqual([
+      { email: "ada@x.com", name: "Ada", sends: 4, lastSeen: 900, self: false },
+      { email: "me@x.com", name: undefined, sends: 0, lastSeen: 0, self: true },
+    ]);
+  });
+
+  it("drops a row with no address, which nothing could insert", () => {
+    expect(mapContacts([{ email: "" }, { email: "   " }, { email: "a@x.com" }])).toHaveLength(1);
+  });
+
+  it("asks list_contacts for the address book with no arguments", async () => {
+    const { transport, calls } = fakeTransport({
+      list_contacts: [{ email: "ada@x.com", name: "Ada", sends: 2, lastSeen: 5, self: false }],
+    });
+    const contacts = await createIpcSource(transport).listContacts();
+    expect(calls[0]?.command).toBe("list_contacts");
+    expect(contacts).toHaveLength(1);
   });
 });
 

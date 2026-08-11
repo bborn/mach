@@ -6,6 +6,7 @@
 //! |---|---|---|
 //! | `list_accounts` | — | `Account[]` |
 //! | `list_labels` | `accountId?` | `Label[]` |
+//! | `list_contacts` | — | `Contact[]` |
 //! | `list_threads` | `query: ThreadQuery` | `ThreadPage` |
 //! | `get_thread` | `threadId` | `ThreadDetail` |
 //! | `search_threads` | `query`, `limit?` | `ThreadPage` |

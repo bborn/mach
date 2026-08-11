@@ -38,6 +38,7 @@ import type {
   TimeRange,
   PendingAuthorization,
 } from "@/types";
+import type { Contact } from "./contacts";
 import * as fixtures from "./fixtures";
 import { matchesSearchNode, type SearchNode } from "./search-query";
 
@@ -375,6 +376,15 @@ export interface MachDataSource {
   listEvents(range: TimeRange): Promise<CalendarEvent[]>;
 
   /**
+   * Every address the store has seen, ranked, for the address fields.
+   *
+   * A scan over every message, so this is the one read the UI starts and then
+   * forgets about: it is fired once after the first render and nothing waits
+   * on it. See `useContacts`.
+   */
+  listContacts(): Promise<Contact[]>;
+
+  /**
    * Dispatch a command.
    *
    * `source` says who asked — `user` (the default), `agent`, or
@@ -554,6 +564,11 @@ export const fixtureSource: MachDataSource = {
     return fixtures.events
       .filter((e) => e.start < range.end && e.end > range.start)
       .sort((a, b) => a.start - b.start);
+  },
+  // People who are in no fixture thread, so the fixture browser shows what the
+  // real store does: completion for somebody who is not on screen.
+  async listContacts(): Promise<Contact[]> {
+    return fixtures.contacts;
   },
 
   async execute(command, _source) {

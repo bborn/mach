@@ -659,6 +659,186 @@ pub fn delete_message(conn: &Connection, message_id: i64) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// the address book
+// ---------------------------------------------------------------------------
+
+/// How many addresses [`address_book`] will hand back.
+///
+/// The store this was built against holds 66,248 messages and yields 3,565
+/// distinct addresses, 681 of them people the owner has actually written to. So
+/// 5,000 covers the whole real corpus with room to grow, and it is small enough
+/// that the cap costs nothing to honour: the frontend scores every contact on
+/// every keystroke, and 5,000 of those scores is a fraction of a millisecond.
+/// A cap exists at all because the shape of the query has no upper bound — a
+/// decade of mailing lists is unbounded — and an address field that has to
+/// think is a worse failure than one that has forgotten a stranger from 2014.
+pub const MAX_CONTACTS: u32 = 5_000;
+
+/// Every address the store has seen, folded, ranked, capped.
+///
+/// # The two halves
+///
+/// Every address arrives from one of two places, and the difference between
+/// them is the whole ranking:
+///
+///  * **People you have written to** — a row in `to_json`, `cc_json` or
+///    `bcc_json` on a message whose `from_email` is one of your own accounts.
+///    Each such appearance is a `send`, and `sends > 0` is the only signal in
+///    the store that says *you chose this address*.
+///  * **People who have written to you** — every other `from_email`. Worth
+///    completing (it is the large majority of the book) and worth ranking
+///    below anyone in the first group, because being mailed by a stranger is
+///    not evidence you want to mail them back.
+///
+/// Recipients of *incoming* mail are not collected. Being cc'd alongside four
+/// hundred people on a list announcement puts four hundred addresses in the
+/// book and tells you nothing about any of them; the sender of that message is
+/// already collected, which is the part that has a person behind it.
+///
+/// Drafts are skipped, on the same reasoning as `noteSent` in
+/// `src/lib/contacts.ts`: a half-typed address in an abandoned draft is not
+/// somebody you correspond with.
+///
+/// # Folding
+///
+/// Deduplication is on the lowercased address, so `Ada@X.com` and `ada@x.com`
+/// are one contact. `last_seen` is the newest sighting anywhere. The name is
+/// the most recent *non-empty* one — a later header carrying a bare address
+/// never unlearns a name an earlier one taught, which is the same rule
+/// `contactsFrom` follows on the frontend.
+///
+/// Your own accounts are marked rather than dropped (mailing yourself is a real
+/// thing people do) and are exempt from the cap, so adding an account can never
+/// push it out of its own address book.
+///
+/// # What it costs
+///
+/// A full scan of `messages`, and those rows carry the message bodies, so the
+/// scan is reading gigabytes off disk to look at one column. Against the
+/// owner's store — 66,248 messages, 1.4 GB — that is a couple of seconds in a
+/// debug build for 3,565 contacts. Nothing waits on it: the frontend fires it
+/// once after the first render and merges the answer whenever it lands. An
+/// index on `from_email` would fix the scan and is not here yet, because the
+/// only caller is a background read that runs once per launch.
+pub fn address_book(conn: &Connection, limit: u32) -> Result<Vec<Contact>> {
+    // One pass per column rather than one clever query: `json_each` is a table
+    // function, so each JSON column needs its own join, and a UNION ALL of four
+    // scans is what SQLite would do with any spelling of this anyway.
+    //
+    // `json_valid` guards the join because `json_each` *errors* on malformed
+    // text, and one bad row must not cost the whole address book. The columns
+    // are written by `people_to_json` so this should never fire.
+    //
+    // The fold happens in SQLite rather than in Rust because the union is
+    // ~70,000 rows against the owner's store and the answer is ~3,500. Grouping
+    // here rather than in a `HashMap` means twenty times fewer rows are turned
+    // into `String`s, and it measured about twice as fast.
+    //
+    // `named` picks the name. It has exactly one aggregate, which is the
+    // condition under which SQLite documents a bare column as coming from the
+    // row that produced the max — so the name beside `max(at)` is the newest
+    // one anybody used. A later header carrying a bare address is not in that
+    // group at all, so it cannot unlearn a name, which is the rule
+    // `contactsFrom` follows on the frontend.
+    const SQL: &str = "\
+        WITH mine(email) AS (SELECT lower(email) FROM accounts), \
+        seen(email, name, at, is_send) AS ( \
+            SELECT trim(lower(from_email)), from_name, internal_date, 0 FROM messages \
+            UNION ALL \
+            SELECT trim(lower(json_extract(v.value, '$.email'))), \
+                   json_extract(v.value, '$.name'), m.internal_date, 1 \
+              FROM messages m, json_each(m.to_json) v \
+             WHERE m.is_draft = 0 AND json_valid(m.to_json) \
+               AND lower(m.from_email) IN mine \
+            UNION ALL \
+            SELECT trim(lower(json_extract(v.value, '$.email'))), \
+                   json_extract(v.value, '$.name'), m.internal_date, 1 \
+              FROM messages m, json_each(m.cc_json) v \
+             WHERE m.is_draft = 0 AND json_valid(m.cc_json) \
+               AND lower(m.from_email) IN mine \
+            UNION ALL \
+            SELECT trim(lower(json_extract(v.value, '$.email'))), \
+                   json_extract(v.value, '$.name'), m.internal_date, 1 \
+              FROM messages m, json_each(m.bcc_json) v \
+             WHERE m.is_draft = 0 AND json_valid(m.bcc_json) \
+               AND lower(m.from_email) IN mine \
+        ), \
+        kept AS (SELECT * FROM seen WHERE email IS NOT NULL AND email <> ''), \
+        folded AS (SELECT email, max(at) AS last_seen, sum(is_send) AS sends \
+                     FROM kept GROUP BY email), \
+        named AS (SELECT email, max(at), name FROM kept \
+                   WHERE name IS NOT NULL \
+                     AND trim(trim(name), '\"') <> '' \
+                     AND lower(trim(trim(name), '\"')) <> email \
+                   GROUP BY email) \
+        SELECT folded.email, named.name, folded.last_seen, folded.sends \
+          FROM folded LEFT JOIN named ON named.email = folded.email";
+
+    let mut by_email: std::collections::HashMap<String, Contact> =
+        std::collections::HashMap::new();
+    let mut stmt = conn.prepare(SQL)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let email: String = row.get(0)?;
+        let name = clean_name(row.get::<_, Option<String>>(1)?, &email);
+        let contact = Contact {
+            name,
+            last_seen: row.get(2)?,
+            sends: row.get(3)?,
+            is_self: false,
+            email,
+        };
+        by_email.insert(contact.email.clone(), contact);
+    }
+
+    let mut mine: Vec<Contact> = Vec::new();
+    let mut theirs: Vec<Contact> = Vec::new();
+    for account in list_accounts(conn)? {
+        let email = account.email.trim().to_lowercase();
+        if email.is_empty() {
+            continue;
+        }
+        match by_email.remove(&email) {
+            Some(contact) => mine.push(Contact {
+                is_self: true,
+                ..contact
+            }),
+            None => mine.push(Contact {
+                name: clean_name(account.display_name, &email),
+                email,
+                sends: 0,
+                last_seen: 0,
+                is_self: true,
+            }),
+        }
+    }
+    theirs.extend(by_email.into_values());
+
+    // Sends first, then recency, then the address so the order is total and a
+    // second call returns the same rows. The frontend re-sorts with the same
+    // rule after merging what is on screen; this order is what decides who
+    // survives the cap.
+    theirs.sort_by(|a, b| {
+        b.sends
+            .cmp(&a.sends)
+            .then(b.last_seen.cmp(&a.last_seen))
+            .then(a.email.cmp(&b.email))
+    });
+    theirs.truncate(limit as usize);
+    theirs.append(&mut mine);
+    Ok(theirs)
+}
+
+/// A "name" that is blank, or that is just the address again, is not a name.
+fn clean_name(name: Option<String>, email: &str) -> Option<String> {
+    let trimmed = name?.trim().trim_matches('"').trim().to_string();
+    if trimmed.is_empty() || trimmed.to_lowercase() == email {
+        return None;
+    }
+    Some(trimmed)
+}
+
+// ---------------------------------------------------------------------------
 // attachments
 // ---------------------------------------------------------------------------
 
