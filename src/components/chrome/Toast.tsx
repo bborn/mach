@@ -292,19 +292,23 @@ export function ToastLayer({
   return (
     <div
       /*
-       * Bottom left, clear of the rail — and z-30, above the panes and below
-       * every dialog and the palette, which are z-50.
+       * Bottom right — and z-30, above the panes and below every dialog and the
+       * palette, which are z-50.
        *
-       * Hard against the left edge was the first version and it was wrong in
-       * the calendar: the sidebar's own display checkboxes live at the bottom
-       * of it, and a toast parked on top of them for twenty seconds is exactly
-       * the "covers the thing you are using" failure. Starting where the rail
-       * ends puts it over the thread list in mail and the last hour of the grid
-       * in the calendar, which are the rows the message is usually about, and
-       * clear of the reading pane entirely — the composer's own undo-send strip
-       * lives down there on the right and must never be sat on.
+       * It sat at the bottom left for most of this file's life, starting where
+       * the rail ends so it covered the thread list rather than the calendar
+       * sidebar's display checkboxes. Moved on request; the corner is the one
+       * every other application puts this in.
+       *
+       * What that costs, and it is a real cost: the composer's send row and its
+       * undo-send offer are at the bottom of the reading pane, on this side. A
+       * toast and an open composer now share the corner, and the toast is on
+       * top. It is `bottom-9` rather than hard against the edge so the status
+       * bar stays readable under it, and the layer takes no pointer events, so
+       * what is underneath is still clickable everywhere except the card's own
+       * few hundred pixels.
        */
-      className="pointer-events-none fixed bottom-9 left-[calc(var(--rail-width)+0.75rem)] z-30 flex flex-col items-start gap-1"
+      className="pointer-events-none fixed bottom-9 right-3 z-30 flex flex-col items-end gap-1"
     >
       {/* Above the status card, because it is the one that stays. */}
       {children}
