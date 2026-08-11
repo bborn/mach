@@ -107,14 +107,20 @@ export function mailActionBindings(
        * here than for most keys — ⌘⌫ is a Back gesture in some WebViews, and a
        * mail client that navigates away when you delete a message is not one.
        *
-       * The key is shared, and this binding is the one that yields. The
-       * composer discards a draft with ⌘⌫ (`COMPOSER_KEYS.discard`) and the
-       * event modal deletes an event with it; both register at
-       * `OVERLAY_KEY_FLOOR`, and this one sits at 0 with the rest of the shell,
-       * so a composer or a modal wins for as long as it is up. That is the
-       * right way round — ⌘⌫ means "throw away the thing I am inside", and a
-       * draft is a thing you are inside. There is no registry conflict either:
+       * The key is shared with the event modal, which deletes an event with it
+       * above `OVERLAY_KEY_FLOOR`, and this binding is the one that yields: it
+       * sits at 0 with the rest of the shell, so the modal wins for as long as
+       * it is up. ⌘⌫ means "throw away the thing I am inside", and an open
+       * modal is a thing you are inside. There is no registry conflict either:
        * `conflicts()` reports same-priority ties, and a priority is a decision.
+       *
+       * The composer used to claim it as well, for discard. It does not any
+       * more: ⌘⌫ deletes to the start of the line on macOS, and the composer's
+       * bindings run while you are typing, so a second press in the editor
+       * destroyed the draft. Discard is ⇧⌘⌫ now — `COMPOSER_KEYS.discard`.
+       *
+       * This binding never had that problem: it is dead while the target is a
+       * field, so ⌘⌫ typed into a composer reaches the editor untouched.
        *
        * No confirmation, deliberately. Undo is the safety net, exactly as it is
        * for archive: `trash` has an exact inverse (`untrash`, restoring the

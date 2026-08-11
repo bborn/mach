@@ -154,37 +154,40 @@ describe("the mail action keys", () => {
     expect(keymap.conflicts()).toEqual([]);
   });
 
-  it("yields ⌘⌫ to the composer, which claimed it first", () => {
+  it("yields ⌘⌫ to the overlay in front of it", () => {
     /*
-     * ⌘⌫ was already spoken for twice when this was added: the composer
-     * discards a draft with it (`COMPOSER_KEYS.discard`) and the event modal
-     * deletes an event. Both register at 100, the overlay class; this one sits
-     * at 0 with the rest of the shell.
+     * ⌘⌫ is spoken for above this binding: the event modal deletes an event
+     * with it, at 100, the overlay class. This one sits at 0 with the rest of
+     * the shell.
      *
-     * That is the whole arbitration, and it is the right way round. A draft or
-     * an event modal is a thing you are *inside*, and ⌘⌫ means "throw away the
-     * thing I am inside" in every Mac app. Trashing the conversation behind it
-     * would be answering a question the user did not ask.
+     * That is the whole arbitration, and it is the right way round. An event
+     * modal is a thing you are *inside*, and ⌘⌫ means "throw away the thing I
+     * am inside" in every Mac app. Trashing the conversation behind it would be
+     * answering a question the user did not ask.
      *
      * `conflicts()` reports same-priority ties among live bindings, so this is
      * not a conflict either — an explicit priority is a decision, not an
      * accident of which component mounted last.
+     *
+     * The composer is no longer one of these: it discards on ⇧⌘⌫, because ⌘⌫
+     * is macOS's "delete to the beginning of the line" and the composer's keys
+     * are live while you type. See `COMPOSER_KEYS.discard`.
      */
-    const composerDiscard = vi.fn();
+    const modalDelete = vi.fn();
     keymap.register({
       keys: "mod+backspace",
       priority: 100,
       allowInInput: true,
-      handler: composerDiscard,
+      handler: modalDelete,
     });
 
     expect(keymap.handle(press("Backspace", { metaKey: true }))).toBe(true);
-    expect(composerDiscard).toHaveBeenCalledTimes(1);
+    expect(modalDelete).toHaveBeenCalledTimes(1);
     expect(handlers.trash).not.toHaveBeenCalled();
     expect(keymap.conflicts()).toEqual([]);
   });
 
-  it("takes ⌘⌫ back the moment the composer goes away", () => {
+  it("takes ⌘⌫ back the moment the overlay goes away", () => {
     const release = keymap.register({
       keys: "mod+backspace",
       priority: 100,
