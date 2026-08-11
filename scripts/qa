@@ -41,6 +41,12 @@ set -euo pipefail
 #   a selector. It exists for the rare thing the page cannot see — a native
 #   menu, a system dialog — and you should have a reason.
 #
+#   It now refuses unless the target instance is already frontmost. A QA
+#   instance runs under an Accessory policy and cannot be raised, so the raise
+#   fails silently and the keystrokes land in whatever is. An agent typed a
+#   sentence into the owner's real mailbox that way and archived a conversation
+#   with it.
+#
 # So: the real app is the answer for anything native. A window edge, the
 # traffic lights, a WebKit-only behaviour, a composer, a full-screen surface —
 # launch a QA instance and drive it.
@@ -171,6 +177,40 @@ window_id() {
 focus() {
   local pid; pid="$(instance_pid)" || return 0
   osascript -e "tell application \"System Events\" to set frontmost of (item 1 of (every process whose unix id is $pid)) to true" >/dev/null 2>&1 || true
+}
+
+# Refuse to type into somebody else's window.
+#
+# `focus` asks System Events to raise the instance. A QA instance cannot be
+# raised: `shell.rs` puts every non-`main` instance under an Accessory
+# activation policy precisely so it can never take the keyboard. So the raise
+# silently fails, `cliclick` types into whatever *is* frontmost — and on this
+# machine that is the owner's own Mach, reading his real mail.
+#
+# That happened. An agent sent "read this thread and reply, Claude" into the
+# live mailbox as mail-list keystrokes, and the `e` archived a conversation.
+#
+# So the OS-input path now proves the target is frontmost before it types, and
+# dies if it is not. There is no flag to skip this.
+require_frontmost() {
+  # The owner's instance is never a target. Being frontmost is not the safety
+  # property — his window is frontmost most of the time, which is exactly when
+  # typing into it does the most damage. This was written after the guard below
+  # was added and then immediately defeated by testing it against `main` while
+  # his window happened to be in front.
+  [ "$INSTANCE" = "main" ] && die "MACH_QA_INPUT will not type into the owner's instance. \
+Launch one of your own: MACH_QA_INSTANCE=agent scripts/qa up"
+
+  local pid; pid="$(instance_pid)" || die "not running"
+  local front
+  front="$(osascript -e 'tell application "System Events" to get unix id of first process whose frontmost is true' 2>/dev/null || echo "")"
+  [ "$front" = "$pid" ] && return 0
+  local name
+  name="$(ps -p "${front:-0}" -o comm= 2>/dev/null | xargs basename 2>/dev/null || echo "something else")"
+  die "MACH_QA_INPUT would type into $name (pid ${front:-unknown}), not instance '$INSTANCE' (pid $pid).
+  A QA instance runs under an Accessory policy and cannot be raised, so synthetic
+  input goes to whatever is frontmost — which is how an agent once typed into the
+  owner's real mailbox. Use the in-page verbs instead: qa key / qa click / qa ui."
 }
 
 ensure_vite() {
@@ -409,6 +449,7 @@ cmd_key() {
     command -v cliclick >/dev/null || die "cliclick is not installed (brew install cliclick)"
     instance_pid >/dev/null || die "not running"
     focus; sleep 0.6
+    require_frontmost
     cliclick "$@"
     return
   fi
@@ -425,6 +466,7 @@ cmd_click() {
     local wx="$1" wy="$2" xy="$5"
     local rx="${xy%%,*}" ry="${xy##*,}"
     focus; sleep 0.5
+    require_frontmost
     cliclick "c:$((wx + rx)),$((wy + ry))"
     echo "clicked window($rx,$ry)"
     return
