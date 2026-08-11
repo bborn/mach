@@ -3,13 +3,24 @@
  *
  * There is no contacts API in this app and there should not be one: the
  * addresses worth completing are the addresses you have actually corresponded
- * with, and every one of those is already in the store. So the index is derived
- * — thread participants, the messages of the open conversation, calendar
- * organisers and attendees — plus one thing the store cannot know, which is who
- * *you* have written to. That last part is the only piece with any persistence
- * behind it, and it lives in `localStorage` behind the same pure-module shape
- * `favorites.ts` uses, because there is still no settings table on the Rust
- * side.
+ * with, and every one of those is already in the store.
+ *
+ * So the index is derived, from two kinds of source that are merged rather than
+ * chosen between:
+ *
+ *  * **The store**, read once through `list_contacts` — every address in every
+ *    message, folded and ranked by `db::queries::address_book`. This is the
+ *    body of the book: thousands of people, including everyone the owner has
+ *    ever replied to.
+ *  * **Whatever is in memory** — the threads currently in the list, the open
+ *    conversation's `to`/`cc` lines, calendar organisers and attendees. A few
+ *    dozen people, and the ones most likely to be wanted next, which is why
+ *    they are folded on top of the index rather than behind it: a sighting a
+ *    second ago is what makes someone the freshest address in the book.
+ *
+ * The whole index used to be the second half alone, which is how a composer
+ * opened in Drafts could offer completions from eight conversations and nothing
+ * else.
  *
  * Three decisions worth knowing:
  *
@@ -46,6 +57,15 @@ export interface Contact {
 /* -------------------------------------------------------------------------- */
 
 export interface ContactSources {
+  /**
+   * The store's own address book, as `list_contacts` returned it.
+   *
+   * Folded first, so everything below is allowed to improve on it: a sighting
+   * in the open conversation moves `lastSeen` forward and can teach a name the
+   * index does not have, while `sends` — which only the store knows — survives
+   * untouched.
+   */
+  indexed?: readonly Contact[];
   threads?: readonly Thread[];
   /** The open conversation — its `to`/`cc` lines hold addresses no row shows. */
   detail?: ThreadDetail | null;
@@ -81,6 +101,18 @@ export function contactsFrom(sources: ContactSources): Contact[] {
     // Lovelace <…>".
     if (!existing.name && name) existing.name = name;
   };
+
+  for (const row of sources.indexed ?? []) {
+    const email = normalizeEmail(row.email);
+    if (!email) continue;
+    byEmail.set(email, {
+      email,
+      name: cleanName(row.name, email),
+      lastSeen: row.lastSeen,
+      sends: row.sends,
+      self: row.self,
+    });
+  }
 
   for (const thread of sources.threads ?? []) {
     for (const participant of thread.participants) note(participant, thread.timestamp);
@@ -217,6 +249,23 @@ export function rankContacts(
 /* Who you write to — the persisted half                                       */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * This used to be the *only* record of who you write to. It is not any more —
+ * `db::queries::address_book` counts every send in the store, going back as far
+ * as the mail does, where this list only ever knew about messages sent from
+ * Mach since the code shipped.
+ *
+ * It is kept for one thing: the gap. The store's book is read once at boot, and
+ * a message sent since then is not in it — the send has to reach Google, come
+ * back through a sync, and land in `messages` before it counts. Writing to
+ * someone for the first time and having them vanish from completion for the
+ * rest of the session is exactly the complaint this whole index exists to
+ * answer, so the localStorage list covers the interval.
+ *
+ * The overlap is harmless because it is resolved rather than merged:
+ * `contactsFrom` takes `Math.max` of the two counts, so a store that says forty
+ * and a local list that says three still says forty.
+ */
 export const CONTACTS_STORAGE_KEY = "mach.contacts.v1";
 
 /** Past this the list is trimmed by usefulness. Nobody has 500 correspondents. */

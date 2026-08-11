@@ -85,6 +85,7 @@ import {
   type Selection,
 } from "@/lib/selection";
 import { mailboxName } from "@/lib/mailboxes";
+import type { Contact } from "@/lib/contacts";
 import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
 import { toMailboxError, useThreadStream } from "@/hooks/useThreadStream";
@@ -422,6 +423,15 @@ interface MachValue {
   events: CalendarEvent[];
   detail: ThreadDetail | null;
   detailLoading: boolean;
+  /**
+   * The store's address book, or `[]` until it arrives.
+   *
+   * Empty is a real and usable state — `useContacts` still has the open
+   * conversation and the loaded list to complete from — which is what lets the
+   * composer open and take typing before a scan of forty thousand messages has
+   * finished.
+   */
+  addressBook: Contact[];
   /** What the user pinned to the sidebar, in the order they pinned it. */
   favorites: Favorite[];
   /** The mailbox-plus-account-scope favorite the current view would produce. */
@@ -573,6 +583,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [detail, setDetail] = useState<ThreadDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [addressBook, setAddressBook] = useState<Contact[]>([]);
   const [sync, setSync] = useState<SyncStatus | null>(null);
   const [booted, setBooted] = useState(false);
   const [bootError, setBootError] = useState<MailboxError | null>(null);
@@ -715,6 +726,37 @@ export function MachProvider({ children }: { children: ReactNode }) {
         if (live) setBooted(true);
       }
     })();
+    return () => {
+      live = false;
+    };
+  }, [reloadKey]);
+
+  /*
+   * The address book, once.
+   *
+   * Its own effect rather than a fifth `Promise.all` member in boot above,
+   * because it is the one read here that scans the whole `messages` table and
+   * nothing may wait on it: `booted` gates the first paint, and a composer that
+   * would not open until every message had been read is a worse bug than the
+   * one this fixes. It arrives when it arrives, `useContacts` merges it, and
+   * completion gets better mid-session without anything on screen moving.
+   *
+   * Reloaded with `reloadKey` — adding or removing an account changes whose
+   * address book this is.
+   */
+  useEffect(() => {
+    let live = true;
+    void getDataSource()
+      .listContacts()
+      .then((rows) => {
+        if (live) setAddressBook(rows);
+      })
+      .catch(() => {
+        // Nothing to report and nothing to act on. Completion falls back to
+        // the conversation and the list, which is what it was before this
+        // read existed; a store broken enough to fail here has already put
+        // its error on screen through `bootError`.
+      });
     return () => {
       live = false;
     };
@@ -1570,6 +1612,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
     events,
     detail,
     detailLoading,
+    addressBook,
     favorites,
     viewFavorite,
     threadFavorite,

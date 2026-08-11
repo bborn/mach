@@ -18,6 +18,7 @@ import type {
   Participant,
   Thread,
 } from "@/types";
+import type { Contact } from "./contacts";
 import { DAY, HOUR, MINUTE, addDays, startOfDay, startOfWeek } from "./time";
 
 export const ME: Participant = { name: "Alex Rivera", email: "alex@northwind.example" };
@@ -459,3 +460,20 @@ function buildEvents(): CalendarEvent[] {
 }
 
 export const events: CalendarEvent[] = buildEvents();
+
+/**
+ * The archive's address book — people who are in no fixture thread at all.
+ *
+ * The store's own `list_contacts` stands in for years of mail, and every one of
+ * these is somebody the fixture browser could not otherwise complete: they are
+ * not in a thread, a message or an event. Typing "cor" in a To field and being
+ * offered Cordelia is the whole feature, visible without a backend.
+ */
+export const contacts: Contact[] = ((ago: (h: number) => number): Contact[] => [
+  { email: "cordelia@quarry.example", name: "Cordelia Nakash", sends: 41, lastSeen: ago(300), self: false },
+  { email: "yusuf@halcyon.example", name: "Yusuf Demir", sends: 12, lastSeen: ago(90), self: false },
+  { email: "beatriz@almeida.example", name: "Beatriz Almeida", sends: 3, lastSeen: ago(800), self: false },
+  // Writes to you and has never been written back to, so it ranks below all
+  // three above however recently it turned up.
+  { email: "no-reply@statuspage.example", name: "Status", sends: 0, lastSeen: ago(2), self: false },
+])((hours) => Date.now() - hours * HOUR);

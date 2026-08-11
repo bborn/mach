@@ -12,7 +12,7 @@
 use tauri::{AppHandle, State};
 
 use crate::commands::{AccountFilter, Command, CommandError, CommandResult, CommandSpec};
-use crate::db::models::{Account, Event, Label, ThreadCursor};
+use crate::db::models::{Account, Contact, Event, Label, ThreadCursor};
 use crate::db::queries::{SearchNode, SearchRequest};
 use crate::google::types::{Filter, FilterAction, FilterCriteria};
 
@@ -39,6 +39,12 @@ pub fn list_labels(
     account_id: Option<i64>,
 ) -> Result<Vec<Label>, IpcError> {
     reads::list_labels(&state.db, account_id)
+}
+
+/// Everyone you have corresponded with, for the address fields to complete.
+#[tauri::command]
+pub fn list_contacts(state: State<'_, AppState>) -> Result<Vec<Contact>, IpcError> {
+    reads::list_contacts(&state.db)
 }
 
 #[tauri::command]
