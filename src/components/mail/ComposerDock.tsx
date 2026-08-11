@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMach } from "@/hooks/useMach";
 import { useContacts } from "@/hooks/useContacts";
 import { useKeyBindings } from "@/hooks/useKeymap";
-import { useViewportHeight } from "@/hooks/useViewportHeight";
+import { useElementHeight, useViewportHeight } from "@/hooks/useViewportHeight";
 import { usePreferences, useUiSession } from "@/components/prefs/PreferencesProvider";
 import {
   COMPOSER_HEIGHT_BOUNDS,
@@ -18,6 +18,7 @@ import { Composer, type ComposerPresentation } from "./Composer";
 import type { RichTextEditorHandle } from "./RichTextEditor";
 import {
   DEFAULT_COMPOSER_HEIGHT,
+  READING_COLUMN,
   canPopOut,
   clampComposerHeight,
   composerPlacement,
@@ -25,6 +26,7 @@ import {
   isOverDropTarget,
   isPoppedOut,
   popOutComposerHeight,
+  readingColumnHeight,
   togglePopOut,
 } from "./composer-layout";
 import { noteSent } from "@/lib/contacts";
@@ -38,7 +40,6 @@ import {
   createAutosave,
   discardDraft,
   flushOutbox,
-  hasWrittenBody,
   inlineImageDataUrl,
   inlineImageMarkup,
   inlineImages as loadInlineImages,
@@ -269,7 +270,19 @@ export function ComposerDock() {
   const { session: where, remember } = useUiSession();
   const [chosenHeight, setChosenHeight] = useState(DEFAULT_COMPOSER_HEIGHT);
   const restoredHeight = useRef(false);
+  /*
+   * Two measurements, because the composer is drawn in two places and they are
+   * bounded by different things.
+   *
+   * Docked, it is a box in the reading column and the column is what it may
+   * fill — a number the window does not know, because the agent drawer takes
+   * its height off the bottom of the same column. Popped out, it is over the
+   * window in an overlay that answers to nothing on the page, so the window is
+   * the only limit there is. Reading the window for both is what put the footer
+   * outside the pane; see `clampComposerHeight`.
+   */
   const viewport = useViewportHeight();
+  const column = readingColumnHeight(useElementHeight(READING_COLUMN), viewport);
 
   // The stored height lands a tick after mount, like the rest of the session,
   // and only the first one counts: `remember` writes back into the same object,
@@ -283,19 +296,20 @@ export function ComposerDock() {
 
   /*
    * What he chose and what fits are two different numbers, as they are for the
-   * agent drawer. Keeping the choice unclamped is what makes a short window a
-   * temporary condition rather than a decision.
+   * agent drawer. Keeping the choice unclamped is what makes a short column a
+   * temporary condition rather than a decision: open the drawer and the
+   * composer gives way, and the height he dragged to comes back when it closes.
    */
-  const dockedHeight = clampComposerHeight(chosenHeight, viewport);
-  const maxHeight = clampComposerHeight(COMPOSER_HEIGHT_BOUNDS.max, viewport);
+  const dockedHeight = clampComposerHeight(chosenHeight, column);
+  const maxHeight = clampComposerHeight(COMPOSER_HEIGHT_BOUNDS.max, column);
 
   const resize = useCallback(
     (next: number) => {
-      const clamped = clampComposerHeight(next, viewport);
+      const clamped = clampComposerHeight(next, column);
       setChosenHeight(clamped);
       remember({ composerHeight: clamped });
     },
-    [remember, viewport],
+    [remember, column],
   );
 
   /** Close one composer, keeping its draft. */
@@ -356,10 +370,21 @@ export function ComposerDock() {
     (kind: DraftKind) => {
       if (threadId === null) return;
       void (async () => {
-        // A half-written reply wins over a freshly prepared one: reopening a
-        // conversation must not throw away what you already typed.
+        /*
+         * A started reply wins over a freshly prepared one: reopening a
+         * conversation must not throw away what you already did to it.
+         *
+         * The test was `hasWrittenBody`, which answered the question "is there
+         * prose in this" rather than the question being asked. Everything else
+         * a person can do to a reply before they write the first sentence was
+         * therefore discarded on reopen — a retitled subject, an address added
+         * to Cc, a file attached. A stored row cannot be a freshly prepared
+         * one: `prepare` returns a draft and writes nothing, so the only way a
+         * row exists is that autosave or `attach` put it there, and both
+         * decline while `isDraftEmpty`.
+         */
         const existing = await loadDraftForThread(threadId).catch(() => null);
-        if (existing && hasWrittenBody(existing)) {
+        if (existing && !isDraftEmpty(existing)) {
           openDraft(signed(existing));
           return;
         }

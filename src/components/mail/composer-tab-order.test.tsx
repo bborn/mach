@@ -7,8 +7,8 @@
  * rich-text buttons — bold, italic, underline, two lists, quote, link — one at
  * a time before reaching the message. The buttons are out of the sequence now
  * (`tabIndex={-1}` in `RichTextEditor`), and every action they offer has a key:
- * Squire binds ⌘B, ⌘I, ⌘U, ⌘⇧8, ⌘⇧9, ⌘] and ⌘[, and the editor registers ⌘K
- * for the link.
+ * Squire binds ⌘B, ⌘I, ⌘U, ⌘⇧8, ⌘⇧9, ⌘] and ⌘[, and the editor registers ⌘⇧K
+ * for the link — ⌘K is the palette's, everywhere, composer included.
  *
  * The whole sequence is asserted, not just the pair, because the failure this
  * guards against is not "somebody deleted the tabIndex". It is somebody adding
@@ -147,14 +147,53 @@ describe("the composer's tab order", () => {
     ]);
   });
 
-  it("drops the subject field for a reply, whose subject is derived", () => {
+  /*
+   * A reply gets the subject field too, in the same place.
+   *
+   * It used to be an `<h2>` and therefore not a stop at all, so a conversation
+   * that had drifted off its own title could not be renamed from anywhere in
+   * the app. The field is first because the subject is drawn first — the
+   * sequence is the visual order or it is not a tab order — which puts it one
+   * ⇧⇥ back from To rather than somewhere a person has to go looking.
+   */
+  it("gives a reply the same subject field, first, where it is drawn", () => {
     expect(stops({ kind: "reply", subject: "Re: the data room" })).toEqual([
+      "Subject",
       "cc / bcc",
       "To",
       "Message",
       "attach",
       "discard",
     ]);
+  });
+
+  // The heading it replaced was `truncate`d text with no name of its own. The
+  // field carries the subject as its value and says what it is, or a reply's
+  // title is a box a screen reader reads as nothing.
+  it("carries the reply's subject as an editable value, named", () => {
+    const host = document.createElement("div");
+    host.innerHTML = renderToStaticMarkup(
+      <KeymapProvider>
+        <Composer
+          draft={draft({ kind: "reply", subject: "Re: the data room" })}
+          html=""
+          bodyHeight={340}
+          onChange={() => {}}
+          onBodyChange={() => {}}
+          onSend={() => {}}
+          onClose={() => {}}
+          onDiscard={() => {}}
+          onAttach={() => {}}
+          onRemoveAttachment={() => {}}
+        />
+      </KeymapProvider>,
+    );
+    const subject = host.querySelector<HTMLInputElement>("#composer-subject")!;
+    expect(subject.getAttribute("value")).toBe("Re: the data room");
+    expect(subject.getAttribute("aria-label")).toBe("Subject");
+    expect(subject.hasAttribute("readonly")).toBe(false);
+    // Nothing left claiming to be the title as well.
+    expect(host.querySelector("h2")).toBe(null);
   });
 
   /*
@@ -290,7 +329,7 @@ describe("the composer's tab order", () => {
       "Bulleted list (⌘⇧8)",
       "Numbered list (⌘⇧9)",
       "Quote (⌘] / ⌘[)",
-      "Link (⌘K)",
+      "Link (⌘⇧K)",
     ]);
     for (const tool of tools) expect(tool.getAttribute("tabindex")).toBe("-1");
   });

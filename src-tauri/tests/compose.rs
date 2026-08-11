@@ -375,6 +375,64 @@ fn a_reply_carries_the_whole_reference_chain() {
 }
 
 #[test]
+fn retitling_a_reply_changes_the_subject_and_nothing_that_threads_it() {
+    // The composer lets a reply's subject be edited, so a conversation that has
+    // drifted off its own title can be renamed. What must not move with it is
+    // the threading: `In-Reply-To` and `References` are what put the message
+    // back in the conversation in the recipient's client, and a subject that
+    // reached them would fork the thread at the far end — silently, and only
+    // for the person receiving it. So the guard is a comparison: the same draft
+    // built twice, once renamed, with every threading header held equal.
+    let (db, _account, thread, _message) = seeded();
+
+    let derived = reply_draft(&db, thread, DraftKind::Reply, "On it.");
+    assert!(
+        derived.subject.starts_with("Re: "),
+        "a prepared reply should arrive already titled, got {:?}",
+        derived.subject
+    );
+
+    let mut renamed = derived.clone();
+    // Plain ASCII, so the assertion below reads the header rather than an
+    // RFC 2047 encoded-word. That the encoding happens at all is
+    // `a_spanish_subject_and_body_survive_the_round_trip`'s business.
+    renamed.subject = "Q3 pricing".to_string();
+
+    let threading = |draft: &Draft| {
+        let built = draft::build(&db, draft, NOW, 0x2b2b).expect("build");
+        (
+            built.outgoing.in_reply_to.clone(),
+            built.outgoing.references.clone(),
+            built.gmail_thread_id.clone(),
+            built.thread_id,
+        )
+    };
+
+    assert_eq!(
+        threading(&derived),
+        threading(&renamed),
+        "renaming a reply moved something that threads it"
+    );
+
+    let headers = headers_of(&built_bytes(&db, &renamed));
+    assert!(
+        headers.contains("In-Reply-To: <parent-1@mail.partner.com>"),
+        "a renamed reply lost In-Reply-To:\n{headers}"
+    );
+    assert!(
+        headers.contains("References: <parent-1@mail.partner.com>"),
+        "a renamed reply lost References:\n{headers}"
+    );
+    // And the new title really is the one that goes out: `build` copies
+    // `draft.subject` through, and `reply_subject` is only ever applied by
+    // `prepare`, which does not run again on a draft that already exists.
+    assert!(
+        headers.contains("Q3 pricing"),
+        "the renamed subject did not reach the wire:\n{headers}"
+    );
+}
+
+#[test]
 fn the_reference_chain_falls_back_to_in_reply_to_when_there_is_no_references() {
     // Some clients send In-Reply-To without References. Dropping the parent's
     // ancestry there is the same thread split by another route.

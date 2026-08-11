@@ -85,27 +85,6 @@ export interface KeyBinding {
   /** Set false for bindings that should not swallow the browser default. */
   preventDefault?: boolean;
   /**
-   * Take the key away from every other binding, then leave the event alone.
-   *
-   * For one situation, and it is the terminal session pane. A pty wants every
-   * keystroke, and the emulator that encodes a keystroke into bytes — dead
-   * keys, composition, ⌃C, the arrow keys' escape sequences — is a DOM listener
-   * on its own textarea. So the pane needs both halves of a thing the registry
-   * could not previously say: *no app binding may answer this key*, and *the
-   * event must still reach the element under the caret*.
-   *
-   * `preventDefault: false` is only the first half of that. The dispatcher
-   * calls `stopPropagation` on every consumed key, which it must, or a dialog's
-   * Escape would also reach whatever is behind it — and stopping propagation in
-   * the capture phase means the textarea never sees the key at all.
-   *
-   * A binding marked this way therefore consumes the *lookup* and nothing else:
-   * no `preventDefault`, no `stopPropagation`, and no further binding tried.
-   * Nothing but the pane should need it; see `TerminalPane` for the contract it
-   * implements.
-   */
-  passthrough?: boolean;
-  /**
    * Registration order, stamped by the registry — not something a caller sets.
    *
    * `active()` hands bindings back in *precedence* order, which is priority
@@ -306,8 +285,6 @@ export function createKeymap(mod: ModKey = detectModKey()): Keymap {
   function run(binding: Registered, event: KeyEventLike): boolean {
     const result = binding.handler(event);
     if (result === false) return false;
-    // Claimed, and then handed straight back to the page. See `passthrough`.
-    if (binding.passthrough) return true;
     if (binding.preventDefault !== false) event.preventDefault?.();
     event.stopPropagation?.();
     return true;

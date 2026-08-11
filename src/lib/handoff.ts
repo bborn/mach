@@ -31,7 +31,7 @@ import { isTauri, tauriTransport, toMachError } from "./ipc";
 /* Shapes                                                                      */
 /* -------------------------------------------------------------------------- */
 
-export type HandoffMode = "terminal" | "inline" | "session";
+export type HandoffMode = "terminal" | "inline";
 
 export interface HandoffTarget {
   id: string;
@@ -65,23 +65,6 @@ export interface HandoffPreview {
   contextFile: string;
   unproven: boolean;
 }
-
-/** A session that is running in the pane. */
-export interface HandoffSession {
-  sessionId: string;
-  targetName: string;
-  /** argv, joined for reading. Nothing runs this string. */
-  command: string;
-  dir: string;
-  /** What the process was started with, exactly. Stays on screen. */
-  prompt: string;
-  contextFile: string;
-}
-
-/** One thing the running session said. */
-export type HandoffSessionEvent =
-  | { type: "output"; sessionId: string; base64: string; dropped: number }
-  | { type: "exited"; sessionId: string; status: number | null };
 
 /** What a launch is willing to say afterwards. Never an outcome. */
 export interface HandoffReceipt {
@@ -477,181 +460,6 @@ export async function runHandoff(input: {
   // changed on the Rust side. Refresh rather than guess.
   void loadTargets().catch(() => undefined);
   return receipt;
-}
-
-/* -------------------------------------------------------------------------- */
-/* The session pane                                                            */
-/* -------------------------------------------------------------------------- */
-
-/** The one channel a running session speaks on. Mirrors `ipc::handoff`. */
-export const HANDOFF_SESSION_EVENT = "handoff-session";
-
-/**
- * Which session the pane is showing, if any.
- *
- * A module store rather than React state for the same reason the target list is
- * one: the thing that starts a session is the handoff dialog and the thing that
- * renders it is the pane, and neither is inside the other. There is at most one
- * — the pane is a place, not a tab strip, and Rust refuses a second by name.
- */
-let session: HandoffSession | null = null;
-const sessionListeners = new Set<() => void>();
-
-export function sessionSnapshot(): HandoffSession | null {
-  return session;
-}
-
-export function subscribeSession(listener: () => void): () => void {
-  sessionListeners.add(listener);
-  return () => void sessionListeners.delete(listener);
-}
-
-export function setSession(next: HandoffSession | null): void {
-  session = next;
-  for (const listener of [...sessionListeners]) listener();
-}
-
-/**
- * Everything the session said before anything was ready to draw it.
- *
- * Three things have to happen before the first byte can be painted: the Tauri
- * listener has to attach, the pane has to mount, and 300 kB of emulator has to
- * arrive over a dynamic import. The process does not wait for any of them — a
- * command that prints its banner and exits can be finished before the second
- * one — and the first time this ran in the real app, the whole of the banner
- * was gone. So the stream is attached *before* the process is started and
- * everything it says is kept here until a consumer takes it.
- */
-let sessionQueue: HandoffSessionEvent[] = [];
-let sessionConsumer: ((event: HandoffSessionEvent) => void) | null = null;
-let sessionStream: Promise<() => void> | null = null;
-
-/**
- * Attach the one listener, once.
- *
- * Idempotent and never detached: there is one channel for the life of the
- * window, and a session that is closed and reopened is the same channel again.
- */
-function ensureSessionStream(): Promise<() => void> {
-  sessionStream ??= listenToSession((event) => {
-    if (sessionConsumer) sessionConsumer(event);
-    else sessionQueue.push(event);
-  });
-  return sessionStream;
-}
-
-/**
- * Take the stream, and everything it has been holding.
- *
- * The pane calls this when its emulator exists. Whatever arrived in the
- * meantime is delivered first, in order, before anything live.
- */
-export function consumeSession(
-  handler: (event: HandoffSessionEvent) => void,
-): () => void {
-  const waiting = sessionQueue;
-  sessionQueue = [];
-  sessionConsumer = handler;
-  for (const event of waiting) handler(event);
-  return () => {
-    if (sessionConsumer === handler) sessionConsumer = null;
-  };
-}
-
-/** Start the target's command on a pty and give the pane its id. */
-export async function openSession(input: {
-  targetId: string;
-  note: string;
-  source: HandoffSourceRef;
-  cols: number;
-  rows: number;
-}): Promise<HandoffSession> {
-  // Before the process, not after it. See `sessionQueue`.
-  sessionQueue = [];
-  await ensureSessionStream();
-  const started = await call<HandoffSession>("handoff_session_open", {
-    targetId: input.targetId,
-    note: input.note,
-    source: input.source,
-    cols: input.cols,
-    rows: input.rows,
-  });
-  setSession(started);
-  // `lastRunAt` moved on the Rust side; the palette's rows read it.
-  void loadTargets().catch(() => undefined);
-  return started;
-}
-
-/**
- * Adopt the session that is already running, if there is one.
- *
- * A webview that reloaded — hot module replacement, a renderer that crashed —
- * comes back with an empty store while the process is still on its pty. Asked
- * once, on mount, exactly as the agent dock asks for its sessions. What was
- * printed before the reload is gone with the emulator that held it.
- */
-export async function adoptSession(): Promise<HandoffSession | null> {
-  if (!isTauri()) return null;
-  try {
-    await ensureSessionStream();
-    const running = await call<HandoffSession | null>("handoff_session_current");
-    if (running) setSession(running);
-    return running;
-  } catch {
-    return null;
-  }
-}
-
-export async function writeSession(sessionId: string, data: string): Promise<void> {
-  await call<void>("handoff_session_write", { sessionId, data });
-}
-
-export async function resizeSession(
-  sessionId: string,
-  cols: number,
-  rows: number,
-): Promise<void> {
-  await call<void>("handoff_session_resize", { sessionId, cols, rows });
-}
-
-/**
- * End it, and forget it.
- *
- * Never rejects. Closing a session whose process has already exited is the
- * ordinary case — the pane stays up after the exit so the last lines can be
- * read — and a pane that refused to close because the thing it was closing was
- * already gone would be worse than useless.
- */
-export async function closeSession(sessionId: string): Promise<void> {
-  if (session?.sessionId === sessionId) setSession(null);
-  try {
-    await call<void>("handoff_session_close", { sessionId });
-  } catch {
-    /* nothing to close */
-  }
-}
-
-async function listenToSession(
-  handler: (event: HandoffSessionEvent) => void,
-): Promise<() => void> {
-  if (!isTauri()) return () => undefined;
-  return tauriTransport.listen<HandoffSessionEvent>(HANDOFF_SESSION_EVENT, handler);
-}
-
-/**
- * The wire's base64 back to the bytes the emulator wants.
- *
- * Output crosses as base64 because a pty carries bytes: escape sequences, and
- * multi-byte characters that a chunk boundary can land in the middle of.
- * Decoding to a string on this side would corrupt exactly those, so the bytes
- * stay bytes until the emulator — the one thing that knows where a character
- * ends — takes them.
- */
-export function decodeChunk(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
 }
 
 /* -------------------------------------------------------------------------- */

@@ -447,49 +447,6 @@ describe("the wildcard", () => {
 });
 
 /**
- * A binding that claims a key and then leaves the event alone.
- *
- * The terminal session pane needs both halves at once: no app binding may
- * answer the key, and the key must still reach the element under the caret,
- * because the thing that turns a keystroke into bytes is a DOM listener on the
- * emulator's own textarea. Consuming normally would `stopPropagation` in the
- * capture phase and the textarea would never see it.
- */
-describe("passthrough", () => {
-  it("takes the key from every other binding without touching the event", () => {
-    const k = createKeymap("meta");
-    const archive = vi.fn();
-    const claimed = vi.fn();
-    k.register({ keys: "e", handler: archive });
-    k.register({ keys: "*", priority: 900, passthrough: true, handler: claimed });
-
-    const event = press("e");
-    expect(k.handle(event)).toBe(true);
-    expect(claimed).toHaveBeenCalledTimes(1);
-    expect(archive).not.toHaveBeenCalled();
-    expect(event.prevented).toBe(false);
-  });
-
-  it("still lets the handler decline, so the next binding answers", () => {
-    const k = createKeymap("meta");
-    const palette = vi.fn();
-    k.register({ keys: "mod+k", priority: 200, handler: palette });
-    k.register({
-      keys: "*",
-      priority: 900,
-      passthrough: true,
-      handler: (event) => !event.metaKey,
-    });
-
-    const event = press("k", { meta: true });
-    expect(k.handle(event)).toBe(true);
-    expect(palette).toHaveBeenCalledTimes(1);
-    // The binding that actually answered is an ordinary one, so it swallows.
-    expect(event.prevented).toBe(true);
-  });
-});
-
-/**
  * An overlay owning the keyboard.
  *
  * The bug: with preferences open, `e` still reached the thread list and

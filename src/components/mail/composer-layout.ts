@@ -34,14 +34,19 @@ import type { ComposerPresentation } from "./Composer";
 export const DEFAULT_COMPOSER_HEIGHT = 200;
 
 /**
- * What the docked composer leaves for everything else: the title bar and the
- * status bar, its own fields, toolbar and legend, and enough of the
- * conversation above it to still be a conversation. A reply that fills the
- * reading pane has hidden the message it is answering, which is the one thing
- * the docked composer exists to avoid — at 320 the ceiling did exactly that,
- * leaving the sender line and nothing under it.
+ * What the docked composer leaves the conversation it is docked under: its own
+ * fields, toolbar and legend, and enough of the thread above it to still be a
+ * thread. A reply that fills the reading pane has hidden the message it is
+ * answering, which is the one thing the docked composer exists to avoid — at
+ * 320 the ceiling did exactly that, leaving the sender line and nothing under
+ * it.
+ *
+ * Measured against the reading column, not the window. It was 420 against the
+ * window, which is the same number with the title bar (40) and the status bar
+ * (24) folded into it — and folding them in is what broke when a third box
+ * appeared at the bottom of the window. See {@link clampComposerHeight}.
  */
-export const RESERVED_READING_HEIGHT = 420;
+export const RESERVED_READING_HEIGHT = 356;
 
 /**
  * What the popped-out composer leaves: the overlay's own margins, and the same
@@ -50,21 +55,61 @@ export const RESERVED_READING_HEIGHT = 420;
 export const POPPED_WINDOW_CHROME = 260;
 
 /**
- * A body height that fits both the bounds and this window.
+ * The title bar and the status bar — what the window has that the reading
+ * column does not.
  *
- * The floor wins ties, as it does for the agent drawer: in a window too short
+ * Only for the case where the column could not be measured at all. `0` means
+ * "not measured yet" to {@link clampComposerHeight}, and the answer it gives
+ * there is the bounds alone: a 900px composer, which in a column is not a
+ * fallback but a worse bug than the one being fixed. So a column that never
+ * arrives falls back to the window less this, which is where the number came
+ * from in the first place.
+ */
+export const CHROME_OUTSIDE_COLUMN = 64;
+
+/** The column's height, or the closest thing to it if it could not be read. */
+export function readingColumnHeight(column: number, viewportHeight: number): number {
+  return column > 0 ? column : Math.max(0, viewportHeight - CHROME_OUTSIDE_COLUMN);
+}
+
+/**
+ * A body height that fits both the bounds and the column the composer is in.
+ *
+ * # Two docks in one column need one owner of the height
+ *
+ * `columnHeight` is the reading column — the pane holding the conversation and
+ * the composer under it — and not the window. The distinction is the whole
+ * defect this argument was changed to fix.
+ *
+ * The bottom of the window is a stack: the agent drawer, the agent's pill
+ * strip, the status bar. Every one of them is `shrink-0`, so each takes its
+ * height off the reading column. The composer sat in that column asking the
+ * *window* how much room it had, which is a number nothing subtracts from when
+ * a second dock opens. With the agent drawer up at 1440×757 the composer stood
+ * 352px tall in a 336px column and hung 87px out of the bottom of it — the
+ * footer drawn clear of the pane, over the drawer's content, because no box
+ * between the two clips.
+ *
+ * So: the column owns the height, and everything in it asks the column. The
+ * composer also gives way rather than overflow — `COMPOSER_COLUMN` on the
+ * docked root, so a measurement that is one frame stale costs a shorter message
+ * instead of a detached footer. A dock that sizes itself from the window is
+ * only correct while it is the only dock, and it never was.
+ *
+ * The floor wins ties, as it does for the agent drawer: in a column too short
  * for even the minimum, a composer at the minimum with the conversation
  * squeezed is a better answer than a two-pixel one. Anything that is not a
  * number lands on the default, because "the stored value is nonsense" and
  * "there is no stored value" should look the same on screen.
  */
-export function clampComposerHeight(height: number, viewportHeight: number): number {
+export function clampComposerHeight(height: number, columnHeight: number): number {
   const { min, max } = COMPOSER_HEIGHT_BOUNDS;
-  // A viewport of zero is "not measured yet" — a server render, a test — and
-  // the honest answer there is the bounds alone.
+  // A column of zero is "not measured yet" — a server render, a test, the
+  // render before the observer has fired — and the honest answer there is the
+  // bounds alone.
   const ceiling =
-    viewportHeight > 0
-      ? Math.max(min, Math.min(max, viewportHeight - RESERVED_READING_HEIGHT))
+    columnHeight > 0
+      ? Math.max(min, Math.min(max, columnHeight - RESERVED_READING_HEIGHT))
       : max;
   if (!Number.isFinite(height)) return Math.min(ceiling, DEFAULT_COMPOSER_HEIGHT);
   return Math.min(ceiling, Math.max(min, Math.round(height)));
@@ -157,6 +202,16 @@ export const COMPOSER_FIXED_ROW = "shrink-0";
 
 /** The one row that gives way. Sized in pixels, shrinkable to nothing. */
 export const COMPOSER_BODY = "min-h-0";
+
+/**
+ * The attribute the reading column carries so the composer can measure it.
+ *
+ * The column is the conversation and the composer under it, and its height is a
+ * fact about what is currently laid out — how tall the agent drawer is standing,
+ * whether it has a pill strip at all — which no store holds and no prop carries
+ * down. Asked of the document for the same reason {@link isOverDropTarget} is.
+ */
+export const READING_COLUMN = "data-mach-reading-column";
 
 /* -------------------------------------------------------------------------- */
 /* Where a dropped file lands                                                  */

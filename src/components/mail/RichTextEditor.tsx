@@ -14,6 +14,7 @@ import { cleanFragment, isBlankHtml } from "@/lib/email-html";
 import { cn } from "@/lib/utils";
 import { caretOffsetIn, caretRangeIn } from "./caret-offset";
 import { COMPOSER_BODY, COMPOSER_COLUMN, COMPOSER_FIXED_ROW } from "./composer-layout";
+import { COMPOSER_KEYS } from "@/lib/compose";
 
 /**
  * The composer's editor.
@@ -328,13 +329,18 @@ export function RichTextEditor({
 
   useKeyBindings([
     {
-      keys: "mod+k",
+      keys: COMPOSER_KEYS.link,
       group: "Composer",
       description: "Link",
       allowInInput: true,
-      // Above the command palette's own ⌘K, and only while this composer is the
-      // one being typed into — so ⌘K is still search everywhere else.
-      priority: 210,
+      /*
+       * The floor an overlay claims, which is where the rest of the composer's
+       * keys sit. It used to be 210 — above the palette — so that a composer
+       * took ⌘K away from search for as long as it was open. The key moved
+       * instead; see `COMPOSER_KEYS.link`. Nothing outranks anything here now,
+       * and 100 is what keeps this alive inside the popped-out overlay's claim.
+       */
+      priority: 100,
       when: () => active && !disabled,
       handler: () => (linking ? setLinking(false) : startLink()),
     },
@@ -357,7 +363,7 @@ export function RichTextEditor({
 
         Nothing becomes mouse-only by it. Every action here has a key, all of
         them Squire's own except the link, which `useKeyBindings` above
-        registers as ⌘K, and each button says which key in its tooltip. The
+        registers as ⇧⌘K, and each button says which key in its tooltip. The
         buttons are what makes the formatting *visible* — the half a keyboard
         cannot do — and reading a toolbar is not something ⇥ is for.
 
@@ -409,7 +415,9 @@ export function RichTextEditor({
         >
           <Quote className="size-3.5" />
         </Tool>
-        <Tool label="Link" keys="⌘K" on={inside("A")} onClick={startLink}>
+        {/* Spelled out rather than derived, like the six above it. The label
+            and the binding are held together by a test — see `compose.test`. */}
+        <Tool label="Link" keys="⌘⇧K" on={inside("A")} onClick={startLink}>
           <Link2 className="size-3.5" />
         </Tool>
       </div>

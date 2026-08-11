@@ -1,7 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import {
   closeHandoff,
-  decodeChunk,
   describeTarget,
   draftTarget,
   handoffRequest,
@@ -11,10 +10,7 @@ import {
   noteFromQuery,
   openHandoff,
   rankTargets,
-  sessionSnapshot,
-  setSession,
   setTargets,
-  subscribeSession,
   targetProblem,
   terminalFromSelection,
   terminalItems,
@@ -252,59 +248,5 @@ describe("the terminal a handoff opens in", () => {
     // "Other" opens a field; what is already there stays there to be edited.
     expect(terminalFromSelection(OTHER_TERMINAL, "iTerm")).toBe("iTerm");
     expect(terminalFromSelection(OTHER_TERMINAL, "")).toBe("");
-  });
-});
-
-/**
- * The session pane's half of this module.
- *
- * The pty, the reaping and the flood cap are Rust's, and
- * `src-tauri/tests/handoff_session.rs` drives those against real processes.
- * What is testable here is the wire: the store the dialog writes and the pane
- * reads, and the decode that turns a chunk back into bytes.
- */
-describe("the session store", () => {
-  beforeEach(() => setSession(null));
-  afterAll(() => setSession(null));
-
-  const session = {
-    sessionId: "s1",
-    targetName: "Mach",
-    command: 'claude "fix the calendar header"',
-    dir: "/Users/x/Projects/mach",
-    prompt: "fix the calendar header",
-    contextFile: "/tmp/mach-handoff-abc/context.txt",
-  };
-
-  it("holds one session and tells its subscribers", () => {
-    const seen: (string | null)[] = [];
-    const unsubscribe = subscribeSession(() => seen.push(sessionSnapshot()?.sessionId ?? null));
-
-    setSession(session);
-    expect(sessionSnapshot()).toEqual(session);
-    setSession(null);
-    expect(sessionSnapshot()).toBeNull();
-    unsubscribe();
-
-    setSession(session);
-    expect(seen).toEqual(["s1", null]);
-  });
-
-  it("keeps the prompt that was handed over, so the pane can go on showing it", () => {
-    setSession(session);
-    expect(sessionSnapshot()?.prompt).toBe("fix the calendar header");
-  });
-});
-
-describe("decodeChunk", () => {
-  it("returns bytes rather than a string", () => {
-    // Output crosses as base64 because a pty carries bytes: escape sequences,
-    // and characters that a chunk boundary can land in the middle of. The
-    // second case below is the first byte of a three-byte character — decoding
-    // it as text here would corrupt it, and handing the emulator the byte lets
-    // it wait for the rest.
-    expect([...decodeChunk("G1swbQ==")]).toEqual([0x1b, 0x5b, 0x30, 0x6d]);
-    expect([...decodeChunk("4g==")]).toEqual([0xe2]);
-    expect([...decodeChunk("")]).toEqual([]);
   });
 });

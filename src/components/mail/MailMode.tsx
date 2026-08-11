@@ -5,6 +5,7 @@ import { keyboardInComposer } from "@/lib/compose";
 import { LIST_WIDTH_BOUNDS } from "@/lib/prefs";
 import { FlexPane, Pane, Resizer } from "@/components/ui/split";
 import { AccountRail } from "./AccountRail";
+import { READING_COLUMN } from "./composer-layout";
 import { ComposerDock } from "./ComposerDock";
 import { mailActionBindings } from "./mail-bindings";
 import { ReadingPane } from "./ReadingPane";
@@ -232,7 +233,9 @@ export function MailMode() {
         max={LIST_WIDTH_BOUNDS.max}
         label="Conversation list width"
       />
-      <FlexPane>
+      {/* Marked because two boxes share this column and its height is the only
+          number that settles how much each may have — see `composer-layout`. */}
+      <FlexPane {...{ [READING_COLUMN]: "" }}>
         {/* The composer grows at the bottom of the conversation it answers, so
             the message being replied to never leaves the screen. */}
         <ReadingPane />
