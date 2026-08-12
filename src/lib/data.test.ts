@@ -22,13 +22,15 @@ describe("the command vocabulary", () => {
       "markRead",
       "star",
       "label",
+      "reportSpam",
+      "notSpam",
       "trash",
       "untrash",
       "snooze",
       "unsnooze",
       "rsvp",
     ];
-    expect(kinds).toHaveLength(10);
+    expect(kinds).toHaveLength(12);
   });
 
   it("separates the batched mail half from the single-event rsvp", () => {
@@ -60,6 +62,14 @@ describe("inverses", () => {
     });
     expect(inverseOf({ kind: "trash", threadIds: [1] })).toEqual({
       kind: "untrash",
+      threadIds: [1],
+    });
+    expect(inverseOf({ kind: "reportSpam", threadIds: [1] })).toEqual({
+      kind: "notSpam",
+      threadIds: [1],
+    });
+    expect(inverseOf({ kind: "notSpam", threadIds: [1] })).toEqual({
+      kind: "reportSpam",
       threadIds: [1],
     });
     expect(inverseOf({ kind: "untrash", threadIds: [1] })).toEqual({

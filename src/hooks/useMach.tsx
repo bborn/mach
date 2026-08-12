@@ -486,6 +486,12 @@ export interface MachActions {
   clearSelection: () => void;
   archiveSelected: () => void;
   trashSelected: () => void;
+  /**
+   * `!` — Gmail's Report spam, over the same selection every other triage verb
+   * acts on. No confirmation, for the same reason trash has none: the inverse
+   * is exact and it goes on the stack ⌘Z reads.
+   */
+  reportSpamSelected: () => void;
   starSelected: () => void;
   /**
    * Snooze to a named instant.
@@ -1499,6 +1505,8 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
       archiveSelected: () => bulk({ kind: "archive", threadIds: commandTargetIds }),
       trashSelected: () => bulk({ kind: "trash", threadIds: commandTargetIds }),
+      reportSpamSelected: () =>
+        bulk({ kind: "reportSpam", threadIds: commandTargetIds }),
       snoozeSelected: (until) =>
         bulk(
           { kind: "snooze", threadIds: commandTargetIds, until },

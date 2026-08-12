@@ -124,6 +124,7 @@ export function MailMode() {
         openSnooze: () => actions.setSnooze(true),
         star: () => actions.starSelected(),
         trash: () => actions.trashSelected(),
+        reportSpam: () => actions.reportSpamSelected(),
         favorite: () => actions.toggleFavoriteFocused(),
         undo: () => actions.undo(),
       },

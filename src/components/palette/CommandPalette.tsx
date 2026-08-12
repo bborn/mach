@@ -47,6 +47,12 @@ const COMMANDS: PaletteCommand[] = [
   { id: "archive", title: "Archive conversation", hint: "E", keywords: "archive done" },
   { id: "snooze", title: "Snooze conversation", hint: "B", keywords: "snooze later" },
   {
+    id: "report-spam",
+    title: "Report spam",
+    hint: "!",
+    keywords: "spam junk phishing report block",
+  },
+  {
     id: "favorite-view",
     title: "Favorite this mailbox",
     hint: "⇧F",
@@ -170,6 +176,8 @@ export function CommandPalette() {
           return actions.goToday();
         case "archive":
           return actions.archiveSelected();
+        case "report-spam":
+          return actions.reportSpamSelected();
         case "snooze":
           // Hands over to the picker rather than committing a time of its own.
           // The reducer's `snooze` case shuts this palette on the way out, so

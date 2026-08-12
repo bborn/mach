@@ -57,6 +57,7 @@ describe("the mail action keys", () => {
       openSnooze: vi.fn(),
       star: vi.fn(),
       trash: vi.fn(),
+      reportSpam: vi.fn(),
       favorite: vi.fn(),
       undo: vi.fn(),
     };
@@ -122,6 +123,63 @@ describe("the mail action keys", () => {
     expect(handlers.trash).not.toHaveBeenCalled();
     release();
     expect(keymap.handle(press("Backspace", { metaKey: true }))).toBe(true);
+  });
+
+  /* -------------------------------------------------------------- spam --- */
+
+  it("reports spam on ⇧1, which the layout delivers as a bare !", () => {
+    /*
+     * The whole point of the token. ⇧1 on a US keyboard produces
+     * `event.key === "!"` with `shiftKey` set, and `tokenFromEvent` records
+     * shift only for letters and named keys — so the token is `"!"`. A binding
+     * written "shift+1" would never fire, and this is the test that would fail
+     * if somebody wrote one.
+     */
+    expect(keymap.handle(press("!", { shiftKey: true }))).toBe(true);
+    expect(handlers.reportSpam).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports spam on a ! that arrived without shift, as other layouts send it", () => {
+    // AZERTY has `!` as an unshifted key. Same character, same command.
+    expect(keymap.handle(press("!"))).toBe(true);
+    expect(handlers.reportSpam).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report spam on a bare 1, or on ⇧1 read as a digit", () => {
+    // `1` belongs to the snooze picker's option keys, and the day somebody
+    // binds it here as "shift+1" this is what catches it.
+    expect(keymap.handle(press("1"))).toBe(false);
+    expect(keymap.handle(press("1", { shiftKey: true }))).toBe(false);
+    expect(handlers.reportSpam).not.toHaveBeenCalled();
+  });
+
+  it("is dead while the caret is in a text field", () => {
+    // It is a bare character key, so this is the one that matters: typing "!"
+    // into a composer must be an exclamation mark, not a spam report.
+    expect(keymap.handle(press("!", { shiftKey: true }, TYPING))).toBe(false);
+    expect(handlers.reportSpam).not.toHaveBeenCalled();
+  });
+
+  it("does not report spam while the keyboard is out of the list", () => {
+    active = false;
+    expect(keymap.handle(press("!", { shiftKey: true }))).toBe(false);
+    expect(handlers.reportSpam).not.toHaveBeenCalled();
+  });
+
+  it("does not report spam from behind a dialog", () => {
+    const release = keymap.claimKeyboard();
+    expect(keymap.handle(press("!", { shiftKey: true }))).toBe(false);
+    expect(handlers.reportSpam).not.toHaveBeenCalled();
+    release();
+    expect(keymap.handle(press("!", { shiftKey: true }))).toBe(true);
+  });
+
+  it("reaches the spam handler and no other action", () => {
+    keymap.handle(press("!", { shiftKey: true }));
+    expect(handlers.reportSpam).toHaveBeenCalledTimes(1);
+    for (const other of [handlers.archive, handlers.trash, handlers.star, handlers.openSnooze]) {
+      expect(other).not.toHaveBeenCalled();
+    }
   });
 
   /* ------------------------------------------------------------ snooze --- */
@@ -209,7 +267,7 @@ describe("the mail action keys", () => {
     )
       .filter((b) => b.description)
       .map((b) => b.keys);
-    expect(documented).toEqual(["e", "b", "s", "#", "shift+f", "z"]);
+    expect(documented).toEqual(["e", "b", "s", "#", "!", "shift+f", "z"]);
   });
 });
 

@@ -280,10 +280,11 @@ export function restoreRedo(state: UndoState, entry: UndoEntry): UndoState {
  */
 export function restoresThreads(
   command: Command,
-): command is Extract<Command, { kind: "unarchive" | "untrash" | "unsnooze" }> {
+): command is Extract<Command, { kind: "unarchive" | "untrash" | "notSpam" | "unsnooze" }> {
   return (
     command.kind === "unarchive" ||
     command.kind === "untrash" ||
+    command.kind === "notSpam" ||
     command.kind === "unsnooze"
   );
 }
@@ -298,8 +299,13 @@ export function restoresThreads(
  */
 export function hidesThreads(
   command: Command,
-): command is Extract<Command, { kind: "archive" | "trash" | "snooze" }> {
-  return command.kind === "archive" || command.kind === "trash" || command.kind === "snooze";
+): command is Extract<Command, { kind: "archive" | "trash" | "reportSpam" | "snooze" }> {
+  return (
+    command.kind === "archive" ||
+    command.kind === "trash" ||
+    command.kind === "reportSpam" ||
+    command.kind === "snooze"
+  );
 }
 
 /** "Undo archived 3 conversations" — what a menu item or status line shows. */

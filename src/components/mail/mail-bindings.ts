@@ -41,6 +41,8 @@ export interface MailActionHandlers {
   openSnooze: () => void;
   star: () => void;
   trash: () => void;
+  /** `!` — report the selection as spam. */
+  reportSpam: () => void;
   favorite: () => void;
   undo: () => void;
 }
@@ -129,6 +131,40 @@ export function mailActionBindings(
       keys: "mod+backspace",
       when: active,
       handler: on.trash,
+    },
+    {
+      /*
+       * `!` — Gmail's Report spam, and nothing invented here.
+       *
+       * The token is `"!"` and not `"shift+1"`. `tokenFromEvent` only appends
+       * `shift` when the key is a letter or a named key; for everything else
+       * the shifted character *is* what the layout produced, so ⇧1 on a US
+       * keyboard arrives as `event.key === "!"` and tokenises to `"!"` — the
+       * same rule `?` is bound under, and pinned by `keymap.test.ts`
+       * ("shift only qualifies alphabetic keys").
+       *
+       * That means the binding follows the *character*, not the physical key.
+       * On a layout where `!` sits somewhere else — AZERTY, where it is an
+       * unshifted key of its own — this fires from wherever `!` is, which is
+       * the behaviour a Gmail hand on that layout already has, since Gmail
+       * reads the character too. On a layout with no `!` at all the key is
+       * simply unreachable; the palette entry and the context menu are the way
+       * in. Reading `event.code` instead (as the Alt-digit case above does)
+       * would pin it to Digit1 and break every non-US layout that moves it, so
+       * it is not done here.
+       *
+       * `active`, so it is dead while the caret is in a field — a bare
+       * character key must never fire mid-sentence in the composer.
+       *
+       * No confirmation, like trash: `reportSpam` has an exact inverse
+       * (`notSpam` carrying the labels the thread actually had) on the same
+       * stack ⌘Z reads.
+       */
+      keys: "!",
+      group: "Actions",
+      description: "Report spam",
+      when: active,
+      handler: on.reportSpam,
     },
     {
       /*

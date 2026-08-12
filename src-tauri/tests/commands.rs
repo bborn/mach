@@ -467,6 +467,216 @@ async fn trashing_one_message_uses_the_trash_endpoint() {
     );
 }
 
+// ======================================================================= spam
+//
+// `!` is Gmail's Report spam key. The design claim being pinned here is the one
+// the command's doc comment argues for: the inverse names the *exact prior
+// state*, so a conversation that was starred, labelled, unread or already out
+// of the inbox comes back as all of those — and specifically is not deposited
+// in an inbox it was never in.
+
+#[tokio::test]
+async fn reporting_spam_adds_spam_and_removes_inbox() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::ReportSpam {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.message, "Reported 1 conversation as spam");
+    // The other labels are untouched — this is a two-label delta, not a move.
+    assert_eq!(thread_labels(&db, thread), sorted(&["Receipts", "SPAM"]));
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    let body = body_json(&requests[0]);
+    assert_eq!(ids_of(&body, "addLabelIds"), vec!["SPAM"]);
+    assert_eq!(ids_of(&body, "removeLabelIds"), vec!["INBOX"]);
+}
+
+#[tokio::test]
+async fn undoing_a_spam_report_restores_every_label_and_the_unread_flag() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "STARRED", "Receipts", "UNREAD"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::ReportSpam {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["Receipts", "SPAM", "STARRED", "UNREAD"]),
+    );
+
+    // The inverse is the restore form, carrying the state as it stood.
+    assert_eq!(
+        result.undo,
+        Some(Command::NotSpam {
+            thread_ids: vec![thread],
+            restore: vec![ThreadLabelState {
+                thread_id: thread,
+                label_ids: sorted(&["INBOX", "Receipts", "STARRED", "UNREAD"]),
+                is_unread: true,
+            }],
+        })
+    );
+
+    d.execute(result.undo.unwrap()).await.unwrap();
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["INBOX", "Receipts", "STARRED", "UNREAD"]),
+        "undo must restore the star and the label, not just the inbox"
+    );
+    assert!(thread_is_unread(&db, thread));
+}
+
+#[tokio::test]
+async fn undoing_a_spam_report_does_not_hand_an_archived_thread_an_inbox() {
+    // The trap `Command::Archive`'s doc comment describes, in its spam form. A
+    // thread reported from a label — already out of the inbox — never lost an
+    // INBOX, so putting one back would be undo making a second move nobody
+    // asked for.
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["Receipts"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::ReportSpam {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+    assert_eq!(thread_labels(&db, thread), sorted(&["Receipts", "SPAM"]));
+    // One label moved, so exactly one moves back.
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(ids_of(&body, "addLabelIds"), vec!["SPAM"]);
+    assert!(ids_of(&body, "removeLabelIds").is_empty());
+
+    d.execute(result.undo.expect("report spam is undoable"))
+        .await
+        .unwrap();
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["Receipts"]),
+        "undo must not put a thread in an inbox it was never in"
+    );
+}
+
+#[tokio::test]
+async fn not_spam_with_no_prior_state_means_the_inbox() {
+    // What a user dispatches from the Spam mailbox, where there is nothing to
+    // restore from.
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["SPAM"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::NotSpam {
+            thread_ids: vec![thread],
+            restore: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.message, "Marked 1 conversation not spam");
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX"]));
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(ids_of(&body, "addLabelIds"), vec!["INBOX"]);
+    assert_eq!(ids_of(&body, "removeLabelIds"), vec!["SPAM"]);
+}
+
+#[tokio::test]
+async fn a_selection_of_spam_is_one_batched_call() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let threads: Vec<i64> = (0..12)
+        .map(|i| seed_thread(&db, account, &format!("s{i}"), &["INBOX", "UNREAD"]))
+        .collect();
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::ReportSpam {
+            thread_ids: threads.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.applied.len(), 12);
+    assert_eq!(result.message, "Reported 12 conversations as spam");
+    assert_eq!(
+        transport.call_count(),
+        1,
+        "a selection must be one batchModify, not one call per row"
+    );
+    let request = &transport.requests()[0];
+    assert!(
+        request.url.ends_with("/users/me/messages/batchModify"),
+        "unexpected url {}",
+        request.url
+    );
+    let body = body_json(request);
+    assert_eq!(ids_of(&body, "ids").len(), 12);
+    assert_eq!(ids_of(&body, "addLabelIds"), vec!["SPAM"]);
+    assert_eq!(ids_of(&body, "removeLabelIds"), vec!["INBOX"]);
+    for thread in &threads {
+        assert_eq!(thread_labels(&db, *thread), sorted(&["SPAM", "UNREAD"]));
+    }
+}
+
+#[tokio::test]
+async fn a_refused_spam_report_is_named_and_rolled_back() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "STARRED", "UNREAD"]);
+    let before = thread_labels(&db, thread);
+
+    let transport = FakeTransport::always_failing(403, r#"{"error":{"message":"nope"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::ReportSpam {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok, "a refusal must not be reported as success");
+    assert!(result.applied.is_empty());
+    assert_eq!(result.failed.len(), 1);
+    assert_eq!(result.failed[0].ids, vec![thread]);
+    assert_eq!(result.failed[0].kind, FailureKind::Forbidden);
+    assert!(result.failed[0].rolled_back);
+    assert!(result.undo.is_none(), "nothing happened, nothing to undo");
+
+    assert_eq!(thread_labels(&db, thread), before);
+    assert!(thread_is_unread(&db, thread));
+}
+
 // =================================================================== rollback
 
 #[tokio::test]
@@ -943,6 +1153,10 @@ async fn no_mail_command_names_an_unsent_message_to_gmail() {
         (
             "trash",
             Box::new(|t| Command::Trash { thread_ids: vec![t] }),
+        ),
+        (
+            "report spam",
+            Box::new(|t| Command::ReportSpam { thread_ids: vec![t] }),
         ),
         (
             "star",
@@ -1950,12 +2164,13 @@ fn every_command_variant_appears_in_the_catalogue() {
     let catalogue = Command::catalogue();
     let kinds: Vec<&str> = catalogue.iter().map(|spec| spec.kind).collect();
     for expected in [
-        "archive", "unarchive", "markRead", "star", "label", "trash", "untrash", "snooze",
-        "unsnooze", "rsvp", "createEvent", "updateEvent", "deleteEvent", "moveEvent",
+        "archive", "unarchive", "markRead", "star", "label", "reportSpam", "notSpam", "trash",
+        "untrash", "snooze", "unsnooze", "rsvp", "createEvent", "updateEvent", "deleteEvent",
+        "moveEvent",
     ] {
         assert!(kinds.contains(&expected), "{expected} missing from catalogue");
     }
-    assert_eq!(kinds.len(), 14);
+    assert_eq!(kinds.len(), 16);
     // Every spec is serialisable, which is what makes it an agent tool schema.
     let json = serde_json::to_value(catalogue).unwrap();
     assert!(json.is_array());

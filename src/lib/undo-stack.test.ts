@@ -188,6 +188,7 @@ describe("restoresThreads", () => {
     expect(restoresThreads(unarchive([1]))).toBe(true);
     expect(restoresThreads({ kind: "untrash", threadIds: [1] })).toBe(true);
     expect(restoresThreads({ kind: "unsnooze", threadIds: [1] })).toBe(true);
+    expect(restoresThreads({ kind: "notSpam", threadIds: [1] })).toBe(true);
   });
 
   it("is false for the ones that do not", () => {
@@ -201,6 +202,7 @@ describe("hidesThreads", () => {
     expect(hidesThreads(archive([1]))).toBe(true);
     expect(hidesThreads({ kind: "trash", threadIds: [1] })).toBe(true);
     expect(hidesThreads({ kind: "snooze", threadIds: [1], until: 5 })).toBe(true);
+    expect(hidesThreads({ kind: "reportSpam", threadIds: [1] })).toBe(true);
   });
 
   it("is false for the ones that leave the list alone", () => {
