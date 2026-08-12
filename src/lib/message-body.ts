@@ -960,3 +960,58 @@ export function revealBlockedImages(root: BlockedImageRoot | null | undefined): 
   }
   return revealed;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Keys inside the frame                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Does the message document keep this keystroke, or does the app get it?
+ *
+ * A message body is a real iframe, so once anything in it has focus — one click
+ * to select a word, or to scroll, or on the way to a link — its keydowns fire
+ * in *its* document and never reach the window listener the keymap is on. Every
+ * shortcut in the app goes dead: not just `r`, but archive, star, snooze and the
+ * way back to the list. It comes back if you click the list again, which is what
+ * made it read as "the R shortcut isn't working consistently" rather than as a
+ * dead keyboard.
+ *
+ * So the frame forwards what it catches. The exceptions are the keys that mean
+ * something *here*, in a document you are reading:
+ *
+ *  * the ones that move within it — arrows, page up and down, home, end, space.
+ *    Forwarding those would scroll the thread list under a message you were
+ *    trying to read down;
+ *  * ⌘A and ⌘C, which are select-all and copy of this message's text. ⌘A is the
+ *    dangerous one: the app binds it to "select every conversation".
+ *
+ * Everything else — the letters, Escape, ⌘Z, the account keys — has no meaning
+ * inside a read-only document and belongs to the app. The sandbox has no
+ * `allow-forms` and the sanitizer drops every input, so there is nothing in
+ * here that a letter could be typed into.
+ */
+export function frameKeepsKey(event: {
+  key: string;
+  metaKey?: boolean;
+  ctrlKey?: boolean;
+}): boolean {
+  const key = event.key;
+  if (MOVES_WITHIN_DOCUMENT.has(key)) return true;
+  if (event.metaKey || event.ctrlKey) {
+    const letter = key.toLowerCase();
+    return letter === "a" || letter === "c";
+  }
+  return false;
+}
+
+const MOVES_WITHIN_DOCUMENT: ReadonlySet<string> = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);

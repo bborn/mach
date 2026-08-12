@@ -37,6 +37,7 @@ import {
   type RenderedMessage,
   type WideCandidate,
 } from "@/lib/message-body";
+import { KeymapProvider } from "@/hooks/useKeymap";
 import { MessageBodyView } from "./MessageBody";
 import { MessageFrame } from "./MessageFrame";
 
@@ -59,15 +60,19 @@ function rendered(over: Partial<RenderedMessage> = {}): RenderedMessage {
 
 function view(over: Partial<RenderedMessage> = {}, props: Partial<Parameters<typeof MessageBodyView>[0]> = {}) {
   return renderToStaticMarkup(
-    <MessageBodyView
-      rendered={rendered(over)}
-      subject="Tawny"
-      allowRemoteImages={false}
-      onLoadRemoteImages={() => {}}
-      quotedOpen={false}
-      onToggleQuoted={() => {}}
-      {...props}
-    />,
+    // The frames inside read the keymap — they forward the keystrokes an iframe
+    // would otherwise swallow. See `frame-keys.test.ts`.
+    <KeymapProvider>
+      <MessageBodyView
+        rendered={rendered(over)}
+        subject="Tawny"
+        allowRemoteImages={false}
+        onLoadRemoteImages={() => {}}
+        quotedOpen={false}
+        onToggleQuoted={() => {}}
+        {...props}
+      />
+    </KeymapProvider>,
   );
 }
 
@@ -98,12 +103,16 @@ function attribute(markup: string, name: string): string | null {
 
 describe("the message frame's sandbox", () => {
   const markup = renderToStaticMarkup(
-    <MessageFrame
-      html="<p>hi</p>"
-      allowRemoteImages={false}
-      format="html"
-      title="Message from Tawny"
-    />,
+    // The frame reads the keymap: it forwards the keystrokes that would
+    // otherwise be swallowed by the iframe. See `frame-keys.test.ts`.
+    <KeymapProvider>
+      <MessageFrame
+        html="<p>hi</p>"
+        allowRemoteImages={false}
+        format="html"
+        title="Message from Tawny"
+      />
+    </KeymapProvider>,
   );
 
   it("is exactly allow-same-origin allow-popups", () => {
@@ -180,7 +189,9 @@ describe("the message frame's CSP", () => {
 
   it("is carried in the srcdoc the component actually renders", () => {
     const markup = renderToStaticMarkup(
-      <MessageFrame html="<p>hi</p>" allowRemoteImages={false} format="html" title="t" />,
+      <KeymapProvider>
+        <MessageFrame html="<p>hi</p>" allowRemoteImages={false} format="html" title="t" />
+      </KeymapProvider>,
     );
     const srcdoc = attribute(markup, "srcdoc") ?? "";
     expect(srcdoc).toContain("Content-Security-Policy");

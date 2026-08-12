@@ -9,6 +9,7 @@ import {
   reportLinkFailure,
   revealBlockedImages,
   FRAME_SANDBOX,
+  frameKeepsKey,
   FRAME_TOKENS,
   MAX_FRAME_HEIGHT,
   MIN_FRAME_HEIGHT,
@@ -17,6 +18,7 @@ import {
   type FrameTokens,
   type WideCandidate,
 } from "@/lib/message-body";
+import { useKeymap } from "@/hooks/useKeymap";
 
 export interface MessageFrameProps {
   /** Sanitizer output. Never raw sender HTML — see `ipc::render`. */
@@ -108,6 +110,48 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
     });
   }, []);
 
+  /*
+   * Hand the app back its keyboard.
+   *
+   * This is a real iframe, so the instant anything inside it has focus — one
+   * click to select a word or to scroll — its keydowns fire in *its* document
+   * and never reach the window the keymap listens on. Every shortcut in the app
+   * dies at once: not only `r`, but archive, star, snooze and the way back to
+   * the list. Clicking the list revives them, which is why it was reported as
+   * "the R shortcut isn't working consistently" rather than as a dead keyboard.
+   *
+   * Straight into the one registry rather than re-dispatching a synthetic event
+   * upward: `keymap.handle` is what decides what a key means everywhere else,
+   * and a second path to it would be a second thing to keep in step. It only
+   * calls `preventDefault` when a binding actually consumed the key, so an
+   * unbound key is left to the document exactly as it was.
+   *
+   * `frameKeepsKey` holds back what belongs to the document being read — see
+   * there for which, and why ⌘A is the one that would hurt.
+   */
+  const keymap = useKeymap();
+  const forwardKey = useCallback(
+    (event: Event) => {
+      const key = event as KeyboardEvent;
+      if (frameKeepsKey(key)) return;
+      keymap.handle({
+        key: key.key,
+        code: key.code,
+        metaKey: key.metaKey,
+        ctrlKey: key.ctrlKey,
+        altKey: key.altKey,
+        shiftKey: key.shiftKey,
+        // The element inside the frame. There is nothing typeable in here — the
+        // sandbox has no `allow-forms` and the sanitizer drops every input — so
+        // this only ever reads as "not typing", which is the truth.
+        target: key.target as unknown as { tagName?: string; isContentEditable?: boolean },
+        preventDefault: () => key.preventDefault(),
+        stopPropagation: () => key.stopPropagation(),
+      });
+    },
+    [keymap],
+  );
+
   // Torn down and rebuilt on every load, because changing `srcdoc` replaces the
   // document these listeners are attached to.
   const teardown = useRef<(() => void) | null>(null);
@@ -135,6 +179,7 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
     doc.addEventListener("auxclick", interceptNavigation, true);
     doc.addEventListener("submit", preventDefault, true);
     doc.addEventListener("dragstart", preventDefault, true);
+    doc.addEventListener("keydown", forwardKey, true);
 
     /*
      * Let the frame scroll itself once it is clamped.
@@ -185,12 +230,13 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
       doc.removeEventListener("auxclick", interceptNavigation, true);
       doc.removeEventListener("submit", preventDefault, true);
       doc.removeEventListener("dragstart", preventDefault, true);
+      doc.removeEventListener("keydown", forwardKey, true);
       observer?.disconnect();
       cancelAnimationFrame(frameId);
       window.clearTimeout(timer);
       teardown.current = null;
     };
-  }, [allowRemoteImages, measure]);
+  }, [allowRemoteImages, measure, forwardKey]);
 
   return (
     <iframe

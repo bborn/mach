@@ -19,6 +19,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { setRenderInvoker } from "@/lib/message-body";
 import type { Message } from "@/types";
+import { KeymapProvider } from "@/hooks/useKeymap";
 import { MessageBody } from "./MessageBody";
 
 declare global {
@@ -95,7 +96,14 @@ function frameHtml(): string {
 
 function mount() {
   act(() => {
-    root.render(<MessageBody message={message} live />);
+    // The frame forwards keystrokes into the keymap — a message body that has
+    // focus is otherwise a hole the whole keyboard falls into. So it needs the
+    // provider the app always gives it.
+    root.render(
+      <KeymapProvider>
+        <MessageBody message={message} live />
+      </KeymapProvider>,
+    );
   });
 }
 
