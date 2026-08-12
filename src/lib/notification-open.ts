@@ -1,18 +1,17 @@
 /**
  * Opening the conversation a notification banner was about.
  *
- * macOS gives us less to work with here than you would expect.
- * `tauri-plugin-notification` delivers through `NSUserNotification` and
- * discards the interaction entirely — no callback, no user-info, nothing comes
- * back to the process to say *which* banner was clicked, or whether one was
- * clicked at all. The only observable signal is that the app was activated.
+ * Both of the Rust-side paths arrive here, and the difference between them
+ * matters only there. `notify::mac` sends each banner on a thread that blocks
+ * until macOS reports the interaction, so an ordinary click comes back to the
+ * process on a thread that already knows which conversation its own banner was
+ * about — exact, with nothing guessed. `notify::PendingOpen` is the fallback
+ * for the banners that cannot have that: it remembers the newest target and
+ * hands it over on the next activation, within two minutes, because an
+ * activation long after a banner is more likely to be someone clicking the Dock
+ * icon and opening a conversation nobody asked for is worse than opening none.
  *
- * So `notify::host` records the conversation each banner was about and hands it
- * over when an activation arrives soon afterwards. That is a guess, and it is
- * deliberately a conservative one: the claim expires after two minutes, because
- * an activation long after a banner is far more likely to be someone clicking
- * the Dock icon, and opening a conversation nobody asked for is worse than
- * opening none.
+ * Either way what reaches this file is a conversation to select.
  *
  * # Why there are two channels
  *

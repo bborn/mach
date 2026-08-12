@@ -6,11 +6,12 @@
 //! somewhere below the fold.
 //!
 //! ```text
-//!   sync::mail::incremental ──► notify::announce ──► rule ──► Banner ──► Host ──► macOS
-//!         (only on an already-        │
-//!          synced account)            └── the notified ring, in `preferences`
-//!
-//!   threads-changed  ──► notify::badge::refresh ──► unread in INBOX ──► Dock
+//!   sync::mail::incremental ──► notify::announce ──► rule ──► Banner ──► Host ──► mac ──► macOS
+//!         (only on an already-        │                                            │
+//!          synced account)            └── the notified ring, in `preferences`      │
+//!                                                                                  ▼
+//!   threads-changed  ──► notify::badge::refresh ──► unread in INBOX ──► Dock    the click,
+//!                                                                              back again
 //! ```
 //!
 //! # The three things that must not happen
@@ -44,6 +45,8 @@
 
 pub mod badge;
 pub mod host;
+#[cfg(target_os = "macos")]
+pub mod mac;
 pub mod rule;
 
 use std::sync::Mutex;
@@ -56,7 +59,7 @@ use serde_json::{json, Value};
 use crate::db::{sync_queries, Db, Result as DbResult};
 use crate::ipc::prefs;
 
-pub use host::{init, Host, Permission};
+pub use host::{init, Delivery, Host, Permission};
 pub use rule::{Arrival, Banner};
 
 // ===========================================================================
@@ -94,21 +97,27 @@ pub const NOTIFIED_MEMORY: usize = 500;
 // What a click has to reopen
 // ===========================================================================
 
-/// The conversation the most recent notification was about.
+/// The conversation a notification was about, for the banners nothing is
+/// watching.
 ///
-/// # Why this is a slot and not a payload
+/// # This is the fallback, not the main path
 ///
-/// On macOS `tauri-plugin-notification` delivers through `NSUserNotification`
-/// and throws the interaction away: the plugin spawns the show and drops the
-/// response, so there is no callback and no user-info dictionary coming back to
-/// this process. The only thing a click reliably produces is the application
-/// being *activated*, which Tauri reports as `RunEvent::Reopen` — with nothing
-/// in it to say which notification caused it.
+/// [`host::Delivery::Watched`] is the main path: `notify::mac` sends the banner
+/// on a thread of its own and blocks there until macOS reports the interaction,
+/// so a click comes back to *this* process carrying nothing — but on a thread
+/// that already knows, by closure, which conversation its own banner was about.
+/// That is exact, and it does not go through this slot at all.
 ///
-/// So the target is remembered here at delivery time and claimed on the next
-/// activation, within [`PENDING_OPEN_TTL_MS`]. It is deliberately a single slot:
-/// a second notification replaces the first, which is the same thing the banner
-/// itself does.
+/// This slot covers what that cannot: a banner sent fire-and-forget because too
+/// many were already outstanding ([`host::Delivery::Unwatched`]), and a bundled
+/// build where clicking the banner activates the application and Tauri reports
+/// `RunEvent::Reopen` with nothing in it to say which notification caused it.
+/// The target is remembered at delivery time and claimed on the next activation,
+/// within [`PENDING_OPEN_TTL_MS`].
+///
+/// It is deliberately a single slot: a second notification replaces the first,
+/// which is the same thing the banner itself does. Being a guess, it is also
+/// the reason the TTL is short — see [`PENDING_OPEN_TTL_MS`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingOpen {
@@ -170,8 +179,12 @@ pub fn announce(db: &Db, account_id: i64, arrived: &[String]) {
     };
 
     if let Some(host) = host::current() {
-        remember_open(target);
-        host.show(&banner);
+        // Armed only when nothing is watching the banner itself. A watched
+        // banner routes its own click, and arming this as well would mean a
+        // Dock click minutes later opened the same conversation a second time.
+        if host.show(&banner, &target) == host::Delivery::Unwatched {
+            remember_open(target);
+        }
         // The count moved with the mail; say so without waiting for the UI to
         // notice and emit `threads-changed`.
         badge::refresh(host.as_ref());
@@ -252,9 +265,10 @@ pub fn hydrate(
 ) -> DbResult<Option<Arrival>> {
     use rusqlite::OptionalExtension;
 
-    let row: Option<(i64, i64, String, Option<String>, String, String)> = conn
+    let row: Option<(i64, i64, String, Option<String>, String, String, String)> = conn
         .query_row(
-            "SELECT m.id, m.thread_id, t.gmail_thread_id, m.from_name, m.from_email, m.subject
+            "SELECT m.id, m.thread_id, t.gmail_thread_id, m.from_name, m.from_email,
+                    m.subject, m.snippet
                FROM messages m
                JOIN threads t ON t.id = m.thread_id
               WHERE m.account_id = ?1 AND m.gmail_message_id = ?2",
@@ -267,12 +281,15 @@ pub fn hydrate(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((message_id, thread_id, gmail_thread_id, from_name, from_email, subject)) = row else {
+    let Some((message_id, thread_id, gmail_thread_id, from_name, from_email, subject, snippet)) =
+        row
+    else {
         return Ok(None);
     };
 
@@ -298,6 +315,7 @@ pub fn hydrate(
         from_name,
         from_email,
         subject,
+        snippet,
         labels,
         thread_has_own_message,
     }))
