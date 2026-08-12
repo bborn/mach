@@ -56,6 +56,7 @@ export const INBOX = "INBOX";
 export const UNREAD = "UNREAD";
 export const STARRED = "STARRED";
 export const TRASH = "TRASH";
+export const DRAFT = "DRAFT";
 
 /**
  * One conversation's worth of "this has happened, the store just does not say
@@ -120,11 +121,24 @@ function guessFor(
     case "archive":
       return { add: [], remove: [INBOX] };
 
-    // Trash is the one command with a dedicated Gmail endpoint, and its label
-    // effect is still exactly this: the conversation gains TRASH and leaves the
-    // inbox.
-    case "trash":
-      return { add: [TRASH], remove: [INBOX] };
+    /*
+     * Trash is the one command with a dedicated Gmail endpoint, and its label
+     * effect is still exactly this: the conversation gains TRASH and leaves the
+     * inbox.
+     *
+     * `DRAFT` goes with it, for a row that has one. Trashing a conversation
+     * discards the draft it was holding — `commands::drafts` deletes it through
+     * `drafts.delete`, because no label delta can — so the row leaves the Drafts
+     * mailbox as well, and pressing delete in Drafts has to take the row off
+     * screen in the frame the keystroke produced. Only for rows that carry the
+     * label: claiming to remove it from every conversation would make an
+     * ordinary archive-to-trash look like it had touched a draft.
+     */
+    case "trash": {
+      const row = rows.find((r) => r.id === id);
+      const remove = row?.labelIds.includes(DRAFT) ? [INBOX, DRAFT] : [INBOX];
+      return { add: [TRASH], remove };
+    }
 
     // Snooze also applies a per-account `Mach/Snoozed` label, which lives in
     // the store and has no id the frontend can know. Leaving it out of the

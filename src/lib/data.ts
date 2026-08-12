@@ -198,6 +198,15 @@ export interface CommandResult {
   message: string;
   /** The command that reverses this one, narrowed to the ids that changed. */
   undo?: Command;
+  /**
+   * What the ⌘Z entry should say, when that is **less** than {@link message}.
+   *
+   * Absent for almost everything, because the two are normally the same
+   * sentence. Trashing a selection that held drafts is the exception: Gmail's
+   * `drafts.delete` is permanent, so "Trashed 3 conversations · discarded 1
+   * draft" is what happened and "Trashed 3 conversations" is what ⌘Z would do.
+   */
+  undoLabel?: string;
   /** Ids whose local state now reflects the command. */
   applied: number[];
   /** Ids that were rolled back, grouped by the failure that hit them. */

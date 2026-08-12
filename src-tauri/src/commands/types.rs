@@ -313,6 +313,18 @@ pub struct CommandResult {
     /// The command that reverses this one. `None` when nothing changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo: Option<Command>,
+    /// What the ⌘Z entry should say, when that is **less** than [`Self::message`].
+    ///
+    /// Normally the two are the same sentence and this is `None`. It is filled
+    /// in when a command did something its inverse cannot take back, which today
+    /// means exactly one thing: trashing a selection that held drafts. Gmail's
+    /// `drafts.delete` is permanent, so "Trashed 3 conversations · discarded 1
+    /// draft" is the truth about what happened and "Trashed 3 conversations" is
+    /// the truth about what ⌘Z would do. A button that offers the first is
+    /// lying, so the two strings are kept apart rather than one being made to
+    /// serve both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_label: Option<String>,
     /// Ids whose local state now reflects the command and whose remote call
     /// succeeded (or was unnecessary).
     pub applied: Vec<i64>,
@@ -327,6 +339,7 @@ impl CommandResult {
             ok: true,
             message: message.into(),
             undo: None,
+            undo_label: None,
             applied: Vec::new(),
             failed: Vec::new(),
         }

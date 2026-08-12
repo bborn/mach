@@ -37,6 +37,7 @@
 //! | [`clients`] | how a command reaches the right account's API client |
 //! | [`filters`] | Gmail filters, which are not commands and say why |
 //! | [`mail`] | the label-delta engine, batching, snooze |
+//! | [`drafts`] | discarding a draft, which no label delta can express |
 //! | [`calendar`] | RSVP, and the event write path (create/update/delete/move) |
 //! | [`catalogue`] | the self-describing schema |
 //!
@@ -45,6 +46,7 @@
 pub mod calendar;
 pub mod catalogue;
 pub mod clients;
+pub mod drafts;
 pub mod error;
 pub mod filters;
 pub mod mail;

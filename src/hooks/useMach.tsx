@@ -1181,6 +1181,15 @@ export function MachProvider({ children }: { children: ReactNode }) {
          * caller's optimistic phrasing would be a lie about what happened.
          */
         const message = options.label && result.ok ? options.label : describeResult(result);
+        /*
+         * The undo entry says less than the toast when the command did
+         * something ⌘Z cannot take back. Only trash produces one today, and
+         * only when the selection held a draft: `drafts.delete` is permanent,
+         * so the toast reports the drafts and the button offers only the
+         * conversations. See `CommandResult.undoLabel`.
+         */
+        const undoLabel =
+          options.label && result.ok ? options.label : result.undoLabel ?? message;
         if (!options.quiet || !result.ok) {
           dispatchUi({
             type: "status",
@@ -1197,7 +1206,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
         // A partial failure still records: the inverse the command layer
         // returned covers only the ids that actually applied.
         if (!options.quiet) {
-          commitUndo(pushUndo(undoRef.current, command, result, message, Date.now()));
+          commitUndo(pushUndo(undoRef.current, command, result, undoLabel, Date.now()));
         }
         return result;
       } catch (caught) {
