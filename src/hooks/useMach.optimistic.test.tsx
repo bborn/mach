@@ -282,6 +282,7 @@ describe("a row leaves the list on the keystroke", () => {
   const cases: { name: string; press: () => void }[] = [
     { name: "archive", press: () => probe().archiveSelected() },
     { name: "trash", press: () => probe().trashSelected() },
+    { name: "report spam", press: () => probe().reportSpamSelected() },
     { name: "snooze", press: () => probe().snoozeSelected(Date.now() + 86_400_000) },
   ];
 
@@ -308,6 +309,40 @@ describe("a row leaves the list on the keystroke", () => {
       expect(frames.every((f) => !f.present)).toBe(true);
     });
   }
+});
+
+describe("reporting spam over a selection", () => {
+  it("names every selected row in one command, as archive does", async () => {
+    // The bulk claim: the Rust layer can only issue one batchModify if the
+    // whole set arrives together, so a selection of three must be one command
+    // with three ids and not three commands.
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    await act(async () => probe().selectAllThreads());
+    await flush();
+
+    s.willBecome((rows) => rows.filter((r) => ![1, TARGET, 3].includes(r.id)));
+    s.commands.length = 0;
+    act(() => probe().reportSpamSelected());
+
+    expect(s.commands).toEqual([{ kind: "reportSpam", threadIds: [1, TARGET, 3] }]);
+    // And every one of them is off the list in the frame the keystroke made.
+    expect(latest(frames).present).toBe(false);
+    await flush();
+  });
+
+  it("falls back to the row under the cursor when nothing is selected", async () => {
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    s.commands.length = 0;
+    act(() => probe().reportSpamSelected());
+    expect(s.commands).toEqual([{ kind: "reportSpam", threadIds: [TARGET] }]);
+    await flush();
+  });
 });
 
 describe("the star", () => {

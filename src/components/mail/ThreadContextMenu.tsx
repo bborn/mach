@@ -325,6 +325,7 @@ export function buildItems(
 
   separate();
   push("Actions", "Archive", "Archive");
+  push("Actions", "Report spam", "Report spam", "danger");
   push("Actions", "Trash", "Trash", "danger");
 
   /*

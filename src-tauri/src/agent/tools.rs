@@ -92,18 +92,26 @@ impl Tool {
     }
 }
 
-/// The commands that touch another human even though they are undoable.
+/// The commands whose effect leaves the mailbox even though they are undoable.
 ///
 /// An RSVP mails the organiser the moment it lands, and un-declining does not
 /// unsend that. The same is true of every calendar write that can carry guests:
 /// creating, moving, editing or cancelling an event with attendees sends them
-/// mail, and the inverse command sends them a second one. Everything else in
-/// the catalogue is a label move nobody else can see.
+/// mail, and the inverse command sends them a second one.
+///
+/// `reportSpam` is here for the same reason wearing different clothes. It looks
+/// like a label move, and locally it is one — but a spam report is a signal to
+/// Google about a sender, it feeds a classifier, and `notSpam` puts the labels
+/// back without retracting it. The undo is exact about the mailbox and cannot
+/// be about Google's opinion of the sender, which is precisely the shape of the
+/// RSVP argument. So the agent may propose it and the owner presses the button.
+/// Everything else in the catalogue is a label move nobody else can see.
 ///
 /// Names rather than a property on [`CommandSpec`] because "does this reach
 /// someone else" is a judgement about consequences, and the catalogue is owned
 /// by the command layer, not by this module.
 pub const APPROVAL_COMMANDS: &[&str] = &[
+    "reportSpam",
     "rsvp",
     "createEvent",
     "updateEvent",

@@ -55,6 +55,7 @@ import { isMailCommand, type Command, type MailCommand } from "./data";
 export const INBOX = "INBOX";
 export const UNREAD = "UNREAD";
 export const STARRED = "STARRED";
+export const SPAM = "SPAM";
 export const TRASH = "TRASH";
 export const DRAFT = "DRAFT";
 
@@ -140,6 +141,13 @@ function guessFor(
       return { add: [TRASH], remove };
     }
 
+    // Gmail's `!`: the conversation gains SPAM and leaves the inbox. Both
+    // halves matter on screen — the second is what takes the row out of the
+    // inbox in the frame the keystroke produced, and the first is what puts it
+    // in Spam if that is the mailbox being viewed.
+    case "reportSpam":
+      return { add: [SPAM], remove: [INBOX] };
+
     // Snooze also applies a per-account `Mach/Snoozed` label, which lives in
     // the store and has no id the frontend can know. Leaving it out of the
     // guess costs nothing on screen — the row is leaving the inbox either way
@@ -166,20 +174,24 @@ function guessFor(
         : { add: [], remove: [command.labelId] };
 
     /*
-     * The two that undo dispatches, and the only two whose target is a set.
+     * The three that undo dispatches, and the only three whose target is a set.
      *
      * `restore` carries the labels the thread actually had before the action
      * being taken back — that is what makes undo exact rather than a guess at
      * `INBOX`. Turning it into a delta needs the row's current labels, so a
      * thread that is not loaded falls back to the same thing the backend falls
-     * back to when it has no restore state: put `INBOX` on, take `TRASH` off.
+     * back to when it has no restore state: put `INBOX` on, take `TRASH` (or
+     * `SPAM`) off.
      */
     case "unarchive":
+    case "notSpam":
     case "untrash": {
       const fallback: ThreadGuess =
         command.kind === "untrash"
           ? { add: [INBOX], remove: [TRASH] }
-          : { add: [INBOX], remove: [] };
+          : command.kind === "notSpam"
+            ? { add: [INBOX], remove: [SPAM] }
+            : { add: [INBOX], remove: [] };
       const state = command.restore?.find((s) => s.threadId === id);
       if (!state) return fallback;
       const row = rows.find((r) => r.id === id);

@@ -114,6 +114,8 @@ export type Command =
   | { kind: "markRead"; threadIds: ThreadId[]; read: boolean }
   | { kind: "star"; threadIds: ThreadId[]; starred: boolean }
   | { kind: "label"; threadIds: ThreadId[]; labelId: LabelId; add: boolean }
+  | { kind: "reportSpam"; threadIds: ThreadId[] }
+  | { kind: "notSpam"; threadIds: ThreadId[]; restore?: ThreadLabelState[] }
   | { kind: "trash"; threadIds: ThreadId[] }
   | { kind: "untrash"; threadIds: ThreadId[]; restore?: ThreadLabelState[] }
   | { kind: "snooze"; threadIds: ThreadId[]; until: number }
@@ -255,10 +257,13 @@ export const FAILURE_LABELS: Record<FailureKind, string> = {
  * the shape-only version the fixture source uses, and the reference for which
  * command reverses which:
  *
- *   archive ⇄ unarchive · trash ⇄ untrash · snooze → unsnooze
+ *   archive ⇄ unarchive · trash ⇄ untrash · reportSpam ⇄ notSpam ·
+ *   snooze → unsnooze
  *
  * Snooze's inverse is `unsnooze`, not `unarchive`: waking a thread restores the
- * labels it was snoozed from, which "add INBOX" would not do.
+ * labels it was snoozed from, which "add INBOX" would not do. `notSpam` here is
+ * the plain form for the same reason `untrash` is — this shape-only version has
+ * no prior state to name, and the real command layer's inverse carries one.
  */
 export function inverseOf(command: Command): Command | undefined {
   switch (command.kind) {
@@ -270,6 +275,10 @@ export function inverseOf(command: Command): Command | undefined {
       return { kind: "untrash", threadIds: command.threadIds };
     case "untrash":
       return { kind: "trash", threadIds: command.threadIds };
+    case "reportSpam":
+      return { kind: "notSpam", threadIds: command.threadIds };
+    case "notSpam":
+      return { kind: "reportSpam", threadIds: command.threadIds };
     case "snooze":
       return { kind: "unsnooze", threadIds: command.threadIds };
     case "markRead":
@@ -597,6 +606,16 @@ export const fixtureSource: MachDataSource = {
         return fixtureResult(command, command.starred ? "Starred" : "Unstarred");
       case "label":
         return fixtureResult(command, command.add ? "Label added" : "Label removed");
+      case "reportSpam":
+        return fixtureResult(
+          command,
+          `Reported ${pluralize(command.threadIds.length, "conversation")} as spam`,
+        );
+      case "notSpam":
+        return fixtureResult(
+          command,
+          `Marked ${pluralize(command.threadIds.length, "conversation")} not spam`,
+        );
       case "trash":
         return fixtureResult(command, `Trashed ${pluralize(command.threadIds.length, "conversation")}`);
       case "untrash":

@@ -166,6 +166,22 @@ pub(crate) const CATALOGUE: &[CommandSpec] = &[
         batch: true,
     },
     CommandSpec {
+        kind: "reportSpam",
+        summary: "Report conversations as spam: they leave the inbox and go to Spam, and \
+                  Google learns from it.",
+        params: &[THREAD_IDS],
+        undoable: true,
+        batch: true,
+    },
+    CommandSpec {
+        kind: "notSpam",
+        summary: "Take conversations out of Spam, restoring their labels — or the inbox, \
+                  with no prior state named.",
+        params: &[THREAD_IDS, RESTORE],
+        undoable: true,
+        batch: true,
+    },
+    CommandSpec {
         kind: "trash",
         summary: "Move conversations to the Gmail trash.",
         params: &[THREAD_IDS],

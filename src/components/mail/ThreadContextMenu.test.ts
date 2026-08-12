@@ -40,6 +40,7 @@ function registry(over: Partial<Record<string, boolean>> = {}): KeyBinding[] {
     { keys: "s", group: "Actions", description: "Star", handler: () => {} },
     { keys: "b", group: "Actions", description: "Snooze", handler: () => {} },
     { keys: "e", group: "Actions", description: "Archive", handler: () => {} },
+    { keys: "!", group: "Actions", description: "Report spam", handler: () => {} },
     { keys: "#", group: "Actions", description: "Trash", handler: () => {} },
   ];
   return all.filter((b) => over[b.description!] !== false);
@@ -72,7 +73,7 @@ describe("buildItems", () => {
     const b = thread({ id: 2 });
     const items = buildItems(registry(), [a.id, b.id], a.id, map(a, b));
 
-    expect(labels(items)).toEqual(["Star", "Snooze", "Archive", "Trash"]);
+    expect(labels(items)).toEqual(["Star", "Snooze", "Archive", "Report spam", "Trash"]);
     expect(labels(items)).not.toContain("Search by sender");
   });
 
@@ -155,7 +156,7 @@ describe("buildItems", () => {
    */
   it("keeps the commands for a row it can no longer read, and only those", () => {
     const items = buildItems(registry(), [404], 404, map());
-    expect(labels(items)).toEqual(["Star", "Snooze", "Archive", "Trash"]);
+    expect(labels(items)).toEqual(["Star", "Snooze", "Archive", "Report spam", "Trash"]);
     expect(labels(items)).not.toContain("Unstar");
     expect(labels(items)).not.toContain("Search by sender");
   });

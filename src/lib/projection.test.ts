@@ -107,6 +107,40 @@ describe("what a command is known to do", () => {
     });
   });
 
+  it("gives a reported conversation SPAM and takes INBOX away", () => {
+    expect(project({ kind: "reportSpam", threadIds: [1] }, [])).toEqual({
+      1: { add: ["SPAM"], remove: ["INBOX"] },
+    });
+    // Which is what takes the row off the inbox in the keystroke's own frame.
+    expect(
+      leavingIds({ kind: "reportSpam", threadIds: [1] }, [row(1)], "INBOX"),
+    ).toEqual([1]);
+  });
+
+  it("puts a rescued conversation back exactly where it was", () => {
+    // Undo's form. The thread was starred and in a label when it was reported,
+    // and all of that comes back — not a bare INBOX.
+    const rows = [row(1, { labelIds: ["SPAM", "STARRED", "Receipts"] })];
+    expect(
+      project(
+        {
+          kind: "notSpam",
+          threadIds: [1],
+          restore: [
+            { threadId: 1, labelIds: ["INBOX", "STARRED", "Receipts"], isUnread: true },
+          ],
+        },
+        rows,
+      ),
+    ).toEqual({ 1: { add: ["INBOX"], remove: ["SPAM"], unread: true } });
+  });
+
+  it("falls back to the inbox for a notSpam with no prior state", () => {
+    expect(project({ kind: "notSpam", threadIds: [1], restore: undefined }, [])).toEqual({
+      1: { add: ["INBOX"], remove: ["SPAM"] },
+    });
+  });
+
   it("turns undo's restored label set into a delta against the row", () => {
     // The whole point of `restore`: undoing an archive puts back the labels the
     // conversation actually had, not a bare INBOX.

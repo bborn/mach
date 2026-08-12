@@ -133,6 +133,7 @@ use super::CommandDispatcher;
 pub const INBOX: &str = "INBOX";
 pub const UNREAD: &str = "UNREAD";
 pub const STARRED: &str = "STARRED";
+pub const SPAM: &str = "SPAM";
 pub const TRASH: &str = "TRASH";
 pub const DRAFT: &str = "DRAFT";
 
@@ -420,6 +421,38 @@ async fn build_plans(
                 )
             }
 
+            // Exactly what Gmail's own Report spam sends: SPAM on, INBOX off,
+            // in one `batchModify`. Nothing else about the thread is touched —
+            // a starred, labelled conversation keeps both — which is what makes
+            // the prior state worth capturing rather than reconstructing.
+            Command::ReportSpam { .. } => (
+                without(&with(&prior, &[SPAM]), &[INBOX]),
+                snap.is_unread,
+                RemoteOp::Modify,
+                SnoozeAction::Leave,
+            ),
+
+            Command::NotSpam { restore, .. } => {
+                match restore_state(restore, snap.thread_id) {
+                    Some(state) => (
+                        normalise(state.label_ids.clone()),
+                        state.is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Leave,
+                    ),
+                    // Dispatched by hand from the Spam mailbox, where "not
+                    // spam" means the inbox and there is no prior state to
+                    // consult. Undo never reaches this arm: it always carries a
+                    // `restore`.
+                    None => (
+                        without(&with(&prior, &[INBOX]), &[SPAM]),
+                        snap.is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Leave,
+                    ),
+                }
+            }
+
             Command::Trash { .. } => (
                 without(&with(&prior, &[TRASH]), &[INBOX]),
                 snap.is_unread,
@@ -656,6 +689,15 @@ fn inverse(command: &Command, changed: &[&ThreadPlan]) -> Option<Command> {
             thread_ids,
             restore: priors,
         },
+        // Both directions invert to the restore form, exactly as trash does.
+        // Taking a report back is not "remove SPAM, add INBOX" — see the doc on
+        // `Command::NotSpam` — and taking back a *rescue* is not "add SPAM"
+        // either, because the thread may have carried other labels in spam.
+        // Naming the prior set covers both without a special case.
+        Command::ReportSpam { .. } | Command::NotSpam { .. } => Command::NotSpam {
+            thread_ids,
+            restore: priors,
+        },
         Command::Snooze { .. } => Command::Unsnooze { thread_ids },
         Command::Unsnooze { .. } => {
             // Re-snoozing needs one wake time. If the threads were snoozed to
@@ -708,6 +750,8 @@ fn describe(command: &Command, n: usize) -> String {
         Command::Star { starred: false, .. } => format!("Unstarred {subject}"),
         Command::Label { add: true, .. } => format!("Labelled {subject}"),
         Command::Label { add: false, .. } => format!("Removed the label from {subject}"),
+        Command::ReportSpam { .. } => format!("Reported {subject} as spam"),
+        Command::NotSpam { .. } => format!("Marked {subject} not spam"),
         Command::Trash { .. } => format!("Trashed {subject}"),
         Command::Untrash { .. } => format!("Restored {subject} from the trash"),
         Command::Snooze { .. } => format!("Snoozed {subject}"),

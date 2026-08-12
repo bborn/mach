@@ -166,6 +166,49 @@ pub enum Command {
         add: bool,
     },
 
+    /// Report as spam: add SPAM, drop INBOX. Gmail's `!`.
+    ///
+    /// A command of its own rather than a [`Command::Label`] naming `SPAM`,
+    /// for three reasons that are all about the undo:
+    ///
+    ///  * `Label` moves **one** label. Reporting spam moves two — SPAM on,
+    ///    INBOX off — so the composition would have to be two commands, two
+    ///    remote calls, and two entries on the undo stack for one keystroke.
+    ///  * Between those two calls a thread can sit in the inbox *and* in spam,
+    ///    and a failure of the second leaves it there.
+    ///  * The inverse of `Label { SPAM, add: true }` is `Label { SPAM, add:
+    ///    false }`, which takes the thread out of spam and does **not** put it
+    ///    back in the inbox. That is the wrong answer for the common case and
+    ///    the right answer for none.
+    #[serde(rename_all = "camelCase")]
+    ReportSpam { thread_ids: Vec<i64> },
+
+    /// Gmail's "Not spam": drop SPAM, and put the thread back where it was.
+    ///
+    /// The pair is named for Gmail's own two buttons — Report spam, Not spam —
+    /// rather than being forced into the `un-` shape `Unarchive` and `Untrash`
+    /// have, because "unreport spam" is not a thing anybody says.
+    ///
+    /// **It carries `restore`, and this is the trap [`Command::Archive`]'s doc
+    /// comment is about.** Archive removes INBOX and touches nothing else, so a
+    /// bare "add INBOX" reverses it exactly. Reporting spam does two things,
+    /// and one of them is conditional: a thread that was already archived, or
+    /// sitting in a label and out of the inbox, did not *lose* an INBOX it
+    /// never had. Reversing that with "remove SPAM, add INBOX" would deposit it
+    /// in an inbox it was never in — undo as a second unrequested move. So the
+    /// inverse names the exact prior label set, the way [`Command::Untrash`]
+    /// does, and a thread that was starred, labelled, unread or already
+    /// archived comes back as all of those.
+    ///
+    /// The plain form (no `restore`) is what a user dispatches from the Spam
+    /// mailbox, and it means the obvious thing: out of spam, into the inbox.
+    #[serde(rename_all = "camelCase")]
+    NotSpam {
+        thread_ids: Vec<i64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restore: Vec<ThreadLabelState>,
+    },
+
     /// Move to Gmail's trash: add TRASH, drop INBOX.
     #[serde(rename_all = "camelCase")]
     Trash { thread_ids: Vec<i64> },
@@ -244,6 +287,8 @@ impl Command {
             Command::MarkRead { .. } => "markRead",
             Command::Star { .. } => "star",
             Command::Label { .. } => "label",
+            Command::ReportSpam { .. } => "reportSpam",
+            Command::NotSpam { .. } => "notSpam",
             Command::Trash { .. } => "trash",
             Command::Untrash { .. } => "untrash",
             Command::Snooze { .. } => "snooze",
@@ -265,6 +310,8 @@ impl Command {
             | Command::MarkRead { thread_ids, .. }
             | Command::Star { thread_ids, .. }
             | Command::Label { thread_ids, .. }
+            | Command::ReportSpam { thread_ids }
+            | Command::NotSpam { thread_ids, .. }
             | Command::Trash { thread_ids }
             | Command::Untrash { thread_ids, .. }
             | Command::Snooze { thread_ids, .. }
