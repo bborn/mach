@@ -556,6 +556,7 @@ fn the_mcp_surface_is_exactly_the_command_layer_and_nothing_more() {
         "search_threads",
         "get_thread",
         "list_events",
+        tools::LIST_CALENDARS_TOOL,
         "list_labels",
         "list_accounts",
         tools::DRAFT_TOOL,

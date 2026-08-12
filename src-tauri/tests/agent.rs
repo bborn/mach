@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 use mach_lib::commands::{AccountClients, Command, CommandDispatcher, GoogleClients};
 use mach_lib::db::models::{
-    LabelType, NewAccount, NewLabel, NewMessage, NewThread, Participant, RsvpStatus,
+    LabelType, NewAccount, NewCalendar, NewLabel, NewMessage, NewThread, Participant, RsvpStatus,
 };
 use mach_lib::db::{queries, Db};
 use mach_lib::google::{
@@ -1813,4 +1813,394 @@ async fn a_malformed_address_fails_visibly_and_writes_nothing() {
 
     // Nothing was written by any of it.
     assert_eq!(draft_count(&harness.db), 1);
+}
+
+// ===========================================================================
+// Naming a calendar
+// ===========================================================================
+//
+// Asked to put eleven recurring "Molly Care" events on a calendar he named —
+// "Dad/Ben Schedule" — the agent gave up and wrote him the list to paste into
+// Google himself. Three things were wrong, and only the first looked like the
+// bug:
+//
+//  1. There was no `list_calendars`. `createEvent` takes a `calendarId`, its
+//     own parameter description said "as returned by list_calendars", and
+//     nothing returned one. A name could not become an id.
+//  2. `attendees` was advertised as an array of strings against a
+//     `Vec<Participant>`, so naming a guest was a deserialize error.
+//  3. `recurrence` was advertised as one string against a `Vec<String>`, so
+//     "every week" was a second one, on the same call.
+//
+// `the_original_request_now_succeeds` is the regression: the name, resolved,
+// with a guest on it.
+
+/// A calendar row, as `calendarList.list` would have left it.
+fn add_calendar(db: &Db, account_id: i64, calendar_id: &str, name: &str, role: &str) {
+    db.write(|conn| {
+        queries::upsert_calendar(
+            conn,
+            &NewCalendar {
+                account_id,
+                calendar_id: calendar_id.into(),
+                summary: Some(name.into()),
+                access_role: Some(role.into()),
+                is_primary: calendar_id == "primary",
+                selected: true,
+                synced_at: 1_754_000_000_000,
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+    })
+    .expect("calendar");
+}
+
+/// One calendar out of a `list_calendars` payload, by the name a person uses.
+fn calendar_named<'a>(payload: &'a Value, name: &str) -> &'a Value {
+    payload["calendars"]
+        .as_array()
+        .expect("calendars is an array")
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("no calendar named {name} in {payload}"))
+}
+
+#[tokio::test]
+async fn list_calendars_names_every_calendar_across_accounts() {
+    let harness = Harness::new("calendars-list");
+    let (first, _thread) = seed(&harness.db);
+    let second = add_account(&harness.db, "ben@example.com");
+
+    add_calendar(&harness.db, first, "primary", "Alex", "owner");
+    add_calendar(
+        &harness.db,
+        first,
+        "dadben@group.calendar.google.com",
+        "Dad/Ben Schedule",
+        "writer",
+    );
+    add_calendar(&harness.db, second, "primary", "Ben", "owner");
+
+    let outcome = tools::execute(&harness.tool_context(), "list_calendars", &json!({}))
+        .await
+        .expect("listed");
+
+    // It spans accounts, which is what makes "which account owns it" a
+    // question with an answer.
+    //
+    // The second account's primary is listed as its address rather than as
+    // "Ben": Google's `summary` for a primary calendar is the account's own
+    // email, and `ipc::reads::list_calendars` substitutes the account's display
+    // name — which this one does not have. The name the model sees is the name
+    // the sidebar shows, which is the point.
+    let names: Vec<&str> = outcome.payload["calendars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Alex", "Dad/Ben Schedule", "ben@example.com"]);
+
+    // Every row carries the id `createEvent` takes, beside the account it has
+    // to be created on.
+    let shared = calendar_named(&outcome.payload, "Dad/Ben Schedule");
+    assert_eq!(shared["calendarId"], "dadben@group.calendar.google.com");
+    assert_eq!(shared["accountId"], first);
+    assert_eq!(shared["accountEmail"], "alex@example.com");
+    assert_eq!(shared["primary"], false);
+    assert_eq!(calendar_named(&outcome.payload, "Alex")["primary"], true);
+    assert_eq!(
+        calendar_named(&outcome.payload, "ben@example.com")["accountId"],
+        second
+    );
+
+    // A read. Nothing to open, nothing to repaint, nothing to approve.
+    assert!(!outcome.mutated);
+    assert!(outcome.artifact.is_none());
+    assert_eq!(tools::policy_for("list_calendars"), ToolPolicy::Auto);
+
+    // Restricting to one account is the same list, filtered.
+    let one = tools::execute(
+        &harness.tool_context(),
+        "list_calendars",
+        &json!({ "accountId": second }),
+    )
+    .await
+    .expect("listed");
+    assert_eq!(one.payload["calendars"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        calendar_named(&one.payload, "ben@example.com")["accountId"],
+        second
+    );
+}
+
+#[tokio::test]
+async fn a_read_only_calendar_says_so_before_the_write_is_attempted() {
+    let harness = Harness::new("calendars-writable");
+    let (account_id, _thread) = seed(&harness.db);
+
+    add_calendar(&harness.db, account_id, "primary", "Alex", "owner");
+    add_calendar(&harness.db, account_id, "team@example.com", "Team", "writer");
+    add_calendar(
+        &harness.db,
+        account_id,
+        "en.usa#holiday@group.v.calendar.google.com",
+        "Holidays in United States",
+        "reader",
+    );
+    add_calendar(
+        &harness.db,
+        account_id,
+        "busy@example.com",
+        "Sam (free/busy)",
+        "freeBusyReader",
+    );
+
+    let outcome = tools::execute(&harness.tool_context(), "list_calendars", &json!({}))
+        .await
+        .expect("listed");
+
+    // The same two role names `Calendar::writable` and `canEditEvent` turn on,
+    // and no third opinion about it.
+    for (name, writable) in [
+        ("Alex", true),
+        ("Team", true),
+        ("Holidays in United States", false),
+        ("Sam (free/busy)", false),
+    ] {
+        assert_eq!(
+            calendar_named(&outcome.payload, name)["writable"],
+            json!(writable),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_account_with_no_calendars_is_an_empty_list_not_an_error() {
+    let harness = Harness::new("calendars-empty");
+    let (account_id, _thread) = seed(&harness.db);
+
+    // An account exists and its calendars have never been swept. Failing here
+    // would have the agent report a broken app rather than "there are no
+    // calendars on that account yet".
+    let outcome = tools::execute(&harness.tool_context(), "list_calendars", &json!({}))
+        .await
+        .expect("an empty store is not a failure");
+    assert_eq!(outcome.payload["calendars"], json!([]));
+    assert_eq!(outcome.summary, "0 calendars");
+
+    let named = tools::execute(
+        &harness.tool_context(),
+        "list_calendars",
+        &json!({ "accountId": account_id }),
+    )
+    .await
+    .expect("still not a failure");
+    assert_eq!(named.payload["calendars"], json!([]));
+}
+
+/// The sentence from his transcript, end to end: a calendar named in words,
+/// resolved to an id, with a recurring event and a guest put on it.
+///
+/// The guest is a fixture address. Nothing here reaches Google — `FakeGoogle`
+/// answers every call and records it — and the assertion is on the request that
+/// *would* have been sent, which is the only honest way to test a write whose
+/// effect is mail to another person.
+#[tokio::test]
+async fn the_original_request_now_succeeds() {
+    let harness = Harness::new("calendars-regression");
+    let (account_id, _thread) = seed(&harness.db);
+    add_calendar(&harness.db, account_id, "primary", "Alex", "owner");
+    add_calendar(
+        &harness.db,
+        account_id,
+        "dadben@group.calendar.google.com",
+        "Dad/Ben Schedule",
+        "writer",
+    );
+
+    // 1. The name he used, resolved to the id and the account the write needs.
+    let listed = tools::execute(&harness.tool_context(), "list_calendars", &json!({}))
+        .await
+        .expect("listed");
+    let target = calendar_named(&listed.payload, "Dad/Ben Schedule");
+    assert_eq!(target["writable"], json!(true), "it is his to write to");
+    let calendar_id = target["calendarId"].as_str().unwrap().to_string();
+    let on_account = target["accountId"].as_i64().unwrap();
+
+    // 2. The event, with a guest and a weekly rule — written the way a model
+    // writes it, addresses as bare strings and one RRULE rather than a list.
+    let start = 1_775_000_000_000i64;
+    let outcome = tools::execute(
+        &harness.tool_context(),
+        "createEvent",
+        &json!({
+            "accountId": on_account,
+            "calendarId": calendar_id,
+            "draft": {
+                "title": "Molly Care",
+                "startTs": start,
+                "endTs": start + 3_600_000,
+                "attendees": ["guest@example.com"],
+                "recurrence": "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=11",
+                "reminderMinutes": 30,
+            },
+        }),
+    )
+    .await
+    .expect("the request he actually made");
+
+    assert!(outcome.mutated);
+    assert_eq!(outcome.payload["ok"], json!(true));
+
+    // It landed on the calendar he named, not on the primary.
+    let event_id = match outcome.artifact {
+        Some(tools::Artifact::Event { event_id, .. }) => event_id,
+        other => panic!("a created event has something to open: {other:?}"),
+    };
+    let stored = harness
+        .db
+        .read(move |conn| queries::events_in_range(conn, start, start + 3_600_000, None))
+        .unwrap()
+        .into_iter()
+        .find(|e| e.id == event_id)
+        .expect("the row it made");
+    assert_eq!(stored.calendar_id, "dadben@group.calendar.google.com");
+    assert_eq!(stored.account_id, on_account);
+    assert_eq!(stored.attendees[0].email, "guest@example.com");
+
+    // 3. The request that would have gone to Google: the right calendar, the
+    // guest, and one recurring event rather than eleven copies.
+    let insert = harness
+        .google
+        .requests()
+        .into_iter()
+        .find(|r| r.url.contains("/events"))
+        .expect("an insert was prepared");
+    assert!(
+        insert.url.contains("dadben%40group.calendar.google.com/events")
+            || insert.url.contains("dadben@group.calendar.google.com/events"),
+        "the insert must name the calendar he asked for: {}",
+        insert.url
+    );
+    let body: Value =
+        serde_json::from_slice(insert.body.as_deref().expect("a body")).expect("json");
+    assert_eq!(body["summary"], "Molly Care");
+    assert_eq!(body["attendees"][0]["email"], "guest@example.com");
+    assert_eq!(
+        body["recurrence"],
+        json!(["RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=11"])
+    );
+
+    // And it still asks before it runs, because it mails the guest.
+    assert_eq!(tools::policy_for("createEvent"), ToolPolicy::Approve);
+}
+
+/// The schema now describes what the command layer actually holds, and takes
+/// the singular form of each list anyway.
+#[test]
+fn the_event_schema_no_longer_describes_a_shape_that_is_refused() {
+    let create = tools::command_tools()
+        .into_iter()
+        .find(|t| t.definition.name == "createEvent")
+        .expect("createEvent is a tool")
+        .definition
+        .input_schema;
+    let draft = &create["properties"]["draft"]["properties"];
+
+    // Advertised as the types `EventDraft` holds — a list of guests, of RRULE
+    // lines, of reminder offsets.
+    assert_eq!(draft["attendees"]["type"], "array");
+    assert_eq!(draft["attendees"]["items"]["type"], "object");
+    assert_eq!(draft["attendees"]["items"]["required"], json!(["email"]));
+    assert_eq!(draft["recurrence"]["type"], "array");
+    assert_eq!(draft["recurrence"]["items"]["type"], "string");
+    assert_eq!(draft["reminderMinutes"]["type"], "array");
+    assert_eq!(draft["reminderMinutes"]["items"]["type"], "integer");
+
+    // Both spellings of each reach the same command, so a model writing the
+    // singular does not lose a turn to a serde error.
+    let event = |attendees: Value, recurrence: Value, reminders: Value| {
+        json!({
+            "accountId": 1,
+            "calendarId": "c",
+            "draft": {
+                "title": "Molly Care",
+                "startTs": 1i64,
+                "endTs": 2i64,
+                "attendees": attendees,
+                "recurrence": recurrence,
+                "reminderMinutes": reminders,
+            },
+        })
+    };
+    let plural = tools::command_from_call(
+        "createEvent",
+        &event(
+            json!([{ "email": "guest@example.com" }]),
+            json!(["RRULE:FREQ=WEEKLY"]),
+            json!([30]),
+        ),
+    )
+    .expect("the documented form");
+    let singular = tools::command_from_call(
+        "createEvent",
+        &event(
+            json!(["guest@example.com"]),
+            json!("RRULE:FREQ=WEEKLY"),
+            json!(30),
+        ),
+    )
+    .expect("what a model writes");
+    assert_eq!(plural, singular);
+
+    // A patch is widened by the same rule, so changing an existing event's
+    // guest list works the same way as setting one.
+    assert_eq!(
+        tools::command_from_call(
+            "updateEvent",
+            &json!({ "eventId": 4, "patch": { "attendees": ["guest@example.com"] } }),
+        )
+        .expect("a patch"),
+        tools::command_from_call(
+            "updateEvent",
+            &json!({ "eventId": 4, "patch": { "attendees": [{ "email": "guest@example.com" }] } }),
+        )
+        .expect("a patch"),
+    );
+
+    // Something in neither shape is still serde's error to report, rather than
+    // a field quietly dropped on the floor.
+    let error = tools::command_from_call(
+        "createEvent",
+        &json!({
+            "accountId": 1,
+            "calendarId": "c",
+            "draft": { "title": "x", "startTs": 1i64, "endTs": 2i64, "attendees": [7] },
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), "invalid");
+}
+
+/// `createEvent`'s own parameter description has always pointed at
+/// `list_calendars`. It now points at something.
+#[test]
+fn the_tool_the_catalogue_names_exists() {
+    let named: Vec<&str> = Command::catalogue()
+        .iter()
+        .flat_map(|spec| spec.params.iter())
+        .filter(|param| param.description.contains("list_calendars"))
+        .map(|param| param.name)
+        .collect();
+    assert!(
+        named.contains(&"calendarId"),
+        "createEvent still has to say where the id comes from"
+    );
+    assert!(
+        tools::find("list_calendars").is_some(),
+        "and the tool it names has to be on the surface"
+    );
 }
