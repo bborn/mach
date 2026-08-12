@@ -66,3 +66,11 @@ tauri-plugin-notification = "2.3.3"
 portable-pty = "0.9"
 libc = "0.2.189"
 
+
+# Already in the tree underneath the plugin, which reaches it through
+# notify-rust. Named here because the plugin exposes neither the banner's
+# subtitle nor the click that comes back, and both are the point — see
+# `notify::mac`. Held to the same minor the plugin resolves to, so there is one
+# copy of the crate and one `NSUserNotificationCenter` delegate.
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-notification-sys = "0.6.13"

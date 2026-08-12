@@ -2346,6 +2346,7 @@ dependencies = [
  "hex",
  "keyring",
  "libc",
+ "mac-notification-sys",
  "mail-builder",
  "mail-parser",
  "png 0.17.16",

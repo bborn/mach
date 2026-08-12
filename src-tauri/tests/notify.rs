@@ -34,7 +34,7 @@ use mach_lib::google::{
     TokenProvider, TransportError,
 };
 use mach_lib::ipc::prefs;
-use mach_lib::notify::{self, host::Host, Banner, PendingOpen, Permission};
+use mach_lib::notify::{self, host::Host, Banner, Delivery, PendingOpen, Permission};
 use mach_lib::sync::{SyncConfig, SyncEngine, TransportClients};
 
 const GMAIL_BASE: &str = "https://gmail.test/gmail/v1";
@@ -565,9 +565,17 @@ impl Seeded {
                 )?;
                 conn.execute(
                     "INSERT INTO messages (thread_id, account_id, gmail_message_id, from_name,
-                                           from_email, subject, is_unread)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
-                    rusqlite::params![thread_id, account_id, id, from.0, from.1, subject],
+                                           from_email, subject, snippet, is_unread)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                    rusqlite::params![
+                        thread_id,
+                        account_id,
+                        id,
+                        from.0,
+                        from.1,
+                        subject,
+                        format!("preview of {id}"),
+                    ],
                 )?;
                 mach_lib::db::sync_queries::set_message_labels(
                     conn,
@@ -598,14 +606,18 @@ impl Seeded {
 
 const INBOX_UNREAD: &[&str] = &["INBOX", "UNREAD"];
 
+/// The three lines, read out of the store rather than composed by hand: the
+/// preview comes from `messages.snippet`, which is the column the sync loop
+/// writes and the only one of the three the rule does not already carry.
 #[test]
-fn a_plain_message_names_its_sender_and_its_subject() {
+fn a_plain_message_names_its_sender_its_subject_and_its_preview() {
     let seeded = Seeded::new();
     seeded.message("m1", ("Anna Lee", "anna@example.com"), "Lunch?", INBOX_UNREAD);
 
     let banner = seeded.plan(&["m1"]).expect("a banner");
     assert_eq!(banner.title, "Anna Lee");
-    assert_eq!(banner.body, "Lunch?");
+    assert_eq!(banner.subtitle.as_deref(), Some("Lunch?"));
+    assert_eq!(banner.body, "preview of m1");
 }
 
 #[test]
@@ -628,7 +640,11 @@ fn five_messages_arriving_together_are_one_banner() {
 
     let banner = seeded.plan(&["m1", "m2", "m3", "m4", "m5"]).expect("a banner");
     assert_eq!(banner.title, "5 new messages");
-    assert_eq!(banner.body, "Anna, Bob, Carol and 2 others");
+    assert_eq!(
+        banner.subtitle.as_deref(),
+        Some("Anna, Bob, Carol and 2 others")
+    );
+    assert_eq!(banner.body, "Hello", "the newest subject, not five of them");
 }
 
 #[test]
@@ -750,21 +766,54 @@ fn a_message_that_is_not_in_the_store_is_skipped_rather_than_guessed_at() {
 // The platform seam
 // ===========================================================================
 
-#[derive(Default)]
+/// The host is process-wide, and so is the pending-open slot, so every test
+/// that installs one takes this first. Without it two of them interleave and
+/// each claims the other's conversation.
+static SEAM: Mutex<()> = Mutex::new(());
+
 struct Recorder {
     banners: Mutex<Vec<Banner>>,
     badges: Mutex<Vec<Option<i64>>>,
+    /// What [`Host::show`] reports back — the thing that decides whether the
+    /// caller arms the fallback.
+    delivery: Delivery,
+    /// Conversations the host was told to open, in order.
+    opened: Mutex<Vec<PendingOpen>>,
+    reopened: Mutex<usize>,
+}
+
+impl Recorder {
+    fn new(delivery: Delivery) -> Self {
+        Self {
+            banners: Mutex::new(Vec::new()),
+            badges: Mutex::new(Vec::new()),
+            delivery,
+            opened: Mutex::new(Vec::new()),
+            reopened: Mutex::new(0),
+        }
+    }
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Self::new(Delivery::Unwatched)
+    }
 }
 
 impl Host for Recorder {
-    fn show(&self, banner: &Banner) {
+    fn show(&self, banner: &Banner, _target: &PendingOpen) -> Delivery {
         self.banners.lock().unwrap().push(banner.clone());
+        self.delivery
     }
     fn set_badge(&self, count: Option<i64>) {
         self.badges.lock().unwrap().push(count);
     }
-    fn reopen(&self) {}
-    fn open_conversation(&self, _target: &PendingOpen) {}
+    fn reopen(&self) {
+        *self.reopened.lock().unwrap() += 1;
+    }
+    fn open_conversation(&self, target: &PendingOpen) {
+        self.opened.lock().unwrap().push(target.clone());
+    }
     fn db(&self) -> Option<Db> {
         None
     }
@@ -778,13 +827,14 @@ impl Host for Recorder {
 
 /// The wire from a decision to the platform, and the slot a click reads.
 ///
-/// The host is process-wide, so this is the one test that installs one; it
-/// looks for its own distinctive sender rather than counting, because another
-/// test running beside it may have announced something of its own.
+/// A host that cannot report its own clicks leaves the fallback armed, which is
+/// the only thing an activation can then go through.
 #[test]
-fn announcing_reaches_the_host_and_leaves_a_conversation_to_open() {
-    let recorder = Arc::new(Recorder::default());
+fn a_banner_nothing_is_watching_leaves_a_conversation_to_open() {
+    let _seam = SEAM.lock().unwrap_or_else(|p| p.into_inner());
+    let recorder = Arc::new(Recorder::new(Delivery::Unwatched));
     notify::host::install(recorder.clone());
+    let _ = notify::take_pending_open();
 
     let seeded = Seeded::new();
     seeded.message(
@@ -808,5 +858,89 @@ fn announcing_reaches_the_host_and_leaves_a_conversation_to_open() {
     assert!(
         notify::take_pending_open().is_none(),
         "claiming it twice would reopen a conversation nobody asked for"
+    );
+}
+
+/// A watched banner carries its own click, so the guess must stay disarmed —
+/// otherwise the next Dock click reopens what the banner already opened.
+#[test]
+fn a_watched_banner_does_not_also_arm_the_fallback() {
+    let _seam = SEAM.lock().unwrap_or_else(|p| p.into_inner());
+    let recorder = Arc::new(Recorder::new(Delivery::Watched));
+    notify::host::install(recorder.clone());
+    let _ = notify::take_pending_open();
+
+    let seeded = Seeded::new();
+    seeded.message(
+        "m1",
+        ("Wilhelmina Ashgrove", "wilhelmina@example.com"),
+        "Watched",
+        INBOX_UNREAD,
+    );
+    notify::announce(&seeded.db, seeded.account_id, &["m1".to_string()]);
+
+    assert!(
+        recorder
+            .banners
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|b| b.title == "Wilhelmina Ashgrove"),
+        "the banner should still be shown"
+    );
+    assert!(
+        notify::take_pending_open().is_none(),
+        "the click is coming back to us; guessing as well would open it twice"
+    );
+}
+
+/// A banner that never reached the screen must leave nothing to claim: a Dock
+/// click should not open mail the owner was never told about.
+#[test]
+fn a_banner_that_was_never_shown_arms_nothing() {
+    let _seam = SEAM.lock().unwrap_or_else(|p| p.into_inner());
+    let recorder = Arc::new(Recorder::new(Delivery::Silent));
+    notify::host::install(recorder.clone());
+    let _ = notify::take_pending_open();
+
+    let seeded = Seeded::new();
+    seeded.message(
+        "m1",
+        ("Ptolemy Vance", "ptolemy@example.com"),
+        "Unseen",
+        INBOX_UNREAD,
+    );
+    notify::announce(&seeded.db, seeded.account_id, &["m1".to_string()]);
+
+    assert!(notify::take_pending_open().is_none());
+}
+
+/// The click path itself: a response against one banner opens *that* banner's
+/// conversation. No macOS in the loop — the assertion is on the routing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_click_opens_the_conversation_its_own_banner_was_about() {
+    let _seam = SEAM.lock().unwrap_or_else(|p| p.into_inner());
+    let recorder = Arc::new(Recorder::new(Delivery::Watched));
+    notify::host::install(recorder.clone());
+
+    let target = PendingOpen {
+        account_id: 7,
+        thread_id: 4321,
+        gmail_thread_id: "the-one-that-was-clicked".into(),
+        at_ms: 0,
+    };
+    // Stands in for `Ok(NotificationResponse::Click)` arriving on the thread
+    // that sent this banner.
+    notify::mac::route_click(&target);
+
+    let opened = recorder.opened.lock().unwrap().clone();
+    assert_eq!(opened.len(), 1, "exactly one conversation, not a guess");
+    assert_eq!(opened[0].thread_id, 4321);
+    assert_eq!(opened[0].gmail_thread_id, "the-one-that-was-clicked");
+    assert_eq!(
+        *recorder.reopened.lock().unwrap(),
+        1,
+        "the window has to come forward too"
     );
 }

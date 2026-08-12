@@ -86,6 +86,9 @@ pub struct Arrival {
     pub from_name: Option<String>,
     pub from_email: String,
     pub subject: String,
+    /// Gmail's own one-line preview of the body, as stored. Already
+    /// entity-decoded — see [`crate::db::backfill::decode_snippets`].
+    pub snippet: String,
     /// The message's full Gmail label set.
     pub labels: Vec<String>,
     /// Whether some *other* message in the same thread was sent from this
@@ -105,6 +108,16 @@ impl Arrival {
             Some(name) if !name.is_empty() => name,
             _ if !self.from_email.is_empty() => &self.from_email,
             _ => "Someone",
+        }
+    }
+
+    /// The subject, or a stand-in. Mail with no subject is rare and real, and a
+    /// blank middle line reads as a rendering bug rather than as an empty
+    /// subject.
+    pub fn subject_line(&self) -> &str {
+        match self.subject.trim() {
+            "" => "(no subject)",
+            subject => subject,
         }
     }
 }
@@ -135,9 +148,17 @@ pub fn earns_a_banner(arrival: &Arrival, own_address: &str) -> bool {
 }
 
 /// What a notification actually says.
+///
+/// Three fields because macOS draws three lines: title and subtitle in bold,
+/// then the body. Mail has exactly that shape — who it is from, what it is
+/// about, what it says — and squeezing it into two lines was throwing one of
+/// them away. `subtitle` is `Option` because the platform treats an empty
+/// subtitle as "no second line" rather than as a blank one, and because a
+/// notifier that cannot draw three lines should collapse rather than invent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Banner {
     pub title: String,
+    pub subtitle: Option<String>,
     pub body: String,
 }
 
@@ -155,28 +176,47 @@ const NAMED_SENDERS: usize = 3;
 /// `label_account` is the caller's answer to "does this person have more than
 /// one mailbox". With one account the address is noise on every banner; with
 /// several it is the first thing you want to know.
+///
+/// # The two shapes
+///
+/// ```text
+///   One message                    Several
+///   ┌──────────────────────────┐   ┌──────────────────────────┐
+///   │ Anna Lee                 │   │ 3 new messages           │
+///   │ Lunch?                   │   │ Anna Lee, Bob and Carol  │
+///   │ Are you free Thursday…   │   │ Lunch?                   │
+///   └──────────────────────────┘   └──────────────────────────┘
+///     sender / subject / preview     count / who / newest subject
+/// ```
+///
+/// The coalesced form keeps the wording it already had — the count as the
+/// title, the same "A, B and 2 others" list — and spends the line it gained on
+/// the newest subject, which is the one thing a stack of banners could have
+/// told you that a count cannot.
 pub fn digest(arrivals: &[Arrival], account_email: &str, label_account: bool) -> Option<Banner> {
     let (first, rest) = arrivals.split_first()?;
+    let newest = arrivals.last().unwrap_or(first);
 
     let mut banner = if rest.is_empty() {
-        let subject = first.subject.trim();
         Banner {
             title: first.sender().to_string(),
-            body: if subject.is_empty() {
-                "(no subject)".to_string()
-            } else {
-                subject.to_string()
-            },
+            subtitle: Some(first.subject_line().to_string()),
+            body: first.snippet.trim().to_string(),
         }
     } else {
         Banner {
             title: format!("{} new messages", arrivals.len()),
-            body: sender_list(arrivals),
+            subtitle: Some(sender_list(arrivals)),
+            body: newest.subject_line().to_string(),
         }
     };
 
     if label_account && !account_email.is_empty() {
-        banner.body.push('\n');
+        // Last, and on its own line: it is the answer to "which mailbox", which
+        // only matters once you have read the rest.
+        if !banner.body.is_empty() {
+            banner.body.push('\n');
+        }
         banner.body.push_str(account_email);
     }
     Some(banner)
@@ -223,6 +263,7 @@ mod tests {
             from_name: Some("Anna Lee".into()),
             from_email: "anna@example.com".into(),
             subject: "Lunch?".into(),
+            snippet: "Are you free Thursday around one?".into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
             thread_has_own_message: false,
         }
@@ -282,10 +323,11 @@ mod tests {
     }
 
     #[test]
-    fn one_message_names_its_sender_and_subject() {
+    fn one_message_is_sender_then_subject_then_preview() {
         let banner = digest(&[arrival(&[INBOX, UNREAD])], "alex@example.com", false).unwrap();
         assert_eq!(banner.title, "Anna Lee");
-        assert_eq!(banner.body, "Lunch?");
+        assert_eq!(banner.subtitle.as_deref(), Some("Lunch?"));
+        assert_eq!(banner.body, "Are you free Thursday around one?");
     }
 
     #[test]
@@ -293,7 +335,17 @@ mod tests {
         let mut bare = arrival(&[INBOX, UNREAD]);
         bare.subject = "   ".into();
         let banner = digest(&[bare], "alex@example.com", false).unwrap();
-        assert_eq!(banner.body, "(no subject)");
+        assert_eq!(banner.subtitle.as_deref(), Some("(no subject)"));
+    }
+
+    #[test]
+    fn a_message_with_no_preview_leaves_the_line_empty_rather_than_padding_it() {
+        let mut terse = arrival(&[INBOX, UNREAD]);
+        terse.snippet = "   ".into();
+        let banner = digest(&[terse], "alex@example.com", false).unwrap();
+        assert_eq!(banner.title, "Anna Lee");
+        assert_eq!(banner.subtitle.as_deref(), Some("Lunch?"));
+        assert_eq!(banner.body, "", "no filler, and no stray whitespace");
     }
 
     #[test]
@@ -302,6 +354,7 @@ mod tests {
         second.from_name = Some("Bob Chen".into());
         let mut third = arrival(&[INBOX, UNREAD]);
         third.from_name = Some("Carol Diaz".into());
+        third.subject = "Thursday works".into();
 
         let banner = digest(
             &[arrival(&[INBOX, UNREAD]), second, third],
@@ -310,7 +363,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(banner.title, "3 new messages");
-        assert_eq!(banner.body, "Anna Lee, Bob Chen and Carol Diaz");
+        assert_eq!(
+            banner.subtitle.as_deref(),
+            Some("Anna Lee, Bob Chen and Carol Diaz")
+        );
+        assert_eq!(
+            banner.body, "Thursday works",
+            "the line the count cannot give you: what the newest one is about"
+        );
     }
 
     #[test]
@@ -322,7 +382,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(banner.title, "2 new messages");
-        assert_eq!(banner.body, "Anna Lee");
+        assert_eq!(banner.subtitle.as_deref(), Some("Anna Lee"));
     }
 
     #[test]
@@ -338,7 +398,7 @@ mod tests {
             .collect();
         let banner = digest(&many, "alex@example.com", false).unwrap();
         assert_eq!(banner.title, "5 new messages");
-        assert_eq!(banner.body, "A, B, C and 2 others");
+        assert_eq!(banner.subtitle.as_deref(), Some("A, B, C and 2 others"));
     }
 
     #[test]
@@ -348,6 +408,13 @@ mod tests {
 
         let several = digest(&[arrival(&[INBOX, UNREAD])], "alex@example.com", true).unwrap();
         assert!(several.body.ends_with("\nalex@example.com"));
+
+        // …and it does not open with a blank line when there is no preview to
+        // sit above it.
+        let mut terse = arrival(&[INBOX, UNREAD]);
+        terse.snippet = String::new();
+        let alone = digest(&[terse], "alex@example.com", true).unwrap();
+        assert_eq!(alone.body, "alex@example.com");
     }
 
     #[test]

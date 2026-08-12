@@ -22,16 +22,26 @@
 //! where taking that lock is ordinary. The side effect is a pleasant one — an
 //! app that never notifies never pays for the plugin.
 //!
+//! # Who actually draws the banner
+//!
+//! On macOS, not the plugin. [`super::mac`] calls `mac-notification-sys` — the
+//! crate the plugin reaches through `notify-rust` anyway — because the plugin's
+//! builder exposes neither the subtitle nor the interaction, and both are the
+//! point. The plugin stays registered for the permission API alone, and never
+//! shows anything, so only one of the two ever calls `set_application` and there
+//! is nothing to conflict over.
+//!
 //! # What "permission refused" looks like on macOS today
 //!
 //! Not like an error. `tauri-plugin-notification`'s desktop path reports
-//! `Granted` unconditionally and delivers through `notify-rust`, which spawns
-//! the actual show and discards its result — so a user who has switched Mach
-//! off in System Settings produces *silence*, never a failure, and there is
-//! nothing for a sync pass to trip over. The permission dance below is written
-//! anyway, and honestly, because it is what the API means and because the
-//! desktop implementation will not always be this one. It costs one cached
-//! atomic read per banner.
+//! `Granted` unconditionally, so a user who has switched Mach off in System
+//! Settings produces *silence* rather than a refusal. What is new is that the
+//! delivery itself now reports: `mac-notification-sys` returns a `Result`, and
+//! [`super::mac`] says so on stderr instead of dropping it, which is the
+//! difference between "no mail" and "could not say so" being distinguishable at
+//! all. The permission dance below is written anyway, and honestly, because it
+//! is what the API means and because the desktop implementation will not always
+//! be this one. It costs one cached atomic read per banner.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
@@ -61,12 +71,34 @@ pub enum Permission {
     Prompt,
 }
 
+/// What happened to a banner, and therefore what a click can still go through.
+///
+/// The distinction is the whole reason [`super::PendingOpen`] is now a fallback
+/// rather than the mechanism: a watched banner routes its own click exactly, and
+/// arming the guess as well would open the same conversation twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Shown, with a thread blocked on it. A click comes back to us and opens
+    /// the conversation *that* banner was about. See [`super::mac`].
+    Watched,
+    /// Shown, but fire-and-forget. Only [`super::PendingOpen`] can carry a
+    /// click, and only when the click activates the application.
+    Unwatched,
+    /// Nothing reached the screen: a QA instance, a refused permission, or a
+    /// platform with no notifier.
+    Silent,
+}
+
 /// Everything the notifier needs from the world outside it.
 ///
 /// Object-safe and free of `Runtime`, so the sync loop can hold one without
 /// becoming generic and a test can implement one in a dozen lines.
 pub trait Host: Send + Sync + 'static {
-    fn show(&self, banner: &Banner);
+    /// `target` is what a click on this banner should open. A host that can
+    /// report clicks keeps it and answers [`Delivery::Watched`]; one that
+    /// cannot ignores it and answers [`Delivery::Unwatched`], leaving the
+    /// caller to arm the fallback.
+    fn show(&self, banner: &Banner, target: &PendingOpen) -> Delivery;
     /// `None` clears the badge.
     fn set_badge(&self, count: Option<i64>);
     /// Show and focus the window, which ⌘W may have hidden.
@@ -180,23 +212,58 @@ fn from_plugin(state: tauri_plugin_notification::PermissionState) -> Permission 
 }
 
 impl<R: Runtime> Host for TauriHost<R> {
-    fn show(&self, banner: &Banner) {
+    fn show(&self, banner: &Banner, target: &PendingOpen) -> Delivery {
         if !banners_allowed() {
-            return;
+            return Delivery::Silent;
         }
         // Asked here, at the moment a banner would appear, which is the only
         // moment the request explains itself.
         if !matches!(self.permission(), Permission::Granted) {
-            return;
+            return Delivery::Silent;
         }
-        use tauri_plugin_notification::NotificationExt;
-        let _ = self
-            .app
-            .notification()
-            .builder()
-            .title(&banner.title)
-            .body(&banner.body)
-            .show();
+
+        // The identifier `mac-notification-sys` will deliver under. The rule is
+        // copied from `tauri-plugin-notification`'s desktop path rather than
+        // invented: a development build is a bare binary with no bundle, and
+        // `NSUserNotification` will not deliver for one, so it borrows
+        // Terminal's identifier. See `notify::mac` for what that does and does
+        // not cost.
+        #[cfg(target_os = "macos")]
+        {
+            let identifier = if tauri::is_dev() {
+                "com.apple.Terminal"
+            } else {
+                &self.app.config().identifier
+            };
+            super::mac::deliver(banner, target, identifier)
+        }
+
+        // Everywhere else the plugin is still the notifier. It has no subtitle,
+        // so the three lines collapse into two, and it discards the interaction
+        // — which leaves the fallback as all a click has.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = target;
+            use tauri_plugin_notification::NotificationExt;
+            let body = match banner.subtitle.as_deref() {
+                Some(subtitle) => format!("{subtitle}\n{}", banner.body),
+                None => banner.body.clone(),
+            };
+            match self
+                .app
+                .notification()
+                .builder()
+                .title(banner.title.clone())
+                .body(body)
+                .show()
+            {
+                Ok(()) => Delivery::Unwatched,
+                Err(error) => {
+                    eprintln!("could not deliver a notification: {error}");
+                    Delivery::Silent
+                }
+            }
+        }
     }
 
     fn set_badge(&self, count: Option<i64>) {
@@ -211,7 +278,15 @@ impl<R: Runtime> Host for TauriHost<R> {
     }
 
     fn reopen(&self) {
-        crate::shell::reopen(&self.app);
+        // Hopped to the main thread on purpose. This used to be reachable only
+        // from `RunEvent::Reopen`, which is already there; a click routed by
+        // `notify::mac` arrives on the notification thread instead, and window
+        // calls are the last thing to find out about off the main thread the
+        // hard way.
+        let app = self.app.clone();
+        let _ = self
+            .app
+            .run_on_main_thread(move || crate::shell::reopen(&app));
     }
 
     fn open_conversation(&self, target: &PendingOpen) {
