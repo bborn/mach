@@ -459,7 +459,7 @@ pub async fn dispatch(
 
         "undo" => {
             let id = required_str(&payload, "outboxId")?;
-            let cancelled = outbox.cancel(&id)?;
+            let cancelled = outbox.cancel(&id, now)?;
             Ok(json!({ "cancelled": cancelled }))
         }
 

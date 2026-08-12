@@ -181,6 +181,8 @@ interface WireMessage {
   snippet?: Nullable<string>;
   /** `db::models::Message.is_draft` — an unsent draft mirrored into the thread. */
   isDraft?: Nullable<boolean>;
+  /** `db::models::Message.mach_draft_id` — which composer draft that mirror is. */
+  machDraftId?: Nullable<string>;
   attachments?: Nullable<WireAttachment[]>;
 }
 
@@ -544,6 +546,7 @@ export function mapMessage(wire: WireMessage): Message {
     // saying the thread carried a DRAFT label. Same trap as `recurringEventId`
     // and all of migration 5 — see the tripwires in `ipc.test.ts`.
     isDraft: wire.isDraft === true,
+    machDraftId: optional(wire.machDraftId),
     attachments: (wire.attachments ?? []).map(mapAttachment),
   };
 }

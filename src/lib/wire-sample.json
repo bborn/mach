@@ -137,6 +137,7 @@
     "internalDate": 1700000000000,
     "isDraft": true,
     "isUnread": true,
+    "machDraftId": "draft-18f0c0ffee",
     "references": "<root@example.com> <prior@example.com>",
     "replyTo": [
       {

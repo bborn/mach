@@ -51,7 +51,7 @@ pub mod mirror;
 pub mod outbox;
 pub mod remote;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::commands::CommandError;
 use crate::db::{DbError, Result as DbResult};
@@ -244,13 +244,133 @@ const ATTACHMENT_INLINE_COLUMNS: &[(&str, &str)] = &[
     ("content_id", "TEXT NOT NULL DEFAULT ''"),
 ];
 
+/// What a retired draft kept of itself.
+///
+/// The tombstone used to carry the Gmail identity and nothing else, which was
+/// enough to stop an autosave resurrecting a sent draft and not enough to put
+/// one back. Undo restored a row with no words in it and left the conversation
+/// to the composer, which still held the text — so recalling a send from a
+/// window that had since been closed, or after a relaunch, revived a draft that
+/// was empty and a conversation that showed no draft at all.
+///
+/// `draft_json` is the draft as [`draft::Draft`] serialises it, written when the
+/// row is retired and spent by [`draft::revive`]. It is what makes the send
+/// path's write reversible without asking the UI to remember anything.
+const RETIRED_DRAFT_COLUMNS: &[(&str, &str)] = &[("draft_json", "TEXT")];
+
 /// Idempotent. Called by every entry point into this module, so no caller has
 /// to remember it.
 pub fn ensure_compose_schema(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(COMPOSE_SCHEMA)?;
     add_missing_columns(conn, "compose_drafts", DRAFT_REMOTE_COLUMNS)?;
     add_missing_columns(conn, "compose_outbox", OUTBOX_DRAFT_COLUMNS)?;
+    add_missing_columns(conn, "compose_retired_drafts", RETIRED_DRAFT_COLUMNS)?;
     add_missing_columns(conn, "compose_attachments", ATTACHMENT_INLINE_COLUMNS)?;
+    ensure_one_mirror_per_draft(conn)?;
+    Ok(())
+}
+
+/// The index that makes a second mirror of one draft impossible, and the repair
+/// that has to come first.
+///
+/// # Why it is here and not in a migration
+///
+/// `messages.mach_draft_id` is a migration — `messages` is a core table. Filling
+/// it in is not: it is read out of `compose_drafts`, and `db::schema` runs
+/// against stores whose composer has never written a row, so it cannot name that
+/// table at all. This module owns it, so this is where the two meet.
+///
+/// # What the repair touches
+///
+/// Existence of the index is the marker: everything below runs once, on the
+/// first compose call after the upgrade, and never again.
+///
+///  1. **Stamps** every mirror that a `compose_drafts` row still claims, by
+///     either of the two ids such a row can be filed under — the placeholder for
+///     a draft Gmail has not heard of, and Gmail's own message id after a push.
+///  2. **Deletes** local mirrors nothing claims: rows under `mach-draft:<id>`
+///     whose draft is not in `compose_drafts`. Nothing on Google is addressed by
+///     one of those — the id is Mach's own — so a row under it stands for a
+///     draft that stopped existing without taking its mirror with it. This is
+///     the `DRAFT` row the owner could see and could not throw away.
+///  3. **Collapses rows that are the same Gmail draft.** `messages.gmail_draft_id`
+///     is what `users.drafts.list` reported about a row, and a Gmail draft has
+///     exactly one message at a time — so two draft rows carrying one draft id
+///     are two copies of one draft, whatever their message ids say. The one a
+///     `compose_drafts` row still names is kept, and the newest otherwise.
+///  4. **Collapses** what is left over: if two rows still answer to one draft,
+///     the one filed under the id Gmail last reported is kept and the other goes.
+///
+/// A draft written in another client and never opened here is deliberately
+/// untouched: it has no `compose_drafts` row *and* no `mach-draft:` id, and it
+/// is a real draft. Deciding that one is litter needs Gmail's own listing, which
+/// is [`mirror::forget_orphan_mirrors`]'s job and not a migration's.
+fn ensure_one_mirror_per_draft(conn: &Connection) -> DbResult<()> {
+    let indexed: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master \
+              WHERE type = 'index' AND name = 'idx_messages_mach_draft'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if indexed.is_some() {
+        return Ok(());
+    }
+
+    let prefix = crate::db::models::DRAFT_ID_PREFIX;
+    conn.execute(
+        "DELETE FROM messages
+          WHERE is_draft = 1 AND gmail_draft_id IS NOT NULL
+            AND id <> (
+                SELECT m.id FROM messages m
+                 WHERE m.is_draft = 1
+                   AND m.account_id = messages.account_id
+                   AND m.gmail_draft_id = messages.gmail_draft_id
+                 ORDER BY EXISTS (
+                              SELECT 1 FROM compose_drafts d
+                               WHERE d.gmail_message_id = m.gmail_message_id) DESC,
+                          m.id DESC
+                 LIMIT 1)",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE messages
+            SET mach_draft_id = (
+                SELECT d.id FROM compose_drafts d
+                 WHERE d.account_id = messages.account_id
+                   AND (messages.gmail_message_id = ?1 || d.id
+                        OR (d.gmail_message_id IS NOT NULL
+                            AND d.gmail_message_id = messages.gmail_message_id))
+                 ORDER BY d.updated_at DESC LIMIT 1)
+          WHERE is_draft = 1 AND mach_draft_id IS NULL",
+        [prefix],
+    )?;
+    conn.execute(
+        "DELETE FROM messages
+          WHERE is_draft = 1
+            AND mach_draft_id IS NULL
+            AND gmail_message_id LIKE ?1 || '%'",
+        [prefix],
+    )?;
+    // Whichever row Gmail last named is the live one; `id` breaks the tie for a
+    // draft that never reached Gmail, keeping the row the conversation has been
+    // showing all along.
+    conn.execute(
+        "DELETE FROM messages
+          WHERE mach_draft_id IS NOT NULL
+            AND id NOT IN (
+                SELECT m.id FROM messages m
+                  JOIN compose_drafts d ON d.id = m.mach_draft_id
+                 WHERE m.mach_draft_id = messages.mach_draft_id
+                 ORDER BY (m.gmail_message_id = d.gmail_message_id) DESC, m.id DESC
+                 LIMIT 1)",
+        [],
+    )?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_mach_draft
+             ON messages (account_id, mach_draft_id) WHERE mach_draft_id IS NOT NULL;",
+    )?;
     Ok(())
 }
 

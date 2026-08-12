@@ -332,6 +332,13 @@ pub struct Message {
     pub internal_date: i64,
     pub is_unread: bool,
     pub is_draft: bool,
+    /// The composer draft this row is the mirror of, when it is one.
+    ///
+    /// The frontend's half of the same identity `compose::mirror` writes: the
+    /// composer knows which draft it has just sent, and this is what lets the
+    /// open conversation drop that row in the same frame rather than waiting for
+    /// the write and the refetch behind it. See `useMach`'s `draftSent`.
+    pub mach_draft_id: Option<String>,
     pub attachments: Vec<Attachment>,
 }
 

@@ -1359,16 +1359,22 @@ pub fn retire(db: &Db, id: &str, now_ms: i64) -> Result<()> {
         return Ok(());
     };
     let now = now_ms;
+    // The words as well as the identity. Undo has to put the draft back into the
+    // conversation, and the composer is not a place to keep the only copy of it:
+    // the window that sent the message can be closed, or the app relaunched,
+    // inside the ten seconds.
+    let draft_json = serde_json::to_string(&draft).ok();
     db.write(|conn| {
         conn.execute(
             "INSERT INTO compose_retired_drafts
                  (id, account_id, thread_id, gmail_draft_id, gmail_message_id,
-                  gmail_thread_id, retired_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                  gmail_thread_id, retired_at, draft_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                  gmail_draft_id   = COALESCE(excluded.gmail_draft_id, gmail_draft_id),
                  gmail_message_id = COALESCE(excluded.gmail_message_id, gmail_message_id),
                  gmail_thread_id  = COALESCE(excluded.gmail_thread_id, gmail_thread_id),
+                 draft_json       = COALESCE(excluded.draft_json, draft_json),
                  retired_at       = excluded.retired_at",
             rusqlite::params![
                 draft.id,
@@ -1378,6 +1384,7 @@ pub fn retire(db: &Db, id: &str, now_ms: i64) -> Result<()> {
                 draft.remote.message_id,
                 draft.remote.thread_id,
                 now,
+                draft_json,
             ],
         )?;
         Ok(())
@@ -1401,31 +1408,39 @@ pub fn is_retired(db: &Db, id: &str) -> Result<bool> {
 
 /// Undo a retirement, and say what the draft used to be.
 ///
-/// Called when a send is recalled inside the undo window. The row itself is not
-/// rebuilt from here — the composer still holds the text and saves it — but the
-/// Gmail identity is, when there is one, because the draft on Google was never
-/// deleted (`drafts.send` would have consumed it, and the send did not happen).
-/// Without this the recalled draft would save as a stranger and `drafts.create`
-/// a second copy beside the one already there.
+/// Called when a send is recalled inside the undo window. The Gmail identity
+/// comes back because the draft on Google was never deleted (`drafts.send` would
+/// have consumed it, and the send did not happen) — without it the recalled
+/// draft would save as a stranger and `drafts.create` a second copy beside the
+/// one already there.
+///
+/// **The text comes back too**, out of `draft_json`. It used to be the
+/// composer's job to save it again, which is fine while the composer that sent
+/// the message is still on screen and is nothing at all if it is not: recalling
+/// from a reopened window, or after a relaunch, revived an identity with no
+/// words in it, and the conversation showed no draft. See [`retire`].
 pub fn revive(db: &Db, id: &str) -> Result<Option<RetiredDraft>> {
     db.write(ensure_compose_schema)?;
-    let found: Option<RetiredDraft> = db.read(|conn| {
+    let found: Option<(RetiredDraft, Option<String>)> = db.read(|conn| {
         Ok(conn
             .query_row(
                 "SELECT id, account_id, thread_id, gmail_draft_id, gmail_message_id,
-                        gmail_thread_id, retired_at
+                        gmail_thread_id, retired_at, draft_json
                    FROM compose_retired_drafts WHERE id = ?1",
                 [id],
                 |row| {
-                    Ok(RetiredDraft {
-                        id: row.get(0)?,
-                        account_id: row.get(1)?,
-                        thread_id: row.get(2)?,
-                        gmail_draft_id: row.get(3)?,
-                        gmail_message_id: row.get(4)?,
-                        gmail_thread_id: row.get(5)?,
-                        retired_at: row.get(6)?,
-                    })
+                    Ok((
+                        RetiredDraft {
+                            id: row.get(0)?,
+                            account_id: row.get(1)?,
+                            thread_id: row.get(2)?,
+                            gmail_draft_id: row.get(3)?,
+                            gmail_message_id: row.get(4)?,
+                            gmail_thread_id: row.get(5)?,
+                            retired_at: row.get(6)?,
+                        },
+                        row.get(7)?,
+                    ))
                 },
             )
             .optional()?)
@@ -1435,9 +1450,33 @@ pub fn revive(db: &Db, id: &str) -> Result<Option<RetiredDraft>> {
         Ok(())
     })?;
 
-    let Some(retired) = found else {
+    let Some((retired, draft_json)) = found else {
         return Ok(None);
     };
+
+    // The whole draft, when the tombstone kept one. Written through the ordinary
+    // save so that everything a saved draft has — the `pending` state that gets
+    // it pushed again, the re-read below — is what a recalled one has.
+    if let Some(draft) = draft_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Draft>(json).ok())
+    {
+        save_draft(db, &draft, retired.retired_at)?;
+        set_remote(
+            db,
+            &draft.id,
+            &DraftRemote {
+                state: if draft.remote.draft_id.is_some() {
+                    RemoteState::Synced
+                } else {
+                    RemoteState::Pending
+                },
+                ..draft.remote.clone()
+            },
+        )?;
+        return Ok(Some(retired));
+    }
+
     // Only a draft Gmail actually holds gets its row put back. Anything else
     // has nothing to point at, and an empty row would offer an empty composer
     // on that conversation for ever.

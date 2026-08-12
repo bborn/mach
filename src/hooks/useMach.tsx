@@ -546,6 +546,22 @@ export interface MachActions {
   /** After an account is added or removed, everything is stale. */
   reload: () => void;
   /**
+   * A draft has been queued for sending, so it is no longer a draft.
+   *
+   * `⌘⏎` is local — build the bytes, write one row, drop the draft — and it is
+   * still a write, and SQLite takes one writer at a time. Under a sync pass that
+   * write can wait seconds for the lock, and the conversation used to wait with
+   * it: the reply appeared, the `DRAFT` row of the same words stayed above it,
+   * and the owner could not tell whether he had sent anything. So the row goes
+   * now, on the same frame as the composer closing, and the refetch behind it
+   * confirms rather than causes.
+   *
+   * Its inverse is {@link draftRecalled}, for `⌘Z` and for a queue that failed.
+   */
+  draftSent: (draftId: string) => void;
+  /** The draft is a draft again — undo, or the queue write refusing. */
+  draftRecalled: (draftId: string) => void;
+  /**
    * Refetch just the calendar window.
    *
    * A calendar write changes one row. `reload()` answers that by refetching
@@ -583,6 +599,12 @@ export function MachProvider({ children }: { children: ReactNode }) {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [detail, setDetail] = useState<ThreadDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  /**
+   * Drafts that have been queued and whose mirror row the store has not dropped
+   * yet — the same guess `lib/projection.ts` makes about a list row, made about
+   * a message inside the open conversation. See `draftSent`.
+   */
+  const [sentDrafts, setSentDrafts] = useState<ReadonlySet<string>>(() => new Set());
   const [addressBook, setAddressBook] = useState<Contact[]>([]);
   const [sync, setSync] = useState<SyncStatus | null>(null);
   const [booted, setBooted] = useState(false);
@@ -858,6 +880,19 @@ export function MachProvider({ children }: { children: ReactNode }) {
         if (!live) return;
         setDetail(d);
         setDetailLoading(false);
+        // A guess stops being a guess when the store agrees with it. Retiring on
+        // the refetch rather than on a timer is what keeps ⌘Z honest: while the
+        // row is still there, the guess is still hiding it.
+        setSentDrafts((current) => {
+          if (current.size === 0) return current;
+          const present = new Set(
+            (d?.messages ?? [])
+              .map((message) => message.machDraftId)
+              .filter((id): id is string => Boolean(id)),
+          );
+          const next = new Set([...current].filter((id) => present.has(id)));
+          return next.size === current.size ? current : next;
+        });
       })
       .catch(() => {
         if (!live) return;
@@ -1060,6 +1095,18 @@ export function MachProvider({ children }: { children: ReactNode }) {
       name: scope ? `${name} · ${scope.name}` : name,
     };
   }, [labels, accounts, ui.labelId, ui.accountId]);
+
+  /**
+   * The conversation as it will be once the queue write lands, which is what the
+   * reading pane draws. Nothing here waits for that write; see `draftSent`.
+   */
+  const visibleDetail = useMemo<ThreadDetail | null>(() => {
+    if (!detail || sentDrafts.size === 0) return detail;
+    const messages = detail.messages.filter(
+      (message) => !message.machDraftId || !sentDrafts.has(message.machDraftId),
+    );
+    return messages.length === detail.messages.length ? detail : { ...detail, messages };
+  }, [detail, sentDrafts]);
 
   const focusedThread = useMemo(
     () =>
@@ -1583,6 +1630,15 @@ export function MachProvider({ children }: { children: ReactNode }) {
         setReloadKey((k) => k + 1);
         streamRef.current.refresh();
       },
+      draftSent: (draftId) =>
+        setSentDrafts((current) => (current.has(draftId) ? current : new Set(current).add(draftId))),
+      draftRecalled: (draftId) =>
+        setSentDrafts((current) => {
+          if (!current.has(draftId)) return current;
+          const next = new Set(current);
+          next.delete(draftId);
+          return next;
+        }),
       reloadEvents: () => setEventsKey((k) => k + 1),
     };
   }, [
@@ -1619,7 +1675,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
     visibleThreads,
     visibleEvents,
     events,
-    detail,
+    detail: visibleDetail,
     detailLoading,
     addressBook,
     favorites,

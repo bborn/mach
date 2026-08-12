@@ -976,6 +976,11 @@ export function ComposerDock() {
       };
       recalled.current = draft;
       setPending(optimistic);
+      // The conversation loses the draft row here, not when Rust answers. Both
+      // halves of "was it sent?" are then on screen in the same frame: the
+      // outbox strip says it is going, and the `DRAFT` row of the same words is
+      // gone from the thread underneath it.
+      actions.draftSent(id);
       close(id);
 
       /*
@@ -998,6 +1003,9 @@ export function ComposerDock() {
         })
         .catch((error) => {
           setPending((current) => (current?.id === optimistic.id ? null : current));
+          // Nothing was queued, so the draft is still a draft — and its row is
+          // still in the conversation.
+          actions.draftRecalled(id);
           actions.setStatus(errorMessage(error), "error");
           const restored = recalled.current;
           recalled.current = null;
@@ -1034,6 +1042,10 @@ export function ComposerDock() {
       openDraft(restored);
       void saveDraft(restored).catch(() => {});
     }
+    // The exact inverse of the hide at `⌘⏎`. Rust has already put the mirror
+    // back — `Outbox::cancel` does it, so a recall works with no composer at all
+    // — and this is what stops the guess from hiding the row it restored.
+    if (restored) actions.draftRecalled(restored.id);
     actions.reload();
   }, [pending, actions, openDraft]);
 

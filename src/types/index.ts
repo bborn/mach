@@ -113,6 +113,15 @@ export interface Message {
    * until this field was named in `mapMessage`.
    */
   isDraft: boolean;
+  /**
+   * The composer draft this row is the mirror of, when it is one.
+   *
+   * `messages.mach_draft_id` in SQLite, written by `compose::mirror` and by
+   * nothing else. It is what lets the conversation drop the draft row in the
+   * same frame as `⌘⏎`: the composer knows which draft it just sent, and this
+   * says which row that draft is. See `useMach`'s `draftSent`.
+   */
+  machDraftId?: string;
 }
 
 export interface ThreadDetail {
