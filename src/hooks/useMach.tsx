@@ -1174,16 +1174,30 @@ export function MachProvider({ children }: { children: ReactNode }) {
    * a ⌘K entry, the snooze picker, the inverse a ⌘Z dispatches and the original
    * a ⇧⌘Z re-applies all arrive here, and none of them has to remember to say
    * what it is about to do to the list.
+   *
+   * `projected` is the one exception, and it is not a caller opting out of
+   * being optimistic — it is a caller that has already been. A ⌘Z over a group
+   * projects every step at once through `projectCommands` below, because one
+   * gesture must land as one change; projecting again here, per step and a
+   * round trip apart, would re-answer the same question against a list that may
+   * have been refetched in between and repaint rows that were already right.
+   * The guess is still *computed*, because the failure path below needs the
+   * ids it covers.
    */
   const run = useCallback(
     async (
       command: Command,
-      options: { quiet?: boolean; reselectFailed?: boolean; label?: string } = {},
+      options: {
+        quiet?: boolean;
+        reselectFailed?: boolean;
+        label?: string;
+        projected?: boolean;
+      } = {},
     ): Promise<CommandResult | null> => {
       // Synchronous, and before the first `await`: everything down to here runs
       // in the same tick as the gesture that called it.
       const guesses = project(command, threadsRef.current);
-      if (guesses) dispatchUi({ type: "project", guesses });
+      if (guesses && !options.projected) dispatchUi({ type: "project", guesses });
       try {
         const result = await getDataSource().execute(command);
         // A calendar command's whole effect is rows in the event window, and
@@ -1281,6 +1295,31 @@ export function MachProvider({ children }: { children: ReactNode }) {
   );
 
   /**
+   * Every step of a traversal, guessed at once, in one dispatch.
+   *
+   * A group of three is one thing the user did and has to be one thing they see
+   * taken back. Left to `run`, each step's guess went out after the previous
+   * step's round trip, so a three-step ⌘Z repainted in three stages a few
+   * hundred milliseconds apart.
+   *
+   * Merged rather than dispatched one after another so it is a single render,
+   * and merged in dispatch order because that is the order `uiReducer` resolves
+   * two claims about the same conversation in: the later one wins, exactly as it
+   * would have if the steps had gone out separately.
+   */
+  const projectCommands = useCallback((commands: Command[]) => {
+    const merged: Guesses = {};
+    let any = false;
+    for (const command of commands) {
+      const guesses = project(command, threadsRef.current);
+      if (!guesses) continue;
+      Object.assign(merged, guesses);
+      any = true;
+    }
+    if (any) dispatchUi({ type: "project", guesses: merged });
+  }, []);
+
+  /**
    * What a traversal of the stack is allowed to do to the app.
    *
    * Undo is not a special dispatch path: it runs the inverse through the same
@@ -1292,7 +1331,9 @@ export function MachProvider({ children }: { children: ReactNode }) {
     () => ({
       read: () => undoRef.current,
       write: commitUndo,
-      execute: (command) => run(command, { quiet: true }),
+      // `projected`, because `project` has already spoken for every step.
+      execute: (command) => run(command, { quiet: true, projected: true }),
+      project: projectCommands,
       /*
        * Both of these are now the same thing: drop whatever guess is standing
        * for these conversations.
@@ -1300,10 +1341,10 @@ export function MachProvider({ children }: { children: ReactNode }) {
        * They used to be the two halves of the optimistic hide — clear it for an
        * unarchive, set it for a redone archive — because `run` knew nothing
        * about what a command did to the list and the traversal had to say so on
-       * its behalf. It does know now, and it projects the inverse it is handed
-       * a moment later in `execute` above. What is left for the traversal to do
-       * is retract the *previous* guess, so the archive's delta is not still
-       * sitting on the row the unarchive is about to describe.
+       * its behalf. It does know now, and `project` above states the whole set a
+       * line later. What is left for the traversal to do is retract the
+       * *previous* guess, so the archive's delta is not still sitting on the row
+       * the unarchive is about to describe.
        */
       restore: (threadIds) => dispatchUi({ type: "forget", threadIds }),
       hide: (threadIds) => dispatchUi({ type: "forget", threadIds }),
@@ -1312,7 +1353,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
       say: (message, offer) =>
         dispatchUi({ type: "status", status: { message, tone: "info", offer } }),
     }),
-    [commitUndo, run],
+    [commitUndo, projectCommands, run],
   );
 
   // Opening an unread conversation marks it read — once, and quietly.
