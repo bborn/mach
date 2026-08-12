@@ -789,6 +789,67 @@ fn placeholder_message_id(entry_id: &str) -> String {
     format!("{OUTBOX_ID_PREFIX}{entry_id}")
 }
 
+/// Is this Gmail draft message one the outbox is holding — a message that has
+/// been sent as far as the owner is concerned?
+///
+/// # The `DRAFT` row above the reply he had just sent
+///
+/// Queuing takes the draft out of the conversation locally and **leaves it on
+/// Gmail**, because `drafts.send` is what will send it when the undo window
+/// lapses; deleting it at `⌘⏎` would leave nothing to send. So between those
+/// two moments Gmail still holds — and still lists — a draft that Mach has
+/// already removed, and the history record the draft's own push wrote is still
+/// sitting there waiting to be replayed.
+///
+/// The next sync pass replays it, fetches the message, sees the `DRAFT` label
+/// and stores it. The mirror it would have upserted onto is gone, so it lands
+/// as a **new row**: no `mach_draft_id`, no `compose_drafts` row behind it,
+/// nothing that any removal path addresses. It renders exactly like the draft
+/// the owner just sent, in the conversation, above the reply, stamped the same
+/// minute — and it stays there until the send actually happens.
+/// [`Outbox::mark_sent`] does clear it, which is why it always went away
+/// eventually; the ten seconds before that is what he kept reporting, and a
+/// scheduled send makes those ten seconds an afternoon.
+///
+/// So the row is refused at the door instead. `holding` and `sending` only:
+/// a send that has permanently failed is not going to consume that draft, and
+/// its text is no longer anywhere else, so Gmail's copy coming back is then the
+/// correct outcome rather than the bug.
+pub fn holds_draft_message(
+    conn: &rusqlite::Connection,
+    account_id: i64,
+    gmail_message_id: &str,
+) -> rusqlite::Result<bool> {
+    if gmail_message_id.is_empty() {
+        return Ok(false);
+    }
+    // The composer owns this table and creates it lazily, so a store whose
+    // owner has never written a message does not have it — and `pragma_table_info`
+    // of a table that is not there is zero rows rather than an error, which
+    // answers "is there a column to read?" and "is there a table?" at once.
+    let column: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('compose_outbox') \
+              WHERE name = 'gmail_draft_message_id'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if column.is_none() {
+        return Ok(false);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM compose_outbox \
+              WHERE account_id = ?1 AND gmail_draft_message_id = ?2 \
+                AND state IN ('holding', 'sending')",
+            rusqlite::params![account_id, gmail_message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some())
+}
+
 fn participants(list: &[super::mime::Mailbox]) -> Vec<Participant> {
     list.iter().map(|m| m.to_participant()).collect()
 }

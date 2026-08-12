@@ -2659,3 +2659,225 @@ async fn a_draft_deleted_elsewhere_loses_its_id_here() {
 
     assert_eq!(draft_id_of(&db, "m2"), None);
 }
+
+/// The `DRAFT` row that outlived the send — reported three times, and still
+/// there after the fix that hid the mirror.
+///
+/// `⌘⏎` takes the draft out of the conversation locally and **deliberately
+/// leaves it on Gmail**: the outbox is going to call `drafts.send` on it once
+/// the undo window lapses, and deleting it now would leave nothing to send. So
+/// until then Gmail still holds a draft Mach has already removed — and the
+/// history record the draft's own push wrote is still waiting to be replayed.
+/// The next pass fetches that message, finds it labelled `DRAFT`, and stores
+/// it. The mirror it would have upserted onto is gone, so it lands as a *new*
+/// row: no `mach_draft_id`, nothing that claims it, no removal path that
+/// addresses it — `DRAFT` above the reply the owner has just watched leave,
+/// with the same words and the same minute on it.
+#[tokio::test]
+async fn a_draft_the_outbox_is_still_holding_does_not_come_back_down() {
+    use mach_lib::ipc::compose::dispatch;
+    use mach_lib::ipc::compose::engine::{draft, mirror, outbox};
+
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    mailbox.seed(FakeMessage::new("m1", "t1").at(1_000));
+    google.install(&format!("tok-{account_id}"), mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+
+    let thread_id: i64 = db
+        .read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT thread_id FROM messages WHERE gmail_message_id = 'm1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap())
+        })
+        .unwrap();
+
+    // He writes a reply. Every save pushes it, so Gmail holds a draft — and
+    // that push is a change to the mailbox, so a history record naming its
+    // message is sitting there waiting for the next pass.
+    let composed: draft::Draft = serde_json::from_value(json!({
+        "id": "draft-1",
+        "accountId": account_id,
+        "threadId": thread_id,
+        "kind": "reply",
+        "to": [{ "email": "m1@example.com" }],
+        "subject": "Re: Subject m1",
+        "body": "Both items are handled.",
+    }))
+    .unwrap();
+    draft::save_draft(&db, &composed, 3_000).unwrap();
+    mirror::mirror(&db, &composed, 3_000).unwrap();
+
+    // The push lands: `drafts.create` puts it on Gmail, the row learns the ids
+    // it answers to, and the mirror is renamed onto Gmail's message id. This is
+    // `remote::DraftRemoteSync::push` without the wire.
+    let remote: draft::DraftRemote = serde_json::from_value(json!({
+        "state": "synced",
+        "draftId": "r-9999",
+        "messageId": "m2",
+        "threadId": "t1",
+        "syncedAt": 3_000,
+    }))
+    .unwrap();
+    draft::set_remote(&db, &composed.id, &remote).unwrap();
+    mirror::adopt(&db, &composed.id, None, "m2", "t1").unwrap();
+    google.with(&format!("tok-{account_id}"), |mailbox| {
+        mailbox.deliver(FakeMessage::new("m2", "t1").at(3_000).labels(&["DRAFT"]));
+        mailbox.drafts.push(("r-9999".into(), "m2".into()));
+    });
+    assert_eq!(
+        draft_rows(&db),
+        vec!["m2 mach_draft_id=draft-1".to_string()],
+        "one mirror, and it knows whose it is"
+    );
+
+    // `⌘⏎`. Queue only: nothing leaves, because the undo window has not lapsed
+    // — which is the whole point.
+    let out = outbox::Outbox::new(db.clone(), outbox_clients(&google, account_id)).unwrap();
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "send", "draft": serde_json::to_value(&composed).unwrap(), "now": 4_000 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        draft_rows(&db),
+        Vec::<String>::new(),
+        "the conversation loses the draft at queue time"
+    );
+
+    // The pass that runs while the message is still waiting out that window.
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+
+    assert_eq!(
+        draft_rows(&db),
+        Vec::<String>::new(),
+        "a draft the outbox is holding must not be imported back into the thread"
+    );
+}
+
+/// The composer's own view of Google, pointed at the same fake.
+fn outbox_clients(
+    google: &Arc<FakeGoogle>,
+    account_id: i64,
+) -> Arc<dyn mach_lib::commands::GoogleClients> {
+    Arc::new(
+        mach_lib::commands::AccountClients::new(Arc::clone(google) as Arc<dyn HttpTransport>)
+            .with_gmail_base_url(GMAIL_BASE)
+            .with_retry_policy(RetryPolicy::none())
+            .with_account(
+                account_id,
+                Arc::new(StaticTokenProvider::new(format!("tok-{account_id}"))),
+            ),
+    )
+}
+
+/// The other half of that refusal: `⌘Z`.
+///
+/// A recall puts the draft back — locally, and pointing at the same Gmail draft
+/// it always was. The outbox row is gone, so the next pass is free to bring
+/// Gmail's copy down again, and it has to land on the restored mirror rather
+/// than beside it.
+#[tokio::test]
+async fn recalling_the_send_lets_the_draft_come_back_down() {
+    use mach_lib::ipc::compose::dispatch;
+    use mach_lib::ipc::compose::engine::{draft, mirror, outbox};
+
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+
+    let google = FakeGoogle::new();
+    let mut mailbox = Mailbox::new("one@example.com");
+    mailbox.seed(FakeMessage::new("m1", "t1").at(1_000));
+    google.install(&format!("tok-{account_id}"), mailbox);
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+    let thread_id: i64 = db
+        .read(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT thread_id FROM messages WHERE gmail_message_id = 'm1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap())
+        })
+        .unwrap();
+
+    let composed: draft::Draft = serde_json::from_value(json!({
+        "id": "draft-1",
+        "accountId": account_id,
+        "threadId": thread_id,
+        "kind": "reply",
+        "to": [{ "email": "m1@example.com" }],
+        "subject": "Re: Subject m1",
+        "body": "Both items are handled.",
+    }))
+    .unwrap();
+    draft::save_draft(&db, &composed, 3_000).unwrap();
+    mirror::mirror(&db, &composed, 3_000).unwrap();
+    let remote: draft::DraftRemote = serde_json::from_value(json!({
+        "state": "synced",
+        "draftId": "r-9999",
+        "messageId": "m2",
+        "threadId": "t1",
+        "syncedAt": 3_000,
+    }))
+    .unwrap();
+    draft::set_remote(&db, &composed.id, &remote).unwrap();
+    mirror::adopt(&db, &composed.id, None, "m2", "t1").unwrap();
+    google.with(&format!("tok-{account_id}"), |mailbox| {
+        mailbox.deliver(FakeMessage::new("m2", "t1").at(3_000).labels(&["DRAFT"]));
+        mailbox.drafts.push(("r-9999".into(), "m2".into()));
+    });
+
+    let out = outbox::Outbox::new(db.clone(), outbox_clients(&google, account_id)).unwrap();
+    let sent = dispatch(
+        &db,
+        &out,
+        json!({ "op": "send", "draft": serde_json::to_value(&composed).unwrap(), "now": 4_000 }),
+    )
+    .await
+    .unwrap();
+    let entry_id = sent["entry"]["id"].as_str().unwrap().to_string();
+
+    dispatch(&db, &out, json!({ "op": "undo", "outboxId": entry_id, "now": 5_000 }))
+        .await
+        .unwrap();
+    assert_eq!(
+        draft_rows(&db),
+        vec!["m2 mach_draft_id=draft-1".to_string()],
+        "the recall puts the mirror back"
+    );
+
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+    assert_eq!(
+        draft_rows(&db),
+        vec!["m2 mach_draft_id=draft-1".to_string()],
+        "and the pass that follows lands on it rather than beside it"
+    );
+}
+
+/// Every message row the store still calls a draft.
+fn draft_rows(db: &Db) -> Vec<String> {
+    db.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT gmail_message_id || ' mach_draft_id=' || COALESCE(mach_draft_id, 'NULL')
+               FROM messages WHERE is_draft = 1 ORDER BY gmail_message_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+    .unwrap()
+}

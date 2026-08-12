@@ -717,7 +717,13 @@ impl MailSync {
                 for record in chunk {
                     for added in &record.messages_added {
                         if let Some(message) = fetched.get(&added.message.id) {
-                            touched.insert(store_message(conn, account_id, message)?);
+                            // `None` is a message this pass declined to store —
+                            // see `store_message`. It did not arrive, so it is
+                            // neither counted nor announced.
+                            let Some(thread_id) = store_message(conn, account_id, message)? else {
+                                continue;
+                            };
+                            touched.insert(thread_id);
                             stored += 1;
                             arrived.push(added.message.id.clone());
                         }
@@ -906,8 +912,10 @@ fn spawn_backfill_writer(
                 let mut stored = 0u64;
                 for (_, message) in &batch {
                     if let Some(message) = message {
-                        touched.insert(store_message(conn, account_id, message)?);
-                        stored += 1;
+                        if let Some(thread_id) = store_message(conn, account_id, message)? {
+                            touched.insert(thread_id);
+                            stored += 1;
+                        }
                     }
                 }
                 // Dequeue everything the batch covers, including ids Google no
@@ -950,12 +958,36 @@ fn spawn_backfill_writer(
 /// Write one Gmail message and everything hanging off it. Returns the thread
 /// row it belongs to, so the caller can recompute that thread once per batch
 /// rather than once per message.
+///
+/// `None` is a message this pass **declined** to store. There is exactly one,
+/// and it is not an error: see the check below.
 pub(crate) fn store_message(
     conn: &rusqlite::Connection,
     account_id: i64,
     message: &g::Message,
-) -> Result<i64, DbError> {
+) -> Result<Option<i64>, DbError> {
     let prepared = convert::prepare_message(account_id, message);
+
+    // The one message this pass must not store: a draft the outbox is already
+    // sending. Mach took it out of the conversation at `⌘⏎` and left it on
+    // Gmail for `drafts.send`, so it is still listed, still labelled `DRAFT`,
+    // and still named by a history record — and storing it here would put a
+    // `DRAFT` row of the owner's own words back above the reply he has just
+    // watched leave, with nothing local claiming it. See
+    // [`outbox::holds_draft_message`](crate::ipc::compose::engine::outbox::holds_draft_message).
+    //
+    // Checked before the thread is ensured, so a first message to somebody new
+    // does not leave an empty conversation behind either.
+    if prepared.message.is_draft
+        && crate::ipc::compose::engine::outbox::holds_draft_message(
+            conn,
+            account_id,
+            &prepared.message.gmail_message_id,
+        )?
+    {
+        return Ok(None);
+    }
+
     let thread_id = sync_queries::ensure_thread(conn, account_id, &prepared.gmail_thread_id)?;
 
     let mut row = prepared.message;
@@ -979,7 +1011,7 @@ pub(crate) fn store_message(
         &row.gmail_message_id,
         &prepared.label_ids,
     )?;
-    Ok(thread_id)
+    Ok(Some(thread_id))
 }
 
 /// Apply one `labelsAdded` / `labelsRemoved` record.
@@ -1005,7 +1037,11 @@ fn apply_label_change(
         let Some(message) = fetched.get(gmail_message_id) else {
             return Ok(None);
         };
-        store_message(conn, account_id, message)?;
+        // Declined — a draft the outbox is sending. There is no row to move a
+        // label on, and creating one is the thing being avoided.
+        if store_message(conn, account_id, message)?.is_none() {
+            return Ok(None);
+        }
     }
 
     let resulting = if add {
