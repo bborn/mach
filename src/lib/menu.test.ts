@@ -89,7 +89,11 @@ describe("connectMenu", () => {
     keymap.register({ keys: "shift+mod+r", allowInInput: true, handler });
 
     const ch = channel();
-    connectMenu(keymap, { subscribe: ch.subscribe, now: () => now, keys: null });
+    // `mod` is pinned, like the keymap above. Left to the platform this passes
+    // on macOS and fails on Linux, where `detectModKey` answers `ctrl`: the
+    // binding would be registered as `meta+shift+r` and the menu's token would
+    // resolve to `ctrl+shift+r`. CI is Linux, and that is exactly how it broke.
+    connectMenu(keymap, { subscribe: ch.subscribe, now: () => now, keys: null, mod: "meta" });
     // The literal id `shell.rs` carries on the menu item.
     ch.fire("shift+mod+r");
 
