@@ -1378,12 +1378,20 @@ fn a_user_write_does_not_queue_behind_the_sync_loop() {
     let sync_db = t.db.clone();
     let sync_stop = Arc::clone(&stop);
     let sync = std::thread::spawn(move || {
-        let mut batches = 0u64;
+        // Each batch times itself. The calibration above ran on an idle
+        // machine; this runs while the user writes are being measured, on
+        // whatever the machine is doing then. Deriving the budget from these
+        // is what makes the assertion about *batches waited* rather than about
+        // milliseconds, which is what it has always claimed to be — and what it
+        // was not on a busy two-core CI runner, where it failed twice for want
+        // of a threshold that could not follow the hardware down.
+        let mut spent: Vec<f64> = Vec::new();
         while !sync_stop.load(Ordering::Relaxed) {
+            let t0 = Instant::now();
             batch(&sync_db, "sync", ROWS);
-            batches += 1;
+            spent.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        batches
+        spent
     });
 
     let mut worst: f64 = 0.0;
@@ -1402,19 +1410,27 @@ fn a_user_write_does_not_queue_behind_the_sync_loop() {
     }
 
     stop.store(true, Ordering::Relaxed);
-    let batches = sync.join().unwrap();
+    let mut spent = sync.join().unwrap();
+    let batches = spent.len() as u64;
     assert!(
         batches > 5,
         "the sync loop has to have actually been running: {batches} batches"
     );
 
+    // The batch cost as it was *during* the measurement, not before it. The
+    // median rather than the mean: one descheduled batch on a shared runner
+    // should not buy the assertion slack it has not earned.
+    spent.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let observed = spent[spent.len() / 2].max(batch_ms);
+
     // One batch already in progress is the irreducible wait. Three is slack for
     // a loaded machine; without the standoff this ran to tens of batches.
-    let budget = (batch_ms * 3.0).max(50.0);
+    let budget = (observed * 3.0).max(50.0);
     assert!(
         worst < budget,
         "a user write waited {worst:.0}ms while the sync loop ran \
-         (one batch is {batch_ms:.1}ms, budget {budget:.0}ms, {batches} batches ran)"
+         (one batch is {observed:.1}ms under load, {batch_ms:.1}ms idle, \
+          budget {budget:.0}ms, {batches} batches ran)"
     );
 }
 
