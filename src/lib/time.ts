@@ -130,12 +130,22 @@ export function timeRangeLabel(start: number, end: number): string {
 }
 
 /**
- * Thread-list time. Ages out from clock, to weekday, to date, to short date —
- * so a fixed-width column always says the most useful thing it can.
+ * The name of the day `ts` falls on, or `null` when that day is today.
+ *
+ * One vocabulary, four widths: "Yesterday", then a weekday for the rest of the
+ * week behind us, then "Aug 10" while the year still goes without saying, then
+ * "8/10/25". Each step is the shortest phrase that is still unambiguous at that
+ * distance — a weekday five weeks back names four different days, and a year on
+ * a message from Tuesday is dead weight.
+ *
+ * Today returns `null` rather than a string, which is what lets the two callers
+ * disagree about what to do with it. The thread list draws nothing else, so it
+ * falls back to the clock; a message row keeps the clock either way and only
+ * prefixes the day when there is one.
  */
-export function listTime(ts: number, now: number = Date.now()): string {
+export function dayLabel(ts: number, now: number = Date.now()): string | null {
   const d = new Date(ts);
-  if (isSameDay(d, now)) return clockTime(d);
+  if (isSameDay(d, now)) return null;
 
   const midnight = startOfDay(now).getTime();
   if (ts >= midnight - DAY) return "Yesterday";
@@ -144,6 +154,39 @@ export function listTime(ts: number, now: number = Date.now()): string {
     return `${monthShort(d)} ${d.getDate()}`;
   }
   return `${d.getMonth() + 1}/${d.getDate()}/${String(d.getFullYear()).slice(2)}`;
+}
+
+/**
+ * Thread-list time. Ages out from clock, to weekday, to date, to short date —
+ * so a fixed-width column always says the most useful thing it can.
+ */
+export function listTime(ts: number, now: number = Date.now()): string {
+  return dayLabel(ts, now) ?? clockTime(ts);
+}
+
+/**
+ * Per-message time: "7:08 AM" today, "Yesterday 7:08 AM" and "Tue 7:08 AM"
+ * before that.
+ *
+ * A message row used to draw the clock alone. In a thread that spans days —
+ * which is most threads worth reopening — that is not a shortened answer, it is
+ * no answer: five rows reading 7:08 AM, 7:35 AM, 10:34 AM, 12:05 PM, 12:14 PM
+ * could be one busy morning or five months, and the row order reads the same
+ * either way.
+ *
+ * The day goes in front and the clock stays flush against the right edge of the
+ * column, so the clocks still line up down the thread even though the prefixes
+ * are four different widths; that is what the `tabular-nums` on the column was
+ * bought for. Today stays a bare clock, both because the date of the
+ * conversation you are in is noise and because the widest label — "Yesterday",
+ * at eighteen characters with a 12-hour clock behind it — is the one the column
+ * has to be sized for, and today's rows are the ones that would pay for it most
+ * often.
+ */
+export function messageTime(ts: number, now: number = Date.now()): string {
+  const day = dayLabel(ts, now);
+  const clock = clockTime(ts);
+  return day ? `${day} ${clock}` : clock;
 }
 
 export function fullDate(ts: number): string {

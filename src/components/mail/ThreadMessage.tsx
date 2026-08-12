@@ -15,7 +15,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import type { Attachment, AttachmentId, Message } from "@/types";
-import { clockTime } from "@/lib/time";
+import { messageTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import {
   attachmentKind,
@@ -118,8 +118,15 @@ export function ThreadMessage({
         {attachments.length > 0 && (
           <Paperclip size={12} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
         )}
-        <span className="shrink-0 font-mono text-micro tabular-nums text-faint-foreground">
-          {clockTime(message.timestamp)}
+        {/*
+          One span for the whole stamp, and `whitespace-nowrap` so the day and
+          the clock can never be broken apart at the space between them. There
+          is no tooltip behind it: the weekday form is only ever used for the
+          six days behind today, so every label the column can draw is already
+          exact on its own.
+        */}
+        <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-faint-foreground">
+          {messageTime(message.timestamp)}
         </span>
       </button>
 
