@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 #
+# USAGE-BEGIN
 # scripts/qa — look at a running Mach instead of guessing.
 #
 #   qa up            launch YOUR instance (the real mailbox)
@@ -11,6 +12,9 @@ set -euo pipefail
 #   qa logs [n]      tail the log
 #   qa key BINDING   press a key in the window: 'mod+2', 'g i', 'c', '?'
 #   qa click CSS     click the first match: '[data-thread-id="41774"]'
+#   qa menu CSS      right-click the first match — opens a context menu
+#   qa type TEXT     put TEXT into whatever has the caret
+#   qa press KEY     an editing key into the caret: Enter, Backspace, mod+Backspace
 #   qa ui            what is on screen: mode, cursor, selection, overlay, rows
 #
 # ---------------------------------------------------------------------------
@@ -28,12 +32,13 @@ set -euo pipefail
 #   `qa shoot` is safe. It captures the window's own buffer by CGWindowID, so
 #   the window is never raised — occluded, backgrounded, whatever.
 #
-#   `qa key`, `qa click` and `qa ui` are safe on a QA instance. They do not
-#   send OS input. They POST one of three verbs to a loopback port the app
-#   opens for QA instances in development builds; the frontend synthesises the
-#   keystroke and hands it to the keymap, or dispatches the click in the page.
-#   Focus never moves, because nothing about this involves the window server.
-#   See `src-tauri/src/qa/` and `src/lib/qa-bridge.ts`.
+#   `qa key`, `qa click`, `qa menu`, `qa type`, `qa press` and `qa ui` are safe
+#   on a QA instance. They do not send OS input. They POST one of six fixed
+#   verbs to a loopback port the app opens for QA instances in development
+#   builds; the frontend synthesises the keystroke and hands it to the keymap,
+#   or dispatches the click in the page. Focus never moves, because nothing
+#   about this involves the window server. See `src-tauri/src/qa/` and
+#   `src/lib/qa-bridge.ts`.
 #
 #   MACH_QA_INPUT=1 switches `key` and `click` back to real OS input, which
 #   raises the window and takes the keyboard. It takes a cliclick spec
@@ -55,6 +60,40 @@ set -euo pipefail
 #   MACH_QA_INSTANCE=agent scripts/qa key 'mod+,'
 #   MACH_QA_INSTANCE=agent scripts/qa shoot prefs
 #   MACH_QA_INSTANCE=agent scripts/qa ui
+#
+# ---------------------------------------------------------------------------
+# TEXT, AND THE DIFFERENCE BETWEEN A BINDING AND A CHARACTER
+# ---------------------------------------------------------------------------
+#
+# `qa key` answers "what does this *binding* do". It hands a synthetic event to
+# the keymap registry, which is the thing that decides what a key means — so a
+# QA keystroke and a real one take the same code path, and `handled` tells you
+# whether anything claimed it.
+#
+# It cannot put a character in a field, and it never could. The keymap is not
+# the text editor; a `KeyboardEvent` the page constructs has no default action,
+# so dispatching one at a composer edits nothing. Every composer bug in one week
+# — Return, Backspace, ⌘⌫, autolinking, the address typeahead — lived in text
+# input, and the port structurally could not reach any of it. They were found by
+# driving Blink through CDP instead, which is not evidence about WebKit.
+#
+#   qa type 'hello there'      insert literal text at the caret
+#   qa press Enter             an editing key, with the edit actually performed
+#   qa press mod+Backspace     delete to the start of the line
+#
+# Both act on whatever has DOM focus and answer with what the field holds
+# afterwards, so you can read back what landed rather than guessing:
+#
+#   MACH_QA_INSTANCE=agent scripts/qa key c              # open a composer
+#   MACH_QA_INSTANCE=agent scripts/qa click '[aria-label="To"]'
+#   MACH_QA_INSTANCE=agent scripts/qa type 'someone@example.com'
+#   MACH_QA_INSTANCE=agent scripts/qa press Enter
+#
+# `qa menu` is the right-click. `qa click`'s sequence is pointerdown, mousedown,
+# pointerup, mouseup, click — no `contextmenu`, so neither of the app's two
+# context menus could be opened from the port at all.
+#
+# USAGE-END
 #
 # Headless Chrome against Vite is still there and is still right for pure
 # component and logic work, where a second engine costs nothing. `webqa.ts`
@@ -100,20 +139,91 @@ set -euo pipefail
 # and `shoot` never captures the wrong window.
 #
 # ---------------------------------------------------------------------------
+# EVERY INSTANCE SERVES ITS OWN FRONTEND. ONLY `main` MAY HAVE 1420.
+# ---------------------------------------------------------------------------
+#
+# Port 1420 is where the owner's running app loads its frontend from. `qa up`
+# used to start `bun run dev` from whatever checkout invoked it whenever nothing
+# was listening there — so an agent in a worktree served *its* half-finished
+# frontend into the window the owner was reading real mail in. It happened
+# twice in one day.
+#
+# So the dev server port is derived from the instance and the checkout:
+#
+#   main              1420, and nothing else may take it
+#   anything else     1430–1928, from a hash of "<repo>|<instance>"
+#
+# Bound with `--strictPort`, so vite either gets that exact port or dies —
+# an instance can never end up attached to a server somebody else started.
+# A taken port means the next candidate is tried, and the one that answers is
+# recorded in .qa/<instance>/vite.json with the pid that owns it.
+#
+# The binary is told where to load from with MACH_DEV_URL, read at *runtime*
+# (see `src-tauri/src/qa/dev.rs`). `devUrl` in tauri.conf.json is expanded by
+# `generate_context!` at compile time, so pointing an instance somewhere else
+# used to need `touch src-tauri/src/lib.rs` *and* `touch src-tauri/build.rs`
+# before the binary would let go of the old port — and if you did neither, it
+# silently loaded the wrong frontend. It is now a runtime value, and a QA
+# instance that would load 1420 refuses to start rather than render into the
+# owner's port by accident.
+#
+# Two guards you will meet if you get it wrong:
+#
+#   - `qa up` refuses to run `main` from a worktree. `main` is the owner's own
+#     app on the owner's own port, and a worktree is by definition not it.
+#   - The app exits with a message if MACH_DEV_URL is missing or points at
+#     1420 while MACH_DATA_DIR is set.
+#
+# ---------------------------------------------------------------------------
 #
 # The binary runs directly rather than under `tauri dev`: the watcher rebuilds
 # on every change, and each new unsigned binary re-prompts macOS for Keychain
 # access. Vite still serves the frontend, so UI changes hot-reload into every
 # running instance; only Rust changes need `down` && `up`.
+#
+# A worktree has no `src-tauri/target` of its own — `bin/worktree-setup` points
+# cargo at the parent's cache so a ten-line change does not rebuild the world.
+# `scripts/cargo-target-dir` is how this script and `scripts/sign` find the
+# binary that cargo actually wrote; neither hardcodes `src-tauri/target` any
+# more, and nobody has to symlink one in by hand.
+#
+# That shared cache has a second consequence: another agent's `cargo build`
+# replaces the file the running instance was launched from, mid-run. A QA
+# instance is therefore launched from a *hard link* taken at `up` time, under
+# .qa/<instance>/bin/mach. Cargo replaces `debug/mach` by unlinking and
+# relinking, which leaves our link pointing at the inode we built and tested —
+# same bytes, same signature, immune to somebody else's build. `qa state` says
+# when the shared binary has moved on underneath you.
+#
+# ---------------------------------------------------------------------------
+# `qa shoot` DOES NOT CAPTURE CONTEXT MENUS
+# ---------------------------------------------------------------------------
+#
+# If ⇧F10 reports `handled: true` and `qa ui` reports an overlay but the
+# screenshot shows no menu, your menu is not broken. The long comment above
+# `cmd_shoot` lists the five explanations that have already been tested and
+# ruled out, and what to assert on instead. Read it before spending the hour.
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTANCE="${MACH_QA_INSTANCE:-main}"
 QA_DIR="$REPO/.qa/$INSTANCE"
 PIDFILE="$QA_DIR/mach.pid"
 LOG="$QA_DIR/mach.log"
-VITE_LOG="$REPO/.qa/vite.log"
-BIN="$REPO/src-tauri/target/debug/mach"
+# Per instance, not one shared file. Two agents tailing the same vite.log to
+# find out why their own server would not start is how the last round of this
+# went.
+VITE_LOG="$QA_DIR/vite.log"
+VITE_STATE="$QA_DIR/vite.json"
 REAL_DB="$HOME/Library/Application Support/com.mach.mail/mach.sqlite3"
+
+# `src-tauri/target` is a lie in a worktree; see `scripts/cargo-target-dir`.
+TARGET_DIR="$("$REPO/scripts/cargo-target-dir" "$REPO")"
+BIN="$TARGET_DIR/debug/mach"
+
+# A git worktree has a `.git` *file* holding a gitdir pointer; a checkout has a
+# directory. No git command needed, and none is run: this script is invoked by
+# agents who are told not to touch git at all.
+is_worktree() { [ -f "$REPO/.git" ]; }
 
 # The owner's instance uses the OS app-data dir; every other instance is
 # self-contained under .qa/<name>/data.
@@ -128,6 +238,13 @@ if [ "$INSTANCE" = "main" ]; then
   DB="$REAL_DB"
   CONTROL=""
   KEYCHAIN_SERVICE="com.mach.mail.oauth"
+  # The one instance that may have 1420, because it is the one the owner's
+  # window loads from.
+  VITE_PORT=1420
+  # Run the artifact itself: `staleness.rs` watches `current_exe()` to offer
+  # "a newer build is waiting", and a hard link's mtime never changes, so
+  # linking here would quietly retire that banner for the owner.
+  LAUNCH_BIN="$BIN"
 else
   DATA_DIR="$QA_DIR/data"
   DB="$DATA_DIR/mach.sqlite3"
@@ -138,11 +255,153 @@ else
   SLUG="$(printf '%s' "$INSTANCE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/^-*//; s/-*$//')"
   [ -n "$SLUG" ] || SLUG="unnamed"
   KEYCHAIN_SERVICE="com.mach.mail.oauth.qa-$SLUG"
+  VITE_PORT=""   # decided by `ensure_vite`, and never 1420
+  LAUNCH_BIN="$QA_DIR/bin/mach"
 fi
 
 mkdir -p "$QA_DIR"
 
 die() { echo "qa[$INSTANCE]: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# The dev server, one per instance
+# ---------------------------------------------------------------------------
+
+# 1430–1928, deterministic per checkout *and* instance.
+#
+# Per checkout matters: two agents in two worktrees both saying
+# MACH_QA_INSTANCE=agent are the common case, and a port derived from the name
+# alone would put them on the same one. Deterministic matters because an
+# instance restarted an hour later should land back where it was rather than
+# leaking a new port every time.
+derived_port_base() {
+  python3 - "$REPO" "$INSTANCE" <<'PY'
+import hashlib, sys
+seed = ("%s|%s" % (sys.argv[1], sys.argv[2])).encode()
+print(1430 + int(hashlib.sha256(seed).hexdigest(), 16) % 450)
+PY
+}
+
+# Nothing listening, on either loopback family.
+#
+# Both, because it is not obvious which one vite will pick: `localhost` resolves
+# to ::1 first on this machine, which is why `curl 127.0.0.1:1420` refuses
+# while the owner's server is up and answering perfectly well.
+port_is_free() {
+  python3 - "$1" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    # SO_REUSEADDR because node sets it too, and without it a port left in
+    # TIME_WAIT by this instance's own last `qa down` reads as taken — so every
+    # restart walked one port further along. It does not let this bind past a
+    # live listener; that is SO_REUSEPORT, which is deliberately not set.
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind((address, port))
+    except OSError:
+        raise SystemExit(1)
+    finally:
+        probe.close()
+raise SystemExit(0)
+PY
+}
+
+vite_answers() { curl -sf -o /dev/null "http://localhost:$1/"; }
+
+# The port of a dev server this instance already owns, if it is still alive.
+running_vite_port() {
+  [ -f "$VITE_STATE" ] || return 1
+  local port pid
+  read -r port pid <<<"$(python3 - "$VITE_STATE" <<'PY'
+import json, sys
+try:
+    state = json.load(open(sys.argv[1]))
+    print(int(state["port"]), int(state["pid"]))
+except Exception:
+    raise SystemExit(1)
+PY
+)" || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  vite_answers "$port" || return 1
+  echo "$port"
+}
+
+# Bring up a dev server this instance owns outright, and set VITE_PORT.
+#
+# The old version of this asked whether *anything* was listening on 1420 and
+# started `bun run dev` from the calling directory if not. Two failures came out
+# of that in one day: an agent's worktree bound 1420 and the owner's window
+# rendered in-progress code while he read real mail, and agents that pointed
+# their instance elsewhere silently kept loading somebody else's frontend.
+#
+# `--strictPort` is the property that makes this safe. Vite gets the port it was
+# given or exits; there is no fallback to "some other port" and no way to end up
+# attached to a server this script did not start.
+ensure_vite() {
+  if [ "$INSTANCE" = "main" ]; then
+    # The owner's app and the owner's port. An agent reaching this line means
+    # MACH_QA_INSTANCE was forgotten — refuse before anything binds.
+    ! is_worktree || die "refusing to serve 1420 from a worktree.
+  1420 is where the owner's running app loads its frontend from, and a worktree
+  is not his checkout. An agent's frontend has been served into his live window
+  this way, twice. Launch one of your own instead:
+      MACH_QA_INSTANCE=agent scripts/qa up"
+    vite_answers 1420 && { VITE_PORT=1420; return 0; }
+    ( cd "$REPO" && nohup bun run dev >"$VITE_LOG" 2>&1 & )
+    for _ in $(seq 1 30); do vite_answers 1420 && { VITE_PORT=1420; return 0; }; sleep 1; done
+    die "vite did not come up; see $VITE_LOG"
+  fi
+
+  if VITE_PORT="$(running_vite_port)"; then
+    return 0
+  fi
+
+  local base attempt port vpid waited
+  base="$(derived_port_base)"
+  for attempt in $(seq 0 49); do
+    port=$((base + attempt))
+    # The non-negotiable one. The arithmetic cannot reach 1420 or vite's HMR
+    # port, and this says so out loud anyway: a range that drifts is a change
+    # somebody makes without thinking about this line.
+    if [ "$port" -le 1421 ]; then
+      die "derived port $port collides with the owner's — this is a bug in derived_port_base"
+    fi
+    port_is_free "$port" || continue
+
+    ( cd "$REPO" && exec nohup "$REPO/node_modules/.bin/vite" \
+        --port "$port" --strictPort >"$VITE_LOG" 2>&1 ) &
+    vpid=$!
+
+    waited=0
+    while [ "$waited" -lt 20 ]; do
+      if vite_answers "$port"; then
+        python3 - "$VITE_STATE" "$port" "$vpid" "$REPO" "$INSTANCE" <<'PY'
+import json, sys
+path, port, pid, repo, instance = sys.argv[1:6]
+json.dump({"port": int(port), "pid": int(pid), "repo": repo, "instance": instance},
+          open(path, "w"))
+PY
+        VITE_PORT="$port"
+        echo "qa[$INSTANCE]: vite on $port (pid $vpid)  $VITE_LOG"
+        return 0
+      fi
+      # Lost the race to another agent scanning the same range, or the port was
+      # taken between the probe and the bind. strictPort turns that into an
+      # exit, which is exactly what makes it detectable.
+      kill -0 "$vpid" 2>/dev/null || break
+      sleep 1
+      waited=$((waited + 1))
+    done
+    kill "$vpid" 2>/dev/null || true
+  done
+
+  die "no free dev-server port in $base–$((base + 49)); see $VITE_LOG"
+}
+
+# The URL this instance's binary must load, once `ensure_vite` has decided.
+dev_url() { echo "http://localhost:$VITE_PORT"; }
 
 instance_pid() {
   [ -f "$PIDFILE" ] || return 1
@@ -213,13 +472,6 @@ Launch one of your own: MACH_QA_INSTANCE=agent scripts/qa up"
   owner's real mailbox. Use the in-page verbs instead: qa key / qa click / qa ui."
 }
 
-ensure_vite() {
-  curl -sf -o /dev/null http://localhost:1420 && return 0
-  ( cd "$REPO" && nohup bun run dev >"$VITE_LOG" 2>&1 & )
-  for _ in $(seq 1 30); do curl -sf -o /dev/null http://localhost:1420 && return 0; sleep 1; done
-  die "vite did not come up; see $VITE_LOG"
-}
-
 cmd_seed() {
   [ "$INSTANCE" != "main" ] || die "seed is for agent instances; MACH_QA_INSTANCE=main is the real store"
   [ -f "$REAL_DB" ] || die "no store to copy from at $REAL_DB"
@@ -240,18 +492,128 @@ cmd_seed() {
   echo "      intended state: mail and calendars to look at, no credentials."
 }
 
+# ---------------------------------------------------------------------------
+# Which binary is this instance actually running?
+# ---------------------------------------------------------------------------
+#
+# Every worktree shares the parent's target directory (see `bin/worktree-setup`
+# — a private one costs several minutes and about 2GB per agent). The price is
+# that `cargo build` in any worktree replaces `debug/mach` for everybody, and an
+# agent halfway through a QA run is suddenly testing somebody else's Rust. One
+# agent caught it by grepping the running binary for a symbol it did not
+# recognise; the rest would not have noticed at all.
+#
+# So a QA instance is launched from its own copy, taken at `up`, under
+# .qa/<instance>/bin/mach. Whatever anyone builds afterwards, the process you
+# are screenshotting is running the bytes you tested.
+#
+# A copy rather than a hard link, and the seventy megabytes are the price of the
+# second property: the copy is signed on its own (`scripts/sign --only`), so an
+# agent's QA run never rewrites the artifact the owner's own app was launched
+# from. A hard link is the same inode, so signing one signs the other.
+#
+# It is not a complete answer: it protects the run in progress and says nothing
+# about *whose* code you built in the first place. `cargo build` still
+# serialises on the target lock, and two agents editing the same crate still
+# overwrite each other's artifact between runs. The honest advice is to build
+# and `up` in one breath, and to read the drift line in `qa state`.
+pin_binary() {
+  [ "$LAUNCH_BIN" = "$BIN" ] && return 0
+  built_here || rebuild_ours
+  mkdir -p "$(dirname "$LAUNCH_BIN")"
+  rm -f "$LAUNCH_BIN"
+  cp "$BIN" "$LAUNCH_BIN" || die "could not take a copy of $BIN"
+  binary_stamp "$BIN" >"$QA_DIR/bin/from.json"
+}
+
+# Was `debug/mach` compiled from *this* checkout?
+#
+# `qa::dev::BUILT_FROM` is `env!("CARGO_MANIFEST_DIR")`, baked in at compile
+# time and printed at startup precisely so this question has a cheap answer. A
+# debug build with `split-debuginfo=unpacked` carries no paths otherwise, which
+# is why "is this my binary" used to be unanswerable without reading the log of
+# a process you had already started.
+built_here() {
+  [ -x "$BIN" ] || return 1
+  LC_ALL=C grep -a -q -F "$REPO/src-tauri" "$BIN"
+}
+
+# Somebody else uplifted their artifact over `debug/mach` between our build and
+# our copy. Their build did not delete ours — it is still in `target/debug/deps`
+# under this checkout's own hash — so one `cargo build` puts it back, and this
+# is a second or two rather than a full compile.
+rebuild_ours() {
+  echo "qa[$INSTANCE]: $BIN was built somewhere else; rebuilding from this checkout" >&2
+  ( cd "$REPO/src-tauri" && cargo build >/dev/null 2>&1 ) || true
+  built_here && return 0
+  die "$BIN is not this checkout's build, and rebuilding did not reclaim it.
+  Every worktree shares the parent's target directory and they all uplift to the
+  same debug/mach, so the last build wins the name. Run:
+      cd src-tauri && cargo build
+  and try again — and if it keeps losing, another agent is building in a loop."
+}
+
+# inode, size and mtime — enough to tell "the same artifact" from "a rebuild".
+binary_stamp() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+try:
+    info = os.stat(sys.argv[1])
+except OSError:
+    print("{}")
+    raise SystemExit(0)
+json.dump({"path": sys.argv[1], "inode": info.st_ino, "size": info.st_size,
+           "mtime": int(info.st_mtime)}, sys.stdout)
+PY
+}
+
+# "" when the instance is still on what it was launched from, a sentence when
+# the shared artifact has moved on underneath it.
+binary_drift() {
+  [ -f "$QA_DIR/bin/from.json" ] || return 0
+  python3 - "$QA_DIR/bin/from.json" "$BIN" <<'PY'
+import json, os, sys, time
+try:
+    was = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+try:
+    now = os.stat(sys.argv[2])
+except OSError:
+    print("the shared binary is gone (%s)" % sys.argv[2])
+    raise SystemExit(0)
+if now.st_ino != was.get("inode"):
+    print("another build replaced %s at %s — this instance is still running the "
+          "one you launched (%s). `qa restart` would take theirs."
+          % (sys.argv[2], time.strftime("%H:%M:%S", time.localtime(now.st_mtime)),
+             was.get("path")))
+PY
+}
+
 cmd_up() {
   if pid="$(instance_pid)"; then echo "already running (pid $pid)"; return 0; fi
   [ -x "$BIN" ] || die "no binary at $BIN — run: cd src-tauri && cargo build"
   [ -f "$REPO/.env.local" ] || die "no .env.local — the app would boot 'not configured'"
   [ "$INSTANCE" = "main" ] || [ -f "$DB" ] || echo "qa[$INSTANCE]: no seeded store; starting empty (try: qa seed)"
 
+  ensure_vite
+  pin_binary
+
   # Same signature every build, so the Keychain stops treating each rebuild as
   # a new program and re-asking for the login password. A no-op until the
   # identity exists; see `scripts/sign --setup`.
-  "$REPO/scripts/sign" >/dev/null 2>&1 || true
+  #
+  # A QA instance signs only its own copy. The shared `debug/mach` may be the
+  # file a running app — possibly the owner's — was launched from, and
+  # `codesign --force` rewrites it; an agent's QA run has no business doing
+  # that. `main` signs the artifact itself, which is the one case where it *is*
+  # the thing about to run.
+  if [ "$LAUNCH_BIN" = "$BIN" ]; then
+    "$REPO/scripts/sign" >/dev/null 2>&1 || true
+  else
+    "$REPO/scripts/sign" --only "$LAUNCH_BIN" com.mach.mail >/dev/null 2>&1 || true
+  fi
 
-  ensure_vite
   # `exec` matters: without it the subshell stays alive as the parent and $!
   # is the *wrapper's* pid, not the app's — so every window lookup misses and
   # `shoot` silently degrades to a whole-screen capture. exec replaces the
@@ -260,7 +622,11 @@ cmd_up() {
     cd "$REPO" || exit 1
     set -a; . ./.env.local; set +a
     [ -n "$DATA_DIR" ] && export MACH_DATA_DIR="$DATA_DIR"
-    exec "$BIN" >"$LOG" 2>&1
+    # Read at runtime by `qa::dev::apply`. The compiled-in devUrl is 1420 for
+    # everybody, so without this a QA instance would load the owner's server —
+    # and the app refuses to start rather than do that silently.
+    export MACH_DEV_URL="$(dev_url)"
+    exec "$LAUNCH_BIN" >"$LOG" 2>&1
   ) &
   echo $! >"$PIDFILE"
   for _ in $(seq 1 30); do instance_pid >/dev/null && break; sleep 1; done
@@ -276,7 +642,7 @@ cmd_up() {
   local waited=0
   while [ "$waited" -lt 60 ]; do
     if [ -n "$(window_id)" ]; then
-      echo "up (pid $pid)${DATA_DIR:+  data=$DATA_DIR}"
+      echo "up (pid $pid)  frontend=$(dev_url)${DATA_DIR:+  data=$DATA_DIR}"
       return 0
     fi
     kill -0 "$pid" 2>/dev/null || die "the app exited during startup; see $LOG"
@@ -316,8 +682,71 @@ cmd_down() {
   [ -n "$CONTROL" ] && rm -f "$CONTROL"
   if pid="$(instance_pid)"; then kill "$pid" 2>/dev/null || true; rm -f "$PIDFILE"; echo "stopped (pid $pid)";
   else echo "not running"; fi
+
+  # Its own dev server goes with it. Nobody else is on that port — the whole
+  # point of deriving one per instance — and the alternative is what the machine
+  # looked like before: a vite left over from every worktree an agent ever
+  # touched, all of them still watching files.
+  #
+  # Never for `main`: 1420 is the owner's, and his window is loading from it.
+  if [ "$INSTANCE" != "main" ] && [ -f "$VITE_STATE" ]; then
+    local vpid
+    vpid="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["pid"])' "$VITE_STATE" 2>/dev/null || echo "")"
+    [ -n "$vpid" ] && kill "$vpid" 2>/dev/null && echo "stopped vite (pid $vpid)"
+    rm -f "$VITE_STATE"
+  fi
+  return 0
 }
 
+# ---------------------------------------------------------------------------
+# KNOWN: `shoot` does not capture context menus. Your menu is not broken.
+# ---------------------------------------------------------------------------
+#
+# Open either context menu — mail or calendar, ⇧F10 or `qa menu` — and:
+#
+#   qa menu '[data-thread-id="46599"]'   → matched: true
+#   qa ui                                → overlays: 1
+#   qa click '[data-slot="context-menu-item"]'  → matched: true, and it runs
+#   qa shoot after                       → no menu anywhere in the image
+#
+# The menu is real. It is mounted, positioned, hit-testable, and choosing an
+# item does what the item says. It is only the *screenshot* that does not have
+# it, and an agent who believed the screenshot would conclude the menu never
+# opened and go and "fix" working code.
+#
+# Five explanations have been tested and are not it. Do not spend the hour
+# again:
+#
+#   1. Not a second window or a higher window layer. `CGWindowListCopyWindowInfo`
+#      reports exactly one window for the pid, layer 0, 1440x900 — the one
+#      `shoot` captures. Base UI portals to `document.body` and does not use
+#      the popover API, so there is no top layer involved either.
+#   2. Not the entry animation. `POPUP_SURFACE` fades and scales in over 100ms
+#      and dialogs do not, which looks like the answer. Stripping the transition
+#      out of `popup.ts` and re-shooting changes nothing.
+#   3. Not occlusion, and not a stale buffer. A QA window is normally covered by
+#      other windows, but Preferences — opened with `qa key 'mod+,'` in exactly
+#      that state — captures perfectly, and so does a list that has just
+#      re-rendered around a new search.
+#   4. Not `position: absolute` vs the offset parent. `positionMethod="fixed"`
+#      on the positioner makes no difference.
+#   5. Not the app. Point headless Chrome at the same dev server — `MACH_WEB_URL`
+#      — dispatch `contextmenu` on a row, and the popup is at its anchor with
+#      `opacity: 1`, `visibility: visible`, and focus inside it.
+#
+# The one difference that survives all of that: in the QA window the popup never
+# takes DOM focus. `qa ui` reports `focused: null` with the menu open, where
+# Blink reports the popup itself. Whether that is the cause or another symptom
+# is not settled.
+#
+# So, until somebody settles it, assert on menus instead of photographing them:
+#
+#   qa ui                                       # overlays goes 0 → 1
+#   qa click '[data-slot="context-menu-item"]'  # and the item does its work
+#
+# and use `bun scripts/webqa.ts` against this instance's own dev server when you
+# need to *look* at a popup. It is Blink rather than WebKit, and for a menu's
+# layout that is a real limitation — but it beats a blank rectangle.
 cmd_shoot() {
   local name="${1:-shot}"
   local pid; pid="$(instance_pid)" || die "not running — try: qa up"
@@ -373,8 +802,28 @@ cmd_state() {
       echo "          pid $other started $(ps -p "$other" -o lstart= 2>/dev/null | xargs)" >&2
     done
   fi
-  echo "process : ${pid:+running (pid $pid)}${pid:-NOT RUNNING}"
-  echo "vite    : $(curl -sf -o /dev/null http://localhost:1420 && echo up || echo down)"
+  # Spelled out: `${pid:+running (pid $pid)}${pid:-NOT RUNNING}` prints the pid
+  # again in the running case — the second expansion substitutes when the
+  # variable is *set*, not when the first one was empty. It read
+  # "running (pid 25769)25769".
+  if [ -n "$pid" ]; then echo "process : running (pid $pid)"; else echo "process : NOT RUNNING"; fi
+
+  # The port this instance's frontend comes from, and whether it is answering.
+  # Printed rather than assumed: "which vite am I looking at" was unanswerable
+  # when there was only ever one, and it is the first question now that there
+  # is one per instance.
+  local port
+  if [ "$INSTANCE" = "main" ]; then port=1420; else port="$(running_vite_port || echo "")"; fi
+  if [ -n "$port" ]; then
+    echo "vite    : http://localhost:$port  $(vite_answers "$port" && echo up || echo DOWN)"
+  else
+    echo "vite    : none yet (qa up starts one; never 1420 for a QA instance)"
+  fi
+
+  echo "binary  : $LAUNCH_BIN"
+  local drift; drift="$(binary_drift)"
+  [ -n "$drift" ] && echo "WARNING : $drift" >&2
+
   echo "store   : $DB"
   echo "keychain: $KEYCHAIN_SERVICE"
   local rect; rect="$(window_rect 2>/dev/null)" || rect=""
@@ -474,6 +923,32 @@ cmd_click() {
   control click "$1"
 }
 
+# The right-click. `click` cannot do this: its sequence has no `contextmenu`,
+# and both of the app's context menus — mail and calendar — hang off exactly
+# that event, so neither was reachable from this port at all.
+cmd_menu() {
+  [ $# -eq 1 ] || die "usage: qa menu <css selector>   e.g. '[data-thread-id=\"41774\"]'"
+  control rightclick "$1"
+}
+
+# Text, into whatever has the caret.
+#
+# Not `key`. `key` asks the keymap what a binding means, which is the right
+# question for `e` and the wrong one for the letter e: a `KeyboardEvent` the
+# page constructs carries no default action, so dispatching one at a composer
+# edits nothing at all. See `src/lib/qa-bridge.ts` for what does the editing.
+cmd_type() {
+  [ $# -gt 0 ] || die "usage: qa type <text>"
+  control type "$*"
+}
+
+# One editing key, with the edit performed: Enter, Backspace, Delete, Tab,
+# Escape, the arrows, Home/End, and mod+Backspace for delete-to-line-start.
+cmd_press() {
+  [ $# -eq 1 ] || die "usage: qa press <key>   e.g. Enter, Backspace, mod+Backspace"
+  control press "$1"
+}
+
 cmd_ui() { control ui; }
 
 cmd_logs() { tail -n "${1:-30}" "$LOG"; }
@@ -507,7 +982,14 @@ case "${1:-}" in
   state) shift; cmd_state "$@" ;;
   key)   shift; cmd_key "$@" ;;
   click) shift; cmd_click "$@" ;;
+  menu)  shift; cmd_menu "$@" ;;
+  type)  shift; cmd_type "$@" ;;
+  press) shift; cmd_press "$@" ;;
   ui)    shift; cmd_ui "$@" ;;
   logs)  shift; cmd_logs "$@" ;;
-  *) sed -n '4,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ; exit 1 ;;
+  # Between markers rather than by line number: the help was `sed -n '4,58p'`,
+  # which silently started printing the wrong paragraph the first time anything
+  # above it grew.
+  *) awk '/^# USAGE-BEGIN/{on=1;next} /^# USAGE-END/{exit} on{sub(/^# ?/,"");print}' \
+       "${BASH_SOURCE[0]}"; exit 1 ;;
 esac

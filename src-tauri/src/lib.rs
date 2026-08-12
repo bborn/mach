@@ -62,6 +62,12 @@ pub fn run() {
     // A QA instance builds its own window in `setup`, unfocused. The configured
     // one would exist before `setup` ran and would already have taken focus.
     shell::suppress_configured_window(&mut context);
+    // …and it loads from its own dev server. The compiled-in devUrl is the
+    // owner's 1420 for every build, so a QA instance that took it would render
+    // into — and be screenshotted from — the server feeding his live window.
+    // Exits with a message rather than doing that quietly.
+    #[cfg(debug_assertions)]
+    qa::dev::apply(&mut context);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

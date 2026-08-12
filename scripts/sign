@@ -59,12 +59,18 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IDENTITY="${MACH_SIGN_IDENTITY:-Mach Dev Signing}"
 CERT_DIR="$HOME/.mach-dev-signing"
 
+# Not `$REPO/src-tauri/target`: an agent worktree points cargo at the parent's
+# cache, so that path does not exist there and the `[ -f ]` test below skipped
+# every target without saying so. Worktree builds went unsigned, and the
+# Keychain went back to asking. See `scripts/cargo-target-dir`.
+TARGET_DIR="$("$REPO/scripts/cargo-target-dir" "$REPO")"
+
 # Stable identifiers. The app's is the bundle id it will ship under; the helper
 # binaries get their own so their ACL entries stay distinguishable.
 declare -a TARGETS=(
-  "src-tauri/target/debug/mach:com.mach.mail"
-  "src-tauri/target/debug/calendar_live:com.mach.mail.calendar-live"
-  "src-tauri/target/debug/plugin_probe:com.mach.mail.plugin-probe"
+  "debug/mach:com.mach.mail"
+  "debug/calendar_live:com.mach.mail.calendar-live"
+  "debug/plugin_probe:com.mach.mail.plugin-probe"
 )
 
 have_identity() {
@@ -108,6 +114,18 @@ if [ "${1:-}" = "--setup" ]; then
   exit 0
 fi
 
+# `--only <path> <identifier>` signs one binary that is not in the table.
+#
+# `scripts/qa` uses it for the private copy a QA instance runs from. Signing the
+# shared `debug/mach` from a worktree would rewrite the artifact the owner's own
+# app was launched from, which is not something an agent's QA run should be
+# doing to a process somebody is reading mail in.
+if [ "${1:-}" = "--only" ]; then
+  [ $# -eq 3 ] || { echo "usage: scripts/sign --only <binary> <identifier>" >&2; exit 2; }
+  TARGETS=("$2:$3")
+  shift 3
+fi
+
 if ! have_identity; then
   # Not an error: signing is an optional comfort, not a build step.
   echo "sign: no \"$IDENTITY\" identity — skipping (run: scripts/sign --setup)" >&2
@@ -116,7 +134,13 @@ fi
 
 signed=0
 for entry in "${TARGETS[@]}"; do
-  binary="$REPO/${entry%%:*}"
+  candidate="${entry%%:*}"
+  # `--only` passes an absolute path; the table above is relative to the target
+  # directory cargo actually used.
+  case "$candidate" in
+    /*) binary="$candidate" ;;
+    *)  binary="$TARGET_DIR/$candidate" ;;
+  esac
   identifier="${entry##*:}"
   [ -f "$binary" ] || continue
 

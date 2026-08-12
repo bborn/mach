@@ -19,22 +19,35 @@
 //! bug that survived months because WebKit will not fire a listener in a
 //! scripting-disabled document and Blink will.
 //!
-//! # Three verbs, and deliberately no fourth
+//! # A closed vocabulary, and no way to spell "run this"
 //!
 //! | verb | argument | what it does |
 //! |---|---|---|
 //! | `key` | a keymap token — `mod+2`, `g i`, `?` | the frontend synthesises the keystroke and hands it to the keymap |
 //! | `click` | a CSS selector | dispatches a click on the first match, in-page |
+//! | `rightclick` | a CSS selector | the same, with `contextmenu` — the app's two context menus hang off it |
+//! | `type` | literal text | inserts it at the caret |
+//! | `press` | one key name — `Enter`, `Backspace`, `mod+Backspace` | an editing key, with the edit performed |
 //! | `ui` | — | reports mode, cursor, selection size, overlay, visible rows |
 //!
 //! There is no `eval`. An endpoint that runs arbitrary JavaScript inside a mail
 //! client is remote code execution, and "it is compiled out of release builds"
 //! is a promise rather than a guarantee — one `#[cfg]` removed by accident and
 //! the whole mailbox is scriptable by anything that can reach a loopback port.
-//! A closed set of three verbs cannot be turned into one. Rust never receives
-//! code, and the frontend never evaluates a string: [`Verb`] is an enum, and
-//! anything that is not one of its three spellings is a 400 before a window
-//! ever hears about it.
+//! A closed set of verbs cannot be turned into one. Rust never receives code,
+//! and the frontend never evaluates a string: [`Verb`] is an enum, and anything
+//! that is not one of its spellings is a 400 before a window ever hears about
+//! it.
+//!
+//! It was three verbs for a while, and the count is not the property — the
+//! property is that every one of them is a fixed word whose argument is *data*.
+//! A selector is matched, never evaluated; text is inserted, never executed; a
+//! key name is looked up in a table in `qa-bridge.ts` and anything not in it is
+//! refused. Adding `type` does not widen what a reader of this port can do by
+//! one instruction, and it is the difference between being able to test the
+//! composer and not: every text-input bug in one week — Return, Backspace, ⌘⌫,
+//! autolinking, the address typeahead — was outside what `key` can reach,
+//! because the keymap is not the text editor.
 //!
 //! # It fails closed, four ways
 //!
@@ -86,6 +99,11 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Runtime};
 
 use crate::ipc::agent::engine::mcp;
 
+/// Which dev server this instance loads its frontend from — a runtime value,
+/// and never the owner's port. See [`dev`] for the two failures that produced
+/// it.
+pub mod dev;
+
 /// The one path served. Anything else is a 404 — a loopback port that answers
 /// on every path is a loopback port that is being scanned.
 pub const PATH: &str = "/qa";
@@ -128,6 +146,12 @@ pub enum Verb {
     Key,
     /// Dispatch a click on the first element matching a CSS selector.
     Click,
+    /// The right-click: the same sequence with `contextmenu` in it.
+    RightClick,
+    /// Insert literal text at the caret.
+    Type,
+    /// One editing key at the caret, with the edit actually performed.
+    Press,
     /// Report what the interface currently is.
     Ui,
 }
@@ -137,6 +161,9 @@ impl Verb {
         match name {
             "key" => Some(Verb::Key),
             "click" => Some(Verb::Click),
+            "rightclick" => Some(Verb::RightClick),
+            "type" => Some(Verb::Type),
+            "press" => Some(Verb::Press),
             "ui" => Some(Verb::Ui),
             _ => None,
         }
@@ -146,13 +173,25 @@ impl Verb {
         match self {
             Verb::Key => "key",
             Verb::Click => "click",
+            Verb::RightClick => "rightclick",
+            Verb::Type => "type",
+            Verb::Press => "press",
             Verb::Ui => "ui",
         }
     }
 
-    /// `ui` is a question; the other two are instructions and need a subject.
+    /// `ui` is a question; the rest are instructions and need a subject.
     fn takes_argument(self) -> bool {
-        matches!(self, Verb::Key | Verb::Click)
+        !matches!(self, Verb::Ui)
+    }
+
+    /// Whether an argument of nothing but spaces is a mistake.
+    ///
+    /// It is, for a selector or a key name — but `qa type ' '` is somebody
+    /// testing what a space does to the address typeahead, and refusing it here
+    /// would make the one interesting case unreachable.
+    fn argument_may_be_blank(self) -> bool {
+        matches!(self, Verb::Type)
     }
 }
 
@@ -169,8 +208,11 @@ pub fn parse_request(body: &str) -> Result<Request, String> {
         serde_json::from_str(body).map_err(|e| format!("that is not JSON: {e}"))?;
 
     let name = value.get("verb").and_then(Value::as_str).unwrap_or_default();
-    let verb = Verb::parse(name)
-        .ok_or_else(|| format!("\"{name}\" is not a verb — this port knows key, click and ui"))?;
+    let verb = Verb::parse(name).ok_or_else(|| {
+        format!(
+            "\"{name}\" is not a verb — this port knows key, click, rightclick, type, press and ui"
+        )
+    })?;
 
     let argument = value
         .get("argument")
@@ -178,7 +220,10 @@ pub fn parse_request(body: &str) -> Result<Request, String> {
         .unwrap_or_default()
         .to_string();
 
-    if verb.takes_argument() && argument.trim().is_empty() {
+    if verb.takes_argument() && argument.is_empty() {
+        return Err(format!("{} needs an argument", verb.as_str()));
+    }
+    if verb.takes_argument() && !verb.argument_may_be_blank() && argument.trim().is_empty() {
         return Err(format!("{} needs an argument", verb.as_str()));
     }
     if !verb.takes_argument() && !argument.is_empty() {
@@ -469,13 +514,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_vocabulary_is_exactly_three_words() {
-        assert_eq!(Verb::parse("key"), Some(Verb::Key));
-        assert_eq!(Verb::parse("click"), Some(Verb::Click));
-        assert_eq!(Verb::parse("ui"), Some(Verb::Ui));
+    fn the_vocabulary_is_a_closed_list() {
+        for word in ["key", "click", "rightclick", "type", "press", "ui"] {
+            assert!(Verb::parse(word).is_some(), "{word} is a verb");
+        }
 
         // The point of the whole design: there is no way to spell "run this".
-        for forbidden in ["eval", "js", "script", "exec", "run", "Key", "KEY", ""] {
+        for forbidden in [
+            "eval", "js", "script", "exec", "run", "Key", "KEY", "", "type ", "click;eval",
+        ] {
             assert_eq!(Verb::parse(forbidden), None, "{forbidden} must not be a verb");
         }
     }
@@ -503,7 +550,20 @@ mod tests {
     fn an_instruction_needs_a_subject_and_a_question_does_not_take_one() {
         assert!(parse_request(r#"{"verb":"key","argument":"   "}"#).is_err());
         assert!(parse_request(r#"{"verb":"click"}"#).is_err());
+        assert!(parse_request(r#"{"verb":"rightclick"}"#).is_err());
+        assert!(parse_request(r#"{"verb":"press","argument":" "}"#).is_err());
         assert!(parse_request(r#"{"verb":"ui","argument":"anything"}"#).is_err());
+    }
+
+    /// A space is text somebody may be testing on purpose — it is the character
+    /// that commits an entry in the address typeahead.
+    #[test]
+    fn only_type_may_be_asked_for_whitespace() {
+        assert_eq!(
+            parse_request(r#"{"verb":"type","argument":" "}"#),
+            Ok(Request { verb: Verb::Type, argument: " ".into() })
+        );
+        assert!(parse_request(r#"{"verb":"type","argument":""}"#).is_err());
     }
 
     #[test]

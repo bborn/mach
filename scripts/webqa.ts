@@ -35,11 +35,64 @@
  * backend. `scripts/qa state` reads the database and needs no UI.
  */
 
+import { readFileSync } from "node:fs";
+
 const CHROME =
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const URL_UNDER_TEST = process.env.MACH_WEB_URL ?? "http://localhost:1420";
-const PORT = Number(process.env.MACH_CDP_PORT ?? 9333);
+
+/**
+ * The dev server this drives, and the debugger port it drives Chrome on.
+ *
+ * Both used to be constants — :1420 and :9333 — and both were wrong on a
+ * machine where several agents work at once.
+ *
+ * :1420 is the *owner's* dev server, feeding the window he reads mail in. An
+ * agent running this from a worktree was reading and clicking his frontend
+ * rather than its own. `scripts/qa` now gives every instance a dev server of
+ * its own and records the port in `.qa/<instance>/vite.json`, so when
+ * MACH_QA_INSTANCE names an instance that is up, that is the server to use.
+ *
+ * :9333 is worse, because `ensureChrome` puts down a browser it thinks is
+ * wedged with `pkill -f remote-debugging-port=9333` — which is every other
+ * agent's browser too. Derived from the dev-server port, one debugger per
+ * instance, so nobody kills anybody.
+ *
+ * MACH_WEB_URL and MACH_CDP_PORT still win when set.
+ */
+function instanceDevPort(): number | null {
+  const instance = process.env.MACH_QA_INSTANCE;
+  if (!instance || instance === "main") return null;
+  try {
+    const repo = new URL("..", import.meta.url).pathname;
+    const state = JSON.parse(
+      readFileSync(`${repo}.qa/${instance}/vite.json`, "utf8"),
+    );
+    return typeof state.port === "number" ? state.port : null;
+  } catch {
+    // No instance up, or no dev server recorded for it. :1420 below is then the
+    // only thing there is, and it is the owner's — so say so rather than
+    // quietly driving his window.
+    return null;
+  }
+}
+
+const DEV_PORT = instanceDevPort();
+const URL_UNDER_TEST =
+  process.env.MACH_WEB_URL ?? `http://localhost:${DEV_PORT ?? 1420}`;
+const PORT = Number(
+  process.env.MACH_CDP_PORT ?? (DEV_PORT ? 9000 + (DEV_PORT % 1000) : 9333),
+);
 const VIEWPORT = process.env.MACH_VIEWPORT ?? "1440,900";
+
+// Unmissable, because the failure it prevents is silent: reading and clicking
+// the owner's live frontend while believing you are looking at your own.
+if (!process.env.MACH_WEB_URL && DEV_PORT === null && URL_UNDER_TEST.includes(":1420")) {
+  console.error(
+    "webqa: driving http://localhost:1420 — that is the OWNER'S dev server.\n" +
+      "       Bring your own instance up first (MACH_QA_INSTANCE=agent scripts/qa up)\n" +
+      "       and this follows it, or set MACH_WEB_URL explicitly.",
+  );
+}
 
 async function ensureChrome(): Promise<void> {
   // Reuse a live instance so a sequence of commands shares one page — but only

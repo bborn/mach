@@ -3,8 +3,10 @@ import { createKeymap } from "./keymap";
 import {
   connectQaBridge,
   describeUi,
+  parseEditingKey,
   runVerb,
   type QaDom,
+  type QaEdit,
   type QaRequest,
   type QaUiSource,
 } from "./qa-bridge";
@@ -12,10 +14,55 @@ import {
 function dom(overrides: Partial<QaDom> = {}): QaDom {
   return {
     click: () => true,
+    rightClick: () => true,
     count: () => 0,
     overlay: () => null,
     focused: () => null,
+    insertText: () => null,
+    pressKey: () => null,
     ...overrides,
+  };
+}
+
+/**
+ * A field that behaves the way the real ones do, without a DOM.
+ *
+ * The tests run in node (see `vitest.config.ts`), so the browser half of
+ * `qa-bridge` — `execCommand`, `Selection.modify`, the prototype value setter —
+ * has no engine to run against here. What this covers is the half that decides
+ * *what* to ask for and reports what came back, which is where the vocabulary
+ * lives. The rest is proved by driving a real window; see `scripts/qa`.
+ */
+function field(initial = "", options: { swallows?: string[] } = {}) {
+  let value = initial;
+  let caret = initial.length;
+  const swallows = new Set(options.swallows ?? []);
+  const done = (handled: boolean): QaEdit => ({ value, caret, handled });
+
+  return {
+    get value() {
+      return value;
+    },
+    dom: (): QaDom =>
+      dom({
+        focused: () => ({ tagName: "INPUT", name: "To" }),
+        insertText: (text) => {
+          value = value.slice(0, caret) + text + value.slice(caret);
+          caret += text.length;
+          return done(false);
+        },
+        pressKey: (key) => {
+          if (swallows.has(key.key)) return done(true);
+          if (key.key === "Backspace" && (key.meta || key.ctrl)) {
+            value = value.slice(caret);
+            caret = 0;
+          } else if (key.key === "Backspace" && caret > 0) {
+            value = value.slice(0, caret - 1) + value.slice(caret);
+            caret -= 1;
+          }
+          return done(false);
+        },
+      }),
   };
 }
 
@@ -157,6 +204,156 @@ describe("click", () => {
   });
 });
 
+describe("rightclick", () => {
+  /**
+   * The gap this closes.
+   *
+   * `click`'s sequence is pointerdown, mousedown, pointerup, mouseup, click,
+   * and neither of the app's two context menus is reachable from any of them —
+   * both hang off `contextmenu`. Two menus shipped that this harness could not
+   * open at all.
+   */
+  it("goes through the right-click path, not the click one", () => {
+    const opened: string[] = [];
+    const clicked: string[] = [];
+    const result = runVerb(
+      { verb: "rightclick", argument: '[data-thread-id="41774"]' },
+      env({
+        dom: dom({
+          click: (selector) => (clicked.push(selector), true),
+          rightClick: (selector) => (opened.push(selector), true),
+        }),
+      }),
+    );
+
+    expect(opened).toEqual(['[data-thread-id="41774"]']);
+    expect(clicked).toEqual([]);
+    expect(result).toMatchObject({ ok: true, verb: "rightclick", matched: true });
+  });
+
+  it("fails rather than passing silently when nothing matched", () => {
+    const result = runVerb(
+      { verb: "rightclick", argument: ".nope" },
+      env({ dom: dom({ rightClick: () => false }) }),
+    );
+    expect(result).toMatchObject({ ok: false, matched: false });
+  });
+});
+
+describe("type", () => {
+  /**
+   * The gap this closes.
+   *
+   * `key` runs a token through the keymap, which answers "what does this
+   * *binding* do" and cannot put a character anywhere. Every composer bug in
+   * one week — Return, Backspace, ⌘⌫, autolinking, the address typeahead — was
+   * in text input, and the port structurally could not reach any of it.
+   */
+  it("puts the text in and reads back what landed", () => {
+    const to = field();
+    const result = runVerb(
+      { verb: "type", argument: "someone@example.com" },
+      env({ dom: to.dom() }),
+    );
+
+    expect(to.value).toBe("someone@example.com");
+    expect(result).toMatchObject({
+      ok: true,
+      verb: "type",
+      value: "someone@example.com",
+      focused: "INPUT[To]",
+    });
+  });
+
+  it("appends rather than replacing, so a sequence of edits composes", () => {
+    const to = field("a@b.com");
+    const dual = to.dom();
+    runVerb({ verb: "type", argument: ", " }, env({ dom: dual }));
+    runVerb({ verb: "type", argument: "c@d.com" }, env({ dom: dual }));
+    expect(to.value).toBe("a@b.com, c@d.com");
+  });
+
+  /**
+   * "Nothing happened" and "there was nothing to happen to" are different
+   * findings. A composer that opens without taking the caret is a bug this app
+   * has shipped, and a `type` that silently succeeded into nowhere would hide
+   * exactly that.
+   */
+  it("fails when nothing has the caret", () => {
+    const result = runVerb({ verb: "type", argument: "hello" }, env());
+    expect(result).toMatchObject({ ok: false, verb: "type", focused: null });
+    expect(String(result.error)).toContain("caret");
+  });
+});
+
+describe("press", () => {
+  it("performs the edit and reports the field", () => {
+    const to = field("hello");
+    const result = runVerb({ verb: "press", argument: "Backspace" }, env({ dom: to.dom() }));
+
+    expect(to.value).toBe("hell");
+    expect(result).toMatchObject({ ok: true, verb: "press", value: "hell", handled: false });
+  });
+
+  it("reads mod as this platform's modifier", () => {
+    const to = field("a line of text");
+    runVerb({ verb: "press", argument: "mod+Backspace" }, env({ dom: to.dom() }));
+    expect(to.value).toBe("");
+  });
+
+  /**
+   * The app claiming the key is a finding, not a failure. A composer that
+   * swallows Return has not lost a line break, it has sent a message — and the
+   * harness performing the edit anyway would put the app in a state a real
+   * keyboard could never produce.
+   */
+  it("does not edit when the app called preventDefault, and says so", () => {
+    const body = field("draft", { swallows: ["Enter"] });
+    const result = runVerb({ verb: "press", argument: "Enter" }, env({ dom: body.dom() }));
+
+    expect(body.value).toBe("draft");
+    expect(result).toMatchObject({ ok: true, handled: true });
+  });
+
+  it("refuses a key it does not know rather than pressing nothing", () => {
+    const result = runVerb({ verb: "press", argument: "Meh" }, env({ dom: field().dom() }));
+    expect(result).toMatchObject({ ok: false });
+    expect(String(result.error)).toContain("does not know");
+  });
+
+  /** A letter is not a press. Sending one here would edit nothing and pass. */
+  it("sends you to type for a character", () => {
+    const result = runVerb({ verb: "press", argument: "r" }, env({ dom: field().dom() }));
+    expect(String(result.error)).toContain("type");
+  });
+
+  it("fails when nothing has the caret", () => {
+    const result = runVerb({ verb: "press", argument: "Enter" }, env());
+    expect(result).toMatchObject({ ok: false, focused: null });
+  });
+});
+
+describe("parseEditingKey", () => {
+  it("resolves mod per platform", () => {
+    expect(parseEditingKey("mod+Backspace", "meta")).toMatchObject({ meta: true, ctrl: false });
+    expect(parseEditingKey("mod+Backspace", "ctrl")).toMatchObject({ meta: false, ctrl: true });
+  });
+
+  it("takes the spellings a person would reach for", () => {
+    for (const token of ["Enter", "enter", "Return", "esc", "left", "ArrowLeft"]) {
+      expect(parseEditingKey(token, "meta"), token).not.toBeNull();
+    }
+  });
+
+  /**
+   * A dropped modifier turns "⌘⌫ deleted the line" into "Backspace deleted a
+   * character" — a passing assertion about the wrong key.
+   */
+  it("refuses a modifier it does not recognise instead of ignoring it", () => {
+    expect(parseEditingKey("hyper+Backspace", "meta")).toBeNull();
+  });
+});
+
 describe("ui", () => {
   it("reports enough to assert against without reading pixels", () => {
     const report = describeUi(
@@ -186,8 +383,14 @@ describe("ui", () => {
 });
 
 describe("the vocabulary", () => {
-  it("has no fourth verb", () => {
-    for (const verb of ["eval", "js", "exec", "screenshot", ""]) {
+  /**
+   * The count is not the property; "every verb is a fixed word whose argument
+   * is data" is. A selector is matched, text is inserted, a key name is looked
+   * up in a table — nothing here evaluates a string, and there is no spelling
+   * of "run this".
+   */
+  it("has no way to ask the window to run code", () => {
+    for (const verb of ["eval", "js", "exec", "screenshot", "type ", ""]) {
       expect(runVerb({ verb, argument: "1+1" }, env())).toMatchObject({ ok: false });
     }
   });
