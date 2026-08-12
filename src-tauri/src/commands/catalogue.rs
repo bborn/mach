@@ -38,12 +38,18 @@ pub enum ParamType {
     /// A Google calendar id — usually an address, e.g. `alex@example.com`.
     CalendarId,
     /// A whole event: `{ title, startTs, endTs, isAllDay, location,
-    /// description, attendees, recurrence, reminderMinutes }`.
+    /// description, attendees, recurrence, reminderMinutes, conferencing,
+    /// notify }`.
     EventDraft,
     /// A partial event edit: the same fields, all optional.
     EventPatch,
     /// `this` or `all` — which occurrences of a series an edit addresses.
     EventScope,
+    /// `guests`, `externalGuests` or `nobody` — who Google emails about the
+    /// write. Omitted means `guests`.
+    Notify,
+    /// Free text.
+    Text,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -90,6 +96,15 @@ const EVENT_SCOPE: ParamSpec = ParamSpec {
     ty: ParamType::EventScope,
     required: false,
     description: "this (default) for one occurrence, all for the whole series.",
+};
+
+/// Who Google emails. Absent from a call means `guests` — see
+/// `commands::types::Notify` for why silence is not the default.
+const NOTIFY: ParamSpec = ParamSpec {
+    name: "notify",
+    ty: ParamType::Notify,
+    required: false,
+    description: "guests (default), externalGuests, or nobody for a silent write.",
 };
 
 const RESTORE: ParamSpec = ParamSpec {
@@ -233,13 +248,20 @@ pub(crate) const CATALOGUE: &[CommandSpec] = &[
                 required: true,
                 description: "accepted, declined, tentative or needsAction.",
             },
+            ParamSpec {
+                name: "comment",
+                ty: ParamType::Text,
+                required: false,
+                description: "A note to the organizer, sent with the response.",
+            },
+            NOTIFY,
         ],
         undoable: true,
         batch: false,
     },
     CommandSpec {
         kind: "createEvent",
-        summary: "Put a new event on a calendar.",
+        summary: "Put a new event on a calendar, inviting any guests it names.",
         params: &[
             ParamSpec {
                 name: "accountId",
@@ -257,7 +279,8 @@ pub(crate) const CATALOGUE: &[CommandSpec] = &[
                 name: "draft",
                 ty: ParamType::EventDraft,
                 required: true,
-                description: "Title, start and end in unix millis, and anything else to set.",
+                description: "Title, start and end in unix millis, and anything else to set. \
+                              Guests named here are invited unless draft.notify is nobody.",
             },
         ],
         undoable: true,
@@ -265,14 +288,16 @@ pub(crate) const CATALOGUE: &[CommandSpec] = &[
     },
     CommandSpec {
         kind: "updateEvent",
-        summary: "Change an event's title, time, place, description or guests.",
+        summary: "Change an event's title, time, place, description, guests or video call. \
+                  Guests are told unless patch.notify is nobody.",
         params: &[
             EVENT_ID,
             ParamSpec {
                 name: "patch",
                 ty: ParamType::EventPatch,
                 required: true,
-                description: "Only the fields to change. An empty string clears a text field.",
+                description: "Only the fields to change. An empty string clears a text field. \
+                              conferencing: meet adds a Google Meet link, none removes the call.",
             },
             EVENT_SCOPE,
         ],
@@ -281,8 +306,8 @@ pub(crate) const CATALOGUE: &[CommandSpec] = &[
     },
     CommandSpec {
         kind: "deleteEvent",
-        summary: "Remove an event, or every occurrence of its series.",
-        params: &[EVENT_ID, EVENT_SCOPE],
+        summary: "Remove an event, or every occurrence of its series, cancelling with its guests.",
+        params: &[EVENT_ID, EVENT_SCOPE, NOTIFY],
         undoable: true,
         batch: false,
     },
@@ -303,6 +328,7 @@ pub(crate) const CATALOGUE: &[CommandSpec] = &[
                 required: true,
                 description: "The destination calendar id.",
             },
+            NOTIFY,
         ],
         undoable: true,
         batch: false,

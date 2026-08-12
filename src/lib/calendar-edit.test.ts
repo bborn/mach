@@ -18,6 +18,7 @@ import {
   formFromEvent,
   formPatch,
   formTimes,
+  hasMeet,
   isDirty,
   isFormError,
   looksRecurring,
@@ -29,6 +30,7 @@ import {
   timestampFrom,
   utcDateField,
   utcMidnightFrom,
+  wouldNotifyGuests,
   type EventForm,
 } from "./calendar-edit";
 import { DAY, MINUTE } from "./time";
@@ -208,7 +210,25 @@ describe("formPatch — only what changed", () => {
   });
 
   it("names only the title when only the title changed", () => {
-    expect(formPatch(event, { ...base, title: "Renamed" })).toEqual({ title: "Renamed" });
+    // `notify` is on every non-empty patch: it is the answer to "tell the
+    // guests?", and the safe answer is the one nobody had to type.
+    expect(formPatch(event, { ...base, title: "Renamed" })).toEqual({
+      title: "Renamed",
+      notify: "guests",
+    });
+  });
+
+  it("carries the answer to the notify question when one was given", () => {
+    expect(formPatch(event, { ...base, title: "Renamed", notify: "nobody" })).toEqual({
+      title: "Renamed",
+      notify: "nobody",
+    });
+  });
+
+  it("is still undefined when only the notify answer differs", () => {
+    // Saying "do not tell them" about a change that is not there is not a
+    // change, and must not cost a round trip.
+    expect(formPatch(event, { ...base, notify: "nobody" })).toBeUndefined();
   });
 
   it("sends start, end and all-day together for any time change", () => {
@@ -217,6 +237,7 @@ describe("formPatch — only what changed", () => {
       startTs: NINE,
       endTs: NINE + 60 * MINUTE,
       isAllDay: false,
+      notify: "guests",
     });
   });
 
@@ -228,7 +249,10 @@ describe("formPatch — only what changed", () => {
   });
 
   it("clears a text field with an empty string rather than omitting it", () => {
-    expect(formPatch(event, { ...base, location: "" })).toEqual({ location: "" });
+    expect(formPatch(event, { ...base, location: "" })).toEqual({
+      location: "",
+      notify: "guests",
+    });
   });
 
   it("ignores a guest list that was only reordered", () => {
@@ -631,5 +655,124 @@ describe("canEditEvent", () => {
     // Every calendar looks like this until its first metadata sweep lands.
     expect(canEditEvent({ ...event, organizerSelf: true }, mine, undefined)).toBe(true);
     expect(canEditEvent({ ...event, organizerSelf: true }, mine)).toBe(true);
+  });
+});
+
+/**
+ * Telling the guests.
+ *
+ * Everything here is about one field. Google's calendar API notifies nobody
+ * unless the request says `sendUpdates`, Mach never said it, and an event with
+ * three names on it that mailed none of them is indistinguishable — from the
+ * organizer's side — from one that worked. These assertions are the frontend
+ * half of making that impossible: the patch and the draft always carry an
+ * answer, and the answer defaults to the loud direction.
+ */
+describe("who hears about a write", () => {
+  const meeting: CalendarEvent = {
+    ...event,
+    attendees: [
+      { name: "Ada", email: "ada@example.com" },
+      { name: "Bob", email: "bob@example.com" },
+    ],
+  };
+  const base = formFromEvent(meeting);
+
+  it("invites the guests a new event names, without being asked", () => {
+    const draft = formDraft({ ...emptyForm({ calendarId: "c1" }), attendees: "ada@example.com" });
+    if ("error" in draft) throw new Error("expected a draft");
+    expect(draft.notify).toBe("guests");
+    expect(draft.attendees).toEqual([{ name: "ada@example.com", email: "ada@example.com" }]);
+  });
+
+  it("lets a create be silent when it was told to be", () => {
+    const draft = formDraft({
+      ...emptyForm({ calendarId: "c1" }),
+      attendees: "ada@example.com",
+      notify: "nobody",
+    });
+    if ("error" in draft) throw new Error("expected a draft");
+    expect(draft.notify).toBe("nobody");
+  });
+
+  it("does not mail the room for a keystroke copy", () => {
+    // ⌘D lands the copy with nothing in front of it. Twenty invitations from
+    // one keystroke, none of them recallable, is not a thing to default to.
+    expect(duplicateDraft(meeting).notify).toBe("nobody");
+    expect(copyDraft(meeting, { start: NINE, end: NINE + 60 * MINUTE }).notify).toBe("nobody");
+    expect(pasteDraft(meeting, NINE + DAY).notify).toBe("nobody");
+  });
+
+  it("asks about a change the guests would act on", () => {
+    for (const form of [
+      { ...base, title: "Renamed" },
+      { ...base, location: "Room 4" },
+      { ...base, startTime: "10:00", endTime: "10:30" },
+      { ...base, attendees: "ada@example.com" },
+      { ...base, meet: true },
+    ]) {
+      const patch = formPatch(meeting, form);
+      expect(patch).toBeDefined();
+      expect(wouldNotifyGuests(meeting, patch!)).toBe(true);
+    }
+  });
+
+  it("does not ask about a change only the organizer can see", () => {
+    // An alert offset is between the owner and their own phone, and Google does
+    // not mail about it either.
+    const patch = formPatch(meeting, { ...base, reminderMinutes: [15] });
+    expect(patch).toBeDefined();
+    expect(wouldNotifyGuests(meeting, patch!)).toBe(false);
+  });
+
+  it("does not ask when there is nobody to tell", () => {
+    const alone: CalendarEvent = { ...event, attendees: [] };
+    const patch = formPatch(alone, { ...formFromEvent(alone), title: "Gym" });
+    expect(patch).toBeDefined();
+    expect(wouldNotifyGuests(alone, patch!)).toBe(false);
+  });
+
+  it("counts the guest being added, not only the ones already there", () => {
+    const patch = formPatch(meeting, { ...base, attendees: "ada@example.com, cy@example.com" });
+    expect(patch).toBeDefined();
+    // The person joining is the person most in need of the mail.
+    expect(patch!.attendees).toHaveLength(2);
+    expect(wouldNotifyGuests(meeting, patch!)).toBe(true);
+  });
+});
+
+describe("the video call", () => {
+  const withMeet: CalendarEvent = {
+    ...event,
+    conference: {
+      id: "abc-defg-hij",
+      name: "Google Meet",
+      entryPoints: [{ kind: "video", uri: "https://meet.google.com/abc-defg-hij" }],
+    },
+  };
+
+  it("reads a real conference and not a link scraped out of the notes", () => {
+    expect(hasMeet(withMeet)).toBe(true);
+    // A Zoom URL in the description is a call you can join and not a thing
+    // Google will take off the event, so the tick stays off.
+    expect(hasMeet({ ...event, description: "https://zoom.us/j/123" })).toBe(false);
+  });
+
+  it("asks for a link on a new event", () => {
+    const draft = formDraft({ ...emptyForm({ calendarId: "c1" }), meet: true });
+    if ("error" in draft) throw new Error("expected a draft");
+    expect(draft.conferencing).toBe("meet");
+  });
+
+  it("adds and removes one on an existing event, and says nothing otherwise", () => {
+    expect(formPatch(event, { ...formFromEvent(event), meet: true })?.conferencing).toBe("meet");
+    expect(formPatch(withMeet, { ...formFromEvent(withMeet), meet: false })?.conferencing).toBe(
+      "none",
+    );
+    // Opening a meeting that already has a call and renaming it must not
+    // re-request the conference — that would retire a link people are using.
+    expect(formPatch(withMeet, { ...formFromEvent(withMeet), title: "x" })?.conferencing).toBe(
+      undefined,
+    );
   });
 });

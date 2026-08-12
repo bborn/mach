@@ -54,6 +54,75 @@ impl EventScope {
     }
 }
 
+/// Whether Google should tell the event's guests about this write.
+///
+/// # Why the default is "tell them"
+///
+/// Google's calendar API notifies nobody unless the request says `sendUpdates`.
+/// Mach never said it, so for as long as this vocabulary has existed, an event
+/// created here with three guests on it went onto one calendar and no others,
+/// and nobody was told. The organizer's own view is indistinguishable from the
+/// working case — the names are all there, in the right order, awaiting a reply
+/// that was never asked for.
+///
+/// That failure is silent and one-directional, so the default is the loud
+/// direction. Over-notifying costs an email nobody needed; under-notifying costs
+/// a meeting nobody attends.
+///
+/// # And why it is not undoable
+///
+/// An invitation cannot be recalled. A command that notified guests still has an
+/// exact *calendar* inverse — the event goes back to what it was, and the guests
+/// are told about that too — but the emails already sent stay sent, so the
+/// commands below report what they did in `message` and what ⌘Z can honour in
+/// `undo_label`. See [`CommandResult::undo_label`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Notify {
+    /// Everyone on the invitation hears about it — Google's `sendUpdates=all`.
+    #[default]
+    Guests,
+    /// Guests outside this Workspace domain only.
+    ExternalGuests,
+    /// A silent write. Real, and never a default: fixing a typo in the notes of
+    /// a thirty-person meeting should not email thirty people.
+    Nobody,
+}
+
+impl Notify {
+    pub fn as_send_updates(self) -> crate::google::types::SendUpdates {
+        use crate::google::types::SendUpdates;
+        match self {
+            Notify::Guests => SendUpdates::All,
+            Notify::ExternalGuests => SendUpdates::ExternalOnly,
+            Notify::Nobody => SendUpdates::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Notify::Guests => "guests",
+            Notify::ExternalGuests => "externalGuests",
+            Notify::Nobody => "nobody",
+        }
+    }
+}
+
+/// What to do about an event's video call.
+///
+/// Google will not take a Meet URL you hand it. The only way onto an event is to
+/// ask for a conference with a `createRequest` and read the minted link back off
+/// the response, which is why this is a verb ("make me one", "take it off")
+/// rather than a field holding a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Conferencing {
+    /// Ask Google for a Meet link.
+    Meet,
+    /// Remove whatever call is on the event.
+    None,
+}
+
 /// Everything needed to bring an event into being.
 ///
 /// `recurrence` and `reminderMinutes` used to be write-only — sendable but with
@@ -84,6 +153,23 @@ pub struct EventDraft {
     pub recurrence: Vec<String>,
     /// Popup reminder offsets in minutes. `None` leaves Google's defaults on.
     pub reminder_minutes: Option<Vec<i64>>,
+    /// Ask Google to mint a Meet link for this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conferencing: Option<Conferencing>,
+    /// Who hears about it. Absent means [`Notify::Guests`] — see [`Notify`].
+    ///
+    /// It rides on the draft rather than on [`Command::CreateEvent`] because the
+    /// draft is the whole payload the editor produces, and the answer to "should
+    /// I invite these people" is made in the same breath as the guest list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<Notify>,
+}
+
+impl EventDraft {
+    /// Who to tell, resolved. See [`Notify`] for why silence is not the default.
+    pub fn notify(&self) -> Notify {
+        self.notify.unwrap_or_default()
+    }
 }
 
 /// A partial edit: every field is optional, and only the named ones change.
@@ -103,12 +189,43 @@ pub struct EventPatch {
     pub attendees: Option<Vec<Participant>>,
     pub recurrence: Option<Vec<String>>,
     pub reminder_minutes: Option<Vec<i64>>,
+    /// Add or remove the video call. See [`Conferencing`].
+    pub conferencing: Option<Conferencing>,
+    /// Who hears about it. Absent means [`Notify::Guests`] — see [`Notify`].
+    pub notify: Option<Notify>,
 }
 
 impl EventPatch {
     /// True when the patch names nothing — a command that would be a no-op.
+    ///
+    /// `notify` is excluded on purpose: it is a directive about the *request*,
+    /// not a field of the event, so a patch carrying only an answer to "tell the
+    /// guests?" still changes nothing and still deserves no round trip.
     pub fn is_empty(&self) -> bool {
-        self == &EventPatch::default()
+        EventPatch {
+            notify: None,
+            ..self.clone()
+        } == EventPatch::default()
+    }
+
+    /// Who to tell, resolved. See [`Notify`] for why silence is not the default.
+    pub fn notify(&self) -> Notify {
+        self.notify.unwrap_or_default()
+    }
+
+    /// True when the change is one a guest would want to hear about.
+    ///
+    /// The time, the place, the name, the call and the guest list are all things
+    /// a person acts on. A reminder offset is between the organizer and their own
+    /// phone, and Google itself does not treat it as an update worth mailing.
+    pub fn guests_would_care(&self) -> bool {
+        self.title.is_some()
+            || self.description.is_some()
+            || self.location.is_some()
+            || self.attendees.is_some()
+            || self.recurrence.is_some()
+            || self.conferencing.is_some()
+            || self.touches_time()
     }
 
     /// True when the patch would move the event in time.
@@ -231,11 +348,23 @@ pub enum Command {
     #[serde(rename_all = "camelCase")]
     Unsnooze { thread_ids: Vec<i64> },
 
-    /// Respond to a calendar invitation.
+    /// Respond to a calendar invitation, optionally with a note.
+    ///
+    /// `comment` is Google Calendar's line next to the three buttons — "Yes,
+    /// I'll be ten minutes late". It replaces whatever note is on the account's
+    /// own attendee row; `None` leaves it alone.
+    ///
+    /// `notify` defaults to telling the organizer, which is what pressing the
+    /// same button in Google Calendar does. A response nobody is told about is
+    /// visible in the organizer's calendar and in no mailbox.
     #[serde(rename_all = "camelCase")]
     Rsvp {
         event_id: i64,
         response: RsvpStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify: Option<Notify>,
     },
 
     /// Put a new event on a calendar. Inverse: [`Command::DeleteEvent`] naming
@@ -261,20 +390,32 @@ pub enum Command {
     /// Remove an event. Inverse: [`Command::CreateEvent`] rebuilt from the row
     /// as it stood — and `None` for a recurring occurrence, which cannot be put
     /// back into its series by any endpoint Google offers.
+    ///
+    /// `notify` carries the cancellation. It lives on the command rather than in
+    /// a payload because a delete has no payload; absent means guests are told,
+    /// for the reason in [`Notify`].
     #[serde(rename_all = "camelCase")]
     DeleteEvent {
         event_id: i64,
         #[serde(default)]
         scope: EventScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify: Option<Notify>,
     },
 
     /// Move an event to another calendar, possibly on another account.
     /// Inverse: the same command pointing back at where it came from.
+    ///
+    /// A move is an insert plus a delete, so `notify` decides both halves — and
+    /// with `Notify::Guests` the guests get one cancellation and one fresh
+    /// invitation, which is the honest description of what happened to them.
     #[serde(rename_all = "camelCase")]
     MoveEvent {
         event_id: i64,
         account_id: i64,
         calendar_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify: Option<Notify>,
     },
 }
 
@@ -363,8 +504,17 @@ pub struct CommandResult {
     /// What the ⌘Z entry should say, when that is **less** than [`Self::message`].
     ///
     /// Normally the two are the same sentence and this is `None`. It is filled
-    /// in when a command did something its inverse cannot take back, which today
-    /// means exactly one thing: trashing a selection that held drafts. Gmail's
+    /// in when a command did something its inverse cannot take back, of which
+    /// there are two cases.
+    ///
+    /// The second one is **telling the guests**. An invitation, an update or a
+    /// cancellation that has gone out cannot be recalled — ⌘Z on a created event
+    /// deletes it and sends a cancellation, which is the correct thing to do to
+    /// the calendar and does nothing about the mail already in three inboxes. So
+    /// "Created “Board call” · invited 3 guests" is the truth about what
+    /// happened, and "Created “Board call”" is the truth about what ⌘Z takes
+    /// back. The first is the older case: trashing a selection that held drafts.
+    /// Gmail's
     /// `drafts.delete` is permanent, so "Trashed 3 conversations · discarded 1
     /// draft" is the truth about what happened and "Trashed 3 conversations" is
     /// the truth about what ⌘Z would do. A button that offers the first is

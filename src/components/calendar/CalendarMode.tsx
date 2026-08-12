@@ -11,6 +11,7 @@ import {
   type Command,
   type EventDraft,
   type EventScope,
+  type Notify,
 } from "@/lib/data";
 import type { KeyBinding } from "@/lib/keymap";
 import { assignHues, FALLBACK_FILLS, fallbackFill, type CalendarColor } from "@/lib/calendar-palette";
@@ -776,10 +777,16 @@ export function CalendarMode() {
   );
 
   const deleteEvent = useCallback(
-    (id: EventId, scope: EventScope) => {
+    /*
+     * `notify` is the guests' half of a deletion, and it is not a detail: a
+     * meeting that vanishes from your calendar and stays on everybody else's is
+     * the failure this whole change exists to end. Absent means tell them —
+     * the same default Google Calendar's own delete has.
+     */
+    (id: EventId, scope: EventScope, notify?: Notify) => {
       const event = allEvents.find((e) => e.id === id);
       if (event && !guardEdit(event)) return;
-      void run({ kind: "deleteEvent", eventId: id, scope }).then((result) => {
+      void run({ kind: "deleteEvent", eventId: id, scope, notify }).then((result) => {
         if (!result?.ok) return;
         setModal(null);
         dispatch({ type: "event", eventId: null });
@@ -1529,7 +1536,7 @@ export function CalendarMode() {
         contacts={contacts}
         onClose={closeModal}
         onSave={saveForm}
-        onDelete={(scope) => modalEvent && deleteEvent(modalEvent.id, scope)}
+        onDelete={(scope, notify) => modalEvent && deleteEvent(modalEvent.id, scope, notify)}
         onDuplicate={() => modalEvent && duplicate(modalEvent)}
         onRsvp={(response) => modalEvent && rsvp(modalEvent.id, response)}
         onOpenExternal={openExternal}

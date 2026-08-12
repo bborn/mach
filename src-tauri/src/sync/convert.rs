@@ -375,7 +375,12 @@ fn person_of(person: &g::EventPerson) -> Option<Participant> {
 ///
 /// An entry point with no `uri` is dropped. There is nothing to show and nothing
 /// to dial, and a row that renders as an empty line is worse than no row.
-fn conference_of(event: &g::Event) -> Option<EventConference> {
+///
+/// `pub(crate)` because the write path needs it too: `events.insert` answers
+/// with the conference Google just minted, and reading it straight off the
+/// response is what puts a Join button on a new meeting now rather than at the
+/// next sync.
+pub(crate) fn conference_of(event: &g::Event) -> Option<EventConference> {
     let data = event.conference_data.as_ref();
 
     let mut entry_points: Vec<ConferenceEntry> = data

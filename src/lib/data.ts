@@ -74,6 +74,28 @@ export interface ThreadLabelState {
  */
 export type EventScope = "this" | "all";
 
+/**
+ * Who Google emails about a write to an event.
+ *
+ * **Omitting this means `guests`, and that is the whole point of the field.**
+ * Google's calendar API notifies nobody unless the request says `sendUpdates`.
+ * Mach never said it, so an event created here with three guests on it went onto
+ * one calendar and no others, and none of the three were told — a failure that
+ * looks identical to the working case from the organizer's side.
+ *
+ * `nobody` is a real thing to want (fixing a typo in the notes of a thirty-person
+ * meeting) and it is never the default.
+ */
+export type Notify = "guests" | "externalGuests" | "nobody";
+
+/**
+ * What to do about an event's video call.
+ *
+ * A verb, not a URL: Google will not accept a Meet link you hand it. The only
+ * way onto an event is to ask for one and read back the code Google minted.
+ */
+export type Conferencing = "meet" | "none";
+
 /** Everything needed to bring an event into being. Times are epoch millis. */
 export interface EventDraft {
   title: string;
@@ -87,6 +109,16 @@ export interface EventDraft {
   recurrence: string[];
   /** Popup reminder offsets in minutes. Omit to keep Google's defaults. */
   reminderMinutes?: number[];
+  /** `meet` asks Google for a Meet link. */
+  conferencing?: Conferencing;
+  /**
+   * Who hears about it. Omitted invites the guests — see {@link Notify}.
+   *
+   * It rides on the draft rather than beside it because the draft is the whole
+   * payload the editor produces, and the answer to "should I invite these
+   * people" is made in the same breath as the guest list.
+   */
+  notify?: Notify;
 }
 
 /**
@@ -107,6 +139,14 @@ export interface EventPatch {
   attendees?: Participant[];
   recurrence?: string[];
   reminderMinutes?: number[];
+  conferencing?: Conferencing;
+  /**
+   * Who hears about it. Omitted tells the guests — see {@link Notify}.
+   *
+   * It does not count towards "did anything change": a patch carrying only an
+   * answer to "tell the guests?" is still a no-op, and still costs no request.
+   */
+  notify?: Notify;
 }
 
 export type Command =
@@ -121,7 +161,14 @@ export type Command =
   | { kind: "untrash"; threadIds: ThreadId[]; restore?: ThreadLabelState[] }
   | { kind: "snooze"; threadIds: ThreadId[]; until: number }
   | { kind: "unsnooze"; threadIds: ThreadId[] }
-  | { kind: "rsvp"; eventId: EventId; response: Rsvp }
+  | {
+      kind: "rsvp";
+      eventId: EventId;
+      response: Rsvp;
+      /** A note to the organizer, sent with the response. */
+      comment?: string;
+      notify?: Notify;
+    }
   | {
       kind: "createEvent";
       accountId: AccountId;
@@ -129,12 +176,13 @@ export type Command =
       draft: EventDraft;
     }
   | { kind: "updateEvent"; eventId: EventId; patch: EventPatch; scope?: EventScope }
-  | { kind: "deleteEvent"; eventId: EventId; scope?: EventScope }
+  | { kind: "deleteEvent"; eventId: EventId; scope?: EventScope; notify?: Notify }
   | {
       kind: "moveEvent";
       eventId: EventId;
       accountId: AccountId;
       calendarId: CalendarId;
+      notify?: Notify;
     };
 
 export type CommandKind = Command["kind"];

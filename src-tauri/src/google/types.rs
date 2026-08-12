@@ -719,6 +719,62 @@ pub struct EventPerson {
     pub is_self: bool,
 }
 
+/// Who Google emails about a write to an event.
+///
+/// **This is the parameter that decides whether an invitation is ever sent.**
+/// Google's calendar API does not notify anybody by default: an `events.insert`
+/// carrying three attendees and no `sendUpdates` puts the event on the
+/// organizer's calendar, records the three names on it, and tells none of them.
+/// The event exists, the guest list is right, and the guests do not know — which
+/// is worse than no event at all, because the organizer believes it is on their
+/// calendar too.
+///
+/// So every write in this file takes one of these explicitly. There is no
+/// "leave it out and let Google decide", because what Google decides is silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendUpdates {
+    /// Tell everyone on the invitation.
+    All,
+    /// Tell only guests outside this Google Workspace domain — Google's
+    /// concession to organisations whose people all see the calendar anyway.
+    ExternalOnly,
+    /// Tell nobody. A silent write, which is a legitimate thing to want (a typo
+    /// in the description of a thirty-person meeting) and never a default.
+    None,
+}
+
+impl SendUpdates {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SendUpdates::All => "all",
+            SendUpdates::ExternalOnly => "externalOnly",
+            SendUpdates::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for SendUpdates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `conferenceData` block that asks Google to mint a new Meet link.
+///
+/// Google will not create a conference from a URL you hand it — the only way to
+/// get a Meet link on an event is to ask for one with a `createRequest` and read
+/// the answer back off the response. `request_id` is the idempotency key: repeat
+/// the same one and Google returns the conference it already made rather than a
+/// second one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConferenceCreateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conference_solution_key: Option<ConferenceSolutionKey>,
+}
+
 /// The four values Google accepts for an attendee's `responseStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseStatus {
@@ -855,6 +911,10 @@ pub struct ConferenceData {
     pub conference_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conference_solution: Option<ConferenceSolution>,
+    /// Only ever *sent*, never received: this is how a client asks for a Meet
+    /// link. See [`ConferenceCreateRequest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request: Option<ConferenceCreateRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_points: Vec<ConferenceEntryPoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

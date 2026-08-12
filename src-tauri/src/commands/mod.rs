@@ -59,7 +59,8 @@ pub use clients::{AccountClients, GoogleClients};
 pub use filters::{AccountFilter, ScopeNotices};
 pub use error::{CommandError, CommandFailure, FailureKind};
 pub use types::{
-    Command, CommandResult, EventDraft, EventPatch, EventScope, ThreadLabelState,
+    Command, CommandResult, Conferencing, EventDraft, EventPatch, EventScope, Notify,
+    ThreadLabelState,
 };
 
 use crate::db::command_queries;
@@ -127,8 +128,20 @@ impl CommandDispatcher {
     /// caller needs the per-id breakdown that a plain error cannot carry.
     pub async fn execute(&self, command: Command) -> Result<CommandResult, CommandError> {
         match command {
-            Command::Rsvp { event_id, response } => {
-                calendar::execute_rsvp(self, event_id, response).await
+            Command::Rsvp {
+                event_id,
+                response,
+                comment,
+                notify,
+            } => {
+                calendar::execute_rsvp(
+                    self,
+                    event_id,
+                    response,
+                    comment.as_deref(),
+                    notify.unwrap_or_default(),
+                )
+                .await
             }
             Command::CreateEvent {
                 account_id,
@@ -140,14 +153,26 @@ impl CommandDispatcher {
                 patch,
                 scope,
             } => calendar::execute_update(self, event_id, &patch, scope).await,
-            Command::DeleteEvent { event_id, scope } => {
-                calendar::execute_delete(self, event_id, scope).await
-            }
+            Command::DeleteEvent {
+                event_id,
+                scope,
+                notify,
+            } => calendar::execute_delete(self, event_id, scope, notify.unwrap_or_default()).await,
             Command::MoveEvent {
                 event_id,
                 account_id,
                 calendar_id,
-            } => calendar::execute_move(self, event_id, account_id, &calendar_id).await,
+                notify,
+            } => {
+                calendar::execute_move(
+                    self,
+                    event_id,
+                    account_id,
+                    &calendar_id,
+                    notify.unwrap_or_default(),
+                )
+                .await
+            }
             other => mail::execute(self, &other).await,
         }
     }
