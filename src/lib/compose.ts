@@ -204,9 +204,28 @@ async function call<T>(payload: Record<string, unknown>): Promise<T> {
   return invoke<T>("send_message", { draft: payload });
 }
 
-export async function prepareDraft(threadId: number, kind: DraftKind): Promise<Draft> {
-  if (!isTauri()) return localPrepare(threadId, kind);
-  const result = await call<{ draft: Draft }>({ op: "prepare", threadId, kind });
+/**
+ * A draft pre-filled from a conversation.
+ *
+ * `replyToId` names the message being answered. Without it the newest message
+ * in the thread is the parent — what the strip under the conversation has
+ * always meant — and with it the reply belongs to that one message: its
+ * recipients, its quoted block, its place in the `References` chain. Rust reads
+ * the thread back off the message, so the two arguments cannot disagree about
+ * which conversation this is.
+ */
+export async function prepareDraft(
+  threadId: number,
+  kind: DraftKind,
+  replyToId?: number | null,
+): Promise<Draft> {
+  if (!isTauri()) return localPrepare(threadId, kind, replyToId);
+  const result = await call<{ draft: Draft }>({
+    op: "prepare",
+    threadId,
+    kind,
+    messageId: replyToId ?? undefined,
+  });
   return result.draft;
 }
 
@@ -1108,13 +1127,19 @@ function localLookup(key: string): Draft | null {
  * addressed, with a subject. It used to answer an empty draft, which made the
  * one keystroke this file exists to support unexercisable outside Tauri.
  */
-function localPrepare(threadId: number, kind: DraftKind): Draft {
+function localPrepare(threadId: number, kind: DraftKind, replyToId?: number | null): Draft {
   const thread = fixtures.threads.find((t) => t.id === threadId);
   const messages = fixtures.messagesByThread.get(threadId) ?? [];
-  // Not the last message: a draft mirrored into the conversation is one, and
-  // threading a reply onto your own unsent text is `context_for_thread`'s bug
-  // to avoid here too.
-  const parent = [...messages].reverse().find((m) => !m.isDraft) ?? messages[messages.length - 1];
+  // The message being answered when one was named, and otherwise not the last
+  // message: a draft mirrored into the conversation is one, and threading a
+  // reply onto your own unsent text is `context_for_thread`'s bug to avoid here
+  // too. A named message that is a draft, or is not in this conversation, falls
+  // back the same way rather than producing a reply to nothing.
+  const named = replyToId == null ? undefined : messages.find((m) => m.id === replyToId);
+  const parent =
+    (named && !named.isDraft ? named : undefined) ??
+    [...messages].reverse().find((m) => !m.isDraft) ??
+    messages[messages.length - 1];
   const accountId = thread?.accountId ?? parent?.accountId ?? 0;
   const account = fixtures.accounts.find((a) => a.id === accountId);
   const subject = thread?.subject ?? "";

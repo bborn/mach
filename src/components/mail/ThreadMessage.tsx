@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import {
   Download,
+  EllipsisVertical,
   File,
   FileArchive,
   FileAudio,
@@ -30,6 +31,7 @@ import {
 } from "@/lib/attachments";
 import { errorMessage } from "@/lib/ipc";
 import { MessageBody } from "./MessageBody";
+import { MESSAGE_CURSOR, MESSAGE_DRAFT, MESSAGE_ROW } from "./thread-cursor";
 
 export interface ThreadMessageProps {
   message: Message;
@@ -41,6 +43,11 @@ export interface ThreadMessageProps {
    * reading pane resolves the row back to its editable copy.
    */
   onOpenDraft?: () => void;
+  /**
+   * Answer *this* message: the pointer's route to reply / reply all / forward.
+   * The anchor is the control that was activated, so the menu hangs off it.
+   */
+  onMenu?: (anchor: Element) => void;
 }
 
 /**
@@ -66,6 +73,19 @@ export interface ThreadMessageProps {
  * activating it opens the draft in the composer rather than unfolding a
  * read-only copy of text nobody has finished writing. There is no expand state
  * for a draft, because editing it is the only thing anyone wants from it.
+ *
+ * # Every message can be answered
+ *
+ * A thread of eleven is eleven questions, not one, and `r` used to mean the
+ * last of them wherever the reader was. So the row carries its own id
+ * (`MESSAGE_ROW`) and its header is the focus stop the conversation's cursor
+ * moves between — `n` and `p` in `ReadingPane`, Gmail's keys for the same
+ * movement. `r`, `a` and `f` then answer whichever message holds the keyboard;
+ * see `thread-cursor.ts`.
+ *
+ * The pointer gets the same three verbs from the ⋮ beside the timestamp rather
+ * than from a row of buttons under every message: eleven of those is a wall of
+ * controls in a conversation that is meant to be read.
  */
 export function ThreadMessage({
   message,
@@ -73,62 +93,97 @@ export function ThreadMessage({
   expanded,
   onToggle,
   onOpenDraft,
+  onMenu,
 }: ThreadMessageProps) {
   const attachments = message.attachments;
   const draft = message.isDraft;
 
   return (
     <article
+      {...{ [MESSAGE_ROW]: message.id }}
+      {...(draft ? { [MESSAGE_DRAFT]: "" } : {})}
       data-draft={draft || undefined}
       className={cn(
-        "border-t border-border py-3 first:border-t-0",
+        "group/message border-t border-border py-3 first:border-t-0",
         // A second, redundant mark, for the reader scanning down the left edge
         // rather than reading the row. Redundancy is the point: neither this
         // nor the pill is the only thing saying "unsent".
         draft && "-ml-3 border-l-2 border-l-danger pl-3",
       )}
     >
-      <button
-        type="button"
-        onClick={draft ? onOpenDraft : onToggle}
-        aria-expanded={draft ? undefined : expanded}
-        title={draft ? "Edit draft" : undefined}
-        className={cn(
-          "-mx-2 flex w-[calc(100%+1rem)] items-baseline gap-2 rounded-[var(--radius)] px-2 py-1 text-left",
-          "hover:bg-row-hover",
-        )}
-      >
-        {draft && (
-          <span className="shrink-0 rounded-[3px] border border-danger px-1 font-medium text-micro uppercase tracking-wide text-danger">
-            Draft
+      <div className="-mx-2 flex items-baseline gap-0.5">
+        <button
+          type="button"
+          {...{ [MESSAGE_CURSOR]: "" }}
+          onClick={draft ? onOpenDraft : onToggle}
+          aria-expanded={draft ? undefined : expanded}
+          title={draft ? "Edit draft" : undefined}
+          className={cn(
+            "flex min-w-0 flex-1 items-baseline gap-2 rounded-[var(--radius)] px-2 py-1 text-left",
+            "hover:bg-row-hover",
+          )}
+        >
+          {draft && (
+            <span className="shrink-0 rounded-[3px] border border-danger px-1 font-medium text-micro uppercase tracking-wide text-danger">
+              Draft
+            </span>
+          )}
+          <span className="shrink-0 truncate text-body font-medium text-foreground">
+            {message.from.name}
           </span>
-        )}
-        <span className="shrink-0 truncate text-body font-medium text-foreground">
-          {message.from.name}
-        </span>
-        {expanded && !draft ? (
-          <span className="min-w-0 flex-1 truncate text-micro text-faint-foreground">
-            {message.from.email}
+          {expanded && !draft ? (
+            <span className="min-w-0 flex-1 truncate text-micro text-faint-foreground">
+              {message.from.email}
+            </span>
+          ) : (
+            <span className="min-w-0 flex-1 truncate text-list text-muted-foreground">
+              {preview(message)}
+            </span>
+          )}
+          {attachments.length > 0 && (
+            <Paperclip size={12} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
+          )}
+          {/*
+            One span for the whole stamp, and `whitespace-nowrap` so the day and
+            the clock can never be broken apart at the space between them. There
+            is no tooltip behind it: the weekday form is only ever used for the
+            six days behind today, so every label the column can draw is already
+            exact on its own.
+          */}
+          <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-faint-foreground">
+            {messageTime(message.timestamp)}
           </span>
-        ) : (
-          <span className="min-w-0 flex-1 truncate text-list text-muted-foreground">
-            {preview(message)}
-          </span>
-        )}
-        {attachments.length > 0 && (
-          <Paperclip size={12} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
-        )}
+        </button>
+
         {/*
-          One span for the whole stamp, and `whitespace-nowrap` so the day and
-          the clock can never be broken apart at the space between them. There
-          is no tooltip behind it: the weekday form is only ever used for the
-          six days behind today, so every label the column can draw is already
-          exact on its own.
+          The pointer's way to answer this message rather than the last one.
+          Hidden until the row is hovered or holds the keyboard — the same
+          treatment the list's favourite star gets — because eleven of these
+          drawn at rest is a column of dots down a conversation.
+
+          `focus-within` is what keeps it off the hover-only list: `n` and `p`
+          put the keyboard on the row and the control appears with it, and
+          every item behind it also has a key, so nothing here is the only
+          route to anything.
         */}
-        <span className="shrink-0 whitespace-nowrap font-mono text-micro tabular-nums text-faint-foreground">
-          {messageTime(message.timestamp)}
-        </span>
-      </button>
+        {onMenu && !draft && (
+          <button
+            type="button"
+            aria-haspopup="menu"
+            aria-label={`Reply to the message from ${message.from.name}`}
+            title="Reply, reply all, forward"
+            onClick={(event) => onMenu(event.currentTarget)}
+            className={cn(
+              "mr-2 shrink-0 self-center rounded-[var(--radius)] p-1 opacity-0",
+              "text-faint-foreground hover:bg-row-hover hover:text-foreground",
+              "focus-visible:opacity-100 group-hover/message:opacity-100",
+              "group-focus-within/message:opacity-100",
+            )}
+          >
+            <EllipsisVertical size={14} strokeWidth={1.75} />
+          </button>
+        )}
+      </div>
 
       {expanded && !draft && (
         <>

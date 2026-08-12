@@ -6,6 +6,7 @@ import type { KeyBinding } from "@/lib/keymap";
 import { keyEventFromToken } from "@/lib/menu";
 import { selectOnly, type Selection } from "@/lib/selection";
 import { openSearch } from "@/components/search/palette";
+import { replyTarget } from "./thread-cursor";
 import {
   ContextMenu,
   ContextMenuItem,
@@ -150,11 +151,18 @@ export function ThreadContextMenu({ children }: { children: ReactNode }) {
 
   /* ------------------------------------------------------------- keyboard --- */
 
+  /*
+   * `replyTarget() === null` is the reading pane's claim on the same key. With
+   * the cursor on a message inside the open conversation, ⇧F10 is that
+   * message's menu — the two are mutually exclusive rather than racing, in the
+   * manner of the two Escapes in `MailMode`.
+   */
   const canOpenFromKeyboard = () =>
     ui.mode === "mail" &&
     ui.focus === "list" &&
     ui.threadId !== null &&
     menu === null &&
+    replyTarget() === null &&
     !overlayOwnsKeyboard(ui);
 
   const openAtCursor = () => {

@@ -19,7 +19,7 @@
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use crate::db::models::{Message, Participant};
+use crate::db::models::{Message, Participant, ThreadSummary};
 use crate::db::{command_queries, queries, Db};
 
 use super::address::{forward_recipients, reply_recipients_for};
@@ -329,7 +329,59 @@ pub fn context_for_thread(db: &Db, thread_id: i64) -> Result<ReplyContext> {
         .cloned()
         .ok_or_else(|| ComposeError::invalid("that conversation has no messages to reply to"))?;
 
-    let account_id = detail.thread.account_id;
+    context_around(db, detail.thread, parent)
+}
+
+/// The same context, aimed at **one message** rather than at the newest one.
+///
+/// A long conversation is not a single question: answering the fourth message
+/// of eleven has to produce a reply whose `In-Reply-To`, `References`,
+/// recipients and quoted block all come from *that* message. Every one of those
+/// is derived from [`ReplyContext::parent`], so pointing the parent somewhere
+/// else is the whole of it — nothing downstream needs to know which route the
+/// context arrived by.
+///
+/// The thread is read from the message rather than passed in beside it, so a
+/// message id and a thread id can never disagree about which conversation this
+/// belongs to.
+pub fn context_for_message(db: &Db, message_id: i64) -> Result<ReplyContext> {
+    let thread_id: Option<i64> = db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT thread_id FROM messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .ok())
+    })?;
+    let thread_id = thread_id.ok_or(ComposeError::UnknownMessage(message_id))?;
+    let detail = db
+        .read(|conn| queries::thread_with_messages(conn, thread_id))?
+        .ok_or(ComposeError::UnknownThread(thread_id))?;
+    let parent = detail
+        .messages
+        .iter()
+        .find(|m| m.id == message_id)
+        .cloned()
+        .ok_or(ComposeError::UnknownMessage(message_id))?;
+    // A draft is not something to answer. The reading pane renders one as a
+    // message row (see [`super::mirror`]), so it is a row the pointer can
+    // reach; threading a reply onto the user's own unsent text is the mistake
+    // `context_for_thread` skips drafts to avoid, and it must not come back in
+    // through this door.
+    if parent.is_draft {
+        return Err(ComposeError::invalid(
+            "that message is an unsent draft, not something to answer",
+        ));
+    }
+
+    context_around(db, detail.thread, parent)
+}
+
+/// Everything a context needs that is not the parent: which account, and which
+/// conversation.
+fn context_around(db: &Db, thread: ThreadSummary, parent: Message) -> Result<ReplyContext> {
+    let account_id = thread.account_id;
     let accounts = db.read(queries::list_accounts)?;
     let account = accounts
         .iter()
@@ -343,9 +395,9 @@ pub fn context_for_thread(db: &Db, thread_id: i64) -> Result<ReplyContext> {
         account_email: account.email,
         account_name: account.display_name,
         my_addresses,
-        thread_id,
-        gmail_thread_id: detail.thread.gmail_thread_id,
-        thread_subject: detail.thread.subject,
+        thread_id: thread.id,
+        gmail_thread_id: thread.gmail_thread_id,
+        thread_subject: thread.subject,
         parent,
     })
 }
@@ -374,8 +426,26 @@ impl ReplyContext {
 /// wrote to; picking a different one is how a reply ends up in somebody's spam
 /// folder and how a work thread accidentally answers from a personal address.
 pub fn prepare(db: &Db, thread_id: i64, kind: DraftKind, draft_id: String) -> Result<Draft> {
-    let ctx = context_for_thread(db, thread_id)?;
+    Ok(prepared(context_for_thread(db, thread_id)?, kind, draft_id))
+}
 
+/// A draft, pre-filled from **one message** rather than from the newest one in
+/// its conversation.
+///
+/// What `r` on the fourth message of eleven reaches. Everything that makes a
+/// reply land in the right place comes from the parent — the `In-Reply-To` and
+/// `References` chain in [`build`], the recipients here, the quoted block — so
+/// this and [`prepare`] differ in exactly one thing: which message that is.
+pub fn prepare_reply_to(
+    db: &Db,
+    message_id: i64,
+    kind: DraftKind,
+    draft_id: String,
+) -> Result<Draft> {
+    Ok(prepared(context_for_message(db, message_id)?, kind, draft_id))
+}
+
+fn prepared(ctx: ReplyContext, kind: DraftKind, draft_id: String) -> Draft {
     let (to, cc, subject) = match kind {
         DraftKind::Forward => {
             let r = forward_recipients();
@@ -393,7 +463,7 @@ pub fn prepare(db: &Db, thread_id: i64, kind: DraftKind, draft_id: String) -> Re
         }
     };
 
-    Ok(Draft {
+    Draft {
         id: draft_id,
         account_id: ctx.account_id,
         thread_id: Some(ctx.thread_id),
@@ -411,7 +481,7 @@ pub fn prepare(db: &Db, thread_id: i64, kind: DraftKind, draft_id: String) -> Re
         updated_at: 0,
         remote: DraftRemote::default(),
         attachments: Vec::new(),
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------

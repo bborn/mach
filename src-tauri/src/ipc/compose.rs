@@ -10,7 +10,7 @@
 //!
 //! | `op` | argument | returns |
 //! |---|---|---|
-//! | `prepare` | `threadId`, `kind` | `{ draft }` |
+//! | `prepare` | `threadId` or `messageId`, `kind` | `{ draft }` |
 //! | `loadDraft` | `draftId`, `messageId` or `threadId` | `{ draft \| null }` |
 //! | `saveDraft` | `draft` | `{ draft }` |
 //! | `discardDraft` | `draftId` | `{ ok, remote }` |
@@ -185,8 +185,14 @@ pub async fn dispatch(
         .unwrap_or_else(now_ms);
 
     match op.as_str() {
+        // `messageId` names the message being answered. Without it the newest
+        // message in the thread is the parent, which is what the strip under
+        // the conversation has always meant; with it, the reply belongs to that
+        // one message — its recipients, its quote, its place in the
+        // `References` chain. The thread is read back off the message there, so
+        // `threadId` is not required when one is named.
         "prepare" => {
-            let thread_id = required_i64(&payload, "threadId")?;
+            let message_id = payload.get("messageId").and_then(Value::as_i64);
             let kind = payload
                 .get("kind")
                 .and_then(Value::as_str)
@@ -197,7 +203,10 @@ pub async fn dispatch(
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| new_draft_id(now));
-            let prepared = draft::prepare(db, thread_id, kind, id)?;
+            let prepared = match message_id {
+                Some(message_id) => draft::prepare_reply_to(db, message_id, kind, id)?,
+                None => draft::prepare(db, required_i64(&payload, "threadId")?, kind, id)?,
+            };
             Ok(json!({ "draft": prepared }))
         }
 

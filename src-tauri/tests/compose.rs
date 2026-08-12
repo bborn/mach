@@ -301,6 +301,115 @@ fn seeded() -> (Db, i64, i64, i64) {
     (db, account, thread, message)
 }
 
+/// A conversation of three, each message with its own people and its own place
+/// in the chain. What replying "from any point in a thread" has to get right.
+///
+/// ```text
+/// 1  Tawny  → Alex, Sam        cc Dana    <one@x>
+/// 2  Priya  → Alex             cc Rex     <two@x>    refs: one
+/// 3  Tawny  → Alex             cc Dana    <three@x>  refs: one two
+/// ```
+///
+/// Returns `(db, account, thread, [m1, m2, m3])`.
+fn seeded_long_thread() -> (Db, i64, i64, Vec<i64>) {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "alex@example.com", Some("Alex Rivera"));
+    let thread = seed_thread(&db, account, "Series A data room");
+
+    let one = seed_message_at(
+        &db,
+        thread,
+        account,
+        "gmsg-1",
+        person("Tawny Rivers", "tawny@partner.com"),
+        vec![
+            person("Alex Rivera", "alex@example.com"),
+            person("Sam Patel", "sam@partner.com"),
+        ],
+        vec![person("Dana Wu", "dana@partner.com")],
+        "<one@x>",
+        None,
+        "Can you send the data room link?",
+        NOW - 300_000,
+    );
+    let two = seed_message_at(
+        &db,
+        thread,
+        account,
+        "gmsg-2",
+        person("Priya Raman", "priya@partner.com"),
+        vec![person("Alex Rivera", "alex@example.com")],
+        vec![person("Rex Oduya", "rex@partner.com")],
+        "<two@x>",
+        Some("<one@x>"),
+        "The diligence checklist is attached.",
+        NOW - 200_000,
+    );
+    let three = seed_message_at(
+        &db,
+        thread,
+        account,
+        "gmsg-3",
+        person("Tawny Rivers", "tawny@partner.com"),
+        vec![person("Alex Rivera", "alex@example.com")],
+        vec![person("Dana Wu", "dana@partner.com")],
+        "<three@x>",
+        Some("<one@x> <two@x>"),
+        "Any movement on this?",
+        NOW - 100_000,
+    );
+
+    (db, account, thread, vec![one, two, three])
+}
+
+/// [`seed_message`] with the clock as an argument, so a thread can have an
+/// order. The conversation is read oldest first, and every message in the older
+/// helpers shares one instant.
+#[allow(clippy::too_many_arguments)]
+fn seed_message_at(
+    db: &Db,
+    thread_id: i64,
+    account_id: i64,
+    gmail_id: &str,
+    from: Participant,
+    to: Vec<Participant>,
+    cc: Vec<Participant>,
+    message_id: &str,
+    references: Option<&str>,
+    body: &str,
+    at: i64,
+) -> i64 {
+    db.write(|c| {
+        queries::upsert_message(
+            c,
+            &NewMessage {
+                thread_id,
+                account_id,
+                gmail_message_id: gmail_id.to_string(),
+                rfc822_message_id: Some(message_id.to_string()),
+                reply_to: vec![],
+                in_reply_to: references
+                    .and_then(|r| r.split_whitespace().last())
+                    .map(str::to_string),
+                references: references.map(str::to_string),
+                from,
+                to,
+                cc,
+                bcc: vec![],
+                subject: "Series A data room".to_string(),
+                body_html: None,
+                body_text: Some(body.to_string()),
+                snippet: body.chars().take(60).collect(),
+                internal_date: at,
+                is_unread: false,
+                is_draft: false,
+                ..Default::default()
+            },
+        )
+    })
+    .unwrap()
+}
+
 fn headers_of(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     text.split("\r\n\r\n").next().unwrap_or_default().to_string()
@@ -454,6 +563,152 @@ fn a_forward_does_not_thread_onto_the_original() {
     assert!(!headers.contains("In-Reply-To"), "{headers}");
     assert!(!headers.contains("References"), "{headers}");
     assert!(headers.contains("Subject: Fwd: Series A data room"), "{headers}");
+}
+
+// ============================================= replying from any point in it
+
+#[test]
+fn a_reply_to_a_middle_message_threads_onto_that_message() {
+    // Eleven messages in, "reply" cannot mean "answer the last one". The chain
+    // has to stop at the message being answered: naming a later id makes the
+    // reply hang off something the recipient may not have, and carrying the
+    // whole thread's References puts it in the wrong place in every client that
+    // groups on them.
+    let (db, _account, _thread, ids) = seeded_long_thread();
+    let middle = ids[1];
+
+    let mut d = draft::prepare_reply_to(&db, middle, DraftKind::Reply, "d1".into()).unwrap();
+    assert_eq!(d.reply_to_id, Some(middle), "the draft answers this message");
+    d.body = "On it.".into();
+
+    let headers = headers_of(&built_bytes(&db, &d))
+        .replace("\r\n\t", " ")
+        .replace("\r\n ", " ");
+
+    assert!(headers.contains("In-Reply-To: <two@x>"), "{headers}");
+    let references = headers
+        .lines()
+        .find(|l| l.starts_with("References:"))
+        .expect("a References header");
+    assert_eq!(
+        references, "References: <one@x> <two@x>",
+        "the ancestry of the message being answered, and nothing after it"
+    );
+    assert!(
+        !headers.contains("three@x"),
+        "the newest message is not this reply's parent:\n{headers}"
+    );
+}
+
+#[test]
+fn with_no_message_named_a_reply_still_answers_the_newest() {
+    // The strip under the conversation has always meant "answer the last
+    // message", and it still does.
+    let (db, _account, thread, ids) = seeded_long_thread();
+    let d = draft::prepare(&db, thread, DraftKind::Reply, "d1".into()).unwrap();
+
+    assert_eq!(d.reply_to_id, Some(ids[2]));
+    let headers = headers_of(&built_bytes(&db, &{
+        let mut d = d;
+        d.body = "ok".into();
+        d
+    }));
+    assert!(headers.contains("In-Reply-To: <three@x>"), "{headers}");
+}
+
+#[test]
+fn reply_all_to_a_middle_message_addresses_that_messages_people() {
+    // Not the thread's participants: the second message is from Priya with Rex
+    // on Cc, and answering it must not mail Tawny, Sam and Dana — who are on
+    // the other two messages and were never on this one.
+    let (db, _account, _thread, ids) = seeded_long_thread();
+    let d = draft::prepare_reply_to(&db, ids[1], DraftKind::ReplyAll, "d1".into()).unwrap();
+
+    assert_eq!(
+        d.to.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["priya@partner.com"]
+    );
+    assert_eq!(
+        d.cc.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["rex@partner.com"]
+    );
+
+    // And a plain reply to the same message goes to its author alone.
+    let plain = draft::prepare_reply_to(&db, ids[1], DraftKind::Reply, "d2".into()).unwrap();
+    assert_eq!(
+        plain.to.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["priya@partner.com"]
+    );
+    assert!(plain.cc.is_empty());
+}
+
+#[test]
+fn a_reply_to_a_middle_message_quotes_that_message() {
+    let (db, _account, _thread, ids) = seeded_long_thread();
+    let mut d = draft::prepare_reply_to(&db, ids[1], DraftKind::Reply, "d1".into()).unwrap();
+    d.body = "Looking now.".into();
+    let bytes = built_bytes(&db, &d);
+    let parsed = MessageParser::new().parse(&bytes).unwrap();
+
+    let plain = parsed.body_text(0).unwrap();
+    assert!(plain.contains("Priya Raman"), "the attribution is theirs:\n{plain}");
+    assert!(plain.contains("> The diligence checklist is attached."), "{plain}");
+    assert!(
+        !plain.contains("Any movement on this?"),
+        "the newest message must not be the quoted one:\n{plain}"
+    );
+}
+
+#[test]
+fn a_forward_of_a_middle_message_carries_that_message() {
+    let (db, _account, _thread, ids) = seeded_long_thread();
+    let mut d = draft::prepare_reply_to(&db, ids[1], DraftKind::Forward, "d1".into()).unwrap();
+    d.to = vec![Mailbox::new("someone@else.com")];
+    d.body = "fyi".into();
+    let bytes = built_bytes(&db, &d);
+
+    let plain = MessageParser::new().parse(&bytes).unwrap().body_text(0).unwrap().into_owned();
+    assert!(plain.contains("---------- Forwarded message ---------"), "{plain}");
+    assert!(plain.contains("The diligence checklist is attached."), "{plain}");
+    assert!(plain.contains("priya@partner.com"), "{plain}");
+    assert!(
+        !plain.contains("Any movement on this?"),
+        "a forward of the middle message must not reproduce the last one:\n{plain}"
+    );
+
+    // A forward still starts its own conversation, whichever message it took.
+    let headers = headers_of(&bytes);
+    assert!(!headers.contains("In-Reply-To"), "{headers}");
+    assert!(!headers.contains("References"), "{headers}");
+}
+
+#[test]
+fn an_unsent_draft_row_is_not_something_to_answer() {
+    // A draft is mirrored into the conversation as a message row, so it is a
+    // row the pointer can reach. Threading a reply onto your own unsent text is
+    // the mistake `context_for_thread` skips drafts to avoid.
+    let (db, account, thread, _ids) = seeded_long_thread();
+    let draft_row = seed_message_at(
+        &db,
+        thread,
+        account,
+        "mach-draft:d-local",
+        person("Alex Rivera", "alex@example.com"),
+        vec![person("Tawny Rivers", "tawny@partner.com")],
+        vec![],
+        "<draft@x>",
+        Some("<one@x> <two@x> <three@x>"),
+        "half a sentence",
+        NOW - 50_000,
+    );
+    db.write(|c| {
+        c.execute("UPDATE messages SET is_draft = 1 WHERE id = ?1", [draft_row])?;
+        Ok(())
+    })
+    .unwrap();
+
+    let refused = draft::prepare_reply_to(&db, draft_row, DraftKind::Reply, "d1".into());
+    assert!(refused.is_err(), "a draft row must not be a reply parent");
 }
 
 // =================================================================== subject
