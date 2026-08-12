@@ -1394,7 +1394,7 @@ fn a_user_write_does_not_queue_behind_the_sync_loop() {
         spent
     });
 
-    let mut worst: f64 = 0.0;
+    let mut waits: Vec<f64> = Vec::new();
     for i in 0..40 {
         let t0 = Instant::now();
         t.db.write(|conn| {
@@ -1405,7 +1405,7 @@ fn a_user_write_does_not_queue_behind_the_sync_loop() {
             Ok(())
         })
         .expect("user write");
-        worst = worst.max(t0.elapsed().as_secs_f64() * 1000.0);
+        waits.push(t0.elapsed().as_secs_f64() * 1000.0);
         std::thread::sleep(Duration::from_millis(5));
     }
 
@@ -1423,14 +1423,31 @@ fn a_user_write_does_not_queue_behind_the_sync_loop() {
     spent.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let observed = spent[spent.len() / 2].max(batch_ms);
 
-    // One batch already in progress is the irreducible wait. Three is slack for
-    // a loaded machine; without the standoff this ran to tens of batches.
-    let budget = (observed * 3.0).max(50.0);
+    waits.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let typical = waits[waits.len() * 9 / 10];
+    let worst = *waits.last().unwrap();
+
+    /*
+     * Two assertions, because "a user write does not queue" is a claim about
+     * the distribution and the old single `worst < 3 batches` could not express
+     * it. On a two-core CI runner one of forty writes is descheduled by the OS
+     * and lands at three and a half batches; that is the machine, not the lock,
+     * and it failed the build twice for it.
+     *
+     * The regression this exists to catch is not subtle. Without the standoff a
+     * user write waited *tens* of batches — the sync loop simply kept the writer
+     * and the user queued behind all of it. So: nine writes in ten finish inside
+     * three batches, which is the standoff working in the ordinary case, and
+     * not one of them exceeds ten, which is far below the failure it guards and
+     * far above anything the scheduler does to a single sample.
+     */
+    let typical_budget = (observed * 3.0).max(50.0);
+    let worst_budget = (observed * 10.0).max(150.0);
     assert!(
-        worst < budget,
-        "a user write waited {worst:.0}ms while the sync loop ran \
-         (one batch is {observed:.1}ms under load, {batch_ms:.1}ms idle, \
-          budget {budget:.0}ms, {batches} batches ran)"
+        typical < typical_budget && worst < worst_budget,
+        "user writes waited p90 {typical:.0}ms / worst {worst:.0}ms while the sync \
+         loop ran (one batch is {observed:.1}ms under load, {batch_ms:.1}ms idle, \
+          budgets {typical_budget:.0}ms / {worst_budget:.0}ms, {batches} batches ran)"
     );
 }
 
