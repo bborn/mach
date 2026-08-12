@@ -617,7 +617,46 @@ export interface UiSession {
   collapsedCalendarAccounts: number[];
   /** Mail rail sections folded up — `"inbox"`, `"folders"`, `"favorites"`. */
   collapsedRailSections: string[];
+  /**
+   * What the user has decided about each calendar, keyed by Google's calendar
+   * id.
+   *
+   * This is the field whose absence was the "Training keeps coming back" bug.
+   * `ui.hiddenCalendars` held the answer for the life of the window and nothing
+   * wrote it down, so every hide was undone by the next launch — five times in
+   * one day, at which point it stops looking like forgetfulness and starts
+   * looking like the app arguing.
+   *
+   * Three states rather than a list of hidden ids, because the rail has to
+   * answer two different questions and a list can only answer one:
+   *
+   *   `shown`     drawn in the grid, listed in the rail
+   *   `hidden`    not drawn, still listed — the tick you take off for an hour
+   *   `unlisted`  not drawn, not listed — the calendar you are done with
+   *
+   * *Presence* carries a third fact, and it is what stops a sync undoing a
+   * local decision: a calendar with no entry here has never been decided about,
+   * so Google's own `selected` is adopted for it once and then never consulted
+   * again. Before this existed the adoption was a `useRef` inside the sidebar,
+   * which meant it ran again on every launch — fine while nothing persisted,
+   * and a way to re-hide a calendar the user had just turned on once anything
+   * did.
+   *
+   * Ids for calendars that are no longer there are kept rather than pruned, on
+   * the same grounds as `collapsedRailSections`: an entry for a calendar that
+   * is not in the list is inert, and an account that is signed out and back in
+   * should not come back with its calendars all re-shown.
+   */
+  calendarVisibility: Record<string, CalendarVisibility>;
 }
+
+/**
+ * One calendar's place in the rail and the grid. See
+ * {@link UiSession.calendarVisibility}.
+ */
+export type CalendarVisibility = "shown" | "hidden" | "unlisted";
+
+const CALENDAR_VISIBILITY = new Set<string>(["shown", "hidden", "unlisted"]);
 
 /** The key the session blob lives under. Alphanumeric, like every other key. */
 export const SESSION_KEY = "uiSession";
@@ -720,6 +759,20 @@ export function parseSession(raw: unknown): Partial<UiSession> {
     out.collapsedRailSections = raw.collapsedRailSections.filter(
       (id): id is string => typeof id === "string" && id.length > 0,
     );
+  }
+  // Kept even when it reads back empty: an empty map and a missing one mean the
+  // same thing to the sidebar, and `{}` is what a profile that has had every
+  // decision cleared legitimately holds. An entry whose state is not one of the
+  // three is dropped on its own rather than taking the map with it — one bad
+  // value should cost one calendar, not every calendar.
+  if (isRecord(raw.calendarVisibility)) {
+    const decisions: Record<string, CalendarVisibility> = {};
+    for (const [id, state] of Object.entries(raw.calendarVisibility)) {
+      if (id.length > 0 && typeof state === "string" && CALENDAR_VISIBILITY.has(state)) {
+        decisions[id] = state as CalendarVisibility;
+      }
+    }
+    out.calendarVisibility = decisions;
   }
 
   return out;
