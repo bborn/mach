@@ -967,6 +967,11 @@ function DayColumn({
           is always somewhere to drag-create even on a full day. Copy it. */}
       <div
         ref={surface}
+        // The day this column is, for anything working back from a pointer to a
+        // time. Drag-to-create measures against this element already; the
+        // right-click menu reads the attribute and does the same arithmetic
+        // rather than inventing a second way to find the hour under the cursor.
+        data-day-start={dayStart}
         className="absolute inset-y-0 left-0"
         style={{ right: BLOCK_RIGHT_GUTTER }}
         onPointerDown={onPointerDown}

@@ -290,6 +290,10 @@ export function EventBlock({
       // order the week reads in — not the order the DOM happens to be in.
       tabIndex={-1}
       data-selected={selected || undefined}
+      // Which event this rectangle is, for anything that has to work back from
+      // a pointer or from `ui.eventId` to a DOM node — the right-click menu is
+      // the only such thing today, and ⇧F10 anchors its popup to this element.
+      data-event-id={event.id}
       onClick={onSelect}
       onPointerDown={(pointer) => {
         // Anything with its own handler (the two edges) has already stopped
@@ -595,6 +599,7 @@ export function EventChip({
       ref={blockRef}
       tabIndex={-1}
       data-selected={selected || undefined}
+      data-event-id={event.id}
       aria-current={selected ? "true" : undefined}
       onClick={onSelect}
       title={event.title}

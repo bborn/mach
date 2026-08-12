@@ -95,6 +95,10 @@ export function MonthGrid({
           return (
             <div
               key={key}
+              // The day this cell is. A month cell has a day and no time, so
+              // the right-click menu creates at the same hour a keyboard
+              // create would pick for that day.
+              data-day-cell={key}
               className={cn(
                 "flex min-h-0 min-w-0 flex-col gap-1 border-b border-r border-border p-1",
                 open ? "overflow-y-auto" : "overflow-hidden",

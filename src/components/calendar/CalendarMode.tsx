@@ -58,6 +58,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { MonthGrid } from "./MonthGrid";
 import { TimeGrid, type EventDraft as GridDraft, type EventMove } from "./TimeGrid";
 import { CalendarSidebar, calendarLabel, type CalendarSettings } from "./CalendarSidebar";
+import { CalendarContextMenu, type CalendarVerbs } from "./CalendarContextMenu";
 import { EventModal, type ModalTarget } from "./EventModal";
 import { EventFinder } from "./EventFinder";
 import { QuickCreate } from "./QuickCreate";
@@ -880,6 +881,84 @@ export function CalendarMode() {
   );
 
   /* ---------------------------------------------------------------------- */
+  /* The verbs, once                                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /*
+   * Everything below is a thing the calendar does to an event, named once and
+   * called from both the keyboard and the right-click menu. They used to be
+   * written inline in the binding list, which is fine while the keyboard is the
+   * only way to reach them and becomes a second implementation the moment it is
+   * not — see the note at the top of `CalendarContextMenu`.
+   */
+
+  /** ⌫ — delete it, unless it repeats, in which case ask which occurrences. */
+  const requestDelete = useCallback(
+    (event: CalendarEvent) => {
+      if (looksRecurring(event, inRange)) setModal({ mode: "view", event });
+      else deleteEvent(event.id, "this");
+    },
+    [deleteEvent, inRange],
+  );
+
+  const copyEvent = useCallback(
+    (event: CalendarEvent) => {
+      setClipboard(event);
+      actions.setStatus(`Copied “${event.title}”`, "info");
+    },
+    [actions],
+  );
+
+  const openInGoogle = useCallback(
+    (event: CalendarEvent) =>
+      openExternal(
+        googleCalendarUrl(event, accounts.find((a) => a.id === event.accountId)?.email),
+      ),
+    [accounts, openExternal],
+  );
+
+  /**
+   * The event as it is *drawn*, which is what a click or the cursor is on.
+   *
+   * The same fallback `nudgeSelected` uses: an optimistic move is in the
+   * settled copy and not yet in the store, and a menu that read the store would
+   * be about the block's old time.
+   */
+  const eventById = useCallback(
+    (id: EventId) => settledEvents.find((e) => e.id === id) ?? allEvents.find((e) => e.id === id),
+    [settledEvents, allEvents],
+  );
+
+  /**
+   * Whether this event's calendar would accept a *new* event on it.
+   *
+   * A separate question from `canEditEvent`, which is about this event: a
+   * stranger's invitation on a calendar you own cannot be edited and can
+   * perfectly well be duplicated, while nothing at all can be created on a
+   * calendar you only subscribe to.
+   */
+  const creatableOn = useCallback(
+    (event: CalendarEvent) => {
+      const role = calendarById(event.calendarId)?.accessRole;
+      return role !== "reader" && role !== "freeBusyReader";
+    },
+    [calendarById],
+  );
+
+  const verbs = useMemo<CalendarVerbs>(
+    () => ({
+      open: (event) => openEvent(event.id),
+      remove: requestDelete,
+      duplicate,
+      copy: copyEvent,
+      openInGoogle,
+      rsvp: (event, response) => rsvp(event.id, response),
+      createAt: (slot) => openCreate(slot),
+    }),
+    [copyEvent, duplicate, openCreate, openEvent, openInGoogle, requestDelete, rsvp],
+  );
+
+  /* ---------------------------------------------------------------------- */
   /* Keyboard                                                                */
   /* ---------------------------------------------------------------------- */
 
@@ -1031,20 +1110,12 @@ export function CalendarMode() {
         group: "Event",
         description: "Delete the event",
         when: () => active,
-        handler: withEvent((event) =>
-          looksRecurring(event, inRange)
-            ? setModal({ mode: "view", event })
-            : deleteEvent(event.id, "this"),
-        ),
+        handler: withEvent(requestDelete),
       },
       {
         keys: "delete",
         when: () => active,
-        handler: withEvent((event) =>
-          looksRecurring(event, inRange)
-            ? setModal({ mode: "view", event })
-            : deleteEvent(event.id, "this"),
-        ),
+        handler: withEvent(requestDelete),
       },
 
       // Moving and resizing without a mouse. Shift slides the whole event,
@@ -1117,10 +1188,7 @@ export function CalendarMode() {
         group: "Event",
         description: "Copy the event",
         when: () => active,
-        handler: withEvent((event) => {
-          setClipboard(event);
-          actions.setStatus(`Copied “${event.title}”`, "info");
-        }),
+        handler: withEvent(copyEvent),
       },
       {
         keys: "mod+v",
@@ -1147,11 +1215,7 @@ export function CalendarMode() {
         group: "Event",
         description: "Open in Google Calendar",
         when: () => active,
-        handler: withEvent((event) =>
-          openExternal(
-            googleCalendarUrl(event, accounts.find((a) => a.id === event.accountId)?.email),
-          ),
-        ),
+        handler: withEvent(openInGoogle),
       },
 
       {
@@ -1222,20 +1286,19 @@ export function CalendarMode() {
     [
       active,
       actions,
-      accounts,
       clipboard,
+      copyEvent,
       create,
       dateOpen,
-      deleteEvent,
       dispatch,
       duplicate,
       goToday,
-      inRange,
       modalOpen,
       nudgeSelected,
       openCreate,
       openEvent,
-      openExternal,
+      openInGoogle,
+      requestDelete,
       createOpen,
       arrow,
       closeFinder,
@@ -1408,35 +1471,47 @@ export function CalendarMode() {
           onSettings={setSettings}
         />
 
-        <div ref={grid} className="flex min-h-0 min-w-0 flex-1 flex-col">
-          {ui.calendarView === "month" ? (
-            <MonthGrid
-              days={days}
-              anchorMonth={ui.anchor}
-              events={merged}
-              colorFor={colorFor}
-              dark={dark}
-              selectedId={ui.eventId}
-              dimIds={dimIds}
-              onSelect={openEvent}
-            />
-          ) : (
-            <TimeGrid
-              days={days}
-              events={merged}
-              colorFor={colorFor}
-              dark={dark}
-              selectedId={ui.eventId}
-              dimIds={dimIds}
-              onSelect={(id) => dispatch({ type: "event", eventId: id })}
-              onOpen={openEvent}
-              onDraft={onGridDraft}
-              onMove={onGridMove}
-              todayNonce={todayNonce}
-              revealNonce={revealNonce}
-            />
-          )}
-        </div>
+        {/* The right-click menu wraps the grid and nothing else: the sidebar's
+            calendars are checkboxes with their own affordances, and a menu about
+            "the selected event" over a list of calendars would be about nothing
+            the pointer is on. */}
+        <CalendarContextMenu
+          active={active}
+          eventById={eventById}
+          canEdit={editable}
+          canCreateOn={creatableOn}
+          verbs={verbs}
+        >
+          <div ref={grid} className="flex min-h-0 min-w-0 flex-1 flex-col">
+            {ui.calendarView === "month" ? (
+              <MonthGrid
+                days={days}
+                anchorMonth={ui.anchor}
+                events={merged}
+                colorFor={colorFor}
+                dark={dark}
+                selectedId={ui.eventId}
+                dimIds={dimIds}
+                onSelect={openEvent}
+              />
+            ) : (
+              <TimeGrid
+                days={days}
+                events={merged}
+                colorFor={colorFor}
+                dark={dark}
+                selectedId={ui.eventId}
+                dimIds={dimIds}
+                onSelect={(id) => dispatch({ type: "event", eventId: id })}
+                onOpen={openEvent}
+                onDraft={onGridDraft}
+                onMove={onGridMove}
+                todayNonce={todayNonce}
+                revealNonce={revealNonce}
+              />
+            )}
+          </div>
+        </CalendarContextMenu>
       </div>
 
       <EventModal
