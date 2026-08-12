@@ -31,6 +31,7 @@ import type { Label, Thread, ThreadCursor } from "@/types";
 import { getDataSource } from "@/lib/data";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
+import { keyboardInComposer } from "@/lib/compose";
 import { mailboxName } from "@/lib/mailboxes";
 import {
   SEARCH_OPERATORS,
@@ -289,14 +290,14 @@ export function SearchView({ children }: { children: ReactNode }) {
       keys: "down",
       priority: 30,
       allowInInput: true,
-      when: () => live,
+      when: () => live && !keyboardInComposer(),
       handler: () => move(1),
     },
     {
       keys: "up",
       priority: 30,
       allowInInput: true,
-      when: () => live,
+      when: () => live && !keyboardInComposer(),
       handler: () => move(-1),
     },
     {
@@ -304,8 +305,24 @@ export function SearchView({ children }: { children: ReactNode }) {
       group: "Search",
       description: "Open the result",
       priority: 30,
+      /*
+       * `allowInInput` because the whole point is to press ⏎ in the search
+       * field — and that is exactly why these three have to stand down inside a
+       * composer.
+       *
+       * A reply opened from a search result leaves the search live, so ⏎ in the
+       * message was reaching this and opening a result instead of making a
+       * line. It was reported as "i still can't press return here, have to do
+       * shift-return" — ⇧⏎ is a different token, so it missed this binding and
+       * worked, which is what made it look like the editor's fault. ↑ and ↓ had
+       * the same fault, moving the result cursor while the caret should have
+       * been moving through the message.
+       *
+       * `keyboardInComposer` is the same guard, for the same reason, that ⇥ in
+       * `MailMode` already uses.
+       */
       allowInInput: true,
-      when: () => live,
+      when: () => live && !keyboardInComposer(),
       handler: () => {
         if (typing()) {
           // The results are already there — search runs as you type — so Enter
