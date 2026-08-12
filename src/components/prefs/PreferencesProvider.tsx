@@ -208,11 +208,26 @@ export function usePreferencesStore(): PreferencesValue {
  * Defaults to "nothing stored, remembering is a no-op" outside a provider, for
  * the same reason `usePreferences` defaults: a component in a test should not
  * have to mount the app to render.
+ *
+ * `loaded` is here for the same reason the restorer needs it. A component that
+ * reconciles itself against the stored session has to be able to tell "nothing
+ * was stored" from "the read has not come back yet"; without that it writes its
+ * own defaults over the session one tick before the session arrives. Outside a
+ * provider it is false, which reads as "the store will never answer" and leaves
+ * such a component inert — the right answer for a test that renders markup.
  */
-export function useUiSession(): { session: Partial<UiSession>; remember: PreferencesValue["remember"] } {
+export function useUiSession(): {
+  session: Partial<UiSession>;
+  remember: PreferencesValue["remember"];
+  loaded: boolean;
+} {
   const value = useContext(PreferencesContext);
   return useMemo(
-    () => ({ session: value?.session ?? EMPTY_SESSION, remember: value?.remember ?? noop }),
+    () => ({
+      session: value?.session ?? EMPTY_SESSION,
+      remember: value?.remember ?? noop,
+      loaded: value?.loaded ?? false,
+    }),
     [value],
   );
 }

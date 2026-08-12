@@ -363,6 +363,36 @@ describe("parseSession", () => {
     expect(parseSession({ collapsedCalendarAccounts: 3 }).collapsedCalendarAccounts).toBeUndefined();
   });
 
+  it("reads back what the user decided about each calendar", () => {
+    // The field whose absence was "this one keeps coming back": `hiddenCalendars`
+    // lived in `ui` and nothing wrote it down, so every hide lasted until the
+    // next launch.
+    expect(
+      parseSession({
+        calendarVisibility: {
+          "6aeu1cenk1nfv03qp19r4ip6q4@group.calendar.google.com": "hidden",
+          "en.usa#holiday@group.v.calendar.google.com": "unlisted",
+          "bruno@example.com": "shown",
+        },
+      }).calendarVisibility,
+    ).toEqual({
+      "6aeu1cenk1nfv03qp19r4ip6q4@group.calendar.google.com": "hidden",
+      "en.usa#holiday@group.v.calendar.google.com": "unlisted",
+      "bruno@example.com": "shown",
+    });
+  });
+
+  it("drops one unreadable calendar decision rather than every calendar", () => {
+    expect(
+      parseSession({ calendarVisibility: { a: "hidden", b: "sideways", c: 7, "": "shown" } })
+        .calendarVisibility,
+    ).toEqual({ a: "hidden" });
+    // Not a map at all: no decisions, rather than a map of nothing.
+    expect(parseSession({ calendarVisibility: ["a"] }).calendarVisibility).toBeUndefined();
+    // An empty map is a real state — every decision cleared — and survives.
+    expect(parseSession({ calendarVisibility: {} }).calendarVisibility).toEqual({});
+  });
+
   it("rejects an empty label id — 'no mailbox' is not a mailbox", () => {
     expect(parseSession({ labelId: "" }).labelId).toBeUndefined();
   });
