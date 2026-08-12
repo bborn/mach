@@ -9,12 +9,15 @@
 //! Argument names are snake_case here and camelCase on the wire; Tauri does that
 //! conversion, which is why `threadId` from TypeScript lands in `thread_id`.
 
+use std::sync::Arc;
+
 use tauri::{AppHandle, State};
 
 use crate::commands::{AccountFilter, Command, CommandError, CommandResult, CommandSpec};
 use crate::db::models::{Account, Contact, Event, Label, ThreadCursor};
 use crate::db::queries::{SearchNode, SearchRequest};
 use crate::google::types::{Filter, FilterAction, FilterCriteria};
+use crate::sync::{ForcedPass, SyncScope};
 
 use super::error::IpcError;
 use super::events;
@@ -232,15 +235,50 @@ pub fn sync_status(state: State<'_, AppState>) -> SyncStatusPayload {
     state.status_payload()
 }
 
+/// Go and look at Google now — mail and calendar, every account or one.
+///
+/// # Why this awaits the pass
+///
+/// It used to nudge the loop and return, which meant the only way to find out
+/// whether anything had happened was to watch the status bar and guess. The
+/// standing rule is that the *UI* never waits on Google, not that nothing may:
+/// nothing on screen is blocked by this, every pane still renders from SQLite
+/// throughout, and the one thing that changes when it resolves is a line of
+/// status text. Awaiting is what lets that line say "up to date" or name the
+/// account Google refused, which is the whole reason the feature exists.
+///
+/// The engine holds the pass to the same writer discipline the loop uses —
+/// `Db::write_background`, which stands aside for a queued user command at
+/// every batch boundary — so a forced pass cannot be the thing that makes
+/// archiving a conversation take seconds. That is not a property of this
+/// command; it is a property of running the *same* pass rather than a special
+/// urgent one.
 #[tauri::command]
-pub async fn sync_now(state: State<'_, AppState>) -> Result<(), IpcError> {
+pub async fn sync_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+) -> Result<ForcedPass, IpcError> {
     state.client_config()?;
     // `start` is idempotent; calling it here is what makes "Sync now" work
     // immediately after the very first account is added, when the loop was
     // never started at boot.
     state.sync.start();
-    state.sync.sync_now();
-    Ok(())
+    let sync = Arc::clone(&state.sync);
+    let scope = match account_id {
+        Some(id) => SyncScope::Account(id),
+        None => SyncScope::All,
+    };
+    let outcome = sync.force_sync(scope).await;
+    // The status the pass just wrote, pushed without waiting for the watch
+    // channel's own forwarder — a failure has to be on screen by the time the
+    // caller's promise resolves, or the message and the detail panel disagree
+    // for a frame.
+    events::emit_sync_status(&app, &state.status_payload());
+    if outcome.accounts.iter().any(|a| a.messages_written > 0) {
+        events::emit_threads_changed(&app);
+    }
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------

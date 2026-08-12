@@ -41,6 +41,7 @@ pub mod convert;
 pub mod mail;
 pub mod status;
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -294,9 +295,30 @@ pub struct AccountOutcome {
     #[serde(default)]
     pub needs_reauthorization: bool,
     pub cancelled: bool,
+    /// This account was already mid-pass, so this pass left it alone.
+    ///
+    /// Not an error and not a success: nothing was asked of Google and nothing
+    /// was written. It is the honest answer to a second "Sync now" pressed
+    /// while the first one is still talking, and it is what stops two passes
+    /// replaying the same history window against the same watermark.
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 impl AccountOutcome {
+    fn new(account_id: i64, email: String) -> Self {
+        AccountOutcome {
+            account_id,
+            email,
+            messages_written: 0,
+            events_written: 0,
+            error: None,
+            needs_reauthorization: false,
+            cancelled: false,
+            skipped: false,
+        }
+    }
+
     pub fn is_ok(&self) -> bool {
         self.error.is_none() && !self.cancelled
     }
@@ -343,6 +365,121 @@ impl SyncPass {
 }
 
 // ===========================================================================
+// forcing a pass
+// ===========================================================================
+
+/// Which mailboxes a pass covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncScope {
+    /// Every account. What the background loop always does, and what "Sync
+    /// now" with nothing selected means.
+    All,
+    /// One account. What the per-account retry beside a failure means — that
+    /// button names an address, so it had better only sync that address.
+    Account(i64),
+}
+
+impl SyncScope {
+    fn covers(self, account_id: i64) -> bool {
+        match self {
+            SyncScope::All => true,
+            SyncScope::Account(id) => id == account_id,
+        }
+    }
+}
+
+/// Why a pass is running.
+///
+/// The two are the *same pass* — see [`SyncEngine::force_sync`] — and this
+/// changes exactly one thing, in [`calendar::CalendarSync`]: whether the
+/// six-hour-old cached calendar list is trusted. Everything else a forced pass
+/// does is byte for byte what the loop does a minute later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    /// The background loop's own tick.
+    Scheduled,
+    /// Somebody pressed something.
+    Forced,
+}
+
+impl Trigger {
+    pub fn is_forced(self) -> bool {
+        matches!(self, Trigger::Forced)
+    }
+}
+
+/// What a forced pass reports back to whoever asked for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForcedPass {
+    /// False when every account asked for was already syncing, so nothing new
+    /// was started. Pressing twice is not an error; it is this.
+    pub started: bool,
+    /// One entry per account the request covered, including the ones that were
+    /// already in flight (`skipped`).
+    pub accounts: Vec<AccountOutcome>,
+}
+
+impl ForcedPass {
+    fn from_pass(pass: SyncPass) -> Self {
+        // "Started" is about work, not about accounts: a request that covered
+        // nothing at all (no accounts yet, or an id that has since been
+        // removed) did not fail to start, it had nothing to do.
+        let started = pass.accounts.is_empty() || pass.accounts.iter().any(|a| !a.skipped);
+        ForcedPass {
+            started,
+            accounts: pass.accounts,
+        }
+    }
+
+    pub fn failures(&self) -> impl Iterator<Item = &AccountOutcome> {
+        self.accounts.iter().filter(|a| a.error.is_some())
+    }
+}
+
+/// One account's place in the in-flight set, released on drop.
+///
+/// The claim is what makes a forced pass safe to run beside the background
+/// loop. Two passes replaying `users.history.list` from the same watermark at
+/// the same time would both write, both promote a watermark, and race over
+/// which one lands last — and two backfills would drain one durable queue from
+/// both ends. Rather than locking the whole engine (which would make "Sync
+/// now" during a thirteen-minute backfill mean "wait thirteen minutes"), each
+/// account is claimed on its own, and whoever gets there second leaves it
+/// alone and says so.
+struct AccountClaim {
+    inner: Arc<Inner>,
+    account_id: i64,
+}
+
+impl AccountClaim {
+    /// Claim `account_id`, or `None` when a pass already holds it.
+    fn acquire(inner: &Arc<Inner>, account_id: i64) -> Option<Self> {
+        let mut set = inner
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !set.insert(account_id) {
+            return None;
+        }
+        Some(AccountClaim {
+            inner: Arc::clone(inner),
+            account_id,
+        })
+    }
+}
+
+impl Drop for AccountClaim {
+    fn drop(&mut self) {
+        self.inner
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.account_id);
+    }
+}
+
+// ===========================================================================
 // the engine
 // ===========================================================================
 
@@ -365,6 +502,9 @@ struct Inner {
     /// is no lock to take and nothing to wake. A change lands on the next tick,
     /// which is the worst case one old interval away.
     poll_interval_ms: AtomicU64,
+    /// Accounts with a pass in flight, whichever path started it. See
+    /// [`AccountClaim`].
+    in_flight: Mutex<HashSet<i64>>,
 }
 
 impl Inner {
@@ -399,6 +539,7 @@ impl SyncEngine {
                 wake: Notify::new(),
                 limiter: Arc::new(Semaphore::new(request_concurrency)),
                 poll_interval_ms,
+                in_flight: Mutex::new(HashSet::new()),
             }),
             loop_handle: Mutex::new(None),
         })
@@ -472,9 +613,54 @@ impl SyncEngine {
     }
 
     /// Run exactly one pass over every account, inline. This is what the tests
-    /// drive, and what a "Sync now" menu item can await.
+    /// drive.
     pub async fn sync_once(&self) -> SyncPass {
-        pass(Arc::clone(&self.inner)).await
+        pass(Arc::clone(&self.inner), SyncScope::All, Trigger::Scheduled).await
+    }
+
+    /// Go and look now.
+    ///
+    /// # What "force" means here, and what it deliberately does not
+    ///
+    /// It is the ordinary pass, run this instant, awaited so the caller can
+    /// say what happened. It is **not** a rebuild: the watermark is left
+    /// exactly where it is.
+    ///
+    /// That is the whole decision, and it is not a compromise. The incremental
+    /// pass is complete by construction — `users.history.list` replayed from
+    /// the stored `historyId` returns *every* change since it, and a calendar
+    /// `syncToken` sweep returns every event that moved since the token — so
+    /// there is nothing a from-scratch rebuild would find that running the
+    /// normal pass now would miss. What a rebuild would add is a 365-day
+    /// backfill: tens of thousands of `messages.get` calls and, measured
+    /// against the owner's mailbox, about thirteen minutes. Pressing a key
+    /// because a message you sent from your phone thirty seconds ago has not
+    /// appeared yet, and getting a thirteen-minute re-download of the year, is
+    /// the wrong trade in every direction.
+    ///
+    /// The case for the stronger thing does exist, and it is already built and
+    /// already automatic: when Gmail says the watermark has aged out of its
+    /// retention window, [`mail::MailSync::run_messages`] throws it away and
+    /// rebuilds, and a 410 on a calendar token re-lists the window. Those are
+    /// repairs for a watermark that is *wrong*, and they are not something to
+    /// put behind a key — a person cannot tell from the outside whether that is
+    /// the situation, and offering the choice would only mean offering the
+    /// expensive answer to a question that already answers itself.
+    ///
+    /// The one place a forced pass does more than the scheduled one is the
+    /// calendar list, where [`calendar::CALENDAR_LIST_MAX_AGE_MS`] normally
+    /// lets a six-hour-old cached list stand. "Go and look now" ought to notice
+    /// a calendar shared with you this morning, and that costs one request.
+    ///
+    /// # Pressing it twice
+    ///
+    /// Each account is claimed for the duration of its sync ([`AccountClaim`]),
+    /// so a second request — or the background loop arriving mid-force —
+    /// finds the account taken, leaves it alone, and reports it `skipped`.
+    /// Nothing queues, nothing doubles, and no two tasks ever replay history
+    /// against the same watermark.
+    pub async fn force_sync(&self, scope: SyncScope) -> ForcedPass {
+        ForcedPass::from_pass(pass(Arc::clone(&self.inner), scope, Trigger::Forced).await)
     }
 
     /// Stop promptly and wait for the loop to actually be gone.
@@ -515,7 +701,7 @@ async fn run_loop(inner: Arc<Inner>) {
         if inner.cancel.is_cancelled() {
             break;
         }
-        pass(Arc::clone(&inner)).await;
+        pass(Arc::clone(&inner), SyncScope::All, Trigger::Scheduled).await;
         if inner.cancel.is_cancelled() {
             break;
         }
@@ -561,28 +747,66 @@ pub(crate) fn checkpoint(db: &Db) {
     let _ = db.checkpoint_if_large(WAL_CHECKPOINT_OVER_BYTES);
 }
 
-/// One pass over every account. Accounts run concurrently and independently;
-/// a failure — or a panic — in one is contained to its own outcome.
-async fn pass(inner: Arc<Inner>) -> SyncPass {
+/// One pass over the accounts in `scope`. Accounts run concurrently and
+/// independently; a failure — or a panic — in one is contained to its own
+/// outcome.
+async fn pass(inner: Arc<Inner>, scope: SyncScope, trigger: Trigger) -> SyncPass {
     let started_at = now_ms();
-    inner.status.begin_pass();
 
     // A store that will not answer is not a reason to spin: report an empty
     // pass and let the next tick try again.
-    let accounts = inner.db.read(queries::list_accounts).unwrap_or_default();
+    let accounts: Vec<Account> = inner
+        .db
+        .read(queries::list_accounts)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| scope.covers(a.id))
+        .collect();
+
+    // Claim before announcing anything.
+    //
+    // The order matters: a pass that turns out to have no work — every account
+    // it covers is already syncing — must not touch the pass timestamps, or a
+    // second "Sync now" pressed during a backfill would stamp the backfill as
+    // finished while it is still running.
+    let mut claimed = Vec::new();
+    let mut skipped = Vec::new();
+    for account in accounts {
+        match AccountClaim::acquire(&inner, account.id) {
+            Some(claim) => claimed.push((account, claim)),
+            None => {
+                let mut outcome = AccountOutcome::new(account.id, account.email);
+                outcome.skipped = true;
+                skipped.push(outcome);
+            }
+        }
+    }
+    if claimed.is_empty() && !skipped.is_empty() {
+        skipped.sort_by_key(|o| o.account_id);
+        return SyncPass {
+            started_at,
+            finished_at: now_ms(),
+            accounts: skipped,
+        };
+    }
+
+    inner.status.begin_pass();
 
     let gate = Arc::new(Semaphore::new(inner.config.account_concurrency.max(1)));
     let mut set: JoinSet<AccountOutcome> = JoinSet::new();
-    for account in accounts {
+    for (account, claim) in claimed {
         let inner = Arc::clone(&inner);
         let gate = Arc::clone(&gate);
         set.spawn(async move {
+            // Held for the whole account task, released when it returns —
+            // including on a panic, because the guard unwinds with it.
+            let _claim = claim;
             let _permit = gate.acquire_owned().await;
-            sync_account(inner, account).await
+            sync_account(inner, account, trigger).await
         });
     }
 
-    let mut outcomes = Vec::new();
+    let mut outcomes = skipped;
     while let Some(joined) = set.join_next().await {
         // A panicked account task is a bug, but it must not abort the pass for
         // the other four mailboxes.
@@ -600,19 +824,11 @@ async fn pass(inner: Arc<Inner>) -> SyncPass {
     }
 }
 
-async fn sync_account(inner: Arc<Inner>, account: Account) -> AccountOutcome {
+async fn sync_account(inner: Arc<Inner>, account: Account, trigger: Trigger) -> AccountOutcome {
     let report = inner.status.account(account.id, &account.email);
     report.begin_pass();
 
-    let mut outcome = AccountOutcome {
-        account_id: account.id,
-        email: account.email.clone(),
-        messages_written: 0,
-        events_written: 0,
-        error: None,
-        needs_reauthorization: false,
-        cancelled: false,
-    };
+    let mut outcome = AccountOutcome::new(account.id, account.email.clone());
 
     if inner.cancel.is_cancelled() {
         report.cancelled();
@@ -654,6 +870,9 @@ async fn sync_account(inner: Arc<Inner>, account: Account) -> AccountOutcome {
                     config: Arc::clone(&inner.config),
                     cancel: inner.cancel.clone(),
                     report: report.clone(),
+                    // The one difference a forced pass makes. See
+                    // `SyncEngine::force_sync`.
+                    refresh_calendar_list: trigger.is_forced(),
                 };
                 match sync.run().await {
                     Ok(n) => outcome.events_written = n,

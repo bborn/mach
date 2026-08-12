@@ -88,6 +88,7 @@ import { mailboxName } from "@/lib/mailboxes";
 import type { Contact } from "@/lib/contacts";
 import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
+import { beginForcedSync, endForcedSync, forcedSyncMessage } from "@/lib/force-sync";
 import { toMailboxError, useThreadStream } from "@/hooks/useThreadStream";
 import { DAY, addDays, addMonths, startOfWeek } from "@/lib/time";
 import { snoozeLabel } from "@/lib/snooze";
@@ -548,7 +549,8 @@ export interface MachActions {
   openFavorite: (favorite: Favorite) => void;
   cycleTheme: () => void;
   loadMore: () => void;
-  syncNow: () => void;
+  /** Sync now. With no argument, every account; with one, that account alone. */
+  syncNow: (accountId?: AccountId) => void;
   /** After an account is added or removed, everything is stale. */
   reload: () => void;
   /**
@@ -1624,15 +1626,36 @@ export function MachProvider({ children }: { children: ReactNode }) {
           theme: ui.theme === "system" ? "light" : ui.theme === "light" ? "dark" : "system",
         }),
       loadMore: () => streamRef.current.loadMore(),
-      syncNow: () => {
+      /*
+       * Go and look at Google now — mail and calendar together.
+       *
+       * The promise resolves when the pass is *over*, not when the request was
+       * accepted, which is what makes the line at the end worth anything.
+       * Nothing on screen waits for it: every pane goes on rendering from
+       * SQLite, and the sync indicator narrates the pass from the `sync-status`
+       * event exactly as it does for a background one.
+       *
+       * `beginForcedSync` is the reason a second press is free. The engine
+       * refuses to run two passes over one account regardless, so this is not
+       * where correctness lives — it is what stops a pointless round trip and
+       * what the palette reads to show the entry as busy.
+       */
+      syncNow: (accountId) => {
+        const key = accountId ?? "all";
+        if (!beginForcedSync(key)) return;
         void getDataSource()
-          .syncNow()
+          .syncNow(accountId)
+          .then((outcome) => {
+            const said = forcedSyncMessage(outcome);
+            dispatch({ type: "status", status: { message: said.message, tone: said.tone } });
+          })
           .catch((caught) =>
             dispatch({
               type: "status",
               status: { message: toMailboxError(caught).message, tone: "error" },
             }),
-          );
+          )
+          .finally(() => endForcedSync(key));
       },
       reload: () => {
         setReloadKey((k) => k + 1);

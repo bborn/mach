@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { useMach } from "@/hooks/useMach";
+import { forcedSyncInFlight, subscribeForcedSync } from "@/lib/force-sync";
 import type { SyncFailure, SyncProgress } from "@/lib/mailbox-state";
 import { openPreferences } from "@/components/prefs/palette";
 import { registerResolver } from "@/lib/palette/resolver";
@@ -38,6 +39,11 @@ import { SYNC_DETAIL_EVENT, syncDetailResolver } from "./sync-detail";
 export function SyncIndicator() {
   const { progress, sync, actions } = useMach();
   const [open, setOpen] = useState(false);
+  const syncing = useSyncExternalStore(
+    subscribeForcedSync,
+    () => forcedSyncInFlight(),
+    () => false,
+  );
 
   // Registered while the indicator is mounted rather than at module scope, so
   // ⌘K offers the panel exactly when there is a window for it to open in.
@@ -64,7 +70,7 @@ export function SyncIndicator() {
             // Named for what pressing it does, which is not the same as what the
             // label says. The label is the state.
             aria-label={failures.length > 0 ? `${progress.label} — details` : undefined}
-            onClick={failures.length > 0 ? undefined : actions.syncNow}
+            onClick={failures.length > 0 ? undefined : () => actions.syncNow()}
             className="flex min-w-0 shrink items-center gap-2 text-micro text-faint-foreground hover:text-foreground"
           />
         }
@@ -87,10 +93,15 @@ export function SyncIndicator() {
           <SyncDetail
             failures={failures}
             lastPassFinishedAt={sync?.lastPassFinishedAt ?? null}
-            onRetry={() => {
+            // The button says "Sync <this address> again", so it syncs that
+            // address. It used to sync all five, which was a small lie with a
+            // real cost: retrying one rate-limited account also spent the
+            // quota of the four that were fine.
+            onRetry={(email) => {
               setOpen(false);
-              actions.syncNow();
+              actions.syncNow(sync?.accounts.find((a) => a.email === email)?.accountId);
             }}
+            syncing={syncing}
             onSignIn={() => {
               setOpen(false);
               openPreferences("accounts");
@@ -117,12 +128,16 @@ export function SyncDetail({
   onRetry,
   onSignIn,
   now = Date.now(),
+  syncing = false,
 }: {
   failures: readonly SyncFailure[];
   lastPassFinishedAt: number | null;
-  onRetry: () => void;
+  /** Retry *this* account. The button names it, so it may not sync the rest. */
+  onRetry: (email: string) => void;
   onSignIn: () => void;
   now?: number;
+  /** A forced pass is already running; the retries have nothing to add. */
+  syncing?: boolean;
 }) {
   return (
     <div className="flex flex-col gap-3">
@@ -158,9 +173,10 @@ export function SyncDetail({
                 size="sm"
                 variant="subtle"
                 aria-label={`Sync ${failure.email} again`}
-                onClick={onRetry}
+                disabled={syncing}
+                onClick={() => onRetry(failure.email)}
               >
-                Sync now
+                {syncing ? "Syncing" : "Sync now"}
               </Button>
             )}
           </div>

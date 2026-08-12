@@ -27,6 +27,7 @@ import type {
   EventConference,
   EventGuest,
   FilterAction,
+  ForcedSync,
   FilterCriteria,
   Label,
   MailFilter,
@@ -292,6 +293,23 @@ interface WireSyncStatus {
   configurationError?: Nullable<string>;
   needsReauthorization?: Nullable<string[]>;
   missingScope?: Nullable<string[]>;
+}
+
+/** `sync_now`, straight off the wire. */
+interface WireForcedSync {
+  started?: Nullable<boolean>;
+  accounts?: Nullable<WireSyncAccountOutcome[]>;
+}
+
+interface WireSyncAccountOutcome {
+  accountId: number;
+  email?: Nullable<string>;
+  messagesWritten?: Nullable<number>;
+  eventsWritten?: Nullable<number>;
+  error?: Nullable<string>;
+  needsReauthorization?: Nullable<boolean>;
+  cancelled?: Nullable<boolean>;
+  skipped?: Nullable<boolean>;
 }
 
 /** `list_filters` / `create_filter`, straight off the wire. */
@@ -710,6 +728,30 @@ export function mapSyncStatus(wire: Nullable<WireSyncStatus>): SyncStatus {
 }
 
 /**
+ * A forced pass's report.
+ *
+ * `started: false` is the honest answer to a second press, not a failure, so it
+ * is defaulted the safe way round: an older backend that says nothing is
+ * assumed to have started something, because the alternative is telling him
+ * nothing happened when it did.
+ */
+export function mapForcedSync(wire: Nullable<WireForcedSync>): ForcedSync {
+  return {
+    started: wire?.started !== false,
+    accounts: (wire?.accounts ?? []).map((a) => ({
+      accountId: a.accountId,
+      email: text(a.email),
+      messagesWritten: num(a.messagesWritten),
+      eventsWritten: num(a.eventsWritten),
+      error: optional(a.error) ?? null,
+      needsReauthorization: a.needsReauthorization === true,
+      cancelled: a.cancelled === true,
+      skipped: a.skipped === true,
+    })),
+  };
+}
+
+/**
  * A filter as the UI holds it.
  *
  * `description` is Rust's sentence and is not rebuilt here: the line in
@@ -851,8 +893,16 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
       return mapSyncStatus(await call<WireSyncStatus>("sync_status"));
     },
 
-    async syncNow() {
-      await call<void>("sync_now");
+    /**
+     * Sync now — every account, or the one named.
+     *
+     * Resolves when the pass is over rather than when the request was
+     * accepted, because "did it work" is the question being asked.
+     */
+    async syncNow(accountId?: AccountId) {
+      return mapForcedSync(
+        await call<WireForcedSync>("sync_now", { accountId: accountId ?? null }),
+      );
     },
 
     async beginAddAccount(email?: string): Promise<PendingAuthorization> {

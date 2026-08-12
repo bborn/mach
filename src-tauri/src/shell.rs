@@ -181,6 +181,11 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .separator()
         .item(&item(&replay("mod+k", "Command Palette…", "CmdOrCtrl+K"))?)
         .separator()
+        // The one item here that reaches the network. It belongs in File for
+        // the same reason Apple Mail puts "Get All New Mail" in Mailbox: it is
+        // the document-level "go and fetch", not a view or a window.
+        .item(&item(&replay("shift+mod+r", "Sync Now", "CmdOrCtrl+Shift+R"))?)
+        .separator()
         // Hides rather than destroys — see the module doc.
         .item(&PredefinedMenuItem::close_window(app, Some("Close Window"))?)
         .build()?;

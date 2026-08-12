@@ -73,7 +73,7 @@ export function MailboxNotice() {
           title="Sync failed"
           detail={state.message}
           action={
-            <Button variant="subtle" onClick={actions.syncNow}>
+            <Button variant="subtle" onClick={() => actions.syncNow()}>
               Try again
             </Button>
           }

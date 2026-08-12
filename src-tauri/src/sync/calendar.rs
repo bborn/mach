@@ -29,6 +29,15 @@ pub struct CalendarSync {
     pub config: Arc<SyncConfig>,
     pub cancel: CancelToken,
     pub report: AccountReporter,
+    /// Ask Google for the calendar list even when the stored one is inside
+    /// [`CALENDAR_LIST_MAX_AGE_MS`].
+    ///
+    /// Set only by a forced pass. Somebody who has just pressed "Sync now"
+    /// because a calendar was shared with them this morning is asking a
+    /// question the cache cannot answer, and one `calendarList.list` is the
+    /// cheapest possible way to answer it. The scheduled loop leaves this
+    /// false and keeps the six-hour cache, which is the whole point of it.
+    pub refresh_calendar_list: bool,
 }
 
 impl CalendarSync {
@@ -76,8 +85,10 @@ impl CalendarSync {
         let stored = self
             .db
             .read(move |conn| queries::list_calendars(conn, Some(account_id)))?;
-        if let Some(fresh) = syncable_from_store(&stored, now_ms()) {
-            return Ok(fresh);
+        if !self.refresh_calendar_list {
+            if let Some(fresh) = syncable_from_store(&stored, now_ms()) {
+                return Ok(fresh);
+            }
         }
 
         let entries = match self.calendar.calendar_list().await {

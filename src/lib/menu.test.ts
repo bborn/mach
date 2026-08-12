@@ -81,6 +81,21 @@ describe("connectMenu", () => {
     expect(handler).toHaveBeenCalledTimes(1);
   });
 
+  it("runs Sync Now from the File menu, through the same binding ⇧⌘R runs", () => {
+    // `shell.rs` puts "Sync Now" in File as a replay of `shift+mod+r`. There is
+    // no second path to a forced sync: the menu item is the shortcut.
+    const keymap = createKeymap("meta");
+    const handler = vi.fn();
+    keymap.register({ keys: "shift+mod+r", allowInInput: true, handler });
+
+    const ch = channel();
+    connectMenu(keymap, { subscribe: ch.subscribe, now: () => now, keys: null });
+    // The literal id `shell.rs` carries on the menu item.
+    ch.fire("shift+mod+r");
+
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
   it("replays a sequence one token at a time", () => {
     const keymap = createKeymap("meta");
     const handler = vi.fn();
