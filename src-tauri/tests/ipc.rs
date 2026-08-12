@@ -1368,6 +1368,22 @@ fn the_wire_sample_is_what_the_frontend_will_receive() {
         is_unread: true,
         is_draft: true,
         mach_draft_id: Some("draft-18f0c0ffee".into()),
+        // Filled in rather than `None`, and filled in with the *matched* shape:
+        // the fields that only exist once the uid has found an event are the
+        // ones a mapper is most likely to forget, and a `None` here would let
+        // every one of them through unnamed.
+        invitation: Some(MessageInvitation {
+            uid: "6r2h1c9k6ss30b9k6ss30b9k6s@google.com".into(),
+            method: "REQUEST".into(),
+            event_id: Some(77),
+            response: Some(RsvpStatus::NeedsAction),
+            title: Some("Quarterly review".into()),
+            start_ts: Some(1_700_000_000_000),
+            end_ts: Some(1_700_003_600_000),
+            is_all_day: false,
+            location: Some("Room 4".into()),
+            recurring: true,
+        }),
         attachments: vec![Attachment {
             id: 9,
             message_id: 512,

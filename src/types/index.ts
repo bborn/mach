@@ -122,6 +122,41 @@ export interface Message {
    * says which row that draft is. See `useMach`'s `draftSent`.
    */
   machDraftId?: string;
+  /**
+   * The meeting this message is an invitation to, when it is one.
+   *
+   * Present only for a message whose `text/calendar` part said `METHOD:REQUEST`
+   * — a reply ("Sam accepted") and a cancellation carry the same uid and are
+   * not invitations, and Rust drops both before this field exists. See
+   * `db::models::MessageInvitation`.
+   */
+  invitation?: Invitation;
+}
+
+/**
+ * A calendar invitation, joined to the event on the local calendar.
+ *
+ * `eventId` absent is the state the whole feature turns on: the invitation is
+ * here and the meeting is not — an unrun calendar sync, an account whose
+ * calendar Mach does not hold, someone else's invitation forwarded on. There is
+ * no row to RSVP against, so there is nothing to offer; see `Invitation.tsx`.
+ */
+export interface Invitation {
+  /** The iCalendar `UID`. Joins to `events.ical_uid` in the store. */
+  uid: string;
+  /** The iCalendar `METHOD`, uppercased. Only `REQUEST` gets a control. */
+  method: string;
+  eventId?: EventId;
+  /** The answer already on the calendar. Absent means never answered. */
+  response?: Rsvp;
+  /** Title, time and place as the *event* has them, not as the mail wrote them. */
+  title?: string;
+  start?: number;
+  end?: number;
+  allDay: boolean;
+  location?: string;
+  /** The matched row is one occurrence of a series. */
+  recurring: boolean;
 }
 
 export interface ThreadDetail {

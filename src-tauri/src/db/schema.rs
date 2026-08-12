@@ -78,7 +78,35 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 15,
         sql: M15_MIRROR_OWNER,
     },
+    Migration {
+        version: 16,
+        sql: M16_MESSAGE_INVITATION,
+    },
 ];
+
+/// Migration 16 — which meeting a message is an invitation to.
+///
+/// The two fields `invite::parse` reads out of a message's `text/calendar`
+/// part, kept on the message row so that opening a conversation stays a local
+/// read. `invite_uid` is the iCalendar `UID`, which is the same string
+/// `events.ical_uid` holds — that pair is the whole join between the mail in
+/// front of the reader and the event to answer.
+///
+/// Both are nullable and there is no backfill, so every message already stored
+/// reads back as "we never looked". That is honest rather than convenient: the
+/// bytes of the calendar part were never kept, and inventing a uid from the
+/// subject line is exactly the guess this column exists to avoid. A message
+/// re-synced for any other reason picks it up; an invitation older than this
+/// build keeps Google's own buttons and nothing else, which is what it had
+/// yesterday.
+///
+/// No index. The lookup runs the other way — uid in hand, find the event — and
+/// `idx_events_ical_uid` already serves it. An index here would only pay for a
+/// query nobody makes.
+const M16_MESSAGE_INVITATION: &str = r#"
+ALTER TABLE messages ADD COLUMN invite_uid    TEXT;
+ALTER TABLE messages ADD COLUMN invite_method TEXT;
+"#;
 
 /// Migration 15 — which composer draft a message row is the mirror of.
 ///

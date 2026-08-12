@@ -431,7 +431,8 @@ const MESSAGE_COLUMNS: &str = "\
     references_header, from_name, from_email, to_json, cc_json, bcc_json, subject, \
     body_html, body_text, snippet, internal_date, is_unread, is_draft, reply_to, \
     body_text_flowed, body_text_delsp, \
-    (html_evicted_at IS NOT NULL AND body_html IS NULL), mach_draft_id";
+    (html_evicted_at IS NOT NULL AND body_html IS NULL), mach_draft_id, \
+    invite_uid, invite_method";
 
 fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
     let to: String = row.get(9)?;
@@ -469,8 +470,114 @@ fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
         is_unread: row.get(17)?,
         is_draft: row.get(18)?,
         mach_draft_id: row.get(23)?,
+        // The half that came off this row. The event half is `None` until
+        // `messages_for_thread` looks it up — see `invitation_event`.
+        invitation: row.get::<_, Option<String>>(24)?.map(|uid| MessageInvitation {
+            uid,
+            method: row
+                .get::<_, Option<String>>(25)
+                .unwrap_or_default()
+                .unwrap_or_default(),
+            event_id: None,
+            response: None,
+            title: None,
+            start_ts: None,
+            end_ts: None,
+            is_all_day: false,
+            location: None,
+            recurring: false,
+        }),
         attachments: Vec::new(),
     })
+}
+
+/// Record what the sync layer read out of a message's calendar part.
+///
+/// Separate from [`upsert_message`] for the same reason
+/// [`set_message_draft_id`] is: the ordinary message write knows nothing about
+/// invitations, and folding this in would mean every writer that is not sync —
+/// the composer's mirror, the outbox — silently cleared the columns on a row
+/// they know nothing about.
+///
+/// `None` clears, which is correct on the one path that reaches it: a message
+/// re-synced after its calendar part changed shape is no longer an invitation.
+pub fn set_message_invitation(
+    conn: &Connection,
+    message_id: i64,
+    invitation: Option<&crate::invite::Invitation>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET invite_uid = ?2, invite_method = ?3 WHERE id = ?1",
+        params![
+            message_id,
+            invitation.map(|i| i.uid.as_str()),
+            invitation.map(|i| i.method.as_str()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The event an invitation's `UID` names, on the account the mail arrived at.
+///
+/// # Why the account is part of the match
+///
+/// `ical_uid` is unique to a *meeting*, not to a calendar: the same uid is on
+/// every invitee's copy, and on both of the owner's copies when two of his
+/// accounts were invited. Answering is not identity-neutral —
+/// `commands::calendar::execute_rsvp` responds as the account the event row
+/// belongs to — so a match on the wrong account would tell the organiser that
+/// the wrong address is coming. Scoping to the message's own account makes the
+/// answer come from the address the invitation was sent to, and turns the
+/// cross-account case into an honest "not here" rather than a confident wrong
+/// answer.
+///
+/// # Which occurrence, when there are many
+///
+/// A recurring meeting is stored as one row per occurrence (`singleEvents=true`)
+/// and every one of them carries the series' uid. The nearest occurrence to
+/// `now` wins, preferring one that has not finished — the invitation that just
+/// arrived is about the next of them, not about a copy from March. Answering
+/// still answers *that occurrence*, which is the same thing the calendar's own
+/// RSVP control does; `recurring` is set so the interface can say so.
+///
+/// A cancelled row is skipped: Google leaves the row behind with
+/// `status = 'cancelled'`, and offering to accept a meeting that has been
+/// called off is worse than offering nothing.
+pub fn invitation_event(
+    conn: &Connection,
+    account_id: i64,
+    uid: &str,
+    now_ms: i64,
+) -> Result<Option<MessageInvitation>> {
+    let found = conn
+        .query_row(
+            "SELECT id, title, start_ts, end_ts, is_all_day, location, rsvp_status,
+                    recurring_event_id
+               FROM events
+              WHERE ical_uid = ?1 AND account_id = ?2 AND status <> 'cancelled'
+              ORDER BY (end_ts < ?3) ASC, ABS(start_ts - ?3) ASC
+              LIMIT 1",
+            params![uid, account_id, now_ms],
+            |row| {
+                let title: String = row.get(1)?;
+                let rsvp: Option<String> = row.get(6)?;
+                let series: Option<String> = row.get(7)?;
+                Ok(MessageInvitation {
+                    uid: uid.to_string(),
+                    method: String::new(),
+                    event_id: Some(row.get(0)?),
+                    response: rsvp.as_deref().and_then(RsvpStatus::parse),
+                    title: (!title.is_empty()).then_some(title),
+                    start_ts: Some(row.get(2)?),
+                    end_ts: Some(row.get(3)?),
+                    is_all_day: row.get(4)?,
+                    location: row.get::<_, Option<String>>(5)?.filter(|l| !l.is_empty()),
+                    recurring: series.is_some_and(|s| !s.is_empty()),
+                })
+            },
+        )
+        .optional()?;
+    Ok(found)
 }
 
 /// A thread's messages, oldest first, with their attachments filled in.
@@ -497,6 +604,34 @@ pub fn messages_for_thread(conn: &Connection, thread_id: i64) -> Result<Vec<Mess
         if let Some(msg) = messages.iter_mut().find(|m| m.id == att.message_id) {
             msg.attachments.push(att);
         }
+    }
+
+    /*
+     * The event half of an invitation, for the messages that are one.
+     *
+     * One indexed lookup per invitation, and a thread holds at most a couple —
+     * ordinary mail costs nothing here because `invitation` is `None` and the
+     * loop never runs a statement. Doing it at read time rather than storing an
+     * event id on the message is what makes the answer *current*: the event may
+     * have arrived in a sync since the mail did, been answered on the phone, or
+     * been moved.
+     */
+    let now = now_ms();
+    for message in messages.iter_mut() {
+        let Some(invitation) = message.invitation.take() else {
+            continue;
+        };
+        let resolved = invitation_event(conn, message.account_id, &invitation.uid, now)?;
+        message.invitation = Some(match resolved {
+            Some(event) => MessageInvitation {
+                method: invitation.method,
+                ..event
+            },
+            // The uid and method still go up: the interface says that the
+            // meeting is not here rather than pretending the message is
+            // ordinary mail.
+            None => invitation,
+        });
     }
 
     Ok(messages)

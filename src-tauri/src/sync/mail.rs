@@ -994,6 +994,11 @@ pub(crate) fn store_message(
     row.thread_id = thread_id;
     let message_id = queries::upsert_message(conn, &row)?;
 
+    // Written every time, including when there is nothing to write: a message
+    // re-synced after its calendar part changed must not keep the uid it no
+    // longer carries.
+    queries::set_message_invitation(conn, message_id, prepared.invitation.as_ref())?;
+
     sync_queries::clear_message_attachments(conn, message_id)?;
     for attachment in prepared.attachments {
         queries::upsert_attachment(
