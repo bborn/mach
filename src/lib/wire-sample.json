@@ -135,6 +135,18 @@
     "id": 512,
     "inReplyTo": "<prior@example.com>",
     "internalDate": 1700000000000,
+    "invitation": {
+      "endTs": 1700003600000,
+      "eventId": 77,
+      "isAllDay": false,
+      "location": "Room 4",
+      "method": "REQUEST",
+      "recurring": true,
+      "response": "needsAction",
+      "startTs": 1700000000000,
+      "title": "Quarterly review",
+      "uid": "6r2h1c9k6ss30b9k6ss30b9k6s@google.com"
+    },
     "isDraft": true,
     "isUnread": true,
     "machDraftId": "draft-18f0c0ffee",

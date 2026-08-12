@@ -20,6 +20,9 @@ pub struct PreparedMessage {
     pub attachments: Vec<NewAttachment>,
     /// The full Gmail label set for this message.
     pub label_ids: Vec<String>,
+    /// The meeting this message invites us to, when its calendar part says so.
+    /// Written to the message row by `sync::mail::store_message`.
+    pub invitation: Option<crate::invite::Invitation>,
 }
 
 /// Turn a `users.messages.get` response into the rows it becomes.
@@ -65,6 +68,25 @@ pub fn prepare_message(account_id: i64, msg: &g::Message) -> PreparedMessage {
         })
         .collect();
 
+    /*
+     * The calendar part, read once, here, while its bytes are in hand.
+     *
+     * Gmail hands back a `text/calendar` alternative inline (`body.data`) and
+     * the `invite.ics` beside it as an attachment id. Only the inline one can
+     * be read without a request, which is the whole reason the recognition
+     * happens at sync time and not when the reading pane opens: nothing the UI
+     * renders may wait on Google.
+     *
+     * `walk` puts every non-body leaf in `attachments`, inline data included,
+     * so both candidates are already here — including the `text/calendar` part
+     * that has no filename and is therefore not a *file* anybody sees.
+     */
+    let invitation = crate::invite::from_parts(
+        body.attachments
+            .iter()
+            .map(|a| (a.mime_type.as_str(), a.filename.as_str(), a.data.as_deref())),
+    );
+
     PreparedMessage {
         gmail_thread_id: msg.thread_id.clone(),
         message: NewMessage {
@@ -98,6 +120,7 @@ pub fn prepare_message(account_id: i64, msg: &g::Message) -> PreparedMessage {
         },
         attachments,
         label_ids,
+        invitation,
     }
 }
 

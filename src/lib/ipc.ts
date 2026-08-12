@@ -28,6 +28,7 @@ import type {
   EventGuest,
   FilterAction,
   FilterCriteria,
+  Invitation,
   Label,
   MailFilter,
   Message,
@@ -184,6 +185,21 @@ interface WireMessage {
   /** `db::models::Message.mach_draft_id` — which composer draft that mirror is. */
   machDraftId?: Nullable<string>;
   attachments?: Nullable<WireAttachment[]>;
+  /** `db::models::MessageInvitation` — absent on every message that is not one. */
+  invitation?: Nullable<WireInvitation>;
+}
+
+interface WireInvitation {
+  uid?: Nullable<string>;
+  method?: Nullable<string>;
+  eventId?: Nullable<number>;
+  response?: Nullable<string>;
+  title?: Nullable<string>;
+  startTs?: Nullable<number>;
+  endTs?: Nullable<number>;
+  isAllDay?: Nullable<boolean>;
+  location?: Nullable<string>;
+  recurring?: Nullable<boolean>;
 }
 
 interface WireThreadDetail {
@@ -548,6 +564,30 @@ export function mapMessage(wire: WireMessage): Message {
     isDraft: wire.isDraft === true,
     machDraftId: optional(wire.machDraftId),
     attachments: (wire.attachments ?? []).map(mapAttachment),
+    invitation: wire.invitation ? mapInvitation(wire.invitation) : undefined,
+  };
+}
+
+/**
+ * An invitation, with the event half left absent when Rust could not find one.
+ *
+ * `eventId` is passed through as `undefined` rather than defaulted to anything,
+ * because every caller's first question is "is there a row to answer against",
+ * and a zero would answer yes.
+ */
+function mapInvitation(wire: WireInvitation): Invitation {
+  const response = wire.response as Rsvp | null | undefined;
+  return {
+    uid: text(wire.uid),
+    method: text(wire.method).toUpperCase(),
+    eventId: typeof wire.eventId === "number" ? wire.eventId : undefined,
+    response: response && RSVP_VALUES.has(response) ? response : undefined,
+    title: optional(wire.title),
+    start: typeof wire.startTs === "number" ? wire.startTs : undefined,
+    end: typeof wire.endTs === "number" ? wire.endTs : undefined,
+    allDay: wire.isAllDay === true,
+    location: optional(wire.location),
+    recurring: wire.recurring === true,
   };
 }
 

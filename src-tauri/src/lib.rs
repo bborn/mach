@@ -36,6 +36,8 @@ pub mod db;
 pub mod evict;
 pub mod google;
 pub mod ipc;
+/// Recognising a calendar invitation in a message, and the uid that identifies it.
+pub mod invite;
 pub mod notify;
 pub mod plugins;
 /// The QA control port — three verbs, and only in a development build.

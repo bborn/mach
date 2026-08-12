@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
 import {
+  ChevronDown,
+  ChevronUp,
   Download,
   EllipsisVertical,
   File,
@@ -30,6 +32,9 @@ import {
   type AttachmentKind,
 } from "@/lib/attachments";
 import { errorMessage } from "@/lib/ipc";
+import { invitationOn, isAnswerable } from "@/lib/invitation";
+import { Button } from "@/components/ui/button";
+import { Invitation } from "./Invitation";
 import { MessageBody } from "./MessageBody";
 import { MESSAGE_CURSOR, MESSAGE_DRAFT, MESSAGE_ROW } from "./thread-cursor";
 
@@ -97,6 +102,15 @@ export function ThreadMessage({
 }: ThreadMessageProps) {
   const attachments = message.attachments;
   const draft = message.isDraft;
+  const invitation = invitationOn(message);
+  /*
+   * The body is only folded when the card above it can actually answer. With
+   * no event in the store there is nothing native to press, and Google's own
+   * buttons are the reader's only route — hiding them would leave an
+   * invitation with no way to answer it at all.
+   */
+  const foldable = isAnswerable(invitation);
+  const [bodyOpen, setBodyOpen] = useState(false);
 
   return (
     <article
@@ -192,7 +206,39 @@ export function ThreadMessage({
             {message.cc.length > 0 && ` · cc ${message.cc.map((p) => p.name).join(", ")}`}
           </div>
 
-          <MessageBody message={message} live={live} />
+          {invitation && <Invitation messageId={message.id} invitation={invitation} />}
+
+          {/*
+            Google's copy of the invitation, folded away rather than altered.
+            The card above answers the same question without leaving the app,
+            and two sets of Yes / No / Maybe — one of them a link to google.com
+            — is what made this confusing to begin with. The disclosure is the
+            quoted-history idiom from `MessageBody`, and what it hides is
+            byte-identical to what arrived: nothing is rewritten, and one
+            keystroke brings the whole message back, organiser's note included.
+          */}
+          {foldable && (
+            <div className="mt-1">
+              <Button
+                size="sm"
+                variant="subtle"
+                className="gap-1"
+                aria-expanded={bodyOpen}
+                onClick={() => setBodyOpen(!bodyOpen)}
+              >
+                {bodyOpen ? (
+                  <ChevronUp size={12} strokeWidth={1.75} />
+                ) : (
+                  <ChevronDown size={12} strokeWidth={1.75} />
+                )}
+                <span className="text-micro">
+                  {bodyOpen ? "Hide Google's invitation" : "Google's invitation"}
+                </span>
+              </Button>
+            </div>
+          )}
+
+          {(!foldable || bodyOpen) && <MessageBody message={message} live={live} />}
 
           {attachments.length > 0 && <AttachmentRow attachments={attachments} live={live} />}
         </>

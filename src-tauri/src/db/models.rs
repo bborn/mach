@@ -294,6 +294,47 @@ pub fn is_local_message_id(gmail_message_id: &str) -> bool {
     gmail_message_id.is_empty() || gmail_message_id.starts_with(LOCAL_ID_PREFIX)
 }
 
+/// A calendar invitation, and the event it turned out to be for.
+///
+/// The two halves are stored in different places and one of them can be
+/// missing. `uid` and `method` come off the message row, written when the
+/// message was synced (see [`crate::invite`]). Everything below them is read
+/// from the *event* the uid matches, at the moment the conversation is opened,
+/// so the response shown is the one currently on the calendar rather than the
+/// one that was true when the mail arrived.
+///
+/// # `event_id` is `None` more often than it looks
+///
+/// An invitation can be in the inbox with no event beside it: the calendar
+/// sync has not run yet, the invitation went to an address whose calendar Mach
+/// does not hold, or the message is a forward of somebody else's meeting. All
+/// three read the same from here, and all three mean the same thing for the
+/// interface — there is nothing local to RSVP against, so no control may be
+/// offered. Dispatching `Rsvp` needs an event row id and there is no id to
+/// send; a button that silently did nothing is the failure mode this whole
+/// field exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageInvitation {
+    /// The iCalendar `UID` from the message's calendar part.
+    pub uid: String,
+    /// The iCalendar `METHOD`, uppercased. Always `REQUEST` today.
+    pub method: String,
+    /// The local event row, when the uid matched one on this account.
+    pub event_id: Option<i64>,
+    /// The answer already recorded on that event, if any.
+    pub response: Option<RsvpStatus>,
+    /// Title, time and place as the *calendar* has them.
+    pub title: Option<String>,
+    pub start_ts: Option<i64>,
+    pub end_ts: Option<i64>,
+    pub is_all_day: bool,
+    pub location: Option<String>,
+    /// True when the matched row is one occurrence of a series, so the
+    /// interface can say that an answer is about this occurrence.
+    pub recurring: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Message {
@@ -332,6 +373,14 @@ pub struct Message {
     pub internal_date: i64,
     pub is_unread: bool,
     pub is_draft: bool,
+    /// The meeting this message is an invitation to, when it is one.
+    ///
+    /// Filled in by [`crate::db::queries::messages_for_thread`], which is the
+    /// one read path a reader's eyes are behind; every other path leaves it
+    /// `None` rather than paying for a join nobody displays. See
+    /// [`MessageInvitation`] for why the event half can be absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invitation: Option<MessageInvitation>,
     /// The composer draft this row is the mirror of, when it is one.
     ///
     /// The frontend's half of the same identity `compose::mirror` writes: the
