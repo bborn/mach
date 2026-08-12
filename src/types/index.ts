@@ -464,6 +464,33 @@ export interface SyncStatus {
   missingScope: string[];
 }
 
+/** What one account did during a pass somebody asked for. */
+export interface SyncAccountOutcome {
+  accountId: AccountId;
+  email: string;
+  messagesWritten: number;
+  eventsWritten: number;
+  /** Google's own text, or `null` when the account finished. */
+  error: string | null;
+  /** Signing in again is the recovery, not syncing again. */
+  needsReauthorization: boolean;
+  cancelled: boolean;
+  /** This account was already mid-pass, so nothing new was started for it. */
+  skipped: boolean;
+}
+
+/**
+ * The answer to "sync now".
+ *
+ * It resolves when the pass is over, which is what lets the window say whether
+ * it worked rather than leaving a spinner to be interpreted.
+ */
+export interface ForcedSync {
+  /** False when everything asked for was already syncing. */
+  started: boolean;
+  accounts: SyncAccountOutcome[];
+}
+
 /** One Gmail filter, as `list_filters` returns it. */
 export interface MailFilter {
   accountId: AccountId;

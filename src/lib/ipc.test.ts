@@ -781,6 +781,70 @@ describe("sync status", () => {
   });
 });
 
+describe("sync now", () => {
+  it("asks for every account by default", async () => {
+    const { transport, calls } = fakeTransport({ sync_now: { started: true, accounts: [] } });
+    await createIpcSource(transport).syncNow();
+    expect(calls[0]).toEqual({ command: "sync_now", args: { accountId: null } });
+  });
+
+  it("names one account when the retry beside it was pressed", async () => {
+    const { transport, calls } = fakeTransport({ sync_now: { started: true, accounts: [] } });
+    await createIpcSource(transport).syncNow(4);
+    expect(calls[0]).toEqual({ command: "sync_now", args: { accountId: 4 } });
+  });
+
+  it("maps the per-account outcome, including the two flags that route it", async () => {
+    const { transport } = fakeTransport({
+      sync_now: {
+        started: true,
+        accounts: [
+          {
+            accountId: 1,
+            email: "bruno@example.com",
+            messagesWritten: 2,
+            eventsWritten: 1,
+            error: null,
+          },
+          {
+            accountId: 2,
+            email: "bruno@work.example",
+            error: "invalid_grant (Token has been expired or revoked.)",
+            needsReauthorization: true,
+          },
+          { accountId: 3, email: "third@example.com", skipped: true },
+        ],
+      },
+    });
+
+    const outcome = await createIpcSource(transport).syncNow();
+
+    expect(outcome.started).toBe(true);
+    expect(outcome.accounts[0]).toEqual({
+      accountId: 1,
+      email: "bruno@example.com",
+      messagesWritten: 2,
+      eventsWritten: 1,
+      error: null,
+      needsReauthorization: false,
+      cancelled: false,
+      skipped: false,
+    });
+    // Google's own text, verbatim — it is what tells a password change from a
+    // revoked grant — and the flag that sends the failure to a sign-in.
+    expect(outcome.accounts[1]?.error).toContain("expired or revoked");
+    expect(outcome.accounts[1]?.needsReauthorization).toBe(true);
+    expect(outcome.accounts[2]?.skipped).toBe(true);
+  });
+
+  it("assumes a pass started when an older backend does not say", async () => {
+    const { transport } = fakeTransport({ sync_now: {} });
+    // The alternative is telling him nothing happened when it did, which is
+    // the worse of the two wrong answers.
+    expect((await createIpcSource(transport).syncNow()).started).toBe(true);
+  });
+});
+
 describe("filters", () => {
   const WIRE_FILTER = {
     accountId: 2,

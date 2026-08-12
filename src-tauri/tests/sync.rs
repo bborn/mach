@@ -24,7 +24,7 @@ use mach_lib::google::{
     BoxFuture, HttpRequest, HttpResponse, HttpTransport, RetryPolicy, StaticTokenProvider,
     TokenProvider, TransportError,
 };
-use mach_lib::sync::{CancelToken, SyncConfig, SyncEngine, TransportClients};
+use mach_lib::sync::{CancelToken, SyncConfig, SyncEngine, SyncScope, TransportClients};
 
 const GMAIL_BASE: &str = "https://gmail.test/gmail/v1";
 const CALENDAR_BASE: &str = "https://calendar.test/calendar/v3";
@@ -2880,4 +2880,290 @@ fn draft_rows(db: &Db) -> Vec<String> {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     })
     .unwrap()
+}
+
+// ===========================================================================
+// forcing a pass
+// ===========================================================================
+
+/// The ordinary incremental pass, run this instant. Nothing is re-downloaded
+/// and the watermark ends where an ordinary pass would have left it.
+#[tokio::test]
+async fn forcing_a_sync_replays_history_now_and_leaves_the_watermark_correct() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+    let account_id =
+        synced_account(&db, &google, vec![FakeMessage::new("m1", "t1").at(1_000)]).await;
+    let token = format!("tok-{account_id}");
+
+    let watermark_after_backfill = history_id(&db, account_id).expect("synced");
+    let gets_before = google.gets_served();
+
+    // He sends from his phone. The background loop will not look for a minute.
+    google.with(&token, |mailbox| {
+        mailbox.deliver(FakeMessage::new("m2", "t2").at(2_000).subject("From the phone"));
+    });
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    let forced = engine.force_sync(SyncScope::All).await;
+
+    assert!(forced.started, "a forced pass with nothing in flight runs");
+    let outcome = forced
+        .accounts
+        .iter()
+        .find(|a| a.account_id == account_id)
+        .expect("the account is reported");
+    assert!(outcome.is_ok(), "forced pass failed: {:?}", outcome.error);
+    assert!(!outcome.skipped);
+    assert_eq!(outcome.messages_written, 1, "the new message landed");
+
+    let subjects: Vec<String> = db
+        .read(|conn| queries::list_threads(conn, &ThreadQuery::default()))
+        .unwrap()
+        .into_iter()
+        .map(|t| t.subject)
+        .collect();
+    assert!(
+        subjects.iter().any(|s| s == "From the phone"),
+        "got {subjects:?}"
+    );
+
+    // The watermark moved forward to exactly where Google is, and was neither
+    // thrown away nor left behind.
+    let stored = history_id(&db, account_id).expect("still synced");
+    assert_ne!(stored, watermark_after_backfill, "the watermark advanced");
+    assert_eq!(
+        stored,
+        google.with(&token, |m| m.current_history_id()).to_string(),
+        "the watermark must end where Google's does"
+    );
+
+    // And it is a replay, not a rebuild: one message fetched, not the mailbox.
+    assert_eq!(
+        google.gets_served() - gets_before,
+        1,
+        "a forced sync must not re-download the year"
+    );
+
+    // The next ordinary pass still works from what the forced one left.
+    let pass = engine.sync_once().await;
+    assert!(pass.account(account_id).unwrap().is_ok());
+    assert_eq!(message_count(&db), 2, "nothing was re-fetched or duplicated");
+    assert_store_is_consistent(&db);
+}
+
+/// Pressing it twice.
+///
+/// The second request finds the account claimed by the first, leaves it alone
+/// and says so. Two passes replaying `history.list` from one watermark is the
+/// specific thing this prevents.
+#[tokio::test]
+async fn a_second_force_while_one_is_in_flight_does_not_start_a_second_pass() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+    let account_id =
+        synced_account(&db, &google, vec![FakeMessage::new("m1", "t1").at(1_000)]).await;
+    let token = format!("tok-{account_id}");
+
+    google.with(&token, |mailbox| {
+        mailbox.deliver(FakeMessage::new("m2", "t2").at(2_000));
+    });
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    let history_before = google.requests_matching("/history?").len();
+
+    // Both requests are live at once. `pass` claims its accounts before its
+    // first await, so whichever is polled second finds the claim taken.
+    let (first, second) = tokio::join!(
+        engine.force_sync(SyncScope::All),
+        engine.force_sync(SyncScope::All)
+    );
+
+    let (ran, refused) = if first.started {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert!(ran.started);
+    assert!(!refused.started, "the second press must not start a pass");
+
+    let skipped = refused
+        .accounts
+        .iter()
+        .find(|a| a.account_id == account_id)
+        .expect("the account is still named");
+    assert!(skipped.skipped, "already syncing is not a failure");
+    assert!(skipped.error.is_none(), "and it is not an error either");
+    assert_eq!(skipped.email, "one@example.com");
+
+    assert_eq!(
+        google.requests_matching("/history?").len() - history_before,
+        1,
+        "history was replayed once, not twice"
+    );
+
+    // One copy of the message, and a watermark that matches Google exactly.
+    assert_eq!(message_count(&db), 2);
+    assert_eq!(
+        history_id(&db, account_id).unwrap(),
+        google.with(&token, |m| m.current_history_id()).to_string()
+    );
+    assert_store_is_consistent(&db);
+}
+
+/// The background loop and a forced pass do not both sync one account.
+///
+/// Same claim, from the other direction: whichever arrives first does the work
+/// and the other reports the account as already in flight.
+#[tokio::test]
+async fn a_forced_pass_and_a_scheduled_one_never_overlap_on_an_account() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+    let account_id =
+        synced_account(&db, &google, vec![FakeMessage::new("m1", "t1").at(1_000)]).await;
+    let token = format!("tok-{account_id}");
+
+    google.with(&token, |mailbox| {
+        mailbox.deliver(FakeMessage::new("m2", "t2").at(2_000));
+    });
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    let history_before = google.requests_matching("/history?").len();
+
+    let (scheduled, forced) = tokio::join!(engine.sync_once(), engine.force_sync(SyncScope::All));
+
+    let ran_scheduled = scheduled
+        .account(account_id)
+        .map(|a| !a.skipped)
+        .unwrap_or(false);
+    let ran_forced = forced.accounts.iter().any(|a| !a.skipped);
+    assert!(
+        ran_scheduled ^ ran_forced,
+        "exactly one of the two passes may sync the account"
+    );
+
+    assert_eq!(
+        google.requests_matching("/history?").len() - history_before,
+        1
+    );
+    assert_eq!(message_count(&db), 2);
+    assert_store_is_consistent(&db);
+}
+
+/// The retry beside a failure names one address, so it had better sync one.
+#[tokio::test]
+async fn forcing_one_account_leaves_the_others_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+
+    let one = add_account(&db, "one@example.com");
+    let two = add_account(&db, "two@example.com");
+
+    let mut first = Mailbox::new("one@example.com");
+    first.seed(FakeMessage::new("m1", "t1").at(1_000));
+    google.install(&format!("tok-{one}"), first);
+    let mut other = Mailbox::new("two@example.com");
+    other.seed(FakeMessage::new("m2", "t2").at(2_000));
+    google.install(&format!("tok-{two}"), other);
+
+    let engine = new_engine(&db, Arc::clone(&google), mail_config());
+    let forced = engine.force_sync(SyncScope::Account(one)).await;
+
+    assert!(forced.started);
+    assert_eq!(forced.accounts.len(), 1, "only the account asked for");
+    assert_eq!(forced.accounts[0].account_id, one);
+    assert!(forced.accounts[0].is_ok());
+
+    assert!(history_id(&db, one).is_some(), "the named account synced");
+    assert_eq!(history_id(&db, two), None, "the other was never touched");
+    assert_eq!(message_count(&db), 1);
+}
+
+/// A failure has to name the account and quote Google, and a dead credential
+/// has to route into "sign in again" rather than "try again".
+#[tokio::test]
+async fn a_forced_pass_reports_each_failure_against_its_own_account() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+
+    let healthy = add_account(&db, "healthy@example.com");
+    let revoked = add_account(&db, "revoked@example.com");
+
+    let mut mailbox = Mailbox::new("healthy@example.com");
+    mailbox.seed(FakeMessage::new("m1", "t1").at(1_000));
+    google.install(&format!("tok-{healthy}"), mailbox);
+
+    let (engine, _live) =
+        engine_with_dead_credential(&db, Arc::clone(&google), "revoked@example.com");
+    let forced = engine.force_sync(SyncScope::All).await;
+
+    assert!(forced.started);
+    assert_eq!(forced.failures().count(), 1, "one account, not the mailbox");
+
+    let broken = forced
+        .accounts
+        .iter()
+        .find(|a| a.account_id == revoked)
+        .expect("the refused account is reported");
+    assert_eq!(broken.email, "revoked@example.com");
+    assert!(
+        broken.needs_reauthorization,
+        "a refused credential routes into signing in again"
+    );
+    let reason = broken.error.as_deref().expect("Google's own words");
+    assert!(reason.contains("invalid_grant"), "got {reason}");
+
+    assert!(forced
+        .accounts
+        .iter()
+        .find(|a| a.account_id == healthy)
+        .unwrap()
+        .is_ok());
+
+    // And the status the window renders says the same thing.
+    let status = engine.status_snapshot();
+    assert_eq!(
+        status.needs_reauthorization().collect::<Vec<_>>(),
+        vec!["revoked@example.com"]
+    );
+    assert_eq!(message_count(&db), 1, "the healthy account still synced");
+}
+
+/// "Go and look now" includes looking at which calendars there are. The
+/// scheduled pass trusts a six-hour-old list; a forced one asks.
+#[tokio::test]
+async fn a_forced_pass_refetches_the_calendar_list_the_loop_would_have_cached() {
+    let db = Db::open_in_memory().unwrap();
+    let account_id = add_account(&db, "one@example.com");
+    let token = format!("tok-{account_id}");
+
+    let google = FakeGoogle::new();
+    google.install(&token, Mailbox::new("one@example.com"));
+
+    let engine = new_engine(&db, Arc::clone(&google), calendar_config());
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+    assert_eq!(google.requests_matching("calendarList").len(), 1);
+
+    // A second scheduled pass still trusts the stored list.
+    assert!(engine.sync_once().await.account(account_id).unwrap().is_ok());
+    assert_eq!(google.requests_matching("calendarList").len(), 1);
+
+    // Somebody shares a calendar, and he presses Sync now.
+    google.with(&token, |mailbox| {
+        mailbox
+            .calendars
+            .push(calendar_entry("shared@group.calendar.google.com", false));
+    });
+    let forced = engine.force_sync(SyncScope::All).await;
+    assert!(forced.started);
+    assert_eq!(
+        google.requests_matching("calendarList").len(),
+        2,
+        "a forced pass asks which calendars there are"
+    );
+
+    let stored = db
+        .read(move |conn| queries::list_calendars(conn, Some(account_id)))
+        .unwrap();
+    assert_eq!(stored.len(), 2, "the new calendar is here without a restart");
 }

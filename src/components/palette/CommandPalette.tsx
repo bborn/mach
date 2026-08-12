@@ -1,5 +1,5 @@
 import { Calendar, Mail, Search, Sparkles, Tag, Terminal, User } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { Participant } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useMach } from "@/hooks/useMach";
@@ -21,6 +21,7 @@ import {
   type FrecencyStore,
 } from "@/lib/palette/frecency";
 import { ghostEnabled, setGhostEnabled } from "@/lib/ghost";
+import { forcedSyncInFlight, subscribeForcedSync } from "@/lib/force-sync";
 import { listTime, monthShort, shortTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import { Overlay } from "@/components/ui/dialog";
@@ -65,7 +66,12 @@ const COMMANDS: PaletteCommand[] = [
   },
   { id: "all-accounts", title: "Show all accounts", keywords: "unified accounts" },
   { id: "add-account", title: "Add a Google account", keywords: "account oauth connect google" },
-  { id: "sync-now", title: "Sync now", keywords: "sync refresh fetch" },
+  {
+    id: "sync-now",
+    title: "Sync now",
+    hint: "⇧⌘R",
+    keywords: "sync refresh fetch reload update check mail calendar google now force",
+  },
   { id: "theme", title: "Cycle theme (system / light / dark)", keywords: "dark light theme" },
   {
     id: "plugins",
@@ -79,8 +85,32 @@ const COMMANDS: PaletteCommand[] = [
   },
 ];
 
+/**
+ * The commands, with the one that has a live state folded in.
+ *
+ * "Sync now" is the only entry here that talks to Google, so it is the only one
+ * that can be *in progress* when you open the palette. Its shortcut column
+ * carries that instead: ⇧⌘R when there is something to press, "Syncing" while
+ * a pass is running. Pressing it again is already harmless — the action refuses
+ * and the engine refuses behind it — and this is what stops it looking like
+ * nothing happened.
+ */
+export function commandsWith(syncing: boolean): PaletteCommand[] {
+  if (!syncing) return COMMANDS;
+  return COMMANDS.map((command) =>
+    command.id === "sync-now" ? { ...command, hint: "Syncing" } : command,
+  );
+}
+
 export function CommandPalette() {
   const { ui, actions, dispatch, allThreads, events, labels, accountById } = useMach();
+
+  const syncing = useSyncExternalStore(
+    subscribeForcedSync,
+    () => forcedSyncInFlight("all"),
+    () => false,
+  );
+  const commands = useMemo(() => commandsWith(syncing), [syncing]);
 
   // Every label is reachable here, which is why the rail does not list them.
   const mailboxes = useMemo(
@@ -117,7 +147,7 @@ export function CommandPalette() {
       events,
       people,
       mailboxes,
-      commands: COMMANDS,
+      commands,
       actions: {
         openThread: (id) => {
           actions.setMode("mail");
@@ -213,7 +243,7 @@ export function CommandPalette() {
         }
       }
     }
-  }, [open, query, allThreads, events, people, mailboxes, actions, dispatch]);
+  }, [open, query, allThreads, events, people, mailboxes, commands, actions, dispatch]);
 
   /*
    * What he actually uses, boosting near-ties and filling the empty query.

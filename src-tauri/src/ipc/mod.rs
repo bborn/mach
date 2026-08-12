@@ -15,7 +15,7 @@
 //! | `execute_command` | `command: Command` | `CommandResult` |
 //! | `command_catalogue` | — | `CommandSpec[]` |
 //! | `sync_status` | — | `SyncStatus` |
-//! | `sync_now` | — | `void` |
+//! | `sync_now` | `accountId?` | `ForcedPass` |
 //! | `begin_add_account` | `email?` | `{ url, pendingId }` |
 //! | `complete_add_account` | `pendingId` | `Account` |
 //! | `remove_account` | `accountId` | `void` |

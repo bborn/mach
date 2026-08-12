@@ -190,6 +190,30 @@ function Shell() {
       description: "Redo",
       handler: () => actions.redo(),
     },
+    /*
+     * ⇧⌘R — go and look at Google now, mail and calendar together.
+     *
+     * Global, and `allowInInput` on purpose: the moment you most want it is
+     * while you are half-way through a reply, waiting for the message you sent
+     * from your phone to turn up. It is safe there in a way a bare letter would
+     * not be — a modified `R` is not an editing key, so `composer-keys.test.ts`
+     * has nothing to object to, and nothing in the app claims ⇧⌘R.
+     *
+     * Neither Gmail nor Google Calendar offers this key, so there is no
+     * vocabulary to match: Gmail has no refresh shortcut at all and Google
+     * Calendar's bare `r` is spent here on Reply, which is Gmail's and which a
+     * Gmail hand will not give up. ⌘R already means "take the held update" one
+     * shelf along (`HeldUpdate`), and ⇧⌘R is every browser's "reload, properly"
+     * — near enough that the hand finds it and far enough that neither key is
+     * ambiguous.
+     */
+    {
+      keys: "shift+mod+r",
+      group: "Global",
+      description: "Sync now",
+      allowInInput: true,
+      handler: () => actions.syncNow(),
+    },
     {
       keys: "mod+1",
       group: "Global",

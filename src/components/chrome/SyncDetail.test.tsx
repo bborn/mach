@@ -24,7 +24,11 @@ const REVOKED =
 
 const NOW = new Date("2026-08-10T15:00:00Z").getTime();
 
-function render(failures: SyncFailure[], lastPassFinishedAt: number | null = NOW - 60_000) {
+function render(
+  failures: SyncFailure[],
+  lastPassFinishedAt: number | null = NOW - 60_000,
+  syncing = false,
+) {
   return renderToStaticMarkup(
     <SyncDetail
       failures={failures}
@@ -32,6 +36,7 @@ function render(failures: SyncFailure[], lastPassFinishedAt: number | null = NOW
       onRetry={() => {}}
       onSignIn={() => {}}
       now={NOW}
+      syncing={syncing}
     />,
   );
 }
@@ -94,5 +99,16 @@ describe("the sync detail", () => {
       `Sign in again as ${dead.email}`,
       `Sync ${throttled.email} again`,
     ]);
+  });
+
+  it("stands its retry down while a pass is already running", () => {
+    const markup = render([throttled], NOW, true);
+    expect(markup).toContain("disabled");
+    expect(markup).toContain("Syncing");
+    // Pressing it again would add nothing: the engine refuses a second pass
+    // over an account it is already syncing.
+    expect(markup).not.toContain(">Sync now<");
+    // The sign-in route is not a sync and stays live throughout.
+    expect(render([dead], NOW, true)).toContain("Sign in again");
   });
 });

@@ -23,6 +23,7 @@ import type {
   EventId,
   FilterAction,
   FilterCriteria,
+  ForcedSync,
   Label,
   LabelId,
   MailFilter,
@@ -415,7 +416,13 @@ export interface MachDataSource {
   commandCatalogue(): Promise<CommandSpec[]>;
 
   syncStatus(): Promise<SyncStatus>;
-  syncNow(): Promise<void>;
+  /**
+   * Sync mail and calendar now — every account, or `accountId` alone.
+   *
+   * Resolves when the pass is over. Nothing on screen waits for it; what waits
+   * is the one line that says whether it worked.
+   */
+  syncNow(accountId?: AccountId): Promise<ForcedSync>;
 
   /**
    * Start an authorization. `email` names the account being repaired, and the
@@ -672,8 +679,25 @@ export const fixtureSource: MachDataSource = {
       missingScope: [],
     };
   },
-  async syncNow() {
-    /* no network to reach from fixtures */
+  async syncNow(accountId?: AccountId): Promise<ForcedSync> {
+    // Fixtures have no Google to look at, so the honest answer is a pass that
+    // ran and found nothing — not a failure, which would put a red dot in the
+    // status bar of a window that is working exactly as intended.
+    return {
+      started: true,
+      accounts: fixtures.accounts
+        .filter((account) => accountId === undefined || account.id === accountId)
+        .map((account) => ({
+          accountId: account.id,
+          email: account.email,
+          messagesWritten: 0,
+          eventsWritten: 0,
+          error: null,
+          needsReauthorization: false,
+          cancelled: false,
+          skipped: false,
+        })),
+    };
   },
 
   async beginAddAccount() {
