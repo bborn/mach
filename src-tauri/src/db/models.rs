@@ -756,15 +756,27 @@ impl Calendar {
     }
 
     /// Whether Google would accept a write to events on this calendar.
-    ///
-    /// `reader` and `freeBusyReader` are read-only; `owner` and `writer` are
-    /// not. Anything else — including `None` — is permissive, because an
-    /// unrecognised role is far more likely to be a role we have not heard of
-    /// than a denial, and the cost of guessing wrong in that direction is one
-    /// refused request rather than an app that will not let you edit anything.
     pub fn writable(&self) -> bool {
-        !matches!(self.access_role.as_deref(), Some("reader") | Some("freeBusyReader"))
+        role_writable(self.access_role.as_deref())
     }
+}
+
+/// Whether an `accessRole` permits writing events.
+///
+/// `reader` and `freeBusyReader` are read-only; `owner` and `writer` are not.
+/// Anything else — including `None` — is permissive, because an unrecognised
+/// role is far more likely to be a role we have not heard of than a denial, and
+/// the cost of guessing wrong in that direction is one refused request rather
+/// than an app that will not let you edit anything.
+///
+/// A free function rather than only a method because the same question is asked
+/// of three different shapes that all carry the role and nothing else in
+/// common: this row, [`crate::ipc::types::Calendar`] on the way to the window,
+/// and the agent's `list_calendars`. `canEditEvent` in `src/lib/calendar-edit.
+/// ts` is the fourth, on the other side of the IPC boundary, and it opens with
+/// the same two role names for the same reason.
+pub fn role_writable(access_role: Option<&str>) -> bool {
+    !matches!(access_role, Some("reader") | Some("freeBusyReader"))
 }
 
 /// The upsert shape: the same row without the identity SQLite assigns.

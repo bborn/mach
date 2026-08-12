@@ -19,11 +19,16 @@
 //!
 //! # Reads
 //!
-//! `list_threads`, `search_threads`, `get_thread`, `list_events`, `list_labels`
-//! and `list_accounts` are the local store, through [`crate::ipc::reads`]. They
-//! are the reason a session can answer "what did Tawny say about the data
-//! room?" rather than only archiving things. They touch nothing and never wait
-//! for approval.
+//! `list_threads`, `search_threads`, `get_thread`, `list_events`,
+//! `list_calendars`, `list_labels` and `list_accounts` are the local store,
+//! through [`crate::ipc::reads`]. They are the reason a session can answer
+//! "what did Tawny say about the data room?" rather than only archiving things.
+//! They touch nothing and never wait for approval.
+//!
+//! `list_calendars` is also the half of `createEvent` that was missing. Every
+//! calendar write takes a `calendarId`, a user names a calendar rather than
+//! identifying it, and nothing turned one into the other — so "add these to
+//! Dad/Ben Schedule" was unanswerable. See [`LIST_CALENDARS_TOOL`].
 //!
 //! # Compose
 //!
@@ -124,6 +129,17 @@ pub const SEND_TOOL: &str = "send_draft";
 pub const DRAFT_TOOL: &str = "draft_reply";
 /// A message to somebody, from nothing — the agent's `c`.
 pub const NEW_DRAFT_TOOL: &str = "draft_message";
+
+/// The calendars, by name, with the id every calendar write demands.
+///
+/// `createEvent` has always taken a `calendarId` and its own parameter
+/// description has always said "as returned by list_calendars" — and until this
+/// existed, nothing returned one. Asked for eleven recurring events on
+/// "Dad/Ben Schedule", the agent had no way to turn that name into an id, no
+/// way to see which account held it, and no way to know whether it could be
+/// written to at all. It wrote the owner a list and asked him to make them
+/// himself.
+pub const LIST_CALENDARS_TOOL: &str = "list_calendars";
 
 /// Gmail filters. Listing is a read; the other two are standing rules.
 pub const LIST_FILTERS_TOOL: &str = "list_filters";
@@ -278,6 +294,24 @@ fn property_for(param: &ParamSpec) -> Value {
 
 /// The event fields, as a schema. `required` is only meaningful for a whole
 /// draft — a patch is by definition partial.
+///
+/// # Three of these used to describe a shape the command layer refuses
+///
+/// `attendees` was advertised as an array of strings against an
+/// [`EventDraft::attendees`] of `Vec<Participant>`; `recurrence` as a single
+/// string against a `Vec<String>` of RRULE lines; `reminderMinutes` as one
+/// integer against a `Vec<i64>`. Serde rejects all three, so a model that read
+/// the schema and did exactly what it said got
+/// *"invalid type: string, expected struct Participant"* back — and a request
+/// for recurring events with a guest on it trips two of them at once, on every
+/// call, with nothing in the error naming the schema as the thing that lied.
+///
+/// So the types here are now the types the command layer holds, and
+/// [`normalize_event`] accepts the singular form of each anyway. Describing the
+/// real shape is what stops the mistake; taking the friendly one is what stops
+/// it costing a turn when the model writes `"molly@example.com"` regardless.
+///
+/// [`EventDraft::attendees`]: crate::commands::EventDraft
 fn event_object(is_draft: bool) -> Value {
     let mut node = json!({
         "type": "object",
@@ -290,11 +324,29 @@ fn event_object(is_draft: bool) -> Value {
             "description": { "type": "string" },
             "attendees": {
                 "type": "array",
-                "items": { "type": "string" },
-                "description": "Email addresses. Adding one invites that person.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "email": { "type": "string" },
+                        "name": { "type": "string" },
+                    },
+                    "required": ["email"],
+                },
+                "description": "Guests, as { email } objects — a bare address string is \
+                                accepted too. Adding one invites that person.",
             },
-            "recurrence": { "type": "string", "description": "An RRULE, e.g. RRULE:FREQ=WEEKLY;BYDAY=TU." },
-            "reminderMinutes": { "type": "integer" },
+            "recurrence": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "RRULE lines, e.g. [\"RRULE:FREQ=WEEKLY;BYDAY=TU\"]. One \
+                                recurring event beats eleven copies. Omit for a one-off.",
+            },
+            "reminderMinutes": {
+                "type": "array",
+                "items": { "type": "integer" },
+                "description": "Popup reminders, minutes before the start. Omit to leave \
+                                the calendar's own defaults on.",
+            },
         },
         "additionalProperties": true,
     });
@@ -306,19 +358,68 @@ fn event_object(is_draft: bool) -> Value {
 
 /// A tool call, back into the typed command it names.
 ///
-/// The catalogue's `kind` is the enum's serde tag, so this is the whole
-/// adapter: put the tag back and let serde do the rest. A malformed call is an
-/// [`AgentError::Invalid`], which the session reports to the model as a tool
-/// error so it can correct itself.
+/// The catalogue's `kind` is the enum's serde tag, so this is very nearly the
+/// whole adapter: put the tag back and let serde do the rest. A malformed call
+/// is an [`AgentError::Invalid`], which the session reports to the model as a
+/// tool error so it can correct itself.
+///
+/// The one thing it does beyond that is [`normalize_event`], which widens the
+/// three event fields that are lists in Rust and singular in the sentence a
+/// model is working from. It is a deliberate exception and not a precedent:
+/// everywhere else, a shape the command layer refuses should be a shape the
+/// schema never offered.
 pub fn command_from_call(name: &str, input: &Value) -> Result<Command, AgentError> {
     let mut object = match input {
         Value::Object(map) => map.clone(),
         Value::Null => Map::new(),
         _ => return Err(AgentError::invalid(format!("{name} takes an object"))),
     };
+    for key in ["draft", "patch"] {
+        if let Some(event) = object.get_mut(key) {
+            normalize_event(event);
+        }
+    }
     object.insert("kind".to_string(), json!(name));
     serde_json::from_value(Value::Object(object))
         .map_err(|e| AgentError::invalid(format!("{name} was called with bad arguments: {e}")))
+}
+
+/// The singular form of a list-valued event field, made plural in place.
+///
+/// `attendees: ["molly@example.com"]` is what a model writes when it is thinking
+/// about who to invite rather than about `Vec<Participant>`, and one RRULE or
+/// one reminder is the overwhelmingly common case for the other two. Each
+/// becomes the shape [`crate::commands::EventDraft`] holds. Anything already in
+/// that shape is untouched, and anything in neither is left exactly as it came
+/// so that serde produces the error rather than this silently dropping a field.
+fn normalize_event(event: &mut Value) {
+    let Some(object) = event.as_object_mut() else {
+        return;
+    };
+
+    if let Some(attendees) = object.get_mut("attendees") {
+        // A bare address becomes a Participant. A name-and-address string is
+        // not parsed here: `Participant` has somewhere to put a display name,
+        // and guessing where "Molly <molly@…>" divides is the composer's job,
+        // not this one's.
+        if let Some(list) = attendees.as_array_mut() {
+            for entry in list.iter_mut() {
+                if let Some(email) = entry.as_str() {
+                    *entry = json!({ "email": email });
+                }
+            }
+        } else if let Some(email) = attendees.as_str() {
+            *attendees = json!([{ "email": email }]);
+        }
+    }
+
+    for key in ["recurrence", "reminderMinutes"] {
+        if let Some(value) = object.get_mut(key) {
+            if value.is_string() || value.is_i64() || value.is_u64() {
+                *value = Value::Array(vec![value.clone()]);
+            }
+        }
+    }
 }
 
 fn read_tools() -> Vec<Tool> {
@@ -374,6 +475,22 @@ fn read_tools() -> Vec<Tool> {
                     "endMs": { "type": "integer", "description": "Unix milliseconds, exclusive." },
                 },
                 "required": ["startMs", "endMs"],
+                "additionalProperties": false,
+            }),
+        ),
+        Tool::auto(
+            LIST_CALENDARS_TOOL,
+            "Every calendar, across every account, with the calendarId createEvent and \
+             moveEvent need. A calendar the user names — \u{201c}Dad/Ben Schedule\u{201d}, \
+             \u{201c}Family\u{201d} — is a name, not an id: resolve it here first, and take \
+             its accountId from the same row. writable is false on a subscription you can \
+             only read, and Google refuses every write to one, so pick another calendar or \
+             say so rather than trying.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "accountId": { "type": "integer", "description": "Restrict to one account. Omit for every account." },
+                },
                 "additionalProperties": false,
             }),
         ),
@@ -665,6 +782,7 @@ pub async fn execute(ctx: &ToolContext, name: &str, input: &Value) -> Result<Too
         "search_threads" => search_threads(ctx, input),
         "get_thread" => get_thread(ctx, input),
         "list_events" => list_events(ctx, input),
+        LIST_CALENDARS_TOOL => list_calendars(ctx, input),
         "list_labels" => list_labels(ctx, input),
         "list_accounts" => list_accounts(ctx),
         DRAFT_TOOL => draft_reply(ctx, input).await,
@@ -858,6 +976,54 @@ fn list_events(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErr
     Ok(ToolOutcome {
         summary: format!("{} events", items.len()),
         payload: json!({ "events": items }),
+        mutated: false,
+        artifact: None,
+    })
+}
+
+/// The calendars, as the four facts a write actually needs.
+///
+/// `id` and `accountId` are what `createEvent` takes, `name` is what the user
+/// said, and `writable` is whether trying is worth a round trip. Everything
+/// else `ipc::reads::list_calendars` carries — the colours, the palette index,
+/// Google's `selected` — is for drawing the grid, and it is dropped here rather
+/// than spent on context the model cannot act on.
+///
+/// `writable` is computed by [`role_writable`], the same rule
+/// `db::models::Calendar::writable` uses and the same two role names
+/// `canEditEvent` opens with in the frontend. A read-only calendar refuses
+/// every write regardless of who is asking, so the answer must not depend on
+/// which of the three asks.
+///
+/// A tombstoned calendar — unsubscribed in Google, still holding events here —
+/// is listed with `writable: false`, because it is: Google will not take an
+/// insert for a calendar this account no longer subscribes to. It is listed at
+/// all so that "move the Molly events off the old calendar" can name it.
+///
+/// [`role_writable`]: crate::db::models::role_writable
+fn list_calendars(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+    let account_id = input.get("accountId").and_then(Value::as_i64);
+    let calendars = reads::list_calendars(&ctx.db).map_err(ipc_to_agent)?;
+    let items: Vec<Value> = calendars
+        .iter()
+        .filter(|c| account_id.is_none_or(|id| c.account_id == id))
+        .map(|c| {
+            json!({
+                "calendarId": c.id,
+                "name": c.name,
+                "accountId": c.account_id,
+                "accountEmail": c.account_email,
+                "primary": c.primary,
+                "writable": !c.deleted
+                    && crate::db::models::role_writable(c.access_role.as_deref()),
+                "timeZone": c.time_zone,
+                "unsubscribed": c.deleted,
+            })
+        })
+        .collect();
+    Ok(ToolOutcome {
+        summary: format!("{} calendars", items.len()),
+        payload: json!({ "calendars": items }),
         mutated: false,
         artifact: None,
     })
