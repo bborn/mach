@@ -147,6 +147,171 @@ pub fn thread_snapshot(conn: &Connection, thread_id: i64) -> Result<Option<Threa
     }))
 }
 
+// ---------------------------------------------------------------------------
+// the drafts a conversation is holding
+// ---------------------------------------------------------------------------
+
+/// One unsent draft sitting in a conversation, as the local store knows it.
+///
+/// A draft is reachable from two different rows, and which of them exists
+/// depends entirely on where the draft was written:
+///
+///  * `compose_drafts` — the composer's editable copy. Present for anything
+///    typed here, and for a draft written elsewhere that has since been opened
+///    here (`draft::load_draft_for_message` adopts it).
+///  * `messages` with `is_draft = 1` — the copy the conversation renders, which
+///    is either the mirror `compose::mirror` wrote or the row the sync pass
+///    upserted from Gmail's `DRAFT` label.
+///
+/// Both, one, or — for a conversation whose messages have not been fetched —
+/// neither. So every field but the thread is optional, and
+/// [`thread_drafts`] returns what there is rather than a shape it had to invent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadDraft {
+    pub thread_id: i64,
+    pub account_id: i64,
+    /// `compose_drafts.id`, when the composer holds an editable copy.
+    pub local_draft_id: Option<String>,
+    /// The id the draft's message row is filed under — Gmail's own once the
+    /// draft has been pushed, `mach-draft:<id>` before that.
+    pub gmail_message_id: Option<String>,
+    /// Gmail's draft id: the only thing `drafts.delete` will take. `None` for a
+    /// draft Google has never been told about, and for one whose id has not
+    /// come down from `drafts.list` yet.
+    pub gmail_draft_id: Option<String>,
+}
+
+impl ThreadDraft {
+    /// Whether this draft is expected to exist at Gmail.
+    ///
+    /// A draft written here and never pushed has no `gmail_draft_id` *and* no
+    /// Gmail-minted message id, and throwing it away is a purely local act. One
+    /// that has a Gmail message id but no draft id is the opposite case: it is
+    /// certainly there, and its draft id has to be looked up before it can be
+    /// deleted, because the id lives on `drafts.list` and nowhere else.
+    pub fn exists_at_gmail(&self) -> bool {
+        self.gmail_draft_id.is_some()
+            || self
+                .gmail_message_id
+                .as_deref()
+                .is_some_and(|id| !models::is_local_message_id(id))
+    }
+}
+
+/// Every draft this conversation is holding, from both of the rows that can
+/// stand for one.
+///
+/// The two are merged on the message id, which is what they share when both
+/// exist: a composer draft that has been pushed carries the same
+/// `gmail_message_id` as the mirror row in the conversation. Merging on it stops
+/// one draft being counted — and deleted — twice.
+pub fn thread_drafts(conn: &Connection, thread_id: i64) -> Result<Vec<ThreadDraft>> {
+    let mut out: Vec<ThreadDraft> = Vec::new();
+
+    // `compose_drafts` may not exist yet: the composer creates its own tables
+    // on first use, and a store that has never drafted anything has none. That
+    // is not an error, it is an empty answer.
+    let has_compose: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'compose_drafts'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if has_compose {
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, gmail_message_id, gmail_draft_id
+               FROM compose_drafts WHERE thread_id = ?1",
+        )?;
+        let rows = stmt.query_map([thread_id], |row| {
+            Ok(ThreadDraft {
+                thread_id,
+                account_id: row.get(1)?,
+                local_draft_id: Some(row.get(0)?),
+                gmail_message_id: row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
+                gmail_draft_id: row.get::<_, Option<String>>(3)?.filter(|s| !s.is_empty()),
+            })
+        })?;
+        out.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT account_id, gmail_message_id, gmail_draft_id
+           FROM messages WHERE thread_id = ?1 AND is_draft = 1",
+    )?;
+    let message_rows = stmt
+        .query_map([thread_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.filter(|s| !s.is_empty()),
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    for (account_id, gmail_message_id, gmail_draft_id) in message_rows {
+        match out
+            .iter_mut()
+            .find(|d| d.gmail_message_id.as_deref() == Some(gmail_message_id.as_str()))
+        {
+            // The composer's row already stands for this message. Take the
+            // message's draft id if the composer has not learned one yet — the
+            // sync sweep writes that column, and it is the whole reason a draft
+            // written on the phone can be addressed at all.
+            Some(existing) => {
+                if existing.gmail_draft_id.is_none() {
+                    existing.gmail_draft_id = gmail_draft_id;
+                }
+            }
+            None => out.push(ThreadDraft {
+                thread_id,
+                account_id,
+                local_draft_id: None,
+                gmail_message_id: Some(gmail_message_id),
+                gmail_draft_id,
+            }),
+        }
+    }
+
+    Ok(out)
+}
+
+/// Take the `DRAFT` label off a conversation, and the conversation with it when
+/// nothing is left inside.
+///
+/// The second half is not tidiness. A conversation whose only content was a
+/// draft has, once the draft is gone, no messages and no labels — it would
+/// render nowhere and be listed by nothing, while still being a row the Drafts
+/// mailbox can find through `thread_labels`. Deleting it is what makes the row
+/// actually leave the list. Sync rebuilds it if Gmail still has the thread.
+///
+/// Returns whether the thread row itself was deleted.
+pub fn forget_thread_draft_label(conn: &Connection, thread_id: i64) -> Result<bool> {
+    let drafts_left: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE thread_id = ?1 AND is_draft = 1",
+        [thread_id],
+        |row| row.get(0),
+    )?;
+    if drafts_left == 0 {
+        conn.execute(
+            "DELETE FROM thread_labels WHERE thread_id = ?1 AND gmail_label_id = 'DRAFT'",
+            [thread_id],
+        )?;
+    }
+
+    let left: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE thread_id = ?1",
+        [thread_id],
+        |row| row.get(0),
+    )?;
+    if left > 0 {
+        return Ok(false);
+    }
+    queries::delete_thread(conn, thread_id)?;
+    Ok(true)
+}
+
 /// Set a thread's label set and unread flag to exactly this state.
 ///
 /// The unread flag is written to `threads` **and** to the thread's `messages`,

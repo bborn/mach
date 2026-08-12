@@ -46,6 +46,28 @@ describe("what a command is known to do", () => {
     });
   });
 
+  /*
+   * Deleting in Drafts. `commands::drafts` discards the draft through
+   * `drafts.delete` — no label delta can express that — so the conversation
+   * loses `DRAFT` as well, and the row has to leave the mailbox on the
+   * keystroke rather than a refetch later.
+   */
+  it("takes DRAFT away too, for a conversation that is holding one", () => {
+    const rows = [row(1, { labelIds: ["DRAFT"] })];
+    expect(project({ kind: "trash", threadIds: [1] }, rows)).toEqual({
+      1: { add: ["TRASH"], remove: ["INBOX", "DRAFT"] },
+    });
+    expect(leavingIds({ kind: "trash", threadIds: [1] }, rows, "DRAFT")).toEqual([1]);
+  });
+
+  it("says nothing about DRAFT for a conversation that has no draft", () => {
+    // Otherwise an ordinary trash would read as having touched a draft, and
+    // `settledGuesses` would be waiting for a label to go that was never there.
+    expect(project({ kind: "trash", threadIds: [1] }, [row(1)])).toEqual({
+      1: { add: ["TRASH"], remove: ["INBOX"] },
+    });
+  });
+
   it("takes a snoozed conversation out of the inbox", () => {
     // The per-account `Mach/Snoozed` label the backend also applies has an id
     // only the store knows. Leaving it out costs nothing on screen and is what

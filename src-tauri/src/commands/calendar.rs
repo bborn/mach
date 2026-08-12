@@ -95,6 +95,7 @@ pub(crate) async fn execute_rsvp(
         return Ok(CommandResult {
             ok: true,
             message: describe(response).to_string(),
+            undo_label: None,
             undo: None,
             applied: vec![event_id],
             failed: Vec::new(),
@@ -128,6 +129,7 @@ pub(crate) async fn execute_rsvp(
             message: describe(response).to_string(),
             // `needsAction` is a real response state, so an event that had no
             // recorded answer still has a faithful inverse.
+            undo_label: None,
             undo: Some(Command::Rsvp {
                 event_id,
                 response: prior.unwrap_or(RsvpStatus::NeedsAction),
@@ -142,6 +144,7 @@ pub(crate) async fn execute_rsvp(
             Ok(CommandResult {
                 ok: false,
                 message: "Could not send the RSVP".to_string(),
+                undo_label: None,
                 undo: None,
                 applied: Vec::new(),
                 failed: vec![CommandFailure::from_google(vec![event_id], &error)],
@@ -258,6 +261,7 @@ pub(crate) async fn execute_create(
             Ok(CommandResult {
                 ok: true,
                 message: format!("Created “{}”", title_or_placeholder(&draft.title)),
+                undo_label: None,
                 undo: Some(Command::DeleteEvent {
                     event_id,
                     scope: if draft.recurrence.is_empty() {
@@ -277,6 +281,7 @@ pub(crate) async fn execute_create(
             Ok(CommandResult {
                 ok: false,
                 message: "Could not create the event".to_string(),
+                undo_label: None,
                 undo: None,
                 applied: Vec::new(),
                 failed: vec![CommandFailure::from_google(vec![event_id], &error)],
@@ -379,6 +384,7 @@ pub(crate) async fn execute_update(
         Ok(_) => Ok(CommandResult {
             ok: true,
             message: update_message(patch, effective, before.len()),
+            undo_label: None,
             undo: inverse_patch(patch, &event).map(|prior| Command::UpdateEvent {
                 event_id,
                 patch: prior,
@@ -397,6 +403,7 @@ pub(crate) async fn execute_update(
             Ok(CommandResult {
                 ok: false,
                 message: "Could not save the change".to_string(),
+                undo_label: None,
                 undo: None,
                 applied: Vec::new(),
                 failed: vec![CommandFailure::from_google(touched, &error)],
@@ -465,6 +472,7 @@ pub(crate) async fn execute_delete(
             // is no endpoint that returns a cancelled instance to its series,
             // and re-creating it would make a standalone event wearing the same
             // name. Claiming an inverse there would be a lie, so there isn't one.
+            undo_label: None,
             undo: if series_parent.is_none() {
                 Some(Command::CreateEvent {
                     account_id: event.account_id,
@@ -485,6 +493,7 @@ pub(crate) async fn execute_delete(
                 return Ok(CommandResult {
                     ok: true,
                     message: "Deleted — it was already gone on Google's side".to_string(),
+                    undo_label: None,
                     undo: None,
                     applied: touched,
                     failed: Vec::new(),
@@ -499,6 +508,7 @@ pub(crate) async fn execute_delete(
             Ok(CommandResult {
                 ok: false,
                 message: "Could not delete the event".to_string(),
+                undo_label: None,
                 undo: None,
                 applied: Vec::new(),
                 failed: vec![CommandFailure::from_google(touched, &error)],
@@ -557,6 +567,7 @@ pub(crate) async fn execute_move(
             return Ok(CommandResult {
                 ok: false,
                 message: "Could not move the event".to_string(),
+                undo_label: None,
                 undo: None,
                 applied: Vec::new(),
                 failed: vec![CommandFailure::from_google(vec![event_id], &error)],
@@ -599,6 +610,7 @@ pub(crate) async fn execute_move(
             return Ok(CommandResult {
                 ok: false,
                 message: "Could not move the event".to_string(),
+                undo_label: None,
                 undo: None,
                 applied: Vec::new(),
                 failed: vec![CommandFailure::from_google(vec![event_id], &error)],
@@ -609,6 +621,7 @@ pub(crate) async fn execute_move(
     Ok(CommandResult {
         ok: true,
         message: format!("Moved “{}”", title_or_placeholder(&event.title)),
+        undo_label: None,
         undo: Some(Command::MoveEvent {
             event_id,
             account_id: prior_account,

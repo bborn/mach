@@ -986,17 +986,365 @@ async fn no_mail_command_names_an_unsent_message_to_gmail() {
     }
 }
 
-/// A conversation that is *only* a draft has nothing Gmail can be told about.
-/// That is a different report from "sync this first", because syncing would not
-/// help.
+// ===================================================== deleting a draft
+//
+// The reported bug: four drafts selected in the Drafts mailbox, delete pressed,
+// nothing deleted and a red toast reading "4 failed — thread has no locally
+// known Gmail message ids; sync it before acting on it". A draft has no message
+// id `batchModify` will take; `commands::drafts` deletes it through
+// `drafts.delete` instead.
+
+/// The refusal that used to fire, quoted so a test failure names the regression
+/// rather than a diff of strings.
+const OLD_REFUSAL: &str = "no locally known Gmail message ids";
+
+/// Give a draft message the Gmail draft id the sweep in `sync::mail` writes,
+/// which is the id — and the *only* id — `drafts.delete` takes.
+fn seed_draft_id(db: &Db, account_id: i64, gmail_message_id: &str, gmail_draft_id: &str) {
+    db.write(|c| {
+        queries::set_message_draft_id(c, account_id, gmail_message_id, gmail_draft_id).map(|_| ())
+    })
+    .unwrap();
+}
+
+fn thread_exists(db: &Db, thread_id: i64) -> bool {
+    db.read(|c| queries::thread_summary(c, thread_id))
+        .unwrap()
+        .is_some()
+}
+
+fn message_ids(db: &Db, thread_id: i64) -> Vec<String> {
+    db.read(|c| queries::thread_with_messages(c, thread_id))
+        .unwrap()
+        .map(|t| {
+            t.messages
+                .into_iter()
+                .map(|m| m.gmail_message_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn drafts_list_body(entries: &[(&str, &str, &str)]) -> String {
+    let drafts: Vec<String> = entries
+        .iter()
+        .map(|(draft_id, message_id, thread_id)| {
+            format!(
+                r#"{{"id":"{draft_id}","message":{{"id":"{message_id}","threadId":"{thread_id}"}}}}"#
+            )
+        })
+        .collect();
+    format!(r#"{{"drafts":[{}]}}"#, drafts.join(","))
+}
+
+/// A conversation that is only a draft, written here and never pushed. Nothing
+/// exists at Gmail, so the whole thing is local and costs no request — and the
+/// refusal is gone.
 #[tokio::test]
-async fn a_conversation_that_is_only_a_draft_is_reported_as_unsent_not_unsynced() {
+async fn deleting_a_draft_only_conversation_discards_the_draft() {
     let db = Db::open_in_memory().unwrap();
     let account = seed_account(&db, "a@example.com");
     // What `mirror` writes for a draft with no conversation behind it.
     let drafted = seed_thread_with_messages(&db, account, "mach-draft:d2", &["DRAFT"], 0);
     seed_unsent_message(&db, account, drafted, "mach-draft:d2", true);
-    // And one that has genuinely never been synced.
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![drafted],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(
+        !format!("{result:?}").contains(OLD_REFUSAL),
+        "the old refusal is still being reported: {result:?}"
+    );
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(result.applied, vec![drafted]);
+    assert_eq!(result.message, "Discarded 1 draft");
+    // Gmail was never told about this draft, so there was nothing to tell it.
+    assert_eq!(transport.call_count(), 0, "{:?}", transport.requests());
+    // `drafts.delete` cannot be undone, so nothing is offered.
+    assert_eq!(result.undo, None);
+    // The row is gone from the Drafts mailbox because the row is gone.
+    assert!(!thread_exists(&db, drafted));
+}
+
+/// The same conversation, with the draft pushed to Gmail. `drafts.delete` takes
+/// the draft id, and no `batchModify` is attempted for it.
+#[tokio::test]
+async fn a_pushed_draft_is_deleted_through_the_drafts_api_and_never_batch_modified() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let drafted = seed_thread_with_messages(&db, account, "t7", &["DRAFT"], 0);
+    seed_unsent_message(&db, account, drafted, "18f0c0ffee", true);
+    seed_draft_id(&db, account, "18f0c0ffee", "r-99");
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![drafted],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.message, "Discarded 1 draft");
+    assert_eq!(result.undo, None);
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0].url.ends_with("/users/me/drafts/r-99"),
+        "unexpected url {}",
+        requests[0].url
+    );
+    // The draft's message id was never named to `messages.batchModify` or to
+    // `messages.trash` — deleting the draft is the whole of what happened.
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r.url.contains("/messages") || r.url.contains("batchModify")),
+        "a draft reached the message endpoints: {requests:?}"
+    );
+}
+
+/// A reply in progress on a real conversation. Delete means the conversation
+/// goes to Trash *and* the draft does not survive it, which is two different
+/// calls to two different endpoints.
+#[tokio::test]
+async fn trashing_a_conversation_that_also_holds_a_draft_takes_both() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread_with_messages(&db, account, "t1", &["INBOX", "DRAFT"], 2);
+    seed_unsent_message(&db, account, thread, "18f0beef", true);
+    seed_draft_id(&db, account, "18f0beef", "r-12");
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.applied, vec![thread]);
+    assert_eq!(result.message, "Trashed 1 conversation · discarded 1 draft");
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    // Drafts first, so the batch below is planned from a store the draft has
+    // already left.
+    assert!(
+        requests[0].url.ends_with("/users/me/drafts/r-12"),
+        "unexpected url {}",
+        requests[0].url
+    );
+    // Exactly the two real messages, and not the draft's.
+    let batched = ids_of(&body_json(&requests[1]), "ids");
+    assert_eq!(batched, vec!["t1-m0".to_string(), "t1-m1".to_string()]);
+    assert!(
+        !requests[1].url.contains("18f0beef") && !batched.iter().any(|id| id == "18f0beef"),
+        "the draft's message id was batch-modified: {:?}",
+        requests[1]
+    );
+
+    // The conversation is in the trash and out of Drafts, and the draft row is
+    // out of the conversation.
+    assert_eq!(thread_labels(&db, thread), sorted(&["TRASH"]));
+    assert_eq!(
+        message_ids(&db, thread),
+        vec!["t1-m0".to_string(), "t1-m1".to_string()]
+    );
+
+    // ⌘Z puts the conversation back. It cannot put the draft back, and the undo
+    // entry says only what it can do.
+    assert!(matches!(result.undo, Some(Command::Untrash { .. })));
+    assert_eq!(result.undo_label.as_deref(), Some("Trashed 1 conversation"));
+}
+
+/// The owner's actual four rows: the Drafts mailbox says there is a draft here
+/// and the store holds no message to prove it. The draft id comes from
+/// `drafts.list`, which is the only endpoint that pairs one with a thread.
+#[tokio::test]
+async fn a_conversation_that_claims_a_draft_it_cannot_name_is_resolved_from_drafts_list() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let shell = seed_thread_with_messages(&db, account, "19fec64272d5a82f", &["DRAFT"], 0);
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        drafts_list_body(&[("r-4", "18ff11", "19fec64272d5a82f")]),
+    ))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![shell],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(
+        !format!("{result:?}").contains(OLD_REFUSAL),
+        "the old refusal is still being reported: {result:?}"
+    );
+    assert_eq!(result.message, "Discarded 1 draft");
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].url.contains("/users/me/drafts"));
+    assert!(
+        requests[1].url.ends_with("/users/me/drafts/r-4"),
+        "unexpected url {}",
+        requests[1].url
+    );
+    assert!(!thread_exists(&db, shell));
+}
+
+/// The same shape, with no such draft at Gmail: the row is a leftover claiming a
+/// draft that stopped existing somewhere else, and clearing it is the job.
+#[tokio::test]
+async fn a_draft_row_gmail_no_longer_has_is_cleared_rather_than_refused() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let shell = seed_thread_with_messages(&db, account, "19fec0cbc69d10a7", &["DRAFT"], 0);
+
+    // `{}` — no drafts at all.
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![shell],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.message, "Discarded 1 draft");
+    // One listing, and no delete: there was nothing there to delete.
+    assert_eq!(transport.call_count(), 1);
+    assert!(!thread_exists(&db, shell));
+}
+
+/// Forty rows, some of them drafts. One command, one round of calls, one
+/// sentence — and the sentence counts the two things separately, because only
+/// one of them can be taken back.
+#[tokio::test]
+async fn a_mixed_selection_discards_the_drafts_and_trashes_the_rest() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let one = seed_thread(&db, account, "t1", &["INBOX"]);
+    let two = seed_thread(&db, account, "t2", &["INBOX"]);
+    let drafted = seed_thread_with_messages(&db, account, "mach-draft:d5", &["DRAFT"], 0);
+    seed_unsent_message(&db, account, drafted, "mach-draft:d5", true);
+    let replying = seed_thread_with_messages(&db, account, "t3", &["INBOX", "DRAFT"], 1);
+    seed_unsent_message(&db, account, replying, "mach-draft:d6", true);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![one, two, drafted, replying],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    assert_eq!(
+        result.message,
+        "Trashed 3 conversations · discarded 2 drafts"
+    );
+    assert_eq!(result.undo_label.as_deref(), Some("Trashed 3 conversations"));
+    // Every id the user pointed at is accounted for.
+    let mut applied = result.applied.clone();
+    applied.sort();
+    let mut expected = vec![one, two, drafted, replying];
+    expected.sort();
+    assert_eq!(applied, expected);
+
+    // Neither draft was ever at Gmail, so the only request is the one batch
+    // that trashes the three conversations.
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let batched = ids_of(&body_json(&requests[0]), "ids");
+    assert_eq!(
+        batched,
+        vec!["t1-m0".to_string(), "t2-m0".to_string(), "t3-m0".to_string()]
+    );
+
+    // ⌘Z reaches the three conversations and names only them.
+    match result.undo {
+        Some(Command::Untrash { ref thread_ids, .. }) => {
+            let mut ids = thread_ids.clone();
+            ids.sort();
+            let mut expected = vec![one, two, replying];
+            expected.sort();
+            assert_eq!(ids, expected);
+        }
+        other => panic!("expected an untrash, got {other:?}"),
+    }
+}
+
+/// A refused `drafts.delete` says so, and leaves the draft exactly where it was
+/// — including in the conversation, which is not trashed around a draft that is
+/// still there.
+#[tokio::test]
+async fn a_refused_draft_delete_is_reported_and_changes_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread_with_messages(&db, account, "t1", &["INBOX", "DRAFT"], 1);
+    seed_unsent_message(&db, account, thread, "18f0beef", true);
+    seed_draft_id(&db, account, "18f0beef", "r-12");
+
+    let transport = FakeTransport::always_failing(403, r#"{"error":{"message":"nope"}}"#);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Trash {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(!result.ok);
+    assert!(result.applied.is_empty(), "{:?}", result.applied);
+    assert_eq!(result.failed.len(), 1, "{:?}", result.failed);
+    let failure = &result.failed[0];
+    assert_eq!(failure.ids, vec![thread]);
+    assert!(
+        failure.message.contains("draft"),
+        "a failure that does not name the thing: {:?}",
+        failure.message
+    );
+    // Gmail was asked once and refused; the conversation was never trashed, so
+    // there is nothing to have rolled back.
+    assert!(!failure.rolled_back);
+    assert_eq!(transport.call_count(), 1);
+    assert_eq!(thread_labels(&db, thread), sorted(&["DRAFT", "INBOX"]));
+    assert!(message_ids(&db, thread).iter().any(|id| id == "18f0beef"));
+}
+
+/// The other half of the original test, unchanged: a conversation nobody has
+/// synced is still refused, and still told to sync. That is a different report
+/// from a draft, and it is the one where the advice is worth giving.
+#[tokio::test]
+async fn a_conversation_that_has_never_been_synced_is_still_refused() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
     let unsynced = seed_thread_with_messages(&db, account, "t9", &["INBOX"], 0);
 
     let transport = FakeTransport::always_ok();
@@ -1004,7 +1352,7 @@ async fn a_conversation_that_is_only_a_draft_is_reported_as_unsent_not_unsynced(
 
     let result = d
         .execute(Command::Trash {
-            thread_ids: vec![drafted, unsynced],
+            thread_ids: vec![unsynced],
         })
         .await
         .unwrap();
@@ -1012,35 +1360,49 @@ async fn a_conversation_that_is_only_a_draft_is_reported_as_unsent_not_unsynced(
     assert!(!result.ok);
     assert_eq!(transport.call_count(), 0, "nothing was addressable");
     assert!(result.applied.is_empty());
-    assert_eq!(result.failed.len(), 2, "{:?}", result.failed);
-
-    let unsent = result
-        .failed
-        .iter()
-        .find(|f| f.ids == vec![drafted])
-        .expect("a failure naming the draft-only conversation");
-    assert_eq!(unsent.kind, FailureKind::Invalid);
+    assert_eq!(result.failed.len(), 1, "{:?}", result.failed);
+    assert_eq!(result.failed[0].kind, FailureKind::Invalid);
     assert!(
-        unsent.message.contains("unsent"),
+        result.failed[0].message.contains("sync it"),
         "unhelpful message {:?}",
-        unsent.message
+        result.failed[0].message
     );
-
-    let never_synced = result
-        .failed
-        .iter()
-        .find(|f| f.ids == vec![unsynced])
-        .expect("a failure naming the unsynced conversation");
-    assert!(
-        never_synced.message.contains("sync it"),
-        "unhelpful message {:?}",
-        never_synced.message
-    );
-
-    // Neither thread moved.
-    assert_eq!(thread_labels(&db, drafted), sorted(&["DRAFT"]));
     assert_eq!(thread_labels(&db, unsynced), sorted(&["INBOX"]));
 }
+
+/// Archiving is not deleting. A conversation holding a draft keeps it, which is
+/// what Gmail does and what `commands::mail` has always documented.
+#[tokio::test]
+async fn archiving_a_conversation_with_a_draft_leaves_the_draft_alone() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread_with_messages(&db, account, "t1", &["INBOX", "DRAFT"], 1);
+    seed_unsent_message(&db, account, thread, "18f0beef", true);
+    seed_draft_id(&db, account, "18f0beef", "r-12");
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Archive {
+            thread_ids: vec![thread],
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(
+        !transport
+            .requests()
+            .iter()
+            .any(|r| r.url.contains("/drafts")),
+        "archive touched the drafts api: {:?}",
+        transport.requests()
+    );
+    assert_eq!(thread_labels(&db, thread), sorted(&["DRAFT"]));
+    assert!(message_ids(&db, thread).iter().any(|id| id == "18f0beef"));
+}
+
 
 // ===================================================================== snooze
 

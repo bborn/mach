@@ -124,6 +124,7 @@ use crate::db::Db;
 use crate::google::gmail::GmailClient;
 use crate::google::GoogleError;
 
+use super::drafts::{self, Discarded};
 use super::error::{CommandError, CommandFailure};
 use super::types::{plural, Command, CommandResult, ThreadLabelState};
 use super::CommandDispatcher;
@@ -133,6 +134,7 @@ pub const INBOX: &str = "INBOX";
 pub const UNREAD: &str = "UNREAD";
 pub const STARRED: &str = "STARRED";
 pub const TRASH: &str = "TRASH";
+pub const DRAFT: &str = "DRAFT";
 
 /// The Gmail user label Mach applies to snoozed threads.
 pub const DEFAULT_SNOOZE_LABEL: &str = "Mach/Snoozed";
@@ -267,8 +269,8 @@ fn restore_state<'a>(
 async fn build_plans(
     dispatcher: &CommandDispatcher,
     command: &Command,
+    thread_ids: &[i64],
 ) -> Result<Vec<ThreadPlan>, CommandError> {
-    let thread_ids = command.target_ids();
     if thread_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -276,7 +278,7 @@ async fn build_plans(
     // Snapshots first, so an unknown id fails before any write.
     let snapshots = dispatcher.db.read(|conn| {
         let mut out = Vec::with_capacity(thread_ids.len());
-        for id in &thread_ids {
+        for id in thread_ids {
             out.push((cq::thread_snapshot(conn, *id)?, cq::snooze_row(conn, *id)?));
         }
         Ok(out)
@@ -679,6 +681,22 @@ fn inverse(command: &Command, changed: &[&ThreadPlan]) -> Option<Command> {
     })
 }
 
+/// The sentence for a trash that also threw drafts away.
+///
+/// Two clauses rather than one number, because they are two different events
+/// and only one of them can be taken back: "Trashed 3 conversations · discarded
+/// 1 draft". The conversation clause is dropped when there were none, so
+/// deleting a selection of drafts reads as "Discarded 4 drafts" and not as a
+/// trash of nothing.
+fn describe_trash(conversations: usize, drafts: usize) -> String {
+    let trashed = format!("Trashed {}", plural(conversations, "conversation"));
+    match (conversations, drafts) {
+        (_, 0) => trashed,
+        (0, _) => format!("Discarded {}", plural(drafts, "draft")),
+        _ => format!("{trashed} · discarded {}", plural(drafts, "draft")),
+    }
+}
+
 fn describe(command: &Command, n: usize) -> String {
     let subject = plural(n, "conversation");
     match command {
@@ -715,9 +733,49 @@ pub(crate) async fn execute(
     dispatcher: &CommandDispatcher,
     command: &Command,
 ) -> Result<CommandResult, CommandError> {
-    let plans = build_plans(dispatcher, command).await?;
-    if plans.is_empty() {
+    let targets = command.target_ids();
+
+    // Drafts first, and only for trash.
+    //
+    // A draft has no message id `batchModify` will take, so the label-delta
+    // engine below cannot touch one; `commands::drafts` deletes it through
+    // `drafts.delete` instead. Doing it *before* the snapshots is what keeps the
+    // two halves from disagreeing: a conversation that held a draft and three
+    // real messages is planned from a store the draft has already left, so the
+    // draft's own message id is not in the batch that trashes the rest of it.
+    //
+    // Only trash. Archiving, starring or labelling a conversation leaves its
+    // draft alone in Gmail, and Mach lands in the same place by the same route —
+    // see the module docs above.
+    let discarded = if matches!(command, Command::Trash { .. }) {
+        drafts::discard_in_threads(dispatcher, &targets, now_ms()).await?
+    } else {
+        Discarded::default()
+    };
+
+    // A conversation whose whole content was a draft no longer has a row to
+    // plan against, and one whose draft could not be deleted is left entirely
+    // alone rather than trashed around a draft that is still there.
+    let remaining: Vec<i64> = targets
+        .iter()
+        .copied()
+        .filter(|id| !discarded.vanished.contains(id) && !discarded.failed.contains(id))
+        .collect();
+
+    let plans = build_plans(dispatcher, command, &remaining).await?;
+    if plans.is_empty() && discarded.is_empty() {
         return Ok(CommandResult::noop(describe(command, 0)));
+    }
+    if plans.is_empty() {
+        return Ok(CommandResult {
+            ok: discarded.failures.is_empty(),
+            message: describe_trash(0, discarded.drafts),
+            // Nothing here can be undone: see `commands::drafts`.
+            undo: None,
+            undo_label: None,
+            applied: discarded.threads.clone(),
+            failed: discarded.failures,
+        });
     }
 
     // A thread with nothing Gmail will accept as an id cannot be named in a
@@ -729,7 +787,7 @@ pub(crate) async fn execute(
     // only messages are Mach's own — a draft that has not been pushed, a reply
     // still in the outbox. The second is not a sync problem and telling the
     // owner to sync would send them after a fix that does not exist.
-    let mut failures: Vec<CommandFailure> = Vec::new();
+    let mut failures: Vec<CommandFailure> = discarded.failures;
     let stranded = |p: &&ThreadPlan| p.remote_needed() && p.snap.message_ids.is_empty();
     let unsynced: Vec<i64> = plans
         .iter()
@@ -815,7 +873,7 @@ pub(crate) async fn execute(
     }
 
     // ------------------------------------------------------------- report
-    let applied: Vec<i64> = actionable
+    let mut applied: Vec<i64> = actionable
         .iter()
         .map(|p| p.id())
         .filter(|id| !failed_ids.contains(id))
@@ -826,10 +884,31 @@ pub(crate) async fn execute(
         .filter(|p| p.changed() && !failed_ids.contains(&p.id()))
         .collect();
 
+    // Two counts, because the summary says two things: how many conversations
+    // were trashed, and how many drafts were thrown away. A conversation that
+    // held a draft *and* real messages is in both — it was trashed, and its
+    // draft went with it — so the conversation count is the label-delta half
+    // alone rather than the union.
+    let conversations = applied.len();
+    let message = if discarded.drafts > 0 {
+        describe_trash(conversations, discarded.drafts)
+    } else {
+        describe(command, conversations)
+    };
+    for id in &discarded.threads {
+        if !applied.contains(id) {
+            applied.push(*id);
+        }
+    }
+
     Ok(CommandResult {
         ok: failures.is_empty(),
-        message: describe(command, applied.len()),
+        // ⌘Z restores the conversations and cannot restore the drafts, so the
+        // undo entry names only the conversations. Reusing `message` there would
+        // put "undo … discarded 1 draft" on a button that does no such thing.
+        undo_label: (discarded.drafts > 0).then(|| describe(command, conversations)),
         undo: inverse(command, &changed),
+        message,
         applied,
         failed: failures,
     })
