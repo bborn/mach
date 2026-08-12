@@ -28,6 +28,7 @@ import {
   type CommandResult,
   type MachDataSource,
 } from "@/lib/data";
+import { describeUndo, peekUndo } from "@/lib/undo-stack";
 import type { Thread, ThreadDetail, ThreadId } from "@/types";
 
 declare global {
@@ -60,6 +61,10 @@ interface Frame {
   unread?: boolean;
   status?: string;
   tone?: string;
+  /** Every row in the list, for the assertions about a group. */
+  rows: ThreadId[];
+  /** What ⌘Z would take back now, phrased as the menu phrases it. */
+  undo: string | null;
 }
 
 function latest(frames: Frame[]): Frame {
@@ -203,7 +208,7 @@ function probe(): MachActions {
 }
 
 function Probe({ onFrame }: { onFrame: (frame: Frame) => void }) {
-  const { visibleThreads, isUnread, ui, actions } = useMach();
+  const { visibleThreads, isUnread, ui, actions, undoState } = useMach();
   const row = visibleThreads.find((t) => t.id === TARGET);
   onFrame({
     present: row !== undefined,
@@ -211,6 +216,8 @@ function Probe({ onFrame }: { onFrame: (frame: Frame) => void }) {
     unread: row ? isUnread(row) : undefined,
     status: ui.status?.message,
     tone: ui.status?.tone,
+    rows: visibleThreads.map((t) => t.id),
+    undo: describeUndo(peekUndo(undoState)),
   });
   useEffect(() => {
     (window as unknown as { probe: unknown }).probe = actions;
@@ -533,5 +540,153 @@ describe("a guess is retired against the list, and only against the list", () =>
     await flush();
     await refetch(s);
     expect(latest(frames).present).toBe(false);
+  });
+});
+
+/**
+ * ⌘Z, frame by frame.
+ *
+ * The forward keys were made instant first and undo was left behind, which is
+ * the complaint this covers: "can you make undos instant or faster". Two things
+ * were still waiting on Google, and both are asserted here on the frame the
+ * keystroke produced rather than on the end state — an end-state test passes on
+ * the slow code, because the undo does arrive eventually.
+ *
+ *  * **A group repainted in stages.** Each step's guess went out inside its own
+ *    `run`, so step two could not move a row until step one's round trip had
+ *    come back. Three steps, three repaints, a Gmail round trip apart.
+ *  * **The confirmation waited for the network.** A single-step undo already
+ *    moved its row in the same frame, and then the toast underneath went on
+ *    saying "Archived 1 conversation · Undo ⌘Z" until the command answered,
+ *    which reads as a keystroke that did not take.
+ */
+describe("⌘Z is on screen in the frame the keystroke produced", () => {
+  it("moves every step's rows at once, not one round trip apart", async () => {
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+    expect(latest(frames).rows).toEqual([1, TARGET, 3]);
+
+    // One gesture, three inverses — what a plugin action hands over, and the
+    // shape `undoSteps` unwinds in reverse.
+    frames.length = 0;
+    act(() => {
+      probe().pushUndoGroup("Moved 3 conversations back to the inbox", [
+        { kind: "archive", threadIds: [1] },
+        { kind: "archive", threadIds: [TARGET] },
+        { kind: "archive", threadIds: [3] },
+      ]);
+      void probe().undo();
+    });
+
+    // Synchronously: nothing has resolved, and the whole undo is on screen.
+    expect(latest(frames).rows).toEqual([]);
+    expect(latest(frames).status).toBe("Undid moved 3 conversations back to the inbox");
+
+    // And no frame between here and the list catching up puts any of it back.
+    await flush();
+    await refetch(s);
+    expect(frames.every((f) => f.rows.length === 0)).toBe(true);
+  });
+
+  it("says what it did with the rows, not after the round trip", async () => {
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    s.willBecome((rows) => rows.filter((r) => r.id !== TARGET));
+    act(() => probe().archiveSelected());
+    await flush();
+    expect(latest(frames).present).toBe(false);
+
+    frames.length = 0;
+    act(() => void probe().undo());
+    expect(latest(frames).present).toBe(true);
+    expect(latest(frames).status).toBe("Undid done");
+    expect(latest(frames).tone).toBe("info");
+    await flush();
+  });
+
+  it("gives ⇧⌘Z the same frame", async () => {
+    // Redo is the same traversal the other way and shares every line of it;
+    // an undo that is instant and a redo that is not would be two keys.
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    act(() => probe().archiveSelected());
+    await flush();
+    await act(async () => void probe().undo());
+    await flush();
+    expect(latest(frames).present).toBe(true);
+
+    frames.length = 0;
+    act(() => void probe().redo());
+    expect(latest(frames).present).toBe(false);
+    expect(latest(frames).status).toBe("Redid done");
+    await flush();
+  });
+});
+
+/**
+ * The rule none of the above is allowed to cost.
+ *
+ * Saying it before Google has answered is only honest if being wrong is
+ * visible, and "the write was refused and nothing said so" is the failure that
+ * has cost this project the most time.
+ */
+describe("when Google refuses the undo", () => {
+  it("replaces the claim with what was refused, and keeps ⌘Z offered", async () => {
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    s.willBecome((rows) => rows.filter((r) => r.id !== TARGET));
+    act(() => probe().archiveSelected());
+    await flush();
+    expect(latest(frames).present).toBe(false);
+    expect(latest(frames).undo).toBe("Undo done");
+
+    s.refuse("Google refused the unarchive");
+    frames.length = 0;
+    act(() => void probe().undo());
+    // The optimistic claim, made in the same frame as the rows.
+    expect(latest(frames).status).toBe("Undid done");
+
+    // And then the truth, over the top of it — dispatched by `run` after this
+    // message and therefore replacing it.
+    await flush();
+    expect(latest(frames).status).toContain("Google refused the unarchive");
+    expect(latest(frames).tone).toBe("error");
+    // The entry is back where it was, so the affordance did not vanish with the
+    // failure.
+    expect(latest(frames).undo).toBe("Undo done");
+  });
+
+  it("stops a group at the first refusal and re-offers the whole thing", async () => {
+    // A partial group is not a redo — `runUndo` only records one for a complete
+    // set — and the entry goes back to the undo side whole.
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    act(() => {
+      probe().pushUndoGroup("Filed 3 conversations", [
+        { kind: "archive", threadIds: [1] },
+        { kind: "archive", threadIds: [TARGET] },
+        { kind: "archive", threadIds: [3] },
+      ]);
+    });
+    s.refuse("Google is rate limiting");
+    s.commands.length = 0;
+    await act(async () => void probe().undo());
+    await flush();
+
+    // One command went out; the rest of a half-undone group would compound the
+    // mess, so nothing after the refusal was dispatched.
+    expect(s.commands).toHaveLength(1);
+    expect(latest(frames).status).toContain("Google is rate limiting");
+    expect(latest(frames).tone).toBe("error");
+    expect(latest(frames).undo).toBe("Undo filed 3 conversations");
   });
 });

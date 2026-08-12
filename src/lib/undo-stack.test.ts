@@ -73,6 +73,7 @@ function fakeHost(
     },
     restore: (ids) => void events.push(`restore:${ids.join(",")}`),
     hide: (ids) => void events.push(`hide:${ids.join(",")}`),
+    project: (commands) => void events.push(`project:${commands.map((c) => c.kind).join(",")}`),
     say: (message) => void events.push(`say:${message}`),
   };
   return {
@@ -313,14 +314,38 @@ describe("runUndo", () => {
     // invisibly — an undo that reports success and shows nothing.
     const app = fakeHost(archived(), () => ok([1, 2], archive([1, 2])));
     await runUndo(app.host);
-    expect(app.events.slice(0, 2)).toEqual(["restore:1,2", "run:unarchive"]);
+    expect(app.events.slice(0, 2)).toEqual(["restore:1,2", "project:unarchive"]);
+  });
+
+  it("puts the whole result on screen before it dispatches anything", async () => {
+    /*
+     * The assertion that pins "instant". Every visible consequence of a ⌘Z —
+     * the rows for every step, and the sentence saying what happened — is out
+     * before the first command reaches the layer, which is what makes the
+     * traversal's cost invisible however many steps it has and however slow
+     * Google is.
+     */
+    const s = recordUndo(emptyUndo(), "Filed 3 conversations", [archive([3]), archive([2]), archive([1])], NOW);
+    const app = fakeHost(s, () => ok([1]));
+    await runUndo(app.host);
+
+    const dispatched = app.events.findIndex((e) => e.startsWith("run:"));
+    expect(app.events.slice(0, dispatched)).toEqual([
+      "hide:1",
+      "hide:2",
+      "hide:3",
+      // One projection carrying every step, in the order they will be
+      // dispatched — not one per step, a round trip apart.
+      "project:archive,archive,archive",
+      "say:Undid filed 3 conversations",
+    ]);
   });
 
   it("hides the rows again when the inverse is the one that removes them", async () => {
     const s = recordUndo(emptyUndo(), "Moved back to the inbox", archive([3]), NOW);
     const app = fakeHost(s, () => ok([3], unarchive([3])));
     await runUndo(app.host);
-    expect(app.events.slice(0, 2)).toEqual(["hide:3", "run:archive"]);
+    expect(app.events.slice(0, 2)).toEqual(["hide:3", "project:archive"]);
   });
 
   it("puts the entry back when the undo itself fails", async () => {
@@ -332,8 +357,23 @@ describe("runUndo", () => {
     expect(outcome.ok).toBe(false);
     expect(peekUndo(app.state)?.label).toBe("Archived 2 conversations");
     expect(peekRedo(app.state)).toBeNull();
-    // And it does not claim to have done anything.
-    expect(app.events.some((e) => e.startsWith("say:"))).toBe(false);
+    /*
+     * The claim was made before the dispatch, and the traversal does not make a
+     * second one on the way out.
+     *
+     * It is not the traversal's job to report the refusal, and it must not try:
+     * `run` has already put what Google actually said into the same status,
+     * after this message and therefore over it. A "Could not undo …" here would
+     * replace the specific reason with a vaguer one. That the failure is
+     * *visible* is asserted where the two halves actually meet, against the real
+     * hook — see `useMach.optimistic.test.tsx`.
+     */
+    expect(app.events.filter((e) => e.startsWith("say:"))).toEqual([
+      "say:Undid archived 2 conversations",
+    ]);
+    expect(app.events.indexOf("say:Undid archived 2 conversations")).toBeLessThan(
+      app.events.findIndex((e) => e.startsWith("run:")),
+    );
   });
 
   it("puts the entry back when the command never reached the layer", async () => {
@@ -412,7 +452,13 @@ describe("runRedo", () => {
 
     expect(outcome.ok).toBe(true);
     expect(app.ran).toEqual([archive([1])]);
-    expect(app.events).toContain("say:Redid archived 1 conversation");
+    // Said before the dispatch, exactly as ⌘Z says it: they share the path, so
+    // one of them being instant and the other not would be two keys.
+    expect(app.events.slice(0, 3)).toEqual([
+      "hide:1",
+      "project:archive",
+      "say:Redid archived 1 conversation",
+    ]);
     // And ⌘Z can take it back again, with the inverse the redo just returned.
     expect(undoSteps(peekUndo(app.state)!)).toEqual([unarchive([1])]);
   });
@@ -492,7 +538,7 @@ describe("trash and snooze on the stack", () => {
     // Restore first, then run: the rows left the list the instant ⌘⌫ was
     // pressed, and putting the threads back without clearing that hide would
     // restore them where nobody can see them.
-    expect(app.events.slice(0, 2)).toEqual(["restore:4,5", "run:untrash"]);
+    expect(app.events.slice(0, 2)).toEqual(["restore:4,5", "project:untrash"]);
     expect(app.events).toContain("say:Undid trashed 2 conversations");
     expect(peekUndo(app.state)).toBeNull();
   });
@@ -509,7 +555,7 @@ describe("trash and snooze on the stack", () => {
     const app = fakeHost(undoneApp.state, () => ok([4], untrash([4])));
     await runRedo(app.host);
     expect(app.ran).toEqual([trash([4])]);
-    expect(app.events.slice(0, 2)).toEqual(["hide:4", "run:trash"]);
+    expect(app.events.slice(0, 2)).toEqual(["hide:4", "project:trash"]);
   });
 
   it("keeps the entry when Google refuses the untrash", async () => {
@@ -551,7 +597,7 @@ describe("trash and snooze on the stack", () => {
 
     expect(outcome.ok).toBe(true);
     expect(app.ran).toEqual([unsnooze([9])]);
-    expect(app.events.slice(0, 2)).toEqual(["restore:9", "run:unsnooze"]);
+    expect(app.events.slice(0, 2)).toEqual(["restore:9", "project:unsnooze"]);
   });
 
   it("re-snoozes to the same instant on redo, not to a fresh one", async () => {

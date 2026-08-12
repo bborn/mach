@@ -38,8 +38,8 @@
  * # Running one
  *
  * {@link runUndo} and {@link runRedo} at the bottom of this file are the whole
- * traversal — pop, clear the list's optimistic hide, dispatch, and either
- * refine the entry with what came back or put it back where it was. They take
+ * traversal — pop, put the entire result on screen, dispatch, and either refine
+ * the entry with what came back or put it back where it was. They take
  * the app as an {@link UndoHost} rather than reaching for it, which is what
  * makes the behaviour testable without a window.
  */
@@ -364,6 +364,22 @@ export interface UndoHost {
   /** The mirror of {@link UndoHost.restore}, for a redone action. */
   hide(threadIds: ThreadId[]): void;
   /**
+   * Say what this whole set of commands is about to do to the list — all of it,
+   * now, before any of it is dispatched.
+   *
+   * `execute` projects the one command it is handed, which is right for a
+   * keystroke and wrong for a traversal: a group of three is one gesture, and
+   * projecting inside `execute` meant step two's rows could not move until step
+   * one's round trip had come back. A three-step ⌘Z repainted in three stages,
+   * a Gmail round trip apart — measured at 54ms, 295ms and 519ms for the three
+   * rows of one group.
+   *
+   * The commands arrive in the order they will be dispatched, and a later guess
+   * about a conversation replaces an earlier one, so a set that touches the same
+   * thread twice lands on the same answer it would have reached one at a time.
+   */
+  project(commands: Command[]): void;
+  /**
    * Say what happened, once it has.
    *
    * `offer` is the button the message should carry: having just undone
@@ -398,6 +414,10 @@ export async function runUndo(host: UndoHost): Promise<UndoOutcome> {
 
   const entry = popped.entry;
   const steps = undoSteps(entry);
+  // Everything the user can see happens here, in the tick the keystroke
+  // produced: every step's rows, and the sentence saying so. See `showSteps`.
+  showSteps(host, steps, `Undid ${uncapitalize(entry.label)}`, "redo");
+
   const applied = await dispatchSteps(host, steps);
   if (!applied) {
     // The affordance must not vanish because the network blipped. Whatever
@@ -412,7 +432,6 @@ export async function runUndo(host: UndoHost): Promise<UndoOutcome> {
   if (applied.length === steps.length) {
     host.write(refineRedo(host.read(), entry.id, applied));
   }
-  host.say(`Undid ${uncapitalize(entry.label)}`, "redo");
   return { entry, ok: true };
 }
 
@@ -432,6 +451,8 @@ export async function runRedo(host: UndoHost): Promise<UndoOutcome> {
   }
 
   host.write(popped.state);
+  showSteps(host, steps, `Redid ${uncapitalize(entry.label)}`, "undo");
+
   const applied = await dispatchSteps(host, steps);
   if (!applied) {
     host.write(restoreRedo(host.read(), entry));
@@ -440,24 +461,77 @@ export async function runRedo(host: UndoHost): Promise<UndoOutcome> {
   if (applied.length === steps.length) {
     host.write(refineUndo(host.read(), entry.id, applied));
   }
-  host.say(`Redid ${uncapitalize(entry.label)}`, "undo");
   return { entry, ok: true };
+}
+
+/**
+ * The whole visible half of a traversal, in one tick.
+ *
+ * Nothing here is awaited, so a ⌘Z arriving in a keydown handler has put the
+ * entire result on screen — every step's rows, and the sentence saying what
+ * happened — in the frame that keystroke produced.
+ *
+ * # Why the message goes out before the network answers
+ *
+ * It used to wait for the last round trip, and that was the lag. A single-step
+ * undo already moved its rows in the same frame; the toast underneath went on
+ * saying "Archived 1 conversation · Undo ⌘Z" until the command answered, which
+ * reads as "the key did not take" — the more so when the rows that moved are
+ * off screen, which after an archive they usually are. Measured at 59ms to the
+ * rows and 308ms to the confirmation, against a 250ms command; at 2s a command
+ * the rows still moved at 60ms and the confirmation took 2055ms.
+ *
+ * This is the same bargain every other write in the app makes: say what
+ * happened, and take it back if Google refuses. The taking-back is real and is
+ * two things. {@link runUndo} puts the entry back on the stack, so ⌘Z is still
+ * offered; and the failed command's own status — `run` reports a refusal even
+ * when it was told to be quiet — replaces this message with what Google
+ * actually said, because it is dispatched after this one. A confirmation that
+ * survived a failure would be the silent-failure bug this project has paid for
+ * more than once, so the ordering there is not incidental.
+ */
+function showSteps(
+  host: UndoHost,
+  steps: Command[],
+  message: string,
+  offer: "undo" | "redo",
+): void {
+  // Drop the previous guess first, then state the new one: an archive's delta
+  // must not still be sitting on the row the unarchive is about to describe.
+  for (const command of steps) {
+    if (restoresThreads(command)) host.restore(command.threadIds);
+    else if (hidesThreads(command)) host.hide(command.threadIds);
+  }
+  host.project(steps);
+  host.say(message, offer);
 }
 
 /**
  * Runs a traversal's commands and collects the inverses they hand back.
  *
- * The optimistic edits go out for the whole set before the first command does,
- * so a group of five lands on screen as one change rather than five. Returns
- * null the moment one fails: the rest of a half-undone group would compound
- * the mess, and the caller puts the entry back.
+ * Returns null the moment one fails: the rest of a half-undone group would
+ * compound the mess, and the caller puts the entry back.
+ *
+ * # In series, still, and on purpose
+ *
+ * Firing a group's steps concurrently would shorten this loop and buy nothing
+ * anybody can see — {@link showSteps} has already put the whole undo on screen,
+ * and what is left to wait for is the inverse each command hands back, which
+ * only ⇧⌘Z reads and only after the fact. Against that:
+ *
+ *  * **A group is ordered because it has to be.** It is unwound in reverse for
+ *    a reason — unarchiving before un-labelling puts the conversation back with
+ *    the label still on it — and `commands::mail` computes each command's label
+ *    delta against the store as it finds it. Two commands touching one thread
+ *    at once would diff against the same pre-write state and send Gmail the
+ *    wrong difference.
+ *  * **Stopping at the first failure is only possible in series.** Concurrent
+ *    steps are already gone by the time one is refused, so "the rest of a
+ *    half-undone group would compound the mess" stops being avoidable.
+ *  * **One SQLite writer, one rate limit.** A burst is the shape both of them
+ *    are worst at, for a saving of nothing.
  */
 async function dispatchSteps(host: UndoHost, steps: Command[]): Promise<Command[] | null> {
-  for (const command of steps) {
-    if (restoresThreads(command)) host.restore(command.threadIds);
-    else if (hidesThreads(command)) host.hide(command.threadIds);
-  }
-
   const applied: Command[] = [];
   for (const command of steps) {
     const result = await host.execute(command);
