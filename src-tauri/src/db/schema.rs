@@ -74,7 +74,70 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 14,
         sql: M14_SENDER_INDEX,
     },
+    Migration {
+        version: 15,
+        sql: M15_MIRROR_OWNER,
+    },
 ];
+
+/// Migration 15 — which composer draft a message row is the mirror of.
+///
+/// # The identity the mirror never had
+///
+/// A draft's mirror row was addressed by `gmail_message_id`, and that is not an
+/// identity: `drafts.update` mints a **new message id on every save**, whoever
+/// calls it. Two writers moved the row between ids — `mirror` writing under the
+/// new one, `mirror::adopt` renaming the old one — and `adopt` did its rename
+/// with `UPDATE OR IGNORE`, so when both ran the collision was swallowed and the
+/// draft ended up as two rows in the conversation. The owner watched one reply
+/// render as two `DRAFT` rows with byte-identical text, and the composer, which
+/// knew about exactly one of them, answered ⌘⇧⌫ with "There is no draft here to
+/// throw away".
+///
+/// This column is the identity. It names the `compose_drafts` row the mirror
+/// stands for, it is written only by `compose::mirror`, and nothing renames it —
+/// so "the mirror of this draft" is a lookup rather than a guess at which of a
+/// draft's several message ids is current. The unique index that makes one
+/// draft's second mirror row impossible is created by
+/// [`ensure_compose_schema`](crate::compose::ensure_compose_schema), because it
+/// can only be built after the duplicates already on disk have been collapsed
+/// and that needs `compose_drafts`, which this module cannot assume exists.
+///
+/// It is not `gmail_draft_id` — that column says what *Gmail* reports about a
+/// message, and the same rule that keeps sync from writing what the editor owns
+/// keeps the editor from writing that.
+///
+/// # The two repairs
+///
+/// Both are for rows already on disk, both name only tables this module owns,
+/// and both are idempotent.
+///
+/// A conversation is in the Drafts mailbox because a `DRAFT` row in
+/// `thread_labels` says so. `unmirror` drops that row only when it can see the
+/// mirror it belongs to, so a mirror removed by any other path left the label
+/// behind — and the Drafts list offered conversations whose reading pane had
+/// nothing in it. The owner's store holds four.
+///
+/// The second is the conversation those drafts were the only message of.
+/// `unmirror` deletes a thread it has emptied only when the thread is synthetic,
+/// so a draft written into a real Gmail conversation that Mach had no other
+/// message of leaves the husk: a row in `threads` with no messages, which is a
+/// blank reading pane wherever it is still listed. Requiring the thread to carry
+/// no labels either is what keeps this off a conversation that is merely waiting
+/// for the backfill to reach it.
+const M15_MIRROR_OWNER: &str = r#"
+ALTER TABLE messages ADD COLUMN mach_draft_id TEXT;
+
+DELETE FROM thread_labels
+ WHERE gmail_label_id = 'DRAFT'
+   AND NOT EXISTS (
+        SELECT 1 FROM messages m
+         WHERE m.thread_id = thread_labels.thread_id AND m.is_draft = 1);
+
+DELETE FROM threads
+ WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = threads.id)
+   AND NOT EXISTS (SELECT 1 FROM thread_labels l WHERE l.thread_id = threads.id);
+"#;
 
 /// Migration 14 — who sent it, as an index.
 ///

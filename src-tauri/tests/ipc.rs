@@ -1367,6 +1367,7 @@ fn the_wire_sample_is_what_the_frontend_will_receive() {
         internal_date: 1_700_000_000_000,
         is_unread: true,
         is_draft: true,
+        mach_draft_id: Some("draft-18f0c0ffee".into()),
         attachments: vec![Attachment {
             id: 9,
             message_id: 512,

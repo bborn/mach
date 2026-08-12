@@ -1011,7 +1011,7 @@ async fn cancelling_inside_the_undo_window_makes_no_request_at_all() {
     assert!(out.flush_due(NOW + 5_000).await.unwrap().is_empty());
     assert_eq!(transport.call_count(), 0);
 
-    assert!(out.cancel(&entry.id).unwrap());
+    assert!(out.cancel(&entry.id, NOW + 5_000).unwrap());
 
     // And well past the window, there is nothing left to send.
     assert!(out.flush_due(NOW + 60_000).await.unwrap().is_empty());
@@ -3945,3 +3945,322 @@ async fn the_draft_pushed_to_gmail_carries_its_attachments() {
     );
     assert_eq!(file.contents(), b"%PDF-1.7 deck");
 }
+
+// ===================================================== one draft, one mirror row
+//
+// "this UX still fucks me up. was it sent? was it not?"
+//
+// He sent a reply and the conversation showed the sent message *and* a red
+// `DRAFT` row of the same words above it, same sender, same time, for several
+// seconds. Two copies of one message with one of them labelled DRAFT is the
+// exact confusion the pill exists to prevent, pointing the other way: he could
+// not tell whether he had answered.
+//
+// The draft row was a *second* mirror of the same draft, stranded under a
+// message id nothing addressed any more, and every removal path names a draft by
+// at most two ids. Nothing could reach it until a sync pass swept it. So the
+// tests below are in two halves: one mirror per draft however the ids move, and
+// the queue taking that mirror out in the same write that puts the reply in.
+
+/// The draft rows a conversation is showing.
+fn draft_rows(db: &Db, thread_id: i64) -> Vec<mach_lib::db::models::Message> {
+    messages_in(db, thread_id)
+        .into_iter()
+        .filter(|m| m.is_draft)
+        .collect()
+}
+
+/// `⌘⏎` on an ordinary reply. The conversation holds the outgoing message and
+/// nothing that says DRAFT — before the ten seconds, before any flush, before
+/// Gmail has been told anything at all.
+#[tokio::test]
+async fn queueing_puts_the_reply_in_the_conversation_and_takes_the_draft_out() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let saved = save_body(&db, &out, thread, "Both items are handled.", NOW).await;
+    assert_eq!(draft_rows(&db, thread).len(), 1, "the draft is in the thread");
+
+    dispatch(&db, &out, json!({ "op": "send", "draft": saved, "now": NOW + 1 }))
+        .await
+        .unwrap();
+
+    assert!(draft_rows(&db, thread).is_empty(), "and it goes at queue time");
+    let sent: Vec<_> = messages_in(&db, thread)
+        .into_iter()
+        .filter(|m| !m.is_draft && m.subject.starts_with("Re:"))
+        .collect();
+    assert_eq!(sent.len(), 1, "with the reply in its place");
+    assert_eq!(transport.call_count(), 0, "and nothing waited on Google");
+    assert!(drafts_mailbox(&db).is_empty(), "the Drafts mailbox agrees");
+}
+
+/// The same, for a draft written in Gmail and adopted here. Its local id is
+/// `gmail-draft-<gmail id>` rather than `draft-<millis>`, and it reaches the
+/// outbox already carrying a Gmail message id — the shape the owner actually
+/// sent when he saw the two rows.
+#[tokio::test]
+async fn queueing_an_adopted_gmail_draft_takes_its_mirror_out_too() {
+    let (db, account, thread, _m) = seeded();
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"r-9999","message":{"id":"gmsg-remote-2","threadId":"gthread-1"}}"#,
+    ))]);
+    let out = outbox(&db, Arc::clone(&transport));
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "First pass.");
+
+    let found = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+    let draft_id = found["draft"]["id"].as_str().unwrap().to_string();
+    assert!(draft_id.starts_with("gmail-draft-"), "{draft_id}");
+    let mut draft = found["draft"].clone();
+    draft["body"] = json!("First pass, edited here.");
+    dispatch(&db, &out, json!({ "op": "saveDraft", "draft": draft, "now": NOW + 1 }))
+        .await
+        .unwrap();
+    // The push moves the draft onto a new Gmail message id, as every save does.
+    sync.push(&draft_id, NOW + 1).await.unwrap();
+    assert_eq!(draft_rows(&db, thread).len(), 1, "still one row");
+
+    let stored = draft::load_draft(&db, &draft_id).unwrap().unwrap();
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "send", "draft": serde_json::to_value(&stored).unwrap(), "now": NOW + 2 }),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        draft_rows(&db, thread).is_empty(),
+        "the adopted draft leaves the conversation at queue time as well"
+    );
+    assert!(drafts_mailbox(&db).is_empty());
+}
+
+/// The collision that produced the two rows.
+///
+/// `drafts.update` mints a new message id on every save. A sync pass that
+/// imports the draft under that new id before `adopt` renames the mirror onto it
+/// used to leave both rows: `adopt` renamed with `UPDATE OR IGNORE`, and the
+/// `IGNORE` was the duplicate.
+#[tokio::test]
+async fn a_sync_landing_before_the_adoption_still_leaves_one_draft_row() {
+    let (db, account, thread, _m) = seeded();
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"r-9999","message":{"id":"gmsg-remote-2","threadId":"gthread-1"}}"#,
+    ))]);
+    let out = outbox(&db, Arc::clone(&transport));
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "First pass.");
+
+    let found = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+    let draft_id = found["draft"]["id"].as_str().unwrap().to_string();
+    let mut draft = found["draft"].clone();
+    draft["body"] = json!("First pass, edited here.");
+    dispatch(&db, &out, json!({ "op": "saveDraft", "draft": draft, "now": NOW + 1 }))
+        .await
+        .unwrap();
+
+    // Gmail's copy of the same draft, under the id the push is about to report.
+    seed_remote_draft(
+        &db,
+        thread,
+        account,
+        "gmsg-remote-2",
+        "r-9999",
+        "First pass, edited here.",
+    );
+    sync.push(&draft_id, NOW + 1).await.unwrap();
+
+    let rows = draft_rows(&db, thread);
+    assert_eq!(rows.len(), 1, "one draft, one row: {rows:?}");
+    assert_eq!(rows[0].gmail_message_id, "gmsg-remote-2", "the live id");
+
+    // And it is still the draft the composer owns, so discard can reach it.
+    let discarded = dispatch(&db, &out, json!({ "op": "discardDraft", "draftId": draft_id }))
+        .await
+        .unwrap();
+    assert_eq!(discarded["ok"].as_bool(), Some(true));
+    assert!(
+        draft_rows(&db, thread).is_empty(),
+        "the thread and the composer cannot disagree about whether a draft exists"
+    );
+}
+
+/// However many times it is saved, pushed and re-synced.
+#[tokio::test]
+async fn a_draft_saved_and_pushed_over_and_over_is_one_row_throughout() {
+    let (db, account, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+
+    let mut saved = save_body(&db, &out, thread, "One.", NOW).await;
+    let draft_id = saved["id"].as_str().unwrap().to_string();
+    for (n, message_id) in ["gmsg-a", "gmsg-b", "gmsg-c"].iter().enumerate() {
+        *transport.default.lock().unwrap() = Ok(HttpResponse::json(
+            200,
+            &format!(r#"{{"id":"r-1","message":{{"id":"{message_id}","threadId":"gthread-1"}}}}"#),
+        ));
+        saved["body"] = json!(format!("Pass {n}."));
+        saved = dispatch(
+            &db,
+            &out,
+            json!({ "op": "saveDraft", "draft": saved, "now": NOW + n as i64 + 1 }),
+        )
+        .await
+        .unwrap()["draft"]
+            .clone();
+        sync.push(&draft_id, NOW + n as i64 + 1).await.unwrap();
+        // And a sync pass re-importing what Gmail now holds.
+        seed_remote_draft(&db, thread, account, message_id, "r-1", &format!("Pass {n}."));
+        assert_eq!(
+            draft_rows(&db, thread).len(),
+            1,
+            "one mirror after save {n}"
+        );
+    }
+    assert_eq!(drafts_mailbox(&db).len(), 1, "and one row in the mailbox");
+}
+
+/// ⌘Z inside the window. The reply goes back to being a draft — in the
+/// conversation, in the Drafts mailbox, and in the composer — without the
+/// window that sent it having to still exist.
+#[tokio::test]
+async fn recalling_a_send_puts_the_draft_row_back_in_the_conversation() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let saved = save_body(&db, &out, thread, "Both items are handled.", NOW).await;
+    let draft_id = saved["id"].as_str().unwrap().to_string();
+    let sent = dispatch(&db, &out, json!({ "op": "send", "draft": saved, "now": NOW + 1 }))
+        .await
+        .unwrap();
+    let entry = sent["entry"]["id"].as_str().unwrap().to_string();
+    assert!(draft_rows(&db, thread).is_empty());
+
+    let undone = dispatch(
+        &db,
+        &out,
+        json!({ "op": "undo", "outboxId": entry, "now": NOW + 2 }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(undone["cancelled"].as_bool(), Some(true));
+
+    let rows = draft_rows(&db, thread);
+    assert_eq!(rows.len(), 1, "the draft is back, once: {rows:?}");
+    assert_eq!(
+        rows[0].body_text.as_deref().map(str::trim),
+        Some("Both items are handled."),
+        "with the words in it, out of the tombstone rather than out of the UI"
+    );
+    assert!(
+        !messages_in(&db, thread)
+            .iter()
+            .any(|m| m.gmail_message_id.starts_with("mach-outbox:")),
+        "and the optimistic copy of the reply is gone"
+    );
+    assert_eq!(drafts_mailbox(&db).len(), 1, "the Drafts mailbox has it back");
+    let reopened = draft::load_draft(&db, &draft_id).unwrap();
+    assert!(reopened.is_some(), "and so does the composer");
+}
+
+/// The same recall, for the adopted Gmail draft — whose row has to come back
+/// still pointing at the Gmail draft it was written as, or the next save creates
+/// a second one beside it.
+#[tokio::test]
+async fn recalling_an_adopted_draft_puts_it_back_pointing_at_the_same_gmail_draft() {
+    let (db, account, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let row = seed_remote_draft(&db, thread, account, "gmsg-remote-1", "r-9999", "First pass.");
+
+    let found = dispatch(&db, &out, json!({ "op": "loadDraft", "messageId": row }))
+        .await
+        .unwrap();
+    let draft_id = found["draft"]["id"].as_str().unwrap().to_string();
+    let sent = dispatch(
+        &db,
+        &out,
+        json!({ "op": "send", "draft": found["draft"], "now": NOW + 1 }),
+    )
+    .await
+    .unwrap();
+    assert!(draft_rows(&db, thread).is_empty());
+
+    dispatch(
+        &db,
+        &out,
+        json!({ "op": "undo", "outboxId": sent["entry"]["id"], "now": NOW + 2 }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(draft_rows(&db, thread).len(), 1, "back in the conversation");
+    let restored = draft::load_draft(&db, &draft_id).unwrap().expect("the row");
+    assert_eq!(
+        restored.remote.draft_id.as_deref(),
+        Some("r-9999"),
+        "still the same Gmail draft"
+    );
+}
+
+/// The rows already on disk. A store carrying the duplicates and the orphans
+/// this bug wrote is repaired once, on the first compose call after the upgrade.
+#[test]
+fn the_repair_collapses_duplicate_mirrors_and_drops_the_ones_nothing_owns() {
+    let (db, account, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let _ = out;
+
+    // A draft with a row under the id Gmail last named *and* a stranded one
+    // under the id before it, which is what `adopt`'s ignored rename left.
+    seed_remote_draft(&db, thread, account, "gmsg-old", "r-1", "Two items.");
+    seed_remote_draft(&db, thread, account, "gmsg-new", "r-1", "Two items.");
+    // And a local mirror whose draft row is gone: the one that answered ⌘⇧⌫
+    // with "There is no draft here to throw away".
+    seed_remote_draft(
+        &db,
+        thread,
+        account,
+        "mach-draft:draft-vanished",
+        "r-2",
+        "Nothing owns this.",
+    );
+    db.write(|conn| {
+        conn.execute(
+            "INSERT INTO compose_drafts (id, account_id, thread_id, kind, subject, body,
+                                         updated_at, gmail_draft_id, gmail_message_id,
+                                         remote_state, remote_synced_at)
+             VALUES ('draft-live', ?1, ?2, 'reply', 'Re: Series A data room', 'Two items.',
+                     ?3, 'r-1', 'gmsg-new', 'synced', ?3)",
+            rusqlite::params![account, thread, NOW],
+        )?;
+        // The state a repaired store must not still be in.
+        conn.execute("UPDATE messages SET mach_draft_id = NULL", [])?;
+        conn.execute("DROP INDEX IF EXISTS idx_messages_mach_draft", [])?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(draft_rows(&db, thread).len(), 3, "the store as it stands");
+
+    db.write(compose::ensure_compose_schema).unwrap();
+
+    let rows = draft_rows(&db, thread);
+    assert_eq!(rows.len(), 1, "one draft, one row: {rows:?}");
+    assert_eq!(rows[0].gmail_message_id, "gmsg-new", "the id Gmail named");
+
+    // Idempotent: running it again is a no-op, not a second opinion.
+    db.write(compose::ensure_compose_schema).unwrap();
+    assert_eq!(draft_rows(&db, thread).len(), 1);
+}
+

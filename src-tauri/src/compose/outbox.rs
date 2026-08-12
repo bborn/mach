@@ -244,6 +244,22 @@ impl Outbox {
             Ok(())
         })?;
 
+        // The draft leaves the conversation here, in the same breath as the
+        // reply arriving in it, because those two are one event: the message the
+        // owner was writing is now the message he has sent. Doing it here rather
+        // than in the caller is what makes the repaint immediate — `⌘⏎` used to
+        // show the reply *and* a `DRAFT` row of the same words, and the draft
+        // went several seconds later when a sync pass got round to it.
+        //
+        // Its inverse is in [`Outbox::cancel`], which is the only other thing
+        // that ever undoes this write.
+        if !built.draft_id.is_empty() {
+            super::mirror::unmirror_ids(
+                &self.db,
+                &built.draft_id,
+                built.gmail_draft_message_id.as_deref(),
+            )?;
+        }
         self.write_local_copy(&entry, built, now_ms)?;
         Ok(entry)
     }
@@ -314,7 +330,17 @@ impl Outbox {
     /// Deleting the row is what guarantees "no API call at all": the flusher
     /// only ever reads rows, so a row that is not there cannot be sent, and
     /// there is no in-flight timer holding a copy of the bytes.
-    pub fn cancel(&self, id: &str) -> Result<bool> {
+    ///
+    /// # The inverse, exactly
+    ///
+    /// [`Outbox::queue`] does three things to the conversation: it takes the
+    /// draft's mirror out, puts the outgoing message in, and retires the draft
+    /// row. This undoes all three, in the opposite order, before it returns — so
+    /// the repaint after `⌘Z` is one refetch and shows what was on screen before
+    /// `⌘⏎`, whether or not the composer that sent it still exists. The window
+    /// can have been closed, or the app relaunched: the text comes back from the
+    /// tombstone rather than from the UI.
+    pub fn cancel(&self, id: &str, now_ms: i64) -> Result<bool> {
         // Read before the delete, because the draft this was written as is only
         // named on the row that is about to go.
         let draft_id = self.get(id)?.and_then(|entry| entry.draft_id);
@@ -353,6 +379,12 @@ impl Outbox {
         if removed {
             if let Some(draft_id) = draft_id {
                 super::draft::revive(&self.db, &draft_id)?;
+                // And back into the conversation it answers, which is where the
+                // owner is looking. The composer saves the text again a moment
+                // later and lands on this same row — one draft, one mirror.
+                if let Some(draft) = super::draft::load_draft(&self.db, &draft_id)? {
+                    super::mirror::mirror(&self.db, &draft, now_ms)?;
+                }
             }
         }
         Ok(removed)

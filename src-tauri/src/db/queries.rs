@@ -431,7 +431,7 @@ const MESSAGE_COLUMNS: &str = "\
     references_header, from_name, from_email, to_json, cc_json, bcc_json, subject, \
     body_html, body_text, snippet, internal_date, is_unread, is_draft, reply_to, \
     body_text_flowed, body_text_delsp, \
-    (html_evicted_at IS NOT NULL AND body_html IS NULL)";
+    (html_evicted_at IS NOT NULL AND body_html IS NULL), mach_draft_id";
 
 fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
     let to: String = row.get(9)?;
@@ -468,6 +468,7 @@ fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
         internal_date: row.get(16)?,
         is_unread: row.get(17)?,
         is_draft: row.get(18)?,
+        mach_draft_id: row.get(23)?,
         attachments: Vec::new(),
     })
 }

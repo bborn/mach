@@ -51,6 +51,102 @@ pub fn mirror_message_id(draft_id: &str) -> String {
     format!("{MIRROR_PREFIX}{draft_id}")
 }
 
+/// Point every row this draft owns at the id it is filed under now, and take out
+/// anything already sitting there that is not it.
+///
+/// # The identity a mirror has, and the one it does not
+///
+/// `gmail_message_id` is not an identity. **`drafts.update` mints a new message
+/// id on every save**, whoever calls it, so the id a mirror answers to moves
+/// under it several times while one draft is being written. Two writers moved
+/// it — this module writing the row under the new id, [`adopt`] renaming the old
+/// one — and `adopt` renamed with `UPDATE OR IGNORE`, which meant that when both
+/// ran the collision was *swallowed*: the old row stayed, the new row stayed,
+/// and the conversation held two `DRAFT` rows with byte-identical text. Every
+/// removal path addresses a draft by at most two ids, so the loser was
+/// unreachable — it survived the send (a `DRAFT` row beside the reply the owner
+/// had just watched leave) and it survived ⌘⇧⌫ ("There is no draft here to throw
+/// away"), until a sync pass happened to sweep it seconds or hours later.
+///
+/// `mach_draft_id` is the identity: the `compose_drafts` row the mirror stands
+/// for, which does not change while the draft exists. This runs before every
+/// write so the invariant is restored rather than assumed, and
+/// `idx_messages_mach_draft` — the unique index
+/// [`ensure_one_mirror_per_draft`](super::ensure_one_mirror_per_draft) creates —
+/// turns a second row from a thing that happens quietly into a write that fails
+/// loudly.
+///
+/// The row taken out of the way is Gmail's own copy of *this same draft*, landed
+/// by a sync pass under the id this draft is about to occupy. It is not a second
+/// message; it is this one, imported from the other end, and the mirror is
+/// standing in for it.
+fn claim_row(
+    conn: &rusqlite::Connection,
+    account_id: i64,
+    draft_id: &str,
+    gmail_message_id: &str,
+    also: &[&str],
+) -> rusqlite::Result<()> {
+    // A row under this id that is not a draft is the message this draft became:
+    // `drafts.send` hands back the id the draft was filed under. Nothing is
+    // renamed onto it — the mirror is over, and the rows that were it go.
+    let sent: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM messages
+              WHERE account_id = ?1 AND gmail_message_id = ?2 AND is_draft = 0",
+            params![account_id, gmail_message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    // Every id this draft has answered to. The callers know at most two beyond
+    // the current one — the placeholder it was written under and the message id
+    // Gmail replaced — and both name rows that are this draft.
+    let older = also.first().map(|id| id.to_string());
+    let oldest = also.get(1).map(|id| id.to_string());
+    const MINE: &str = "account_id = ?1 AND is_draft = 1 \
+                        AND (mach_draft_id = ?2 OR gmail_message_id = ?3 \
+                             OR gmail_message_id = ?4 OR gmail_message_id = ?5)";
+
+    // The row that survives, and the reason for the order: the stamped row is
+    // the one the reading pane and the composer have been addressing by its
+    // local id, so continuity is worth more than which Gmail id it happens to
+    // hold. The rest of the ordering only decides between rows that are all new
+    // to the draft.
+    let keep: Option<i64> = conn
+        .query_row(
+            &format!(
+                "SELECT id FROM messages WHERE {MINE}
+                  ORDER BY (mach_draft_id = ?2) DESC, (gmail_message_id = ?3) DESC, id DESC
+                  LIMIT 1"
+            ),
+            params![account_id, draft_id, gmail_message_id, &older, &oldest],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    conn.execute(
+        &format!("DELETE FROM messages WHERE {MINE} AND (?6 IS NULL OR id <> ?6)"),
+        params![
+            account_id,
+            draft_id,
+            gmail_message_id,
+            &older,
+            &oldest,
+            keep.filter(|_| sent.is_none()),
+        ],
+    )?;
+    if sent.is_none() {
+        if let Some(keep) = keep {
+            conn.execute(
+                "UPDATE messages SET gmail_message_id = ?2, mach_draft_id = ?3 WHERE id = ?1",
+                params![keep, gmail_message_id, draft_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// The id the mirror row is filed under *right now*.
 ///
 /// The placeholder until Gmail has been told, and Gmail's own message id after
@@ -118,13 +214,18 @@ pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
             )?,
         };
 
+        // "Is this draft already in the conversation" is a question about the
+        // draft, not about whichever message id it currently answers to — see
+        // `claim_row`, which runs next and is what makes those the same row.
         let existed: Option<i64> = conn
             .query_row(
-                "SELECT id FROM messages WHERE account_id = ?1 AND gmail_message_id = ?2",
-                params![draft.account_id, gmail_message_id],
+                "SELECT id FROM messages
+                  WHERE account_id = ?1 AND (mach_draft_id = ?3 OR gmail_message_id = ?2)",
+                params![draft.account_id, gmail_message_id, draft.id],
                 |row| row.get(0),
             )
             .optional()?;
+        claim_row(conn, draft.account_id, &draft.id, &gmail_message_id, &[])?;
 
         queries::upsert_message(
             conn,
@@ -155,6 +256,14 @@ pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
                 is_unread: false,
                 is_draft: true,
             },
+        )?;
+
+        // Whose row this is. Written here and nowhere else, and never rewritten:
+        // it is what "the mirror of this draft" means.
+        conn.execute(
+            "UPDATE messages SET mach_draft_id = ?3
+              WHERE account_id = ?1 AND gmail_message_id = ?2",
+            params![draft.account_id, &gmail_message_id, &draft.id],
         )?;
 
         // The label is the whole point: this is what the Drafts mailbox reads.
@@ -200,6 +309,12 @@ pub fn unmirror(db: &Db, draft: &Draft) -> Result<()> {
 /// is what makes this safe to call after a send: `drafts.send` can hand back the
 /// same message id the draft had, and the row under that id is by then the sent
 /// message. Deleting it would remove the reply the owner just watched leave.
+///
+/// Addressed by the draft first and by the ids second. The ids are a draft's
+/// *current* names and a draft has had several; `mach_draft_id` is the one that
+/// held still, so a mirror stranded under a message id nobody remembers — the
+/// shape every bug in this file's history has ended in — goes with the rest of
+/// them rather than outliving the draft it stood for.
 pub fn unmirror_ids(db: &Db, draft_id: &str, gmail_message_id: Option<&str>) -> Result<()> {
     db.write(ensure_compose_schema)?;
     // Both ids, because a draft that has been pushed is filed under Gmail's,
@@ -210,14 +325,18 @@ pub fn unmirror_ids(db: &Db, draft_id: &str, gmail_message_id: Option<&str>) -> 
         .filter(|id| !id.is_empty())
         .unwrap_or(&placeholder)
         .to_string();
+    // The sweep reaches here with no draft to name; an empty string must not
+    // match the rows of every draft that has none.
+    let owner = (!draft_id.is_empty()).then(|| draft_id.to_string());
     db.write(|conn| {
         let row: Option<(i64, String)> = conn
             .query_row(
                 "SELECT m.thread_id, t.gmail_thread_id
                    FROM messages m JOIN threads t ON t.id = m.thread_id
                   WHERE m.is_draft = 1
-                    AND (m.gmail_message_id = ?1 OR m.gmail_message_id = ?2)",
-                params![&gmail_message_id, &placeholder],
+                    AND (m.gmail_message_id = ?1 OR m.gmail_message_id = ?2
+                         OR (?3 IS NOT NULL AND m.mach_draft_id = ?3))",
+                params![&gmail_message_id, &placeholder, &owner],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -227,8 +346,10 @@ pub fn unmirror_ids(db: &Db, draft_id: &str, gmail_message_id: Option<&str>) -> 
 
         conn.execute(
             "DELETE FROM messages
-              WHERE is_draft = 1 AND (gmail_message_id = ?1 OR gmail_message_id = ?2)",
-            params![&gmail_message_id, &placeholder],
+              WHERE is_draft = 1
+                AND (gmail_message_id = ?1 OR gmail_message_id = ?2
+                     OR (?3 IS NOT NULL AND mach_draft_id = ?3))",
+            params![&gmail_message_id, &placeholder, &owner],
         )?;
         conn.execute(
             "UPDATE threads SET message_count = (SELECT COUNT(*) FROM messages WHERE thread_id = ?1)
@@ -300,26 +421,30 @@ pub fn forget_orphan_mirrors(
     listed_at: i64,
 ) -> Result<Vec<String>> {
     db.write(ensure_compose_schema)?;
-    let candidates: Vec<String> = db.read(|conn| {
+    let candidates: Vec<(String, Option<String>)> = db.read(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT gmail_message_id FROM messages
+            "SELECT gmail_message_id, mach_draft_id FROM messages
               WHERE account_id = ?1 AND is_draft = 1 AND internal_date < ?2",
         )?;
-        let rows = stmt.query_map(params![account_id, listed_at], |row| row.get(0))?;
+        let rows = stmt.query_map(params![account_id, listed_at], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     })?;
 
     let mut removed = Vec::new();
-    for gmail_message_id in candidates {
+    for (gmail_message_id, owner) in candidates {
         if live_message_ids.contains(&gmail_message_id) {
             continue;
         }
-        // Which draft row would own this mirror, if one did: the id Gmail filed
-        // it under for a pushed draft, and the placeholder for one that never
-        // got that far.
-        let placeholder_owner = gmail_message_id
-            .strip_prefix(MIRROR_PREFIX)
-            .map(str::to_string);
+        // Which draft row would own this mirror, if one did: the stamp it was
+        // written with, the id Gmail filed it under for a pushed draft, and the
+        // placeholder for one that never got that far.
+        let placeholder_owner = owner.or_else(|| {
+            gmail_message_id
+                .strip_prefix(MIRROR_PREFIX)
+                .map(str::to_string)
+        });
         let claimed: bool = db.read(|conn| {
             let by_message: Option<i64> = conn
                 .query_row(
@@ -366,6 +491,16 @@ pub fn forget_orphan_mirrors(
 /// than editing it, so a mirror that only ever answered to `mach-draft:<id>`
 /// would be adopted once and then go stale on the second keystroke-save — and
 /// the stale row is a duplicate waiting for the next sync.
+///
+/// # The rename that used to be allowed to fail
+///
+/// This was `UPDATE OR IGNORE`, and the `IGNORE` was the whole duplicate: a sync
+/// pass that had already imported the draft under its new message id — or an
+/// autosave that wrote the mirror under it while the push was in flight — put a
+/// row where this one was going, the rename was silently refused, and the draft
+/// was two rows from then on. So the row in the way is taken out first. It is
+/// the same draft, filed under the same id, arriving from the other end; there
+/// is nothing in it this row does not have.
 pub fn adopt(
     db: &Db,
     draft_id: &str,
@@ -379,32 +514,39 @@ pub fn adopt(
     let placeholder = mirror_message_id(draft_id);
     let previous = previous.unwrap_or(&placeholder).to_string();
     db.write(|conn| {
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT thread_id, account_id FROM messages
+                  WHERE mach_draft_id = ?1
+                     OR gmail_message_id = ?2 OR gmail_message_id = ?3",
+                params![draft_id, &placeholder, &previous],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((thread_id, account_id)) = row else {
+            return Ok(());
+        };
+
         // The thread first: a synthetic one has to become the real conversation
         // before its message can point at a Gmail id, or a sync pass could land
         // the real message in a thread that is still provisional.
+        //
+        // Only a provisional thread is renamed. A reply's thread is a real
+        // conversation and already carries Gmail's own id.
         if !gmail_thread_id.is_empty() {
-            let thread_id: Option<i64> = conn
-                .query_row(
-                    "SELECT thread_id FROM messages
-                      WHERE gmail_message_id = ?1 OR gmail_message_id = ?2",
-                    params![&placeholder, &previous],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(thread_id) = thread_id {
-                // Only a provisional thread is renamed. A reply's thread is a
-                // real conversation and already carries Gmail's own id.
-                conn.execute(
-                    "UPDATE OR IGNORE threads SET gmail_thread_id = ?2
-                      WHERE id = ?1 AND gmail_thread_id LIKE 'mach-draft:%'",
-                    params![thread_id, gmail_thread_id],
-                )?;
-            }
+            conn.execute(
+                "UPDATE OR IGNORE threads SET gmail_thread_id = ?2
+                  WHERE id = ?1 AND gmail_thread_id LIKE 'mach-draft:%'",
+                params![thread_id, gmail_thread_id],
+            )?;
         }
-        conn.execute(
-            "UPDATE OR IGNORE messages SET gmail_message_id = ?3
-              WHERE gmail_message_id = ?1 OR gmail_message_id = ?2",
-            params![placeholder, previous, gmail_message_id],
+
+        claim_row(
+            conn,
+            account_id,
+            draft_id,
+            gmail_message_id,
+            &[&previous, &placeholder],
         )?;
         Ok(())
     })?;
