@@ -635,13 +635,31 @@ export function ComposerDock() {
     [drafts, activeId, ensureSaved, applyAttachments, actions],
   );
 
+  /**
+   * Take a file off the draft.
+   *
+   * The chip goes in the frame the × was clicked, not when the store answers.
+   * It used to wait, which made the one control on screen whose whole job is to
+   * make something disappear the one that visibly did nothing — and a second
+   * click on a chip that had not gone yet sent a second delete for a row that
+   * was already being removed.
+   *
+   * The inverse is exact because the list it removes from is the answer: on
+   * failure the draft's attachments go back to what they were, which is the
+   * array that was in hand before the call.
+   */
   const unattach = useCallback(
     (id: string, attachmentId: string) => {
+      const before = drafts.find((entry) => entry.id === id)?.attachments;
+      if (before) applyAttachments(id, before.filter((file) => file.id !== attachmentId));
       void removeAttachment(attachmentId)
         .then((attachments) => applyAttachments(id, attachments))
-        .catch((error: unknown) => actions.setStatus(errorMessage(error), "error"));
+        .catch((error: unknown) => {
+          if (before) applyAttachments(id, before);
+          actions.setStatus(errorMessage(error), "error");
+        });
     },
-    [applyAttachments, actions],
+    [applyAttachments, actions, drafts],
   );
 
   /**

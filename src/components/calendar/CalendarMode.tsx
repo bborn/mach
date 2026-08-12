@@ -6,13 +6,13 @@ import { useMach, viewRange, type CalendarView } from "@/hooks/useMach";
 import { usePreferences } from "@/components/prefs/PreferencesProvider";
 import { useContacts } from "@/hooks/useContacts";
 import {
-  describeResult,
   getDataSource,
   type Command,
   type EventDraft,
   type EventScope,
   type Notify,
 } from "@/lib/data";
+import { isPendingEvent } from "@/lib/projection";
 import type { KeyBinding } from "@/lib/keymap";
 import { assignHues, FALLBACK_FILLS, fallbackFill, type CalendarColor } from "@/lib/calendar-palette";
 import { assignCalendarColors } from "@/lib/colors";
@@ -75,23 +75,6 @@ const SETTINGS_KEY = "mach.calendar.settings";
 
 /** ⇧1…⇧5 as the characters a US keyboard actually emits. */
 const SHIFTED_DIGITS = ["!", "@", "#", "$", "%"];
-
-/**
- * Where a dragged, resized or nudged event has been *put*, before the store
- * agrees that it is there.
- *
- * There is no expiry on it, and none is needed: the command layer writes the
- * local row to exactly these values before it calls Google, so a successful
- * write always produces a store that agrees, and agreement is what retires the
- * guess. A refused write deletes it outright. The only way one could outlive
- * its usefulness is a later sync moving the event to a third time, which is a
- * race with a background pass rather than a state this can be in on its own.
- */
-interface PendingMove {
-  start: number;
-  end: number;
-  allDay: boolean;
-}
 
 const DEFAULT_SETTINGS: CalendarSettings = {
   // §7: merging is the right default. It hides that a meeting exists on two
@@ -158,21 +141,6 @@ export function CalendarMode() {
   } | null>(null);
   /** ⌘C parks an event here; ⌘V drops a copy of it on the anchored day. */
   const [clipboard, setClipboard] = useState<CalendarEvent | null>(null);
-  /**
-   * Where a dragged, resized or nudged event has been *put*, before the store
-   * agrees.
-   *
-   * The same idea as `starOverrides` in `useMach`, and for the same reason: the
-   * UI never waits on Google. A drop used to leave the block sitting at its old
-   * time for the length of an IPC round trip, a Google call and a refetch —
-   * a quarter of a second on a good day, and a visible snap-back on a bad one,
-   * which reads as "the drag did not work" rather than as "it is saving".
-   *
-   * Kept here rather than in `useMach` deliberately: it is a fact about the
-   * calendar surface, it is discarded the moment the surface unmounts, and
-   * nothing else in the app needs to know an event is mid-flight.
-   */
-  const [pendingMoves, setPendingMoves] = useState<Record<EventId, PendingMove>>({});
 
   const modalOpen = modal !== null;
   const finderOpen = finder !== null;
@@ -233,57 +201,25 @@ export function CalendarMode() {
     [colors],
   );
 
-  /**
-   * The events as the user has just left them.
+  /*
+   * `visibleEvents` is already what the user has just left the calendar as.
    *
-   * A guess is applied only while it still *differs* from the store, which is
-   * the same rule `starOverrides` uses: the moment sync catches up, the
-   * override is a no-op and the row renders from the truth. The effect below
-   * then drops it, so the map cannot accumulate.
+   * There used to be a private `pendingMoves` map here doing that job for drag,
+   * resize and nudge alone — the only three calendar commands that were ever
+   * optimistic. It has moved into `lib/projection.ts` beside the mail one, so
+   * every calendar command gets the same treatment and there is one answer to
+   * "what does this block say" rather than a surface-local override map that
+   * only three of five commands wrote to.
    */
-  const settledEvents = useMemo(() => {
-    if (Object.keys(pendingMoves).length === 0) return visibleEvents;
-    return visibleEvents.map((event) => {
-      const move = pendingMoves[event.id];
-      if (!move) return event;
-      if (move.start === event.start && move.end === event.end && move.allDay === event.allDay) {
-        return event;
-      }
-      return { ...event, start: move.start, end: move.end, allDay: move.allDay };
-    });
-  }, [visibleEvents, pendingMoves]);
-
-  // Drop guesses the store has caught up with, and guesses about events that
-  // are no longer there at all. Without this the map grows for the life of the
-  // session and every render pays for it.
-  useEffect(() => {
-    const ids = Object.keys(pendingMoves);
-    if (ids.length === 0) return;
-    const byId = new Map(visibleEvents.map((e) => [e.id, e] as const));
-    const stale = ids.filter((key) => {
-      const id = Number(key);
-      const event = byId.get(id);
-      if (!event) return true;
-      const move = pendingMoves[id];
-      return move.start === event.start && move.end === event.end && move.allDay === event.allDay;
-    });
-    if (stale.length === 0) return;
-    setPendingMoves((current) => {
-      const next = { ...current };
-      for (const key of stale) delete next[Number(key)];
-      return next;
-    });
-  }, [visibleEvents, pendingMoves]);
-
   const inRange = useMemo(() => {
     const soloed = soloAccount;
-    return settledEvents.filter((event) => {
+    return visibleEvents.filter((event) => {
       if (event.start >= rangeEnd || event.end <= rangeStart) return false;
       if (soloed !== null && event.accountId !== soloed) return false;
       if (!settings.showDeclined && event.rsvp === "declined") return false;
       return true;
     });
-  }, [settledEvents, rangeStart, rangeEnd, soloAccount, settings.showDeclined]);
+  }, [visibleEvents, rangeStart, rangeEnd, soloAccount, settings.showDeclined]);
 
   const merged = useMemo(
     () =>
@@ -375,56 +311,55 @@ export function CalendarMode() {
   /* ---------------------------------------------------------------------- */
 
   /**
-   * Dispatch a calendar command and reconcile.
+   * Dispatch a calendar command.
    *
-   * The command layer writes to SQLite before it talks to Google, so by the
-   * time this resolves the local store is already right — but `useMach` loads
-   * the calendar window once per anchor and has no idea a row changed. Asking
-   * it to refetch is the seam: `actions.reloadEvents()` refetches just that
-   * window. It used to be `actions.reload()`, which also refetched accounts,
-   * labels, calendars, the sync snapshot and the entire thread list — a lot of
-   * work, and a visible stutter, to redraw one block fifteen minutes lower.
+   * This used to execute against the data source itself, and that is exactly
+   * why nothing on this surface was optimistic: the guess is made in
+   * `useMach`'s `run`, before its first `await`, and a caller that goes around
+   * it goes around that too. Answering "Going" from the right-click menu
+   * changed nothing on screen until Google had replied — the report this was
+   * written for. It now goes through `actions.execute`, which projects the
+   * command in the same tick as the gesture, refetches the event window, puts
+   * the sentence on the status rail and records the undo entry.
    *
-   * `undo` is threaded into the status bar exactly the way the mail commands
-   * do it, so `z` reverses a drag as readily as it reverses an archive.
+   * What is left here is the part that is about *this surface*: the busy flag
+   * the modal reads, and the banner. The status rail is 24px tall, it
+   * truncates, and it clears itself with the undo offer — a failure there is
+   * indistinguishable from a success you looked away from, which is how a stale
+   * binary once read as "I tried to create an event and nothing happened". A
+   * refused write parks a banner that stays until it is dismissed or retried.
    */
   const run = useCallback(
     async (command: Command) => {
       setBusy(true);
       setFailure(null);
       try {
-        const result = await getDataSource().execute(command);
-        // One dispatch, carrying the inverse: `z` reads `ui.status.undo`, so a
-        // plain `setStatus` here would say the right thing and then quietly
-        // make the last action un-undoable.
-        dispatch({
-          type: "status",
-          status: {
-            message: describeResult(result),
-            undo: result.ok ? result.undo : undefined,
-            tone: result.ok ? "info" : "error",
-          },
-        });
-        // The status bar is not enough on its own, and this is the whole reason
-        // a stale binary read as "I tried to create an event and nothing
-        // happened". That rail is 24px tall, it truncates, and it clears itself
-        // after six seconds — a failure there is indistinguishable from a
-        // success you looked away from. A failed write now also parks a banner
-        // that stays until it is dismissed or retried, and keeps the modal open
-        // on top of the values that did not save.
-        if (!result.ok) setFailure({ message: describeResult(result), command });
-        actions.reloadEvents();
-        return result;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Not saved";
-        dispatch({ type: "status", status: { message, tone: "error" } });
-        setFailure({ message, command });
-        return null;
+        return await actions.execute(command, { onRefused: setFailure });
       } finally {
         setBusy(false);
       }
     },
-    [actions, dispatch],
+    [actions],
+  );
+
+  /**
+   * Refuse a write to a block that Google has not been told about yet, and say
+   * so rather than sending it.
+   *
+   * A create is drawn from its draft the instant it is asked for, under an id
+   * no Google event has. Every verb on this surface addresses an event by id,
+   * so one of them landing on a placeholder would be a request the command
+   * layer can only reject in words nobody wrote for it. The refusal is
+   * immediate, which is the point: a rejected action must never feel like a
+   * slow one.
+   */
+  const guardSaved = useCallback(
+    (event: CalendarEvent) => {
+      if (!isPendingEvent(event.id)) return true;
+      actions.setStatus(`“${event.title || "New event"}” is still saving`, "info");
+      return false;
+    },
+    [actions],
   );
 
   /** Whether Google would accept a write to this event at all. */
@@ -432,7 +367,11 @@ export function CalendarMode() {
   const editable = useCallback(
     // The calendar's own access role is part of the same decision: a `reader`
     // subscription refuses every write whoever organized the event.
+    // A block that is still being created is not editable either — there is
+    // nothing to address the edit to — which is what makes the modal open on
+    // one read-only rather than offering a Save that can only fail.
     (event: CalendarEvent) =>
+      !isPendingEvent(event.id) &&
       canEditEvent(event, accountEmails, calendarById(event.calendarId)?.accessRole),
     [accountEmails, calendarById],
   );
@@ -446,6 +385,10 @@ export function CalendarMode() {
    */
   const guardEdit = useCallback(
     (event: CalendarEvent) => {
+      // Ordered: "still saving" is the more specific and more temporary of the
+      // two, and reporting a placeholder as somebody else's event would be a
+      // sentence the user cannot act on.
+      if (!guardSaved(event)) return false;
       if (editable(event)) return true;
       const who = event.organizer?.email;
       actions.setStatus(
@@ -456,7 +399,7 @@ export function CalendarMode() {
       );
       return false;
     },
-    [editable, actions],
+    [editable, actions, guardSaved],
   );
 
   /** The calendar a new event lands on: the one in view, else the first. */
@@ -488,37 +431,23 @@ export function CalendarMode() {
    * same optimistic shape.
    *
    * The block is drawn at its new time *before* the command is dispatched, so
-   * the drop is instant however slow Google is. On failure the guess is dropped
-   * and the block snaps back to where it was — visibly, and with the banner
-   * saying why. A silent snap-back is the worst of both worlds: it looks like
-   * the drag missed, and it teaches the user that dragging is unreliable rather
-   * than that this particular write was refused.
+   * the drop is instant however slow Google is. That is `projectEvent` now,
+   * inside the one write path, rather than a map this file kept: on failure the
+   * guess is dropped there and the block snaps back to where it was — visibly,
+   * and with the banner saying why. A silent snap-back is the worst of both
+   * worlds: it looks like the drag missed, and it teaches the user that
+   * dragging is unreliable rather than that this particular write was refused.
    */
   const applyMove = useCallback(
     (eventId: EventId, outcome: DragOutcome, allDay: boolean) => {
       const event = allEvents.find((e) => e.id === eventId);
       if (event && !guardEdit(event)) return;
 
-      setPendingMoves((current) => ({
-        ...current,
-        [eventId]: { start: outcome.start, end: outcome.end, allDay },
-      }));
-
       void run({
         kind: "updateEvent",
         eventId,
         patch: { startTs: outcome.start, endTs: outcome.end, isAllDay: allDay },
         scope: "this",
-      }).then((result) => {
-        if (result?.ok) return;
-        // Google refused it, or never answered. `run` has already put the
-        // reason on screen; this is the half that puts the block back.
-        setPendingMoves((current) => {
-          if (!(eventId in current)) return current;
-          const next = { ...current };
-          delete next[eventId];
-          return next;
-        });
       });
     },
     [run, allEvents, guardEdit],
@@ -564,7 +493,7 @@ export function CalendarMode() {
       // made the second of two quick presses a no-op: it recomputed "fifteen
       // minutes after 1pm" from a row that still said 1pm, and arrived back at
       // the time the first press had already moved it to.
-      const event = settledEvents.find((e) => e.id === ui.eventId) ?? selectedEvent;
+      const event = visibleEvents.find((e) => e.id === ui.eventId) ?? selectedEvent;
       if (!event) {
         actions.setStatus("Pick an event first", "info");
         return;
@@ -584,7 +513,7 @@ export function CalendarMode() {
       );
       applyMove(event.id, outcome, false);
     },
-    [selectedEvent, settledEvents, ui.eventId, applyMove, actions],
+    [selectedEvent, visibleEvents, ui.eventId, applyMove, actions],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -786,11 +715,19 @@ export function CalendarMode() {
     (id: EventId, scope: EventScope, notify?: Notify) => {
       const event = allEvents.find((e) => e.id === id);
       if (event && !guardEdit(event)) return;
-      void run({ kind: "deleteEvent", eventId: id, scope, notify }).then((result) => {
-        if (!result?.ok) return;
-        setModal(null);
-        dispatch({ type: "event", eventId: null });
-      });
+      /*
+       * The panel closes and the cursor moves off now, not when Google answers.
+       *
+       * It used to wait for the result, which meant deleting a meeting left the
+       * modal sitting there over a grid that had not changed — for the length of
+       * a round trip, with nothing saying the key had been heard. There is
+       * nothing to preserve here the way a refused *save* has typed values to
+       * preserve: the block is gone from the grid in the same frame, and if
+       * Google refuses, `run` puts it back and the banner says why.
+       */
+      setModal(null);
+      dispatch({ type: "event", eventId: null });
+      void run({ kind: "deleteEvent", eventId: id, scope, notify });
     },
     [run, dispatch, allEvents, guardEdit],
   );
@@ -803,11 +740,23 @@ export function CalendarMode() {
     [create],
   );
 
+  /**
+   * Answer an invitation.
+   *
+   * The reported case, and now the plainest one in the file: `run` projects the
+   * answer onto the event before it dispatches, so the block's fill, the tick
+   * in the right-click menu and the guest's own chip in the detail panel all
+   * change in the frame the menu item was chosen. With "show declined" off — the
+   * default — answering No takes the block off the grid there and then, which
+   * is what Google Calendar does with the same answer.
+   */
   const rsvp = useCallback(
     (id: EventId, response: Rsvp) => {
+      const event = allEvents.find((e) => e.id === id);
+      if (event && !guardSaved(event)) return;
       void run({ kind: "rsvp", eventId: id, response });
     },
-    [run],
+    [run, allEvents, guardSaved],
   );
 
   const onGridDraft = useCallback(
@@ -917,11 +866,13 @@ export function CalendarMode() {
   );
 
   const openInGoogle = useCallback(
-    (event: CalendarEvent) =>
-      openExternal(
-        googleCalendarUrl(event, accounts.find((a) => a.id === event.accountId)?.email),
-      ),
-    [accounts, openExternal],
+    (event: CalendarEvent) => {
+      // Google has no id for a block that is still being created, so the URL
+      // would be a guess at a page that does not exist yet.
+      if (!guardSaved(event)) return;
+      openExternal(googleCalendarUrl(event, accounts.find((a) => a.id === event.accountId)?.email));
+    },
+    [accounts, openExternal, guardSaved],
   );
 
   /**
@@ -932,8 +883,8 @@ export function CalendarMode() {
    * be about the block's old time.
    */
   const eventById = useCallback(
-    (id: EventId) => settledEvents.find((e) => e.id === id) ?? allEvents.find((e) => e.id === id),
-    [settledEvents, allEvents],
+    (id: EventId) => visibleEvents.find((e) => e.id === id) ?? allEvents.find((e) => e.id === id),
+    [visibleEvents, allEvents],
   );
 
   /**

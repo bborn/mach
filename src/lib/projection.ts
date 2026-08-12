@@ -46,10 +46,39 @@
  *
  * A guess stops being a guess when the loaded list agrees with it — never on a
  * clock. See {@link settledGuesses}.
+ *
+ * # The calendar half
+ *
+ * The second half of this file does the same job for events, and it exists
+ * because the calendar had none of it. Every calendar command — `rsvp`,
+ * `createEvent`, `updateEvent`, `deleteEvent`, `moveEvent` — went out and the
+ * grid did not move until Google had answered and the event window had been
+ * refetched. Answering "Going" from the right-click menu changed nothing on
+ * screen for the length of a round trip, which is the report this was written
+ * for.
+ *
+ * An event is not a label set, so the guess is a different shape: the fields
+ * the command already decided, plus a "this is gone" flag for a delete. The
+ * three rules are the same ones —
+ *
+ *  * the guess is made **before** the command is dispatched, in the same tick
+ *    as the gesture;
+ *  * it has an exact inverse, which is dropping it, and a refusal drops it;
+ *  * it retires when the store agrees, never on a clock.
+ *
+ * A create is the one command with no id to key a guess by, because the row it
+ * makes does not exist until it has run. {@link placeholderEvent} answers that
+ * with a block drawn from the draft under a negative id, which
+ * {@link settledPendingEvents} retires once the real row shows up.
  */
 
-import type { LabelId, Thread, ThreadId } from "@/types";
-import { isMailCommand, type Command, type MailCommand } from "./data";
+import type { CalendarEvent, EventId, LabelId, Thread, ThreadId } from "@/types";
+import {
+  isMailCommand,
+  type Command,
+  type EventPatch,
+  type MailCommand,
+} from "./data";
 
 /** Gmail's system labels this module names directly, as `commands::mail` does. */
 export const INBOX = "INBOX";
@@ -361,4 +390,342 @@ function agrees(row: Pick<Thread, "labelIds" | "unread">, guess: ThreadGuess): b
   if (guess.add.some((l) => !row.labelIds.includes(l))) return false;
   if (guess.remove.some((l) => row.labelIds.includes(l))) return false;
   return true;
+}
+
+/* ========================================================================== */
+/* The calendar half                                                          */
+/* ========================================================================== */
+
+/** The fields of an event a command can decide without asking Google. */
+export type EventFields = Partial<
+  Pick<
+    CalendarEvent,
+    | "start"
+    | "end"
+    | "allDay"
+    | "title"
+    | "location"
+    | "description"
+    | "attendees"
+    | "recurrence"
+    | "rsvp"
+    | "calendarId"
+    | "accountId"
+  >
+>;
+
+/**
+ * One event's worth of "this has happened, the store just does not say so yet".
+ *
+ * Fields rather than a delta, because an event is not a set: `updateEvent`
+ * carries the values it is setting, and `rsvp` carries the one answer. There is
+ * nothing here for `conferencing` on purpose — a Meet link is minted by Google
+ * and read back, so the only honest guess about one is no guess at all.
+ */
+export interface EventGuess {
+  patch?: EventFields;
+  /** The event is not there any more. `deleteEvent`, and only that. */
+  gone?: boolean;
+}
+
+export type EventGuesses = Record<EventId, EventGuess>;
+
+/**
+ * A block drawn while the create that made it is still in flight.
+ *
+ * `realId` is the row id the command layer minted, once it has answered — which
+ * is what retires the placeholder: the moment an event with that id is in the
+ * store, the store is drawing the same block and this one is a duplicate.
+ */
+export interface PendingEvent {
+  event: CalendarEvent;
+  realId: EventId | null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Making one                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The guess a calendar command implies for the event it names.
+ *
+ * Returns `null` for a mail command, and for `createEvent` — see
+ * {@link placeholderEvent} for what stands in for that one.
+ */
+export function projectEvent(command: Command): EventGuesses | null {
+  switch (command.kind) {
+    /*
+     * The reported case. `event.rsvp` is what the block's fill is derived from
+     * (`toneFor` in `TimeGrid` and `MonthGrid`), what the context menu ticks,
+     * and what the "show declined" filter reads — so one field carries the
+     * whole visible answer to "did it hear me".
+     */
+    case "rsvp":
+      return { [command.eventId]: { patch: { rsvp: command.response } } };
+
+    case "updateEvent": {
+      const patch = patchFields(command.patch);
+      return patch ? { [command.eventId]: { patch } } : null;
+    }
+
+    case "deleteEvent":
+      return { [command.eventId]: { gone: true } };
+
+    /*
+     * A move is insert-into-destination then delete-from-source, so the row
+     * this names really does go away. Claiming `gone` would be the more
+     * literal guess and the worse one: the event has not been cancelled, it
+     * has changed calendars, and a block that vanishes for a round trip and
+     * comes back in another colour reads as a failed drag. Re-pointing it at
+     * the destination shows the colour change at once and settles either way.
+     */
+    case "moveEvent":
+      return {
+        [command.eventId]: {
+          patch: { calendarId: command.calendarId, accountId: command.accountId },
+        },
+      };
+
+    case "createEvent":
+      return null;
+
+    default:
+      return null;
+  }
+}
+
+/** The event fields an `EventPatch` decides, or `null` when it decides none. */
+function patchFields(patch: EventPatch): EventFields | null {
+  const fields: EventFields = {};
+  if (patch.startTs !== undefined) fields.start = patch.startTs;
+  if (patch.endTs !== undefined) fields.end = patch.endTs;
+  if (patch.isAllDay !== undefined) fields.allDay = patch.isAllDay;
+  if (patch.title !== undefined) fields.title = patch.title;
+  if (patch.location !== undefined) fields.location = patch.location;
+  if (patch.description !== undefined) fields.description = patch.description;
+  if (patch.attendees !== undefined) fields.attendees = patch.attendees;
+  if (patch.recurrence !== undefined) fields.recurrence = patch.recurrence;
+  return Object.keys(fields).length > 0 ? fields : null;
+}
+
+/** The ids a calendar command's guess is about. Empty for a mail command. */
+export function guessedEventIds(command: Command): EventId[] {
+  if (isMailCommand(command) || command.kind === "createEvent") return [];
+  return [command.eventId];
+}
+
+/*
+ * Placeholder ids count down from -1.
+ *
+ * Real ids are SQLite `INTEGER PRIMARY KEY` row ids and start at 1, so a
+ * negative id can never collide with one and {@link isPendingEvent} is a total
+ * answer rather than a lookup. Everything that writes to Google checks it: a
+ * placeholder has no id Google knows, so an edit to one has nowhere to go.
+ */
+let nextPendingId = -1;
+
+export function pendingEventId(): EventId {
+  return nextPendingId--;
+}
+
+export function isPendingEvent(id: EventId): boolean {
+  return id < 0;
+}
+
+/** The block to draw for a create, from the draft the create carries. */
+export function placeholderEvent(
+  command: Extract<Command, { kind: "createEvent" }>,
+  id: EventId,
+): CalendarEvent {
+  const draft = command.draft;
+  return {
+    id,
+    calendarId: command.calendarId,
+    accountId: command.accountId,
+    title: draft.title,
+    start: draft.startTs,
+    end: draft.endTs,
+    allDay: draft.isAllDay,
+    location: draft.location,
+    description: draft.description,
+    attendees: draft.attendees,
+    recurrence: draft.recurrence.length > 0 ? draft.recurrence : undefined,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Applying one                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The event as the guess says it now is.
+ *
+ * Returns the **same object** when the guess changes nothing, so a grid of
+ * eighty blocks re-renders as eighty unchanged references.
+ *
+ * An answered `rsvp` also rewrites the signed-in account's own row in `guests`,
+ * which is the list the detail panel draws its chips from. It is derived here
+ * rather than carried in the guess for the same reason `starred` is in
+ * {@link applyGuess}: it is not an independent fact, it is the same answer read
+ * a second way, and a guess that stated both could state them differently.
+ */
+export function applyEventGuess(event: CalendarEvent, guess: EventGuess): CalendarEvent {
+  const patch = guess.patch;
+  if (!patch) return event;
+  const keys = Object.keys(patch) as (keyof EventFields)[];
+  if (keys.every((key) => sameValue(event[key], patch[key]))) return event;
+  const next: CalendarEvent = { ...event, ...patch };
+  if (patch.rsvp !== undefined && event.guests) {
+    next.guests = event.guests.map((guest) =>
+      guest.isSelf ? { ...guest, response: patch.rsvp } : guest,
+    );
+  }
+  return next;
+}
+
+/** Shallow equality, one array deep — enough for `attendees` and `recurrence`. */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((item, i) => shallowEqual(item, b[i]));
+  }
+  return false;
+}
+
+function shallowEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => left[key] === right[key]);
+}
+
+/**
+ * The events as the outstanding guesses leave them, placeholders included.
+ *
+ * The one place a guess becomes a row, so the grid, the cursor, the context
+ * menu and the detail panel are all looking at the same events. Returns the
+ * **same array** when there is nothing pending, which is almost always.
+ */
+export function applyEventGuesses(
+  events: CalendarEvent[],
+  guesses: EventGuesses,
+  pending: readonly PendingEvent[],
+): CalendarEvent[] {
+  if (Object.keys(guesses).length === 0 && pending.length === 0) return events;
+  const rows: CalendarEvent[] = [];
+  for (const event of events) {
+    const guess = guesses[event.id];
+    if (!guess) {
+      rows.push(event);
+      continue;
+    }
+    if (guess.gone) continue;
+    rows.push(applyEventGuess(event, guess));
+  }
+  /*
+   * A placeholder is skipped the moment its real row is in the window, rather
+   * than waiting for the effect that retires it from state.
+   *
+   * Those are one render apart, and one render is enough: the retirement effect
+   * runs *after* the commit, so drawing both here would put a frame on screen
+   * with two copies of the event that was just created. Deciding it in the same
+   * pass makes the duplicate impossible rather than brief.
+   */
+  for (const item of pending) {
+    if (!hasLanded(events, item)) rows.push(item.event);
+  }
+  return rows;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Retiring one                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The ids whose guess the loaded events now agree with.
+ *
+ * Same rule as {@link settledGuesses}, and the same two shapes:
+ *
+ *  * **The event is loaded.** It agrees when every guessed field matches — and
+ *    a `gone` guess never agrees with a row that is still there, because the
+ *    delete has plainly not landed yet.
+ *  * **The event is absent.** Then it agrees outright. A delete that landed is
+ *    the obvious case; so is the source row of a move, which the command layer
+ *    removes. The one thing it must be asked about is the *whole* loaded
+ *    window rather than the visible subset — hiding a calendar in the sidebar
+ *    takes rows off screen without anything having happened to them, and
+ *    retiring on that would drop a guess that is still doing work.
+ */
+export function settledEventGuesses(
+  events: readonly CalendarEvent[],
+  guesses: EventGuesses,
+): EventId[] {
+  const keys = Object.keys(guesses);
+  if (keys.length === 0) return [];
+
+  const byId = new Map(events.map((event) => [event.id, event] as const));
+  const settled: EventId[] = [];
+  for (const key of keys) {
+    const id = Number(key);
+    const event = byId.get(id);
+    if (!event) {
+      settled.push(id);
+      continue;
+    }
+    const guess = guesses[id]!;
+    if (guess.gone) continue;
+    if (agreesEvent(event, guess.patch)) settled.push(id);
+  }
+  return settled;
+}
+
+function agreesEvent(event: CalendarEvent, patch: EventFields | undefined): boolean {
+  if (!patch) return true;
+  return (Object.keys(patch) as (keyof EventFields)[]).every((key) =>
+    sameValue(event[key], patch[key]),
+  );
+}
+
+/**
+ * The placeholder ids the store has caught up with.
+ *
+ * Two ways it can, and both are needed. `realId` is the exact one: the command
+ * layer answers with the row id it minted, and the placeholder goes the moment
+ * that row is in the window. The field match is the fallback for a source that
+ * cannot name an id — the fixture one does not — and for a create whose answer
+ * arrived after the refetch that already carried the row.
+ */
+export function settledPendingEvents(
+  events: readonly CalendarEvent[],
+  pending: readonly PendingEvent[],
+): EventId[] {
+  if (pending.length === 0) return [];
+  return pending.filter((item) => hasLanded(events, item)).map((item) => item.event.id);
+}
+
+/** Whether the row a placeholder was standing in for is in the window now. */
+function hasLanded(events: readonly CalendarEvent[], item: PendingEvent): boolean {
+  return events.some((event) =>
+    item.realId !== null ? event.id === item.realId : sameSlot(event, item.event),
+  );
+}
+
+/**
+ * Whether a stored event is the one a placeholder was standing in for.
+ *
+ * The four fields the command layer writes to SQLite verbatim, before it says
+ * anything to Google. Deliberately not the description or the guest list: both
+ * come back normalized, and a placeholder that never matched would sit on the
+ * grid as a second copy of an event that did save.
+ */
+function sameSlot(event: CalendarEvent, placeholder: CalendarEvent): boolean {
+  return (
+    event.calendarId === placeholder.calendarId &&
+    event.start === placeholder.start &&
+    event.end === placeholder.end &&
+    event.title === placeholder.title
+  );
 }

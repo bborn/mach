@@ -36,13 +36,22 @@ import {
   type MailCommand,
 } from "@/lib/data";
 import {
+  applyEventGuesses,
   applyGuess,
+  guessedEventIds,
   leavesMailbox,
   leavingIds,
+  pendingEventId,
+  placeholderEvent,
   project,
+  projectEvent,
+  settledEventGuesses,
   settledGuesses,
+  settledPendingEvents,
   READ_GUESS,
+  type EventGuesses,
   type Guesses,
+  type PendingEvent,
 } from "@/lib/projection";
 import {
   emptyUndo,
@@ -246,6 +255,27 @@ interface UiState {
    * agreeing with one retires it; the reducer here only stores what it is told.
    */
   guesses: Guesses;
+  /**
+   * The same thing for events, and it exists for the same reason.
+   *
+   * The calendar had none of this: `rsvp`, `createEvent`, `updateEvent`,
+   * `deleteEvent` and `moveEvent` all went out and the grid did not move until
+   * Google had answered and the event window had been refetched. Answering
+   * "Going" from the right-click menu changed nothing on screen at all.
+   *
+   * `lib/projection.ts` owns the rule for these exactly as it does for
+   * conversations — what a command claims, how it lands on a row, and when the
+   * store agreeing retires it. The reducer only stores what it is told.
+   */
+  eventGuesses: EventGuesses;
+  /**
+   * Blocks drawn for creates that are still in flight.
+   *
+   * Separate from `eventGuesses` because a create has no id to key a guess by:
+   * the row it makes does not exist until the command layer has minted one. See
+   * `placeholderEvent`.
+   */
+  pendingEvents: PendingEvent[];
   status: StatusMessage | null;
 }
 
@@ -274,6 +304,19 @@ type UiAction =
   | { type: "project"; guesses: Guesses }
   /** Drop guesses — the list agrees now, or the write was refused. */
   | { type: "forget"; threadIds: ThreadId[] }
+  /** Show what a calendar command did, before the event window was refetched. */
+  | { type: "projectEvents"; guesses: EventGuesses }
+  /** Draw a block for a create that has not come back yet. */
+  | { type: "pendEvent"; event: CalendarEvent }
+  /** The command layer minted a row id for a pending create. */
+  | { type: "resolvePending"; eventId: EventId; realId: EventId | null }
+  /**
+   * Drop event guesses and pending blocks — the store agrees now, or the write
+   * was refused. One action for both because a refusal has to take back
+   * whichever of the two the command produced, and the caller should not have
+   * to know which that was.
+   */
+  | { type: "forgetEvents"; eventIds: EventId[] }
   | { type: "status"; status: UiState["status"] };
 
 export const initialUi: UiState = {
@@ -296,6 +339,8 @@ export const initialUi: UiState = {
   hiddenCalendars: [],
   theme: "system",
   guesses: {},
+  eventGuesses: {},
+  pendingEvents: [],
   status: null,
 };
 
@@ -389,6 +434,32 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
       const next = { ...state.guesses };
       for (const id of action.threadIds) delete next[id];
       return { ...state, guesses: next };
+    }
+    // Same rule as `project` above: a later claim about one event replaces the
+    // earlier one outright. Dragging a block and then answering "Going" are two
+    // statements about it, and the second is the current one.
+    case "projectEvents":
+      return { ...state, eventGuesses: { ...state.eventGuesses, ...action.guesses } };
+    case "pendEvent":
+      return {
+        ...state,
+        pendingEvents: [...state.pendingEvents, { event: action.event, realId: null }],
+      };
+    case "resolvePending": {
+      const index = state.pendingEvents.findIndex((p) => p.event.id === action.eventId);
+      if (index === -1) return state;
+      const pendingEvents = [...state.pendingEvents];
+      pendingEvents[index] = { ...pendingEvents[index]!, realId: action.realId };
+      return { ...state, pendingEvents };
+    }
+    case "forgetEvents": {
+      const ids = new Set(action.eventIds);
+      const hitGuess = action.eventIds.some((id) => id in state.eventGuesses);
+      const pendingEvents = state.pendingEvents.filter((p) => !ids.has(p.event.id));
+      if (!hitGuess && pendingEvents.length === state.pendingEvents.length) return state;
+      const eventGuesses = { ...state.eventGuesses };
+      for (const id of action.eventIds) delete eventGuesses[id];
+      return { ...state, eventGuesses, pendingEvents };
     }
     case "status":
       return { ...state, status: action.status };
@@ -569,6 +640,24 @@ export interface MachActions {
   draftSent: (draftId: string) => void;
   /** The draft is a draft again — undo, or the queue write refusing. */
   draftRecalled: (draftId: string) => void;
+  /**
+   * Dispatch one command through the app's only write path.
+   *
+   * The calendar had its own — `CalendarMode` executed against the data source
+   * directly — and that is why none of its commands was optimistic: the guess
+   * is made here, before the first `await`, and a caller that goes around this
+   * goes around that. It also loses the undo stack's better entry, which holds
+   * the original command rather than only the inverse a status message can
+   * carry.
+   *
+   * Resolves with what the command layer said, or `null` when it was never
+   * reached. `onRefused` is for a caller with somewhere better than the status
+   * rail to put a failure.
+   */
+  execute: (
+    command: Command,
+    options?: { onRefused?: (failure: { message: string; command: Command }) => void },
+  ) => Promise<CommandResult | null>;
   /**
    * Refetch just the calendar window.
    *
@@ -1026,10 +1115,39 @@ export function MachProvider({ children }: { children: ReactNode }) {
     return rows;
   }, [allThreads, ui.guesses, ui.labelId]);
 
+  /*
+   * Retire an event guess when the store catches up with it.
+   *
+   * Asked of `events` — the whole loaded window — and never of `visibleEvents`,
+   * because hiding a calendar in the sidebar takes rows off screen without
+   * anything having happened to them, and retiring a guess on that would drop
+   * one that is still doing work.
+   */
+  useEffect(() => {
+    const settled = [
+      ...settledEventGuesses(events, ui.eventGuesses),
+      ...settledPendingEvents(events, ui.pendingEvents),
+    ];
+    if (settled.length > 0) dispatchUi({ type: "forgetEvents", eventIds: settled });
+  }, [events, ui.eventGuesses, ui.pendingEvents]);
+
+  /**
+   * The event window with every outstanding guess on it, placeholders included.
+   *
+   * The calendar half of `visibleThreads`, and the one place a calendar guess
+   * becomes a row — so the grid, the keyboard cursor, the right-click menu and
+   * the detail panel are all looking at the same events rather than three of
+   * them looking at the store and one at a private override map.
+   */
+  const projectedEvents = useMemo(
+    () => applyEventGuesses(events, ui.eventGuesses, ui.pendingEvents),
+    [events, ui.eventGuesses, ui.pendingEvents],
+  );
+
   const visibleEvents = useMemo(() => {
     const hidden = new Set(ui.hiddenCalendars);
-    return events.filter((e) => !hidden.has(e.calendarId));
-  }, [events, ui.hiddenCalendars]);
+    return projectedEvents.filter((e) => !hidden.has(e.calendarId));
+  }, [projectedEvents, ui.hiddenCalendars]);
 
   const selectedIndex = useMemo(
     () => visibleThreads.findIndex((t) => t.id === ui.threadId),
@@ -1064,9 +1182,12 @@ export function MachProvider({ children }: { children: ReactNode }) {
     [ui.selection],
   );
 
+  // The event as it is *drawn*. An optimistic move is in the projection and not
+  // yet in the store, and a cursor that read the store would be pointing at the
+  // block's old time.
   const selectedEvent = useMemo(
-    () => events.find((e) => e.id === ui.eventId) ?? null,
-    [events, ui.eventId],
+    () => projectedEvents.find((e) => e.id === ui.eventId) ?? null,
+    [projectedEvents, ui.eventId],
   );
 
   const accountById = useCallback(
@@ -1175,6 +1296,13 @@ export function MachProvider({ children }: { children: ReactNode }) {
    * a ⇧⌘Z re-applies all arrive here, and none of them has to remember to say
    * what it is about to do to the list.
    *
+   * **Both halves of the vocabulary**, since the calendar came through this
+   * door. It used to have a write path of its own that executed against the
+   * data source directly, which is the whole reason none of its five commands
+   * was optimistic: the guess is made here, so a caller that went around this
+   * went around that. `lib/projection.ts` answers for a conversation and for an
+   * event, and this asks it both questions.
+   *
    * `projected` is the one exception, and it is not a caller opting out of
    * being optimistic — it is a caller that has already been. A ⌘Z over a group
    * projects every step at once through `projectCommands` below, because one
@@ -1192,12 +1320,47 @@ export function MachProvider({ children }: { children: ReactNode }) {
         reselectFailed?: boolean;
         label?: string;
         projected?: boolean;
+        /**
+         * Told about a command that did not entirely succeed.
+         *
+         * The status line says so already, and for most of the app that is
+         * enough — it is transient because the undo offer beside it is. The
+         * calendar's failures are the exception: a drag, a resize and an
+         * arrow-key nudge have no dialog to fail in, so `CalendarMode` parks a
+         * banner that stays until it is dismissed or retried. This is how it
+         * hears, without a second execute path to hear it on.
+         */
+        onRefused?: (failure: { message: string; command: Command }) => void;
       } = {},
     ): Promise<CommandResult | null> => {
-      // Synchronous, and before the first `await`: everything down to here runs
-      // in the same tick as the gesture that called it.
+      /*
+       * Synchronous, and before the first `await`: everything down to here runs
+       * in the same tick as the gesture that called it. Both halves of the
+       * vocabulary — the conversation the command names, or the event.
+       */
       const guesses = project(command, threadsRef.current);
       if (guesses && !options.projected) dispatchUi({ type: "project", guesses });
+      const eventGuesses = projectEvent(command);
+      if (eventGuesses && !options.projected) {
+        dispatchUi({ type: "projectEvents", guesses: eventGuesses });
+      }
+      /*
+       * A create has no id to guess about, so it gets a block instead — drawn
+       * from the draft it carries, under an id nothing on Google could have.
+       * Made here rather than in `projectCommands` because a placeholder is not
+       * a guess about a row that exists: there is nothing for a second caller
+       * to have already spoken for, so `projected` does not apply to it.
+       */
+      const placeholder =
+        command.kind === "createEvent" ? pendingEventId() : null;
+      if (placeholder !== null && command.kind === "createEvent") {
+        dispatchUi({ type: "pendEvent", event: placeholderEvent(command, placeholder) });
+      }
+      /** Everything this command drew, for the failure path to take back. */
+      const drawnEventIds = [
+        ...guessedEventIds(command),
+        ...(placeholder === null ? [] : [placeholder]),
+      ];
       try {
         const result = await getDataSource().execute(command);
         // A calendar command's whole effect is rows in the event window, and
@@ -1205,6 +1368,29 @@ export function MachProvider({ children }: { children: ReactNode }) {
         // event puts it back on Google and in SQLite and leaves the grid empty —
         // undo that reports success and visibly does nothing.
         if (!isMailCommand(command)) setEventsKey((k) => k + 1);
+        /*
+         * The exact inverse of what was drawn above, and it is the whole of it:
+         * the write did not happen, so the block goes back to where it was and
+         * a placeholder for an event that was never created is removed. Not
+         * dropped on success, for the same reason a thread guess is not — the
+         * refetch behind this carries the truth eventually, and until it does
+         * the guess is what is right.
+         */
+        if (!result.ok && drawnEventIds.length > 0) {
+          dispatchUi({ type: "forgetEvents", eventIds: drawnEventIds });
+        } else if (result.ok && placeholder !== null) {
+          // `applied` is where a create's new row id comes back. Handing it to
+          // the placeholder is what lets the placeholder retire on the exact
+          // row rather than on a guess at which event is the one it drew.
+          dispatchUi({
+            type: "resolvePending",
+            eventId: placeholder,
+            realId: result.applied[0] ?? null,
+          });
+        }
+        if (!result.ok) {
+          options.onRefused?.({ message: describeResult(result), command });
+        }
         /*
          * The guess is deliberately *not* dropped here on success.
          *
@@ -1284,10 +1470,12 @@ export function MachProvider({ children }: { children: ReactNode }) {
         if (guesses) {
           dispatchUi({ type: "forget", threadIds: Object.keys(guesses).map(Number) });
         }
-        dispatchUi({
-          type: "status",
-          status: { message: toMailboxError(caught).message, tone: "error" },
-        });
+        if (drawnEventIds.length > 0) {
+          dispatchUi({ type: "forgetEvents", eventIds: drawnEventIds });
+        }
+        const message = toMailboxError(caught).message;
+        dispatchUi({ type: "status", status: { message, tone: "error" } });
+        options.onRefused?.({ message, command });
         return null;
       }
     },
@@ -1309,14 +1497,26 @@ export function MachProvider({ children }: { children: ReactNode }) {
    */
   const projectCommands = useCallback((commands: Command[]) => {
     const merged: Guesses = {};
+    const mergedEvents: EventGuesses = {};
     let any = false;
+    let anyEvent = false;
     for (const command of commands) {
       const guesses = project(command, threadsRef.current);
-      if (!guesses) continue;
-      Object.assign(merged, guesses);
-      any = true;
+      if (guesses) {
+        Object.assign(merged, guesses);
+        any = true;
+      }
+      // A group can hold both halves — a plugin action that labels a thread and
+      // deletes the event it named is one thing the user did, and undoing it
+      // has to put both back in one frame.
+      const events = projectEvent(command);
+      if (events) {
+        Object.assign(mergedEvents, events);
+        anyEvent = true;
+      }
     }
     if (any) dispatchUi({ type: "project", guesses: merged });
+    if (anyEvent) dispatchUi({ type: "projectEvents", guesses: mergedEvents });
   }, []);
 
   /**
@@ -1711,6 +1911,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
           next.delete(draftId);
           return next;
         }),
+      execute: (command, options) => run(command, options),
       reloadEvents: () => setEventsKey((k) => k + 1),
     };
   }, [
@@ -1746,7 +1947,9 @@ export function MachProvider({ children }: { children: ReactNode }) {
     allThreads,
     visibleThreads,
     visibleEvents,
-    events,
+    // The projection, not the store: an id looked up here has to resolve to the
+    // block that is on screen, whatever the store still says about it.
+    events: projectedEvents,
     detail: visibleDetail,
     detailLoading,
     addressBook,

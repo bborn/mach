@@ -210,9 +210,22 @@ export function HandoffDialog() {
     setPhase("idle");
   }, []);
 
+  /*
+   * `preparing` is on this list, and it was the bug.
+   *
+   * ⌘K closes the palette the moment a handoff is asked for, and for an
+   * unproven target — or any session target — the next thing that happens is a
+   * `previewHandoff` round trip. With `preparing` missing from here the dialog
+   * did not exist for the length of it, so choosing a target emptied the screen
+   * and left it empty: the one gesture in this surface with no answer at all.
+   */
   const open =
     request?.kind === "run" &&
-    (phase === "confirming" || phase === "running" || phase === "shown" || phase === "failed");
+    (phase === "preparing" ||
+      phase === "confirming" ||
+      phase === "running" ||
+      phase === "shown" ||
+      phase === "failed");
 
   useKeyBindings([
     {
@@ -265,6 +278,12 @@ export function HandoffDialog() {
 
       <div className="min-h-0 overflow-y-auto p-3">
         {phase === "confirming" && preview && <Confirm preview={preview} />}
+        {phase === "preparing" && (
+          <span className="flex items-center gap-1.5 text-list text-muted-foreground">
+            <LoaderCircle size={13} strokeWidth={2} className="animate-spin" />
+            Working out what would run…
+          </span>
+        )}
         {phase === "running" && (
           <span className="flex items-center gap-1.5 text-list text-muted-foreground">
             <LoaderCircle size={13} strokeWidth={2} className="animate-spin" />
