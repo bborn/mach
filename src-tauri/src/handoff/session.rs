@@ -259,11 +259,6 @@ impl Sessions {
         let child = pair.slave.spawn_command(command).map_err(|e| {
             HandoffError::Io(format!("could not start {}: {e}", plan.argv[0]))
         })?;
-        // The slave descriptor belongs to the child now. Holding a copy would
-        // mean the pty never reports EOF when the child exits, and the pane
-        // would sit there looking alive forever.
-        drop(pair.slave);
-
         let reader = pair
             .master
             .try_clone_reader()
@@ -280,6 +275,21 @@ impl Sessions {
         let pending = Arc::new(Mutex::new(Pending::default()));
 
         spawn_reader(reader, child, Arc::clone(&pending));
+        /*
+         * The slave descriptor belongs to the child now, and holding a copy for
+         * the session's life would mean the pty never reports EOF when the child
+         * exits — the pane would sit there looking alive forever. So it goes,
+         * but not until the reader is attached.
+         *
+         * Dropping it before that is a race a fast program loses. When the last
+         * slave closes, a read on the master answers EIO on Linux and can take
+         * whatever was still buffered with it; macOS hands back the buffer and
+         * then reports the end. So a command that prints and exits within a
+         * millisecond — `echo`, `git rev-parse`, anything that answers at once —
+         * could have its entire output discarded before this process ever read
+         * it. It cost a CI run to find, on a test whose program was `/bin/echo`.
+         */
+        drop(pair.slave);
         spawn_flusher(
             id.clone(),
             Arc::clone(&pending),
