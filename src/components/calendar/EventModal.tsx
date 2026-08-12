@@ -84,12 +84,16 @@ import {
   formFromEvent,
   formPatch,
   formTimes,
+  hasMeet,
   isFormError,
+  parseAttendees,
   reminderChoiceById,
   reminderChoiceId,
   reminderMinutesOf,
+  wouldNotifyGuests,
   type EventForm,
 } from "@/lib/calendar-edit";
+import type { Notify } from "@/lib/data";
 import { fullDate } from "@/lib/time";
 import { calendarLabel } from "./CalendarSidebar";
 
@@ -198,6 +202,8 @@ export function EventModal({
   const [form, setForm] = useState<EventForm | null>(null);
   /** Set when a series edit needs the this/all answer before it can run. */
   const [scopePrompt, setScopePrompt] = useState<"save" | "delete" | null>(null);
+  /** Set when a save would email guests and has not been told whether to. */
+  const [notifyPrompt, setNotifyPrompt] = useState<{ scope: EventScope } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const titleField = useRef<HTMLInputElement>(null);
   const guestField = useRef<HTMLTextAreaElement>(null);
@@ -215,6 +221,7 @@ export function EventModal({
       return;
     }
     setScopePrompt(null);
+    setNotifyPrompt(null);
     setConfirmDelete(false);
     if (target.mode === "view") {
       setForm(formFromEvent(target.event));
@@ -278,6 +285,33 @@ export function EventModal({
     setSaveNonce((n) => n + 1);
   };
 
+  /**
+   * The last gate before a save: does this email anybody?
+   *
+   * Google Calendar asks the same question with a dialog, because both answers
+   * are things people want — a moved meeting has to reach the room, and a typo
+   * fixed in the notes of a thirty-person standup does not. Neither is a default
+   * this component gets to pick.
+   *
+   * It is only asked where it is a question. A new event invites the people it
+   * names, the way it does in Google Calendar; an event with no guests has
+   * nobody to tell; and a change nobody can see from outside this window
+   * (`wouldNotifyGuests`) is not a change worth mailing.
+   */
+  const saveWithScope = (current: EventForm, scope: EventScope) => {
+    if (!event) {
+      onSave(current, scope);
+      return;
+    }
+    const patch = formPatch(event, current);
+    if (patch && wouldNotifyGuests(event, patch)) {
+      setScopePrompt(null);
+      setNotifyPrompt({ scope });
+      return;
+    }
+    onSave(current, scope);
+  };
+
   useEffect(() => {
     if (saveNonce === 0 || !form || busy) return;
     if (timeError) return;
@@ -289,7 +323,7 @@ export function EventModal({
       setScopePrompt("save");
       return;
     }
-    onSave(form, "this");
+    saveWithScope(form, "this");
     // Only the nonce may start a save; every other value here is read fresh
     // from the render the nonce caused.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -330,6 +364,10 @@ export function EventModal({
       description: "Close without saving",
       when: live,
       handler: () => {
+        if (notifyPrompt !== null) {
+          setNotifyPrompt(null);
+          return;
+        }
         if (scopePrompt !== null) {
           setScopePrompt(null);
           return;
@@ -431,6 +469,9 @@ export function EventModal({
   const color = colorFor(form.calendarId);
   const tone = event ? toneFor(event.rsvp) : "solid";
   const set = (patch: Partial<EventForm>) => setForm((current) => ({ ...current!, ...patch }));
+  // Read off the field rather than off the event, so somebody added a moment
+  // ago is counted in the question about whether to tell them.
+  const guestCount = parseAttendees(form.attendees).length;
 
   // A rule this form cannot author still has to be *shown*, and shown as
   // itself. It leads the list so the trigger has a label, and picking anything
@@ -674,18 +715,42 @@ export function EventModal({
           </Field>
 
           {/* The call comes before the room. A meeting you cannot join from is
-              a calendar entry, and this is the row that stops it being one. */}
-          {(event?.conference || conference) && (
+              a calendar entry, and this is the row that stops it being one.
+
+              The tick is what makes it editable at all. Google mints the code —
+              there is no link to paste — so "add a Meet link" has to be a
+              request, and until now the only way to make one was to leave for
+              Google Calendar. */}
+          {(event?.conference || conference || canEdit) && (
             <Field orientation="row">
               <RowCaption>
                 <Video size={11} strokeWidth={1.75} />
                 Call
               </RowCaption>
-              <ConferenceBlock
-                conference={event?.conference}
-                fallback={conference}
-                onOpenExternal={onOpenExternal}
-              />
+              <div className="flex min-w-0 flex-1 flex-col gap-1">
+                {(event?.conference || conference) && (
+                  <ConferenceBlock
+                    conference={event?.conference}
+                    fallback={conference}
+                    onOpenExternal={onOpenExternal}
+                  />
+                )}
+                {canEdit && (
+                  <Label className="cursor-pointer gap-2 text-micro text-muted-foreground">
+                    <Checkbox
+                      aria-label="Google Meet"
+                      checked={form.meet}
+                      onCheckedChange={(on) => set({ meet: on })}
+                    />
+                    Google Meet
+                  </Label>
+                )}
+                {/* Removing a call is not reversible: Google issues a new code
+                    every time, so the link that goes is gone. */}
+                {canEdit && !form.meet && event !== null && hasMeet(event) && (
+                  <FieldDescription>Removing the call retires this link</FieldDescription>
+                )}
+              </div>
             </Field>
           )}
 
@@ -896,12 +961,23 @@ export function EventModal({
         </FieldGroup>
       </div>
 
-      {scopePrompt !== null ? (
+      {notifyPrompt !== null ? (
+        <NotifyPrompt
+          count={guestCount}
+          busy={busy}
+          onChoose={(notify) => {
+            setNotifyPrompt(null);
+            onSave({ ...form, notify }, notifyPrompt.scope);
+          }}
+          onCancel={() => setNotifyPrompt(null)}
+        />
+      ) : scopePrompt !== null ? (
         <ScopePrompt
           action={scopePrompt}
           busy={busy}
+          guests={scopePrompt === "delete" ? guestCount : 0}
           onChoose={(scope) =>
-            scopePrompt === "save" ? onSave(form, scope) : onDelete(scope)
+            scopePrompt === "save" ? saveWithScope(form, scope) : onDelete(scope)
           }
           onCancel={() => setScopePrompt(null)}
         />
@@ -919,6 +995,14 @@ export function EventModal({
                 <Trash2 size={12} strokeWidth={1.75} />
                 {confirmDelete ? "Really delete" : "Delete"}
               </Button>
+              {/* Deleting a meeting cancels it *with* its guests. Said here
+                  rather than asked, because the answer is not the modal's to
+                  give — see `GuestNotice`. */}
+              {confirmDelete && guestCount > 0 && (
+                <span className="text-micro text-danger">
+                  Cancels with {guestCount} {guestCount === 1 ? "guest" : "guests"}
+                </span>
+              )}
             </>
           )}
           {event && (
@@ -1246,11 +1330,14 @@ function useFieldIds() {
 function ScopePrompt({
   action,
   busy,
+  guests,
   onChoose,
   onCancel,
 }: {
   action: "save" | "delete";
   busy: boolean;
+  /** How many people a delete would cancel with. Zero says nothing. */
+  guests: number;
   onChoose: (scope: EventScope) => void;
   onCancel: () => void;
 }) {
@@ -1263,6 +1350,12 @@ function ScopePrompt({
     <div className="flex flex-col gap-2 border-t border-border-strong bg-surface-raised px-3 py-2">
       <p className="text-micro text-muted-foreground">
         This event repeats. {action === "delete" ? "Delete" : "Change"} which occurrences?
+        {guests > 0 && (
+          <span className="text-danger">
+            {" "}
+            Cancels with {guests} {guests === 1 ? "guest" : "guests"}.
+          </span>
+        )}
       </p>
       <div className="flex items-center gap-2">
         <Button
@@ -1291,6 +1384,63 @@ function ScopePrompt({
       <p className="text-micro text-faint-foreground">
         “This and following” — in Google Calendar
       </p>
+    </div>
+  );
+}
+
+/**
+ * "Tell the guests?"
+ *
+ * The question Google Calendar asks with a dialog, and the reason it asks: both
+ * answers are things people want. A meeting that moved has to reach the room.
+ * A typo fixed in the notes of a thirty-person standup does not, and mailing
+ * thirty people about it is a cost the software should not choose on its own.
+ *
+ * **Send is the first button and takes focus**, so ⏎ is the safe answer. The
+ * failure this whole change exists to fix is silence, and a prompt whose default
+ * is silence would reintroduce it one keystroke lower down.
+ *
+ * Same shape as `ScopePrompt` — an inline bar, not a second modal — for the same
+ * reason: a dialog on top of a dialog is where keyboard focus goes to die.
+ */
+function NotifyPrompt({
+  count,
+  busy,
+  onChoose,
+  onCancel,
+}: {
+  count: number;
+  busy: boolean;
+  onChoose: (notify: Notify) => void;
+  onCancel: () => void;
+}) {
+  const first = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    first.current?.focus();
+  }, []);
+
+  return (
+    <div className="flex flex-col gap-2 border-t border-border-strong bg-surface-raised px-3 py-2">
+      <p className="text-micro text-muted-foreground">
+        Email {count} {count === 1 ? "guest" : "guests"} about this change?
+      </p>
+      <div className="flex items-center gap-2">
+        <Button
+          ref={first}
+          size="sm"
+          variant="default"
+          disabled={busy}
+          onClick={() => onChoose("guests")}
+        >
+          Send
+        </Button>
+        <Button size="sm" variant="subtle" disabled={busy} onClick={() => onChoose("nobody")}>
+          Don't send
+        </Button>
+        <Button size="sm" disabled={busy} onClick={onCancel} className="ml-auto">
+          Back
+        </Button>
+      </div>
     </div>
   );
 }

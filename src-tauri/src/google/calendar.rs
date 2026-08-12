@@ -5,6 +5,11 @@
 //! so Mach never has to interpret an RRULE. Incremental sync then rides on
 //! `syncToken`, whose expiry (410) is surfaced as a distinct error the way
 //! Gmail's expired `historyId` is.
+//!
+//! On the write side the load-bearing detail is `sendUpdates`. Google notifies
+//! nobody unless it is told to, so every write method here takes a
+//! [`SendUpdates`] by value rather than defaulting one — see its documentation
+//! for what leaving it off used to cost.
 
 use std::sync::Arc;
 
@@ -12,7 +17,7 @@ use serde_json::json;
 
 use super::types::{
     CalendarListEntry, CalendarListResponse, Event, EventsListResponse, EventsSweep,
-    ResponseStatus,
+    ResponseStatus, SendUpdates,
 };
 use super::{
     GoogleError, HttpMethod, HttpTransport, RestClient, RetryPolicy, Sleeper, TokenProvider,
@@ -257,14 +262,20 @@ impl CalendarClient {
     }
 
     /// `events.insert`. Unset fields are omitted rather than sent as null.
+    ///
+    /// `send_updates` is not optional and has no default here on purpose: it is
+    /// the difference between an invitation and a private note to yourself. See
+    /// [`SendUpdates`].
     pub async fn events_insert(
         &self,
         calendar_id: &str,
         event: &Event,
+        send_updates: SendUpdates,
     ) -> Result<Event, GoogleError> {
-        let url = self
+        let mut url = self
             .rest
             .endpoint(&["calendars", calendar_id, "events"])?;
+        write_params(&mut url, send_updates);
         let body = serde_json::to_vec(event).map_err(|e| GoogleError::InvalidRequest {
             message: format!("could not serialize event: {e}"),
         })?;
@@ -278,10 +289,12 @@ impl CalendarClient {
         calendar_id: &str,
         event_id: &str,
         patch: &serde_json::Value,
+        send_updates: SendUpdates,
     ) -> Result<Event, GoogleError> {
-        let url = self
+        let mut url = self
             .rest
             .endpoint(&["calendars", calendar_id, "events", event_id])?;
+        write_params(&mut url, send_updates);
         let body = serde_json::to_vec(patch).map_err(|e| GoogleError::InvalidRequest {
             message: format!("could not serialize patch: {e}"),
         })?;
@@ -292,22 +305,34 @@ impl CalendarClient {
 
     /// `events.delete`. Answers 204 with an empty body, which is why this does
     /// not try to deserialize anything.
+    ///
+    /// `send_updates` decides whether the guests find out. A meeting that
+    /// vanishes out of one person's calendar and stays in everyone else's is
+    /// the shape of a missed cancellation.
     pub async fn events_delete(
         &self,
         calendar_id: &str,
         event_id: &str,
+        send_updates: SendUpdates,
     ) -> Result<(), GoogleError> {
-        let url = self
+        let mut url = self
             .rest
             .endpoint(&["calendars", calendar_id, "events", event_id])?;
+        url.query_pairs_mut()
+            .append_pair("sendUpdates", send_updates.as_str());
         self.rest.send_empty(HttpMethod::Delete, url, None).await
     }
 
-    /// RSVP on behalf of a named attendee.
+    /// RSVP on behalf of a named attendee, optionally with a note.
     ///
     /// Google has no "set my response" endpoint: patching `attendees` replaces
     /// the whole array, so this reads the event, changes exactly one row, and
     /// writes the full list back. Nothing else about the event is touched.
+    ///
+    /// `comment` is the "Yes, but I'll be ten minutes late" line Google Calendar
+    /// offers next to the three buttons. It rides on the attendee row, which is
+    /// why it can only be set by the same read-modify-write the response is.
+    /// `None` leaves whatever is already there; `Some("")` clears it.
     ///
     /// An address that is not on the invitation is an error rather than a
     /// silent no-op — RSVPing to the wrong event should be loud.
@@ -317,8 +342,10 @@ impl CalendarClient {
         event_id: &str,
         attendee_email: &str,
         response: ResponseStatus,
+        comment: Option<&str>,
+        send_updates: SendUpdates,
     ) -> Result<Event, GoogleError> {
-        self.rsvp_matching(calendar_id, event_id, response, |a| {
+        self.rsvp_matching(calendar_id, event_id, response, comment, send_updates, |a| {
             a.email
                 .as_deref()
                 .map(|e| e.eq_ignore_ascii_case(attendee_email))
@@ -342,9 +369,13 @@ impl CalendarClient {
         calendar_id: &str,
         event_id: &str,
         response: ResponseStatus,
+        comment: Option<&str>,
+        send_updates: SendUpdates,
     ) -> Result<Event, GoogleError> {
-        self.rsvp_matching(calendar_id, event_id, response, |a| a.is_self)
-            .await
+        self.rsvp_matching(calendar_id, event_id, response, comment, send_updates, |a| {
+            a.is_self
+        })
+        .await
     }
 
     async fn rsvp_matching(
@@ -352,13 +383,20 @@ impl CalendarClient {
         calendar_id: &str,
         event_id: &str,
         response: ResponseStatus,
+        comment: Option<&str>,
+        send_updates: SendUpdates,
         matches: impl Fn(&super::types::EventAttendee) -> bool,
     ) -> Result<Event, GoogleError> {
         let event = self.events_get(calendar_id, event_id).await?;
         let mut attendees = event.attendees.clone();
 
         match attendees.iter_mut().find(|a| matches(a)) {
-            Some(attendee) => attendee.response_status = Some(response.as_str().to_string()),
+            Some(attendee) => {
+                attendee.response_status = Some(response.as_str().to_string());
+                if let Some(text) = comment {
+                    attendee.comment = Some(text.to_string()).filter(|s| !s.is_empty());
+                }
+            }
             None => {
                 return Err(GoogleError::InvalidRequest {
                     message: format!("no matching attendee on event {event_id}; nothing to RSVP"),
@@ -366,9 +404,28 @@ impl CalendarClient {
             }
         }
 
-        self.events_patch(calendar_id, event_id, &json!({ "attendees": attendees }))
-            .await
+        self.events_patch(
+            calendar_id,
+            event_id,
+            &json!({ "attendees": attendees }),
+            send_updates,
+        )
+        .await
     }
+}
+
+/// The two query parameters every event write owes Google.
+///
+/// `conferenceDataVersion=1` is not about notifications and is here because
+/// leaving it off means version 0, and version 0 makes Google **silently ignore**
+/// the `conferenceData` in a request body. A "add a Meet link" that answers 200
+/// and produces no link is exactly the kind of quiet failure this codebase keeps
+/// paying for, so the version is declared on every write rather than only on the
+/// ones that happen to carry a conference.
+fn write_params(url: &mut url::Url, send_updates: SendUpdates) {
+    let mut pairs = url.query_pairs_mut();
+    pairs.append_pair("sendUpdates", send_updates.as_str());
+    pairs.append_pair("conferenceDataVersion", "1");
 }
 
 /// `events.list` answers 410 when a stored `syncToken` has aged out. Some

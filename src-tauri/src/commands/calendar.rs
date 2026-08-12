@@ -51,13 +51,16 @@ use crate::db::command_queries::{self as cq, EventFields};
 use crate::db::models::{Event, EventReminder, EventReminders, NewEvent, Participant, RsvpStatus};
 use crate::db::queries;
 use crate::google::types::{
-    EventAttendee, EventDateTime, EventReminderOverride, EventReminders as GoogleReminders,
-    Event as GoogleEvent, ResponseStatus,
+    ConferenceCreateRequest, ConferenceData, ConferenceSolutionKey, EventAttendee, EventDateTime,
+    EventReminderOverride, EventReminders as GoogleReminders, Event as GoogleEvent, ResponseStatus,
+    SendUpdates,
 };
 use crate::google::GoogleError;
 
 use super::error::{CommandError, CommandFailure};
-use super::types::{Command, CommandResult, EventDraft, EventPatch, EventScope};
+use super::types::{
+    Command, CommandResult, Conferencing, EventDraft, EventPatch, EventScope, Notify,
+};
 use super::CommandDispatcher;
 
 fn to_google(status: RsvpStatus) -> ResponseStatus {
@@ -82,6 +85,8 @@ pub(crate) async fn execute_rsvp(
     dispatcher: &CommandDispatcher,
     event_id: i64,
     response: RsvpStatus,
+    comment: Option<&str>,
+    notify: Notify,
 ) -> Result<CommandResult, CommandError> {
     let event = dispatcher
         .db
@@ -90,8 +95,11 @@ pub(crate) async fn execute_rsvp(
 
     // Idempotent: responding the same way twice is not an error and costs no
     // round trip. The inverse stays `None` because nothing moved.
+    //
+    // A note is a change even when the answer is not — "yes" twice says nothing
+    // new, "yes, running late" does — so a comment defeats the shortcut.
     let prior = event.rsvp_status;
-    if prior == Some(response) {
+    if prior == Some(response) && comment.is_none() {
         return Ok(CommandResult {
             ok: true,
             message: describe(response).to_string(),
@@ -121,18 +129,28 @@ pub(crate) async fn execute_rsvp(
             &event.google_event_id,
             &account.email,
             to_google(response),
+            comment,
+            notify.as_send_updates(),
         )
         .await
     {
         Ok(_) => Ok(CommandResult {
             ok: true,
             message: describe(response).to_string(),
-            // `needsAction` is a real response state, so an event that had no
-            // recorded answer still has a faithful inverse.
+            // The organizer has been mailed by now, and un-mailing is not a
+            // thing. Both directions of an RSVP notify, though, so ⌘Z is a
+            // faithful correction rather than a promise it cannot keep — no
+            // narrowed label is needed.
             undo_label: None,
+            // `needsAction` is a real response state, so an event that had no
+            // recorded answer still has a faithful inverse. The note is not
+            // inverted: the store never had the old one to put back, and
+            // guessing at it would be worse than leaving it.
             undo: Some(Command::Rsvp {
                 event_id,
                 response: prior.unwrap_or(RsvpStatus::NeedsAction),
+                comment: None,
+                notify: Some(notify),
             }),
             applied: vec![event_id],
             failed: Vec::new(),
@@ -228,8 +246,13 @@ pub(crate) async fn execute_create(
 
     let event_id = dispatcher.db.write(|conn| queries::upsert_event(conn, &row))?;
 
+    let notify = draft.notify();
     match client
-        .events_insert(calendar_id, &google_event_for(draft))
+        .events_insert(
+            calendar_id,
+            &google_event_for(draft, now_ms()),
+            notify.as_send_updates(),
+        )
         .await
     {
         Ok(created) => {
@@ -247,6 +270,10 @@ pub(crate) async fn execute_create(
                     Some(google_id.clone()),
                 )
             };
+            // The conference Google just minted. Written now rather than waited
+            // for: the Join button on a meeting created ten seconds ago should
+            // not be the thing that arrives at the next sync.
+            let conference = crate::sync::convert::conference_of(&created);
             dispatcher.db.write(|conn| {
                 cq::set_event_identity(
                     conn,
@@ -255,13 +282,34 @@ pub(crate) async fn execute_create(
                     created.html_link.as_deref(),
                     parent.as_deref(),
                     created.ical_uid.as_deref(),
-                )
+                )?;
+                if conference.is_some() {
+                    cq::set_event_conference(conn, event_id, conference.as_ref())?;
+                }
+                Ok(())
             })?;
 
+            let created_msg = format!("Created “{}”", title_or_placeholder(&draft.title));
+            let note = guest_note(
+                "invited",
+                Some("nobody was invited"),
+                &draft.attendees,
+                notify,
+            );
             Ok(CommandResult {
                 ok: true,
-                message: format!("Created “{}”", title_or_placeholder(&draft.title)),
-                undo_label: None,
+                message: match &note {
+                    Some(n) => format!("{created_msg} · {}", n.clause),
+                    None => created_msg.clone(),
+                },
+                // ⌘Z deletes the event and sends the cancellation, which is the
+                // right thing to do to everyone's calendar and does nothing
+                // about the invitation already sitting in their inbox. So the
+                // undo entry claims only the half it can honour.
+                undo_label: note
+                    .as_ref()
+                    .is_some_and(|n| n.mailed)
+                    .then(|| created_msg.clone()),
                 undo: Some(Command::DeleteEvent {
                     event_id,
                     scope: if draft.recurrence.is_empty() {
@@ -269,6 +317,7 @@ pub(crate) async fn execute_create(
                     } else {
                         EventScope::All
                     },
+                    notify: Some(notify),
                 }),
                 applied: vec![event_id],
                 failed: Vec::new(),
@@ -377,22 +426,66 @@ pub(crate) async fn execute_update(
         Ok(())
     })?;
 
+    // Who to tell — and about *what*. A change nobody outside this window can
+    // see (an alert offset moved by five minutes) is not worth an email even
+    // when the answer to "tell the guests?" was yes, so the request says `none`
+    // rather than mailing everyone about the organizer's own phone.
+    let notify = if patch.guests_would_care() {
+        patch.notify()
+    } else {
+        Notify::Nobody
+    };
+    // The guest list *after* the patch: adding somebody and then telling only
+    // the people who were already there is the wrong half of the room.
+    let audience = patch.attendees.clone().unwrap_or_else(|| event.attendees.clone());
+
     match client
-        .events_patch(&event.calendar_id, &target_id, &patch_body(patch))
+        .events_patch(
+            &event.calendar_id,
+            &target_id,
+            &patch_body(patch, now_ms()),
+            notify.as_send_updates(),
+        )
         .await
     {
-        Ok(_) => Ok(CommandResult {
-            ok: true,
-            message: update_message(patch, effective, before.len()),
-            undo_label: None,
-            undo: inverse_patch(patch, &event).map(|prior| Command::UpdateEvent {
-                event_id,
-                patch: prior,
-                scope: effective,
-            }),
-            applied: touched,
-            failed: Vec::new(),
-        }),
+        Ok(updated) => {
+            // A conference is minted or removed by Google, never by us, so the
+            // response is the only place its new state can be read.
+            if patch.conferencing.is_some() {
+                let conference = crate::sync::convert::conference_of(&updated);
+                dispatcher.db.write(|conn| {
+                    for row in &before {
+                        cq::set_event_conference(conn, row.id, conference.as_ref())?;
+                    }
+                    Ok(())
+                })?;
+            }
+            let saved = update_message(patch, effective, before.len());
+            // No silence phrase: an update either asked the question and got an
+            // answer, or touched nothing a guest would have been mailed about.
+            // Reporting the quiet in either case is narration.
+            let note = guest_note("told", None, &audience, notify);
+            Ok(CommandResult {
+                ok: true,
+                message: match &note {
+                    Some(n) => format!("{saved} · {}", n.clause),
+                    None => saved.clone(),
+                },
+                // The correction ⌘Z sends is another update, and the guests get
+                // told about that one too. What it cannot do is unsend the first.
+                undo_label: note
+                    .as_ref()
+                    .is_some_and(|n| n.mailed)
+                    .then(|| saved.clone()),
+                undo: inverse_patch(patch, &event).map(|prior| Command::UpdateEvent {
+                    event_id,
+                    patch: prior,
+                    scope: effective,
+                }),
+                applied: touched,
+                failed: Vec::new(),
+            })
+        }
         Err(error) => {
             dispatcher.db.write(|conn| {
                 for row in &before {
@@ -420,6 +513,7 @@ pub(crate) async fn execute_delete(
     dispatcher: &CommandDispatcher,
     event_id: i64,
     scope: EventScope,
+    notify: Notify,
 ) -> Result<CommandResult, CommandError> {
     let event = dispatcher
         .db
@@ -458,33 +552,58 @@ pub(crate) async fn execute_delete(
         Ok(())
     })?;
 
-    match client.events_delete(&event.calendar_id, &target_id).await {
-        Ok(()) => Ok(CommandResult {
-            ok: true,
-            message: match effective {
+    match client
+        .events_delete(&event.calendar_id, &target_id, notify.as_send_updates())
+        .await
+    {
+        Ok(()) => {
+            let deleted = match effective {
                 EventScope::All => format!(
                     "Deleted every occurrence of “{}”",
                     title_or_placeholder(&event.title)
                 ),
                 EventScope::This => format!("Deleted “{}”", title_or_placeholder(&event.title)),
-            },
-            // A one-off can be put back verbatim. An occurrence cannot: there
-            // is no endpoint that returns a cancelled instance to its series,
-            // and re-creating it would make a standalone event wearing the same
-            // name. Claiming an inverse there would be a lie, so there isn't one.
-            undo_label: None,
-            undo: if series_parent.is_none() {
-                Some(Command::CreateEvent {
-                    account_id: event.account_id,
-                    calendar_id: event.calendar_id.clone(),
-                    draft: draft_from(&event),
-                })
-            } else {
-                None
-            },
-            applied: touched,
-            failed: Vec::new(),
-        }),
+            };
+            let note = guest_note(
+                "cancelled with",
+                Some("nobody was told"),
+                &event.attendees,
+                notify,
+            );
+            Ok(CommandResult {
+                ok: true,
+                message: match &note {
+                    Some(n) => format!("{deleted} · {}", n.clause),
+                    None => deleted.clone(),
+                },
+                // A one-off can be put back verbatim — and putting it back
+                // re-invites, which is the only honest way to reverse a
+                // cancellation. What ⌘Z cannot do is unsend the one that went.
+                // An occurrence cannot be put back at all: there is no endpoint
+                // that returns a cancelled instance to its series, and
+                // re-creating it would make a standalone event wearing the same
+                // name. Claiming an inverse there would be a lie, so there isn't
+                // one.
+                undo_label: note
+                    .as_ref()
+                    .is_some_and(|n| n.mailed)
+                    .then_some(deleted),
+                undo: if series_parent.is_none() {
+                    Some(Command::CreateEvent {
+                        account_id: event.account_id,
+                        calendar_id: event.calendar_id.clone(),
+                        draft: EventDraft {
+                            notify: Some(notify),
+                            ..draft_from(&event)
+                        },
+                    })
+                } else {
+                    None
+                },
+                applied: touched,
+                failed: Vec::new(),
+            })
+        }
         Err(error) => {
             // A 404 means Google already lost it. Keeping the row would put a
             // block on screen that nothing can delete, so the local delete
@@ -526,6 +645,7 @@ pub(crate) async fn execute_move(
     event_id: i64,
     account_id: i64,
     calendar_id: &str,
+    notify: Notify,
 ) -> Result<CommandResult, CommandError> {
     let event = dispatcher
         .db
@@ -556,7 +676,11 @@ pub(crate) async fn execute_move(
 
     let draft = draft_from(&event);
     let created = match destination
-        .events_insert(calendar_id, &google_event_for(&draft))
+        .events_insert(
+            calendar_id,
+            &google_event_for(&draft, now_ms()),
+            notify.as_send_updates(),
+        )
         .await
     {
         Ok(created) => created,
@@ -590,12 +714,18 @@ pub(crate) async fn execute_move(
     // The copy exists. Removing the original is the half that can leave a
     // duplicate behind, so a failure here undoes the copy rather than leaving
     // the same meeting on two calendars.
+    // The source copy goes quietly whatever the caller asked for. The guests
+    // have just been invited to the destination copy of the same meeting; a
+    // cancellation for the one it replaced would arrive alongside it and read as
+    // "your meeting is off", which is the opposite of what happened.
     if let Err(error) = source
-        .events_delete(&prior_calendar, &prior_google_id)
+        .events_delete(&prior_calendar, &prior_google_id, SendUpdates::None)
         .await
     {
         if !matches!(error, GoogleError::NotFound { .. }) {
-            let _ = destination.events_delete(calendar_id, &new_google_id).await;
+            let _ = destination
+                .events_delete(calendar_id, &new_google_id, SendUpdates::None)
+                .await;
             dispatcher.db.write(|conn| {
                 cq::set_event_calendar(conn, event_id, prior_account, &prior_calendar)?;
                 cq::set_event_identity(
@@ -618,14 +748,20 @@ pub(crate) async fn execute_move(
         }
     }
 
+    let moved = format!("Moved “{}”", title_or_placeholder(&event.title));
+    let note = guest_note("re-invited", Some("nobody was told"), &event.attendees, notify);
     Ok(CommandResult {
         ok: true,
-        message: format!("Moved “{}”", title_or_placeholder(&event.title)),
-        undo_label: None,
+        message: match &note {
+            Some(n) => format!("{moved} · {}", n.clause),
+            None => moved.clone(),
+        },
+        undo_label: note.as_ref().is_some_and(|n| n.mailed).then_some(moved),
         undo: Some(Command::MoveEvent {
             event_id,
             account_id: prior_account,
             calendar_id: prior_calendar,
+            notify: Some(notify),
         }),
         applied: vec![event_id],
         failed: Vec::new(),
@@ -728,7 +864,25 @@ fn start_end(start_ts: i64, end_ts: i64, all_day: bool) -> (EventDateTime, Event
     }
 }
 
-fn google_event_for(draft: &EventDraft) -> GoogleEvent {
+/// The `conferenceData` that asks Google for a Meet link.
+///
+/// `request_id` is Google's idempotency key: the same one twice returns the
+/// conference it already made rather than a second one. It is derived from the
+/// clock the caller passes rather than read from one here, so a test can assert
+/// on the exact request that would go out.
+fn meet_request(nonce: i64) -> ConferenceData {
+    ConferenceData {
+        create_request: Some(ConferenceCreateRequest {
+            request_id: Some(format!("mach-{nonce}")),
+            conference_solution_key: Some(ConferenceSolutionKey {
+                solution_type: Some("hangoutsMeet".into()),
+            }),
+        }),
+        ..Default::default()
+    }
+}
+
+fn google_event_for(draft: &EventDraft, nonce: i64) -> GoogleEvent {
     let (start, end) = start_end(draft.start_ts, draft.end_ts, draft.is_all_day);
     GoogleEvent {
         summary: Some(draft.title.clone()).filter(|s| !s.is_empty()),
@@ -739,8 +893,70 @@ fn google_event_for(draft: &EventDraft) -> GoogleEvent {
         attendees: attendee_rows(&draft.attendees),
         recurrence: draft.recurrence.clone(),
         reminders: draft.reminder_minutes.as_deref().map(reminders_for),
+        // `Conferencing::None` on a create is the absence of a conference, and
+        // an absent key is already that — there is nothing to remove from an
+        // event that does not exist yet.
+        conference_data: match draft.conferencing {
+            Some(Conferencing::Meet) => Some(meet_request(nonce)),
+            _ => None,
+        },
         ..Default::default()
     }
+}
+
+/// What the status line owes the user about the guests.
+struct GuestNote {
+    /// The clause to hang off the message.
+    clause: String,
+    /// Whether mail actually went out — which is the half no undo can reverse.
+    mailed: bool,
+}
+
+/// The clause naming who was told, or that nobody was.
+///
+/// **Both halves can be news.** "invited 3 guests" is a count that can be
+/// checked against the list in front of you, which a bare "the guests were
+/// invited" cannot. And "nobody was invited" is the sentence whose absence is
+/// the whole bug: an event with three names on it and no mail sent looked
+/// exactly like one with three invitations out.
+///
+/// `silence` is `None` where the quiet is not news — where the user was asked
+/// and answered, or where nobody was ever going to be mailed. Saying "nobody was
+/// told" back to somebody who has just pressed *Don't send* is the software
+/// talking about itself. The commands that do pass a phrase are the ones whose
+/// silence leaves a guest's calendar disagreeing with yours and nobody asked: an
+/// event they were never invited to, a deleted one they still have, a moved one
+/// pointing at the copy that went.
+///
+/// Which guests are external is Google's business, so that case names the rule
+/// rather than guessing at a number.
+fn guest_note(
+    verb: &str,
+    silence: Option<&str>,
+    attendees: &[Participant],
+    notify: Notify,
+) -> Option<GuestNote> {
+    let count = attendees
+        .iter()
+        .filter(|p| !p.email.trim().is_empty())
+        .count();
+    if count == 0 {
+        return None;
+    }
+    Some(match notify {
+        Notify::Nobody => GuestNote {
+            clause: silence?.to_string(),
+            mailed: false,
+        },
+        Notify::Guests => GuestNote {
+            clause: format!("{verb} {}", super::types::plural(count, "guest")),
+            mailed: true,
+        },
+        Notify::ExternalGuests => GuestNote {
+            clause: format!("{verb} the guests outside your domain"),
+            mailed: true,
+        },
+    })
 }
 
 /// The `events.patch` body: only the keys the patch actually named.
@@ -748,8 +964,21 @@ fn google_event_for(draft: &EventDraft) -> GoogleEvent {
 /// `events.patch` is a genuine partial update, so an absent key is "leave it
 /// alone" and an explicit `null` is "clear it". Both are used here, which is
 /// why this is hand-built rather than a serialized struct with skip rules.
-fn patch_body(patch: &EventPatch) -> Value {
+fn patch_body(patch: &EventPatch, nonce: i64) -> Value {
     let mut body = Map::new();
+
+    // `null` really does mean "take the call off", and it only works because
+    // every write declares `conferenceDataVersion=1`; at version 0 Google reads
+    // the key and does nothing. See `google::calendar::write_params`.
+    match patch.conferencing {
+        Some(Conferencing::Meet) => {
+            body.insert("conferenceData".into(), json!(meet_request(nonce)));
+        }
+        Some(Conferencing::None) => {
+            body.insert("conferenceData".into(), Value::Null);
+        }
+        None => {}
+    }
 
     if let Some(title) = &patch.title {
         body.insert("summary".into(), json!(title));
@@ -849,6 +1078,16 @@ fn stored_fields(patch: &EventPatch) -> EventFields {
 /// vocabulary cannot express, and the honest answer is no inverse at all rather
 /// than an undo that quietly sets "no alert" and calls it the default. The
 /// status bar then offers no undo, which is true.
+///
+/// **A removed conference is the same shape of problem.** Google mints the
+/// meeting code, and it mints a fresh one every time; a link that has been taken
+/// off an event cannot be put back, only replaced by a different meeting at a
+/// different address that half the guests will not be at. So a patch that
+/// removes a call the event actually had offers no undo either.
+///
+/// The notify choice rides along unchanged: if the guests were told about the
+/// change, they are told about the correction, and if they were not, they are
+/// not.
 fn inverse_patch(patch: &EventPatch, event: &Event) -> Option<EventPatch> {
     // `Option<Option<_>>`: the outer says whether the patch named reminders at
     // all, the inner whether the prior state can be spoken.
@@ -861,6 +1100,17 @@ fn inverse_patch(patch: &EventPatch, event: &Event) -> Option<EventPatch> {
     if matches!(prior_reminders, Some(None)) {
         return None;
     }
+
+    let prior_conferencing = match patch.conferencing {
+        None => None,
+        // Adding a call to an event that had none reverses exactly; adding one
+        // *over* an existing call throws the old address away.
+        Some(Conferencing::Meet) if event.conference.is_none() => Some(Conferencing::None),
+        // Removing a call the event did not have changed nothing, so saying
+        // "no call" again is a faithful no-op.
+        Some(Conferencing::None) if event.conference.is_none() => Some(Conferencing::None),
+        Some(_) => return None,
+    };
 
     let prior = EventPatch {
         title: patch.title.as_ref().map(|_| event.title.clone()),
@@ -880,6 +1130,8 @@ fn inverse_patch(patch: &EventPatch, event: &Event) -> Option<EventPatch> {
         attendees: patch.attendees.as_ref().map(|_| event.attendees.clone()),
         recurrence: patch.recurrence.as_ref().map(|_| event.recurrence.clone()),
         reminder_minutes: prior_reminders.flatten(),
+        conferencing: prior_conferencing,
+        notify: patch.notify,
     };
     (!prior.is_empty()).then_some(prior)
 }
@@ -902,6 +1154,14 @@ fn draft_from(event: &Event) -> EventDraft {
             .reminders
             .as_ref()
             .and_then(EventReminders::explicit_minutes),
+        // Not carried across. A re-created event gets a *different* Meet code,
+        // and putting a link on the copy that half the room will not be at is
+        // worse than putting none — the caller sets this when it means it.
+        conferencing: None,
+        // Left to the caller. A delete's undo wants the choice the delete made;
+        // a move wants the choice the move made. Neither is a property of the
+        // row this was read from.
+        notify: None,
     }
 }
 

@@ -619,6 +619,23 @@ pub fn set_event_identity(
     Ok(())
 }
 
+/// Adopt the conference Google minted on an insert or a patch.
+///
+/// A Meet link cannot be guessed the way an instance id can — Google invents the
+/// code — so it is read off the response and written here. `None` clears the
+/// column, which is what removing the call from an event means locally.
+pub fn set_event_conference(
+    conn: &Connection,
+    event_id: i64,
+    conference: Option<&models::EventConference>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE events SET conference = ?2 WHERE id = ?1",
+        params![event_id, queries::json_of(conference)],
+    )?;
+    Ok(())
+}
+
 /// Re-home an event on another calendar, possibly on another account.
 pub fn set_event_calendar(
     conn: &Connection,

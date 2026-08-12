@@ -55,7 +55,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mach_lib::commands::types::{Command, EventDraft, EventPatch};
+use mach_lib::commands::types::{Command, EventDraft, EventPatch, Notify};
 use mach_lib::db::{command_queries, queries};
 use mach_lib::{config, ipc};
 
@@ -132,6 +132,10 @@ fn run() -> Result<(), String> {
             description: Some("Created by cargo run --bin calendar_live.".into()),
             start_ts: start,
             end_ts: start + HOUR_MS,
+            // This runs against a real account. It invites nobody, and every
+            // write below says so explicitly, so a harness that grows a guest
+            // list one day still cannot mail a real person.
+            notify: Some(Notify::Nobody),
             ..EventDraft::default()
         };
         let created = state
@@ -163,6 +167,7 @@ fn run() -> Result<(), String> {
                     title: Some(format!("{TEST_TITLE_PREFIX} renamed")),
                     start_ts: Some(start + HOUR_MS),
                     end_ts: Some(start + 2 * HOUR_MS),
+                    notify: Some(Notify::Nobody),
                     ..EventPatch::default()
                 },
                 scope: Default::default(),
@@ -184,6 +189,7 @@ fn run() -> Result<(), String> {
                         event_id,
                         account_id: account.id,
                         calendar_id: destination.calendar_id.clone(),
+                        notify: Some(Notify::Nobody),
                     })
                     .await
                     .map_err(|e| format!("move failed: {e}"))?;
@@ -199,6 +205,7 @@ fn run() -> Result<(), String> {
             .execute(Command::DeleteEvent {
                 event_id,
                 scope: Default::default(),
+                notify: Some(Notify::Nobody),
             })
             .await
             .map_err(|e| format!("delete failed: {e}"))?;
@@ -291,7 +298,11 @@ async fn sweep(state: &ipc::state::AppState, account_id: i64) {
     for id in ids {
         match state
             .dispatcher
-            .execute(Command::DeleteEvent { event_id: id, scope: Default::default() })
+            .execute(Command::DeleteEvent {
+                event_id: id,
+                scope: Default::default(),
+                notify: Some(Notify::Nobody),
+            })
             .await
         {
             Ok(_) => println!("swept   : removed leftover test event #{id}"),

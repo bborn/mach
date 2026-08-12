@@ -13,7 +13,7 @@ use mach_lib::google::gmail::{
 };
 use mach_lib::google::types::{
     Event, EventsListResponse, Filter, FilterAction, FilterCriteria, HistoryListResponse, Message,
-    ResponseStatus,
+    ResponseStatus, SendUpdates,
 };
 use mach_lib::google::{
     BoxFuture, GoogleError, HttpMethod, HttpRequest, HttpResponse, HttpTransport, RetryPolicy,
@@ -1112,11 +1112,14 @@ async fn events_insert_posts_the_event_body() {
         Some("America/Chicago"),
     ));
 
-    client.events_insert("primary", &draft).await.unwrap();
+    client
+        .events_insert("primary", &draft, SendUpdates::All)
+        .await
+        .unwrap();
 
     let req = &t.requests()[0];
     assert_eq!(req.method, HttpMethod::Post);
-    assert!(req.url.ends_with("/calendars/primary/events"), "{}", req.url);
+    assert!(req.url.contains("/calendars/primary/events?"), "{}", req.url);
     let body: serde_json::Value = serde_json::from_slice(req.body.as_ref().unwrap()).unwrap();
     assert_eq!(body["summary"], "Coffee with Tawny");
     assert_eq!(body["start"]["dateTime"], "2026-08-20T10:00:00-05:00");
@@ -1125,6 +1128,50 @@ async fn events_insert_posts_the_event_body() {
         body.get("id").is_none(),
         "unset fields must be omitted, not sent as null: {body}"
     );
+}
+
+/// The parameter that decides whether an invitation exists.
+///
+/// Without `sendUpdates`, Google puts the event on the organizer's calendar,
+/// records every attendee on it, and mails none of them. Nothing about the
+/// response says so. This asserts on the request rather than the response for
+/// exactly that reason: there is nothing in the answer to check.
+#[tokio::test]
+async fn every_event_write_names_send_updates_and_the_conference_version() {
+    for (label, updates, expected) in [
+        ("all", SendUpdates::All, "sendUpdates=all"),
+        ("external", SendUpdates::ExternalOnly, "sendUpdates=externalOnly"),
+        ("none", SendUpdates::None, "sendUpdates=none"),
+    ] {
+        let t = FakeTransport::new(vec![
+            ok_json("event_single.json"),
+            ok_json("event_single.json"),
+            Ok(HttpResponse::new(204, Vec::new())),
+        ]);
+        let client = calendar(t.clone());
+
+        client
+            .events_insert("primary", &Event::default(), updates)
+            .await
+            .unwrap();
+        client
+            .events_patch("primary", "e1", &serde_json::json!({ "summary": "x" }), updates)
+            .await
+            .unwrap();
+        client.events_delete("primary", "e1", updates).await.unwrap();
+
+        for req in t.requests() {
+            assert!(
+                req.url.contains(expected),
+                "{label}: {} carried no {expected}",
+                req.url
+            );
+        }
+        // Version 0 makes Google silently ignore `conferenceData` in the body,
+        // so a request that leaves it off can answer 200 and mint no link.
+        assert!(t.requests()[0].url.contains("conferenceDataVersion=1"));
+        assert!(t.requests()[1].url.contains("conferenceDataVersion=1"));
+    }
 }
 
 #[tokio::test]
@@ -1137,6 +1184,7 @@ async fn events_patch_sends_only_the_supplied_fields() {
             "primary",
             "berlin_board_call",
             &serde_json::json!({ "summary": "Board call (moved)" }),
+            SendUpdates::All,
         )
         .await
         .unwrap();
@@ -1144,7 +1192,7 @@ async fn events_patch_sends_only_the_supplied_fields() {
     let req = &t.requests()[0];
     assert_eq!(req.method, HttpMethod::Patch);
     assert!(
-        req.url.ends_with("/calendars/primary/events/berlin_board_call"),
+        req.url.contains("/calendars/primary/events/berlin_board_call?"),
         "{}",
         req.url
     );
@@ -1158,13 +1206,15 @@ async fn events_delete_issues_a_delete_and_tolerates_204() {
     let client = calendar(t.clone());
 
     client
-        .events_delete("primary", "berlin_board_call")
+        .events_delete("primary", "berlin_board_call", SendUpdates::All)
         .await
         .expect("204 with an empty body must not be a deserialize error");
 
     let req = &t.requests()[0];
     assert_eq!(req.method, HttpMethod::Delete);
-    assert!(req.url.ends_with("/calendars/primary/events/berlin_board_call"));
+    assert!(req
+        .url
+        .contains("/calendars/primary/events/berlin_board_call?"));
 }
 
 #[tokio::test]
@@ -1182,6 +1232,8 @@ async fn rsvp_patches_the_full_attendee_list_with_only_our_status_changed() {
             "berlin_board_call",
             "alex@example.com",
             ResponseStatus::Accepted,
+            Some("Running ten minutes late"),
+            SendUpdates::All,
         )
         .await
         .expect("rsvp");
@@ -1197,6 +1249,19 @@ async fn rsvp_patches_the_full_attendee_list_with_only_our_status_changed() {
     assert_eq!(attendees[0]["responseStatus"], "accepted");
     assert_eq!(attendees[1]["email"], "alex@example.com");
     assert_eq!(attendees[1]["responseStatus"], "accepted");
+    assert_eq!(
+        attendees[1]["comment"], "Running ten minutes late",
+        "the note rides on the same attendee row as the answer"
+    );
+    assert!(
+        attendees[0].get("comment").is_none(),
+        "and on nobody else's: {body}"
+    );
+    assert!(
+        reqs[1].url.contains("sendUpdates=all"),
+        "an RSVP the organizer is never told about is a response in a vacuum: {}",
+        reqs[1].url
+    );
     assert!(
         body.get("summary").is_none(),
         "rsvp must not clobber other fields: {body}"
@@ -1214,6 +1279,8 @@ async fn rsvp_for_an_unknown_attendee_is_an_error_not_a_silent_no_op() {
             "berlin_board_call",
             "stranger@example.com",
             ResponseStatus::Declined,
+            None,
+            SendUpdates::All,
         )
         .await
         .unwrap_err();

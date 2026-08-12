@@ -24,7 +24,7 @@ import type {
   CalendarId,
   Participant,
 } from "@/types";
-import type { EventDraft, EventPatch } from "./data";
+import type { EventDraft, EventPatch, Notify } from "./data";
 import { DEFAULT_EVENT_MINUTES } from "./calendar-geometry";
 import { DAY, MINUTE, startOfDay } from "./time";
 
@@ -180,6 +180,23 @@ export interface EventForm {
   recurrenceRules: string[];
   /** `null` = the calendar's default; `[]` = no alert; otherwise the offsets. */
   reminderMinutes: number[] | null;
+  /**
+   * Whether the event should have a Google Meet link.
+   *
+   * A boolean rather than a URL, because that is the only question Google will
+   * answer: it mints the code, and it mints a new one every time. Turning this
+   * off and on again is a *different* meeting at a different address.
+   */
+  meet: boolean;
+  /**
+   * Who to tell — the answer to the question the modal asks before saving.
+   *
+   * `null` while the question has not been asked, which is the state every form
+   * starts in and the state a form with no guests stays in. `formPatch` and
+   * `formDraft` turn `null` into "tell them", so the safe direction is also the
+   * one that needs no code at the call site.
+   */
+  notify: Notify | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -502,7 +519,17 @@ export function formFromEvent(event: CalendarEvent): EventForm {
     recurrence: choiceForEvent(event),
     recurrenceRules: [...rules],
     reminderMinutes: reminderMinutesOf(event),
+    // A call scraped out of the description or the location is not a Google
+    // conference and cannot be removed by taking one off, so only the real
+    // thing ticks this box.
+    meet: hasMeet(event),
+    notify: null,
   };
+}
+
+/** Whether Google itself has a conference on this event. */
+export function hasMeet(event: CalendarEvent): boolean {
+  return (event.conference?.entryPoints.length ?? 0) > 0;
 }
 
 /** A blank form for a new event in a given slot. */
@@ -529,6 +556,8 @@ export function emptyForm(options: {
     recurrence: "none",
     recurrenceRules: [],
     reminderMinutes: null,
+    meet: false,
+    notify: null,
   };
 }
 
@@ -615,7 +644,37 @@ export function formPatch(event: CalendarEvent, form: EventForm): EventPatch | u
     patch.reminderMinutes = form.reminderMinutes;
   }
 
-  return Object.keys(patch).length > 0 ? patch : undefined;
+  if (form.meet !== hasMeet(event)) patch.conferencing = form.meet ? "meet" : "none";
+
+  // Last, and after the emptiness test below reads its keys: `notify` says what
+  // to do about a change, so on its own it is not one.
+  if (Object.keys(patch).length === 0) return undefined;
+  patch.notify = form.notify ?? "guests";
+  return patch;
+}
+
+/**
+ * Whether saving this would email anybody.
+ *
+ * The modal asks the "tell the guests?" question exactly when the answer
+ * matters: there is somebody to tell, and the change is one they would act on.
+ * A reminder offset moved by five minutes is between the owner and their own
+ * phone, and Google does not mail about it either.
+ */
+export function wouldNotifyGuests(event: CalendarEvent, patch: EventPatch): boolean {
+  const guests = (patch.attendees ?? event.attendees).filter((p) => p.email.trim() !== "");
+  if (guests.length === 0) return false;
+  return (
+    patch.title !== undefined ||
+    patch.description !== undefined ||
+    patch.location !== undefined ||
+    patch.attendees !== undefined ||
+    patch.recurrence !== undefined ||
+    patch.conferencing !== undefined ||
+    patch.startTs !== undefined ||
+    patch.endTs !== undefined ||
+    patch.isAllDay !== undefined
+  );
 }
 
 /**
@@ -644,10 +703,24 @@ export function formDraft(form: EventForm): EventDraft | { error: string } {
     attendees: parseAttendees(form.attendees),
     recurrence: rulesOf(form, times.start),
     reminderMinutes: form.reminderMinutes ?? undefined,
+    conferencing: form.meet ? "meet" : undefined,
+    // A new event invites the people it names, the way it does in Google
+    // Calendar. `null` is the form that was never asked, and the answer to a
+    // question nobody asked is the safe one.
+    notify: form.notify ?? "guests",
   };
 }
 
-/** The draft that duplicates an event — same everything, new row. */
+/**
+ * The draft that duplicates an event — same everything, new row.
+ *
+ * **It invites nobody**, and that is the one place `notify` is not left to its
+ * default. ⌘D lands the copy without opening anything, so mailing twenty people
+ * would be a keystroke with no confirmation in front of it and no way back —
+ * Google Calendar's own Duplicate puts the editor between you and that. The
+ * status line says "nobody was invited" so the copy is not mistaken for a
+ * meeting anyone has been told about.
+ */
 export function duplicateDraft(event: CalendarEvent): EventDraft {
   return {
     title: event.title === "(no title)" ? "" : `${event.title} (copy)`,
@@ -658,6 +731,7 @@ export function duplicateDraft(event: CalendarEvent): EventDraft {
     isAllDay: event.allDay,
     attendees: event.attendees,
     recurrence: [],
+    notify: "nobody",
   };
 }
 
@@ -669,6 +743,9 @@ export function duplicateDraft(event: CalendarEvent): EventDraft {
  * "(copy)" because it lands exactly on top of the original and there would
  * otherwise be nothing to tell the two apart; a copy that arrives somewhere
  * else is already told apart by the thing that put it there.
+ *
+ * It invites nobody, for the reason in `duplicateDraft`: a drag is not a
+ * decision to mail the room.
  */
 export function copyDraft(
   event: CalendarEvent,
@@ -683,6 +760,7 @@ export function copyDraft(
     isAllDay: event.allDay,
     attendees: event.attendees,
     recurrence: [],
+    notify: "nobody",
   };
 }
 

@@ -19,8 +19,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use mach_lib::commands::{
-    AccountClients, Command, CommandDispatcher, EventDraft, EventPatch, EventScope, FailureKind,
-    ThreadLabelState,
+    AccountClients, Command, CommandDispatcher, Conferencing, EventDraft, EventPatch, EventScope,
+    FailureKind, Notify, ThreadLabelState,
 };
 use mach_lib::db::models::{
     Event, EventReminder, EventReminders, LabelType, NewAccount, NewEvent, NewLabel, NewMessage,
@@ -2086,6 +2086,8 @@ async fn rsvp_updates_the_local_event_and_patches_the_right_endpoint() {
         .execute(Command::Rsvp {
             event_id,
             response: RsvpStatus::Accepted,
+            comment: None,
+            notify: None,
         })
         .await
         .unwrap();
@@ -2098,21 +2100,27 @@ async fn rsvp_updates_the_local_event_and_patches_the_right_endpoint() {
 
     let requests = transport.requests();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0]
-        .url
-        .ends_with("/calendars/primary/events/evt-1"));
+    assert!(
+        requests[0].url.ends_with("/calendars/primary/events/evt-1"),
+        "the read half of an RSVP is a plain events.get: {}",
+        requests[0].url
+    );
     assert_eq!(requests[1].method, mach_lib::google::HttpMethod::Patch);
     assert!(requests[1]
         .url
-        .ends_with("/calendars/primary/events/evt-1"));
+        .contains("/calendars/primary/events/evt-1?"));
     let patched = body_json(&requests[1]);
     assert_eq!(patched["attendees"][0]["responseStatus"], "accepted");
 
     assert_eq!(
         result.undo,
+        // Undoing an RSVP tells the organizer too — a retraction nobody hears
+        // about is the same silence the response was.
         Some(Command::Rsvp {
             event_id,
             response: RsvpStatus::NeedsAction,
+            comment: None,
+            notify: Some(Notify::Guests),
         })
     );
 }
@@ -2145,6 +2153,8 @@ async fn a_failed_rsvp_restores_the_previous_response() {
         .execute(Command::Rsvp {
             event_id,
             response: RsvpStatus::Declined,
+            comment: None,
+            notify: None,
         })
         .await
         .unwrap();
@@ -2267,7 +2277,7 @@ async fn creating_an_event_writes_the_row_before_the_insert_goes_out() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, mach_lib::google::HttpMethod::Post);
     assert!(
-        requests[0].url.ends_with("/calendars/primary/events"),
+        requests[0].url.contains("/calendars/primary/events?"),
         "unexpected url {}",
         requests[0].url
     );
@@ -2278,9 +2288,12 @@ async fn creating_an_event_writes_the_row_before_the_insert_goes_out() {
 
     assert_eq!(
         result.undo,
+        // The undo carries the choice the create made, so ⌘Z on an event that
+        // invited three people cancels with the same three.
         Some(Command::DeleteEvent {
             event_id: events[0].id,
             scope: EventScope::This,
+            notify: Some(Notify::Guests),
         })
     );
     assert_eq!(result.applied, vec![events[0].id]);
@@ -2370,6 +2383,7 @@ async fn a_recurring_create_adopts_the_id_its_first_occurrence_will_have() {
         Some(Command::DeleteEvent {
             event_id: events[0].id,
             scope: EventScope::All,
+            notify: Some(Notify::Guests),
         })
     );
 }
@@ -2417,7 +2431,7 @@ async fn moving_an_event_in_time_patches_google_and_inverts_to_where_it_was() {
     let requests = transport.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, mach_lib::google::HttpMethod::Patch);
-    assert!(requests[0].url.ends_with("/calendars/primary/events/evt-1"));
+    assert!(requests[0].url.contains("/calendars/primary/events/evt-1?"));
     // A time change always sends both halves: Google rejects a body whose start
     // is a `date` and whose end is a `dateTime`.
     let body = body_json(&requests[0]);
@@ -2577,7 +2591,7 @@ async fn renaming_a_whole_series_patches_the_master_and_every_local_occurrence()
     assert!(
         transport.requests()[0]
             .url
-            .ends_with("/calendars/primary/events/series"),
+            .contains("/calendars/primary/events/series?"),
         "unexpected url {}",
         transport.requests()[0].url
     );
@@ -2666,6 +2680,7 @@ async fn deleting_an_event_removes_the_row_and_inverts_to_a_create() {
         .execute(Command::DeleteEvent {
             event_id,
             scope: EventScope::This,
+            notify: None,
         })
         .await
         .unwrap();
@@ -2674,7 +2689,7 @@ async fn deleting_an_event_removes_the_row_and_inverts_to_a_create() {
     assert!(all_events(&db).is_empty());
     let requests = transport.requests();
     assert_eq!(requests[0].method, mach_lib::google::HttpMethod::Delete);
-    assert!(requests[0].url.ends_with("/calendars/primary/events/evt-1"));
+    assert!(requests[0].url.contains("/calendars/primary/events/evt-1?"));
 
     match result.undo {
         Some(Command::CreateEvent {
@@ -2718,6 +2733,7 @@ async fn a_failed_delete_puts_the_event_back_with_its_id_intact() {
         .execute(Command::DeleteEvent {
             event_id,
             scope: EventScope::This,
+            notify: None,
         })
         .await
         .unwrap();
@@ -2760,6 +2776,7 @@ async fn deleting_a_series_takes_every_occurrence_and_offers_no_undo() {
         .execute(Command::DeleteEvent {
             event_id: ids[2],
             scope: EventScope::All,
+            notify: None,
         })
         .await
         .unwrap();
@@ -2769,7 +2786,7 @@ async fn deleting_a_series_takes_every_occurrence_and_offers_no_undo() {
     assert_eq!(result.applied.len(), 3);
     assert!(transport.requests()[0]
         .url
-        .ends_with("/calendars/primary/events/series"));
+        .contains("/calendars/primary/events/series?"));
     // Google has no endpoint that puts a cancelled occurrence back into its
     // series, so claiming an inverse here would be a lie.
     assert!(result.undo.is_none());
@@ -2815,6 +2832,7 @@ async fn deleting_one_occurrence_addresses_the_instance_not_the_series() {
         .execute(Command::DeleteEvent {
             event_id: drop,
             scope: EventScope::This,
+            notify: None,
         })
         .await
         .unwrap();
@@ -2825,7 +2843,7 @@ async fn deleting_one_occurrence_addresses_the_instance_not_the_series() {
     assert_eq!(events[0].id, keep);
     assert!(transport.requests()[0]
         .url
-        .ends_with("/calendars/primary/events/series_1"));
+        .contains("/calendars/primary/events/series_1?"));
 }
 
 #[tokio::test]
@@ -2851,6 +2869,7 @@ async fn deleting_something_google_already_lost_still_clears_the_grid() {
         .execute(Command::DeleteEvent {
             event_id,
             scope: EventScope::This,
+            notify: None,
         })
         .await
         .unwrap();
@@ -2890,6 +2909,7 @@ async fn moving_an_event_to_another_account_inserts_there_and_deletes_here() {
             event_id,
             account_id: to,
             calendar_id: "work".into(),
+            notify: None,
         })
         .await
         .unwrap();
@@ -2902,8 +2922,8 @@ async fn moving_an_event_to_another_account_inserts_there_and_deletes_here() {
 
     let requests = transport.requests();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].url.ends_with("/calendars/work/events"));
-    assert!(requests[1].url.ends_with("/calendars/primary/events/evt-1"));
+    assert!(requests[0].url.contains("/calendars/work/events?"));
+    assert!(requests[1].url.contains("/calendars/primary/events/evt-1?"));
     assert_eq!(requests[1].method, mach_lib::google::HttpMethod::Delete);
 
     assert_eq!(
@@ -2912,6 +2932,7 @@ async fn moving_an_event_to_another_account_inserts_there_and_deletes_here() {
             event_id,
             account_id: from,
             calendar_id: "primary".into(),
+            notify: Some(Notify::Guests),
         })
     );
 }
@@ -2946,6 +2967,7 @@ async fn a_move_whose_copy_lands_but_whose_delete_fails_leaves_one_event_not_two
             event_id,
             account_id: to,
             calendar_id: "work".into(),
+            notify: None,
         })
         .await
         .unwrap();
@@ -2958,7 +2980,7 @@ async fn a_move_whose_copy_lands_but_whose_delete_fails_leaves_one_event_not_two
     // Three calls: insert, the delete that failed, and the cleanup of the copy.
     let requests = transport.requests();
     assert_eq!(requests.len(), 3);
-    assert!(requests[2].url.ends_with("/calendars/work/events/evt-2"));
+    assert!(requests[2].url.contains("/calendars/work/events/evt-2?"));
     assert_eq!(requests[2].method, mach_lib::google::HttpMethod::Delete);
 }
 
@@ -3005,6 +3027,7 @@ async fn an_unknown_event_is_a_typed_error_before_anything_is_written() {
         .execute(Command::DeleteEvent {
             event_id: 404,
             scope: EventScope::This,
+            notify: None,
         })
         .await
         .expect_err("no such event");
@@ -3461,6 +3484,7 @@ async fn a_failed_delete_puts_the_rule_and_the_uid_back_as_well() {
         .execute(Command::DeleteEvent {
             event_id,
             scope: EventScope::This,
+            notify: None,
         })
         .await
         .unwrap();
@@ -3507,6 +3531,7 @@ async fn undoing_a_delete_re_creates_the_event_rather_than_a_lookalike() {
         .execute(Command::DeleteEvent {
             event_id,
             scope: EventScope::This,
+            notify: None,
         })
         .await
         .unwrap();
@@ -3560,6 +3585,7 @@ async fn a_moved_event_keeps_its_alerts_on_the_calendar_it_lands_on() {
             event_id,
             account_id: to,
             calendar_id: "work".into(),
+            notify: None,
         })
         .await
         .unwrap();
@@ -3610,6 +3636,7 @@ async fn a_failed_move_restores_the_identity_it_had_before() {
             event_id,
             account_id: to,
             calendar_id: "work".into(),
+            notify: None,
         })
         .await
         .unwrap();
@@ -3657,6 +3684,529 @@ fn the_event_commands_round_trip_through_the_wire_shape_the_ui_uses() {
         Command::DeleteEvent {
             event_id: 3,
             scope: EventScope::This,
+            notify: None,
         }
     );
+}
+
+// ================================================ calendar: telling the guests
+
+/// The bug this whole section exists for.
+///
+/// Google's calendar API notifies nobody unless the request says so. Mach never
+/// said so, so every event the owner ever created in it with a guest list went
+/// onto his calendar, recorded the names, and mailed none of them. Nothing in
+/// the response distinguishes that from the working case — which is why these
+/// tests assert on the *request*, and why the local rows are barely mentioned.
+fn guest_draft(title: &str, guests: &[&str]) -> EventDraft {
+    EventDraft {
+        attendees: guests.iter().map(|e| Participant::new(*e)).collect(),
+        ..timed_draft(title, NOON, 1)
+    }
+}
+
+fn seeded_event(db: &Db, account: i64, guests: &[&str]) -> i64 {
+    db.write(|c| {
+        queries::upsert_event(
+            c,
+            &NewEvent {
+                account_id: account,
+                calendar_id: "primary".into(),
+                google_event_id: "evt-1".into(),
+                title: "Board call".into(),
+                start_ts: NOON,
+                end_ts: NOON + HOUR_MS,
+                attendees: guests.iter().map(|e| Participant::new(*e)).collect(),
+                status: "confirmed".into(),
+                ..Default::default()
+            },
+        )
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn creating_an_event_with_guests_actually_invites_them() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let transport =
+        FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-new"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::CreateEvent {
+            account_id: account,
+            calendar_id: "primary".into(),
+            draft: guest_draft("Board call", &["ada@example.com", "bob@example.com"]),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let url = &transport.requests()[0].url;
+    assert!(
+        url.contains("sendUpdates=all"),
+        "an insert with attendees and no sendUpdates invites nobody: {url}"
+    );
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(body["attendees"][0]["email"], "ada@example.com");
+    assert_eq!(body["attendees"][1]["email"], "bob@example.com");
+
+    // What happened, and what ⌘Z can take back, are two different sentences.
+    assert_eq!(result.message, "Created “Board call” · invited 2 guests");
+    assert_eq!(result.undo_label.as_deref(), Some("Created “Board call”"));
+}
+
+#[tokio::test]
+async fn a_silent_create_is_available_and_says_so_out_loud() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let transport =
+        FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-new"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::CreateEvent {
+            account_id: account,
+            calendar_id: "primary".into(),
+            draft: EventDraft {
+                notify: Some(Notify::Nobody),
+                ..guest_draft("Board call", &["ada@example.com"])
+            },
+        })
+        .await
+        .unwrap();
+
+    assert!(transport.requests()[0].url.contains("sendUpdates=none"));
+    // An event carrying a guest list that nobody has been told about is the
+    // exact shape of the original bug, so a quiet create names its own quiet —
+    // this is the ⌘D path, where nobody was asked.
+    assert_eq!(result.message, "Created “Board call” · nobody was invited");
+    // Nothing irreversible happened, so the undo entry is the whole sentence.
+    assert_eq!(result.undo_label, None);
+}
+
+#[tokio::test]
+async fn an_event_with_no_guests_claims_no_invitations() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let transport =
+        FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-new"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::CreateEvent {
+            account_id: account,
+            calendar_id: "primary".into(),
+            draft: timed_draft("Gym", NOON, 1),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.message, "Created “Gym”");
+    assert_eq!(result.undo_label, None);
+}
+
+#[tokio::test]
+async fn changing_the_time_of_a_meeting_tells_the_people_in_it() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seeded_event(&db, account, &["ada@example.com", "bob@example.com"]);
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                start_ts: Some(NOON + HOUR_MS),
+                end_ts: Some(NOON + 2 * HOUR_MS),
+                is_all_day: Some(false),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(transport.requests()[0].url.contains("sendUpdates=all"));
+    assert_eq!(result.message, "Moved the event · told 2 guests");
+    assert_eq!(result.undo_label.as_deref(), Some("Moved the event"));
+}
+
+#[tokio::test]
+async fn adding_a_guest_tells_the_new_list_not_the_old_one() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seeded_event(&db, account, &["ada@example.com"]);
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                attendees: Some(vec![
+                    Participant::new("ada@example.com"),
+                    Participant::new("bob@example.com"),
+                ]),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(transport.requests()[0].url.contains("sendUpdates=all"));
+    // Two, not one: the person being added is the person most in need of the
+    // mail, and counting the pre-patch list would leave them out of the sentence.
+    assert_eq!(result.message, "Updated the guest list · told 2 guests");
+}
+
+#[tokio::test]
+async fn a_change_only_the_organizer_can_see_does_not_mail_anybody() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seeded_event(&db, account, &["ada@example.com"]);
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            // An alert offset is between the owner and their own phone.
+            patch: EventPatch {
+                reminder_minutes: Some(vec![15]),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        transport.requests()[0].url.contains("sendUpdates=none"),
+        "{}",
+        transport.requests()[0].url
+    );
+    assert_eq!(result.message, "Saved the event");
+}
+
+#[tokio::test]
+async fn a_quiet_edit_is_available_and_the_undo_stays_quiet_too() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seeded_event(&db, account, &["ada@example.com"]);
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                title: Some("Board call (short)".into()),
+                notify: Some(Notify::Nobody),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(transport.requests()[0].url.contains("sendUpdates=none"));
+    assert_eq!(result.message, "Renamed the event");
+    assert_eq!(result.undo_label, None);
+    // The correction is as quiet as the change was.
+    match result.undo {
+        Some(Command::UpdateEvent { patch, .. }) => {
+            assert_eq!(patch.notify, Some(Notify::Nobody));
+            assert_eq!(patch.title.as_deref(), Some("Board call"));
+        }
+        other => panic!("expected an update inverse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_meeting_sends_the_cancellation() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seeded_event(&db, account, &["ada@example.com", "bob@example.com"]);
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::new(204, Vec::new()))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::DeleteEvent {
+            event_id,
+            scope: EventScope::This,
+            notify: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(
+        transport.requests()[0].url.contains("sendUpdates=all"),
+        "a meeting that vanishes from one calendar and stays in everyone else's \
+         is a missed cancellation: {}",
+        transport.requests()[0].url
+    );
+    assert_eq!(
+        result.message,
+        "Deleted “Board call” · cancelled with 2 guests"
+    );
+    assert_eq!(result.undo_label.as_deref(), Some("Deleted “Board call”"));
+    // Putting it back re-invites, which is the only honest reversal there is.
+    match result.undo {
+        Some(Command::CreateEvent { draft, .. }) => {
+            assert_eq!(draft.notify, Some(Notify::Guests));
+            assert_eq!(draft.attendees.len(), 2);
+        }
+        other => panic!("expected a create inverse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_move_re_invites_once_rather_than_cancelling_and_inviting() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seeded_event(&db, account, &["ada@example.com"]);
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(200, r#"{"id":"evt-2"}"#)),
+        Ok(HttpResponse::new(204, Vec::new())),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MoveEvent {
+            event_id,
+            account_id: account,
+            calendar_id: "work".into(),
+            notify: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let reqs = transport.requests();
+    assert!(reqs[0].url.contains("sendUpdates=all"), "{}", reqs[0].url);
+    // The source copy goes quietly. A cancellation arriving beside the fresh
+    // invitation for the same meeting reads as "your meeting is off".
+    assert!(reqs[1].url.contains("sendUpdates=none"), "{}", reqs[1].url);
+    assert_eq!(result.message, "Moved “Board call” · re-invited 1 guest");
+}
+
+#[tokio::test]
+async fn an_rsvp_tells_the_organizer_and_can_carry_a_note() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = db
+        .write(|c| {
+            queries::upsert_event(
+                c,
+                &NewEvent {
+                    account_id: account,
+                    calendar_id: "primary".into(),
+                    google_event_id: "evt-1".into(),
+                    title: "Standup".into(),
+                    attendees: vec![Participant::new("a@example.com")],
+                    rsvp_status: Some(RsvpStatus::NeedsAction),
+                    status: "confirmed".into(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(
+            200,
+            r#"{"id":"evt-1","attendees":[{"email":"a@example.com","self":true,
+                 "responseStatus":"needsAction"}]}"#,
+        )),
+        Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#)),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::Rsvp {
+            event_id,
+            response: RsvpStatus::Tentative,
+            comment: Some("Might be five minutes late".into()),
+            notify: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let reqs = transport.requests();
+    assert!(reqs[1].url.contains("sendUpdates=all"), "{}", reqs[1].url);
+    let body = body_json(&reqs[1]);
+    assert_eq!(body["attendees"][0]["responseStatus"], "tentative");
+    assert_eq!(body["attendees"][0]["comment"], "Might be five minutes late");
+}
+
+#[tokio::test]
+async fn answering_the_same_way_twice_is_still_free_unless_a_note_came_with_it() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = db
+        .write(|c| {
+            queries::upsert_event(
+                c,
+                &NewEvent {
+                    account_id: account,
+                    calendar_id: "primary".into(),
+                    google_event_id: "evt-1".into(),
+                    title: "Standup".into(),
+                    attendees: vec![Participant::new("a@example.com")],
+                    rsvp_status: Some(RsvpStatus::Accepted),
+                    status: "confirmed".into(),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(
+            200,
+            r#"{"id":"evt-1","attendees":[{"email":"a@example.com","self":true,
+                 "responseStatus":"accepted"}]}"#,
+        )),
+        Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#)),
+    ]);
+    let d = dispatcher(&db, transport.clone());
+
+    d.execute(Command::Rsvp {
+        event_id,
+        response: RsvpStatus::Accepted,
+        comment: None,
+        notify: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(transport.call_count(), 0, "same answer, no round trip");
+
+    d.execute(Command::Rsvp {
+        event_id,
+        response: RsvpStatus::Accepted,
+        comment: Some("Bringing the deck".into()),
+        notify: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        transport.call_count(),
+        2,
+        "a note is news even when the answer is not"
+    );
+}
+
+// ============================================= calendar: adding the video call
+
+#[tokio::test]
+async fn asking_for_a_meet_link_sends_a_create_request_and_adopts_the_answer() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"evt-new","conferenceData":{"conferenceId":"abc-defg-hij",
+             "conferenceSolution":{"name":"Google Meet"},
+             "entryPoints":[{"entryPointType":"video",
+                             "uri":"https://meet.google.com/abc-defg-hij"}]}}"#,
+    ))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::CreateEvent {
+            account_id: account,
+            calendar_id: "primary".into(),
+            draft: EventDraft {
+                conferencing: Some(Conferencing::Meet),
+                ..timed_draft("Board call", NOON, 1)
+            },
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let req = &transport.requests()[0];
+    // Version 0 makes Google read the block and do nothing with it.
+    assert!(req.url.contains("conferenceDataVersion=1"), "{}", req.url);
+    let body = body_json(req);
+    assert_eq!(
+        body["conferenceData"]["createRequest"]["conferenceSolutionKey"]["type"],
+        "hangoutsMeet"
+    );
+    assert!(body["conferenceData"]["createRequest"]["requestId"].is_string());
+
+    // The link Google minted is on the row now, not at the next sync.
+    let events = all_events(&db);
+    let conference = events[0].conference.as_ref().expect("the minted conference");
+    assert_eq!(
+        conference.video().map(|e| e.uri.as_str()),
+        Some("https://meet.google.com/abc-defg-hij")
+    );
+}
+
+#[tokio::test]
+async fn taking_the_call_off_an_event_sends_an_explicit_null_and_offers_no_undo() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = db
+        .write(|c| {
+            queries::upsert_event(
+                c,
+                &NewEvent {
+                    account_id: account,
+                    calendar_id: "primary".into(),
+                    google_event_id: "evt-1".into(),
+                    title: "Board call".into(),
+                    start_ts: NOON,
+                    end_ts: NOON + HOUR_MS,
+                    status: "confirmed".into(),
+                    conference: Some(mach_lib::db::models::EventConference {
+                        id: Some("abc-defg-hij".into()),
+                        name: Some("Google Meet".into()),
+                        entry_points: vec![mach_lib::db::models::ConferenceEntry {
+                            kind: "video".into(),
+                            uri: "https://meet.google.com/abc-defg-hij".into(),
+                            label: None,
+                            pin: None,
+                            region_code: None,
+                        }],
+                        notes: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(200, r#"{"id":"evt-1"}"#))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                conferencing: Some(Conferencing::None),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    let body = body_json(&transport.requests()[0]);
+    assert!(
+        body.get("conferenceData").is_some() && body["conferenceData"].is_null(),
+        "removing a call is an explicit null, not an absent key: {body}"
+    );
+    assert!(all_events(&db)[0].conference.is_none());
+    // Google mints a new code every time, so there is no putting that meeting
+    // back — offering an undo would hand back a different address.
+    assert_eq!(result.undo, None);
 }

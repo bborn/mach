@@ -653,7 +653,11 @@ fn a_tool_call_becomes_the_typed_command() {
         tools::command_from_call("rsvp", &json!({ "eventId": 4, "response": "declined" })).unwrap(),
         Command::Rsvp {
             event_id: 4,
-            response: RsvpStatus::Declined
+            response: RsvpStatus::Declined,
+            // Left off the call, so the organizer is told — the default the
+            // whole calendar half of the vocabulary now leans on.
+            comment: None,
+            notify: None,
         }
     );
 

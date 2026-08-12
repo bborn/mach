@@ -258,6 +258,11 @@ fn property_for(param: &ParamSpec) -> Value {
             "type": "string",
             "enum": ["this", "all"],
         }),
+        ParamType::Notify => json!({
+            "type": "string",
+            "enum": ["guests", "externalGuests", "nobody"],
+        }),
+        ParamType::Text => json!({ "type": "string" }),
         ParamType::ThreadLabelStates => json!({
             "type": "array",
             "items": {
@@ -295,6 +300,16 @@ fn event_object(is_draft: bool) -> Value {
             },
             "recurrence": { "type": "string", "description": "An RRULE, e.g. RRULE:FREQ=WEEKLY;BYDAY=TU." },
             "reminderMinutes": { "type": "integer" },
+            "conferencing": {
+                "type": "string",
+                "enum": ["meet", "none"],
+                "description": "meet adds a Google Meet link; none removes the call.",
+            },
+            "notify": {
+                "type": "string",
+                "enum": ["guests", "externalGuests", "nobody"],
+                "description": "Who Google emails. Omit to tell the guests.",
+            },
         },
         "additionalProperties": true,
     });
