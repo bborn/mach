@@ -4,7 +4,6 @@ import type { Invitation as InvitationData, MessageId, Rsvp } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { keyboardInComposer } from "@/lib/compose";
-import { describeResult, getDataSource } from "@/lib/data";
 import { ANSWERS, activeInvitation, answerLabel, isAnswerable, whenLabel } from "@/lib/invitation";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -67,7 +66,7 @@ export interface InvitationProps {
  * when you are not.
  */
 export function Invitation({ messageId, invitation }: InvitationProps) {
-  const { ui, dispatch } = useMach();
+  const { ui, actions } = useMach();
   /** The answer this session has given, before the store has been re-read. */
   const [optimistic, setOptimistic] = useState<Rsvp | null>(null);
   const [busy, setBusy] = useState<Rsvp | null>(null);
@@ -84,38 +83,30 @@ export function Invitation({ messageId, invitation }: InvitationProps) {
       setOptimistic(response);
       setBusy(response);
       setError(null);
-      void (async () => {
-        try {
-          const result = await getDataSource().execute({ kind: "rsvp", eventId, response });
-          const message = describeResult(result);
-          if (!result.ok) {
+      /*
+       * Through `actions.execute` rather than the data source directly.
+       *
+       * The button above is already optimistic and always was, and that was the
+       * whole of it: this card executed the command itself, so the *event* — the
+       * block on the calendar, the tick in its right-click menu — went on saying
+       * the old answer until the next refetch. One write path means the answer
+       * lands in both places at once, and it is also what puts a proper entry on
+       * the undo stack, which a status message carrying only the inverse cannot.
+       */
+      void actions
+        .execute(
+          { kind: "rsvp", eventId, response },
+          {
             // Rust has already put the row back; this puts the button back.
-            setOptimistic(previous);
-            setError(message);
-          }
-          // One dispatch carrying the inverse, the way the calendar's own write
-          // path does it: `z` reverses an RSVP as readily as it reverses an
-          // archive. A plain `setStatus` would say the right thing and quietly
-          // make the last action un-undoable.
-          dispatch({
-            type: "status",
-            status: {
-              message,
-              undo: result.ok ? result.undo : undefined,
-              tone: result.ok ? "info" : "error",
+            onRefused: ({ message }) => {
+              setOptimistic(previous);
+              setError(message);
             },
-          });
-        } catch (caught: unknown) {
-          const message = caught instanceof Error ? caught.message : "Could not send the RSVP";
-          setOptimistic(previous);
-          setError(message);
-          dispatch({ type: "status", status: { message, tone: "error" } });
-        } finally {
-          setBusy(null);
-        }
-      })();
+          },
+        )
+        .finally(() => setBusy(null));
     },
-    [busy, dispatch, invitation.eventId, optimistic],
+    [busy, actions, invitation.eventId, optimistic],
   );
 
   /*

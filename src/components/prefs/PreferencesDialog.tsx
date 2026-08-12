@@ -753,10 +753,22 @@ export function Accounts({
   onReauthorize: (account: Account) => void;
 }) {
   const [failed, setFailed] = useState<string | null>(null);
+  /**
+   * The account being removed, while it is being removed.
+   *
+   * Deleting an account's mail and calendar off the Mac is not quick, and the
+   * confirmation collapsing was the only thing that happened when the button
+   * was pressed — the row itself sat there, unchanged and still offering
+   * "Remove", which reads as the press having missed. The row does not vanish
+   * optimistically because it is the thing that will carry the failure if there
+   * is one; it says what it is doing instead.
+   */
+  const [removing, setRemoving] = useState<number | null>(null);
 
   const remove = (account: Account) => {
     onConfirm(null);
     setFailed(null);
+    setRemoving(account.id);
     void getDataSource()
       .removeAccount(account.id)
       // Every list in the window loses rows, so the whole read model reloads.
@@ -765,7 +777,8 @@ export function Accounts({
         // Silent failure is the thing this project has paid most for: an
         // account that is still there after you removed it has to say why.
         setFailed(caught instanceof Error ? caught.message : String(caught));
-      });
+      })
+      .finally(() => setRemoving(null));
   };
 
   return (
@@ -801,10 +814,11 @@ export function Accounts({
               <Button
                 size="sm"
                 variant="ghost"
+                disabled={removing !== null}
                 aria-label={`Remove ${account.email}`}
                 onClick={() => onConfirm(confirming === account.id ? null : account.id)}
               >
-                Remove
+                {removing === account.id ? "Removing…" : "Remove"}
               </Button>
             </div>
 

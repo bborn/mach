@@ -139,6 +139,10 @@ export function PluginsPanel() {
                   await backend.remove(plugin.id);
                   await refresh();
                 }}
+                onFailed={(message) => {
+                  setError(message);
+                  actions.setStatus(message, "error");
+                }}
               />
             ))}
           </ul>
@@ -206,16 +210,45 @@ function SandboxBadge({
   );
 }
 
+/**
+ * One installed plugin, and the two buttons that change its life.
+ *
+ * Both of them used to do nothing on screen and swallow their failures at the
+ * same time: `onToggle` and `onRemove` were bare `await`s with no busy state,
+ * no optimistic flip and no `catch`, so "Enable" went on saying Enable through
+ * the round trip and a refusal was an unhandled rejection nobody would ever
+ * see. Enabling a plugin is exactly the kind of thing that has to say whether
+ * it worked.
+ *
+ * The label flips now — the optimistic claim — and the row goes quiet while
+ * the call is out. A refusal puts the label back and reports; there is no
+ * third state to invent, because the button has only ever had two.
+ */
 function PluginRow({
   plugin,
   onToggle,
   onRemove,
+  onFailed,
 }: {
   plugin: InstalledPlugin;
-  onToggle: (enabled: boolean) => void;
-  onRemove: () => void;
+  onToggle: (enabled: boolean) => Promise<void>;
+  onRemove: () => Promise<void>;
+  onFailed: (message: string) => void;
 }) {
   const status = describeStatus(plugin.status);
+  const disabled = plugin.status.state === "disabled";
+  /** What this row claims about itself, until the list is refetched. */
+  const [claimed, setClaimed] = useState<{ enabled: boolean } | null>(null);
+  const [removed, setRemoved] = useState(false);
+  const [working, setWorking] = useState(false);
+  const enabled = claimed ? claimed.enabled : !disabled;
+
+  // The list is authoritative again the moment it says the same thing.
+  useEffect(() => {
+    if (claimed && claimed.enabled === !disabled) setClaimed(null);
+  }, [claimed, disabled]);
+
+  if (removed) return null;
   return (
     <li className="flex items-start justify-between gap-3 rounded border p-3">
       <div className="min-w-0">
@@ -236,11 +269,32 @@ function PluginRow({
       <div className="flex shrink-0 gap-2">
         <Button
           variant="ghost"
-          onClick={() => onToggle(plugin.status.state === "disabled")}
+          disabled={working}
+          onClick={() => {
+            const next = !enabled;
+            setClaimed({ enabled: next });
+            setWorking(true);
+            void onToggle(next)
+              .catch((e: unknown) => {
+                setClaimed(null);
+                onFailed(errorMessage(e));
+              })
+              .finally(() => setWorking(false));
+          }}
         >
-          {plugin.status.state === "disabled" ? "Enable" : "Disable"}
+          {enabled ? "Disable" : "Enable"}
         </Button>
-        <Button variant="ghost" onClick={onRemove}>
+        <Button
+          variant="ghost"
+          disabled={working}
+          onClick={() => {
+            setRemoved(true);
+            void onRemove().catch((e: unknown) => {
+              setRemoved(false);
+              onFailed(errorMessage(e));
+            });
+          }}
+        >
           Remove
         </Button>
       </div>

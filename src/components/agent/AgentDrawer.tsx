@@ -19,6 +19,7 @@ import {
   type Artifact,
   type ContextItem,
   type Entry,
+  type PendingApproval,
 } from "@/lib/agent";
 import { errorMessage } from "@/lib/ipc";
 import { cn } from "@/lib/utils";
@@ -77,6 +78,23 @@ export function AgentDrawer({
 }) {
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
+  /**
+   * The approval this drawer has answered, before the agent has said so.
+   *
+   * The highest-stakes pair of buttons in the app had no same-frame feedback at
+   * all: "Send it" dispatched an IPC call and then everything sat exactly as it
+   * was until Rust pushed a `status` back, which is long enough to press it
+   * twice and not know which press counted.
+   *
+   * Keyed by the tool call rather than held as a bare flag, so it can only ever
+   * describe the approval it was given for: the next one arrives with a
+   * different `toolUseId` and this stops applying on its own, with nothing to
+   * remember to clear.
+   */
+  const [answered, setAnswered] = useState<{
+    toolUseId: string;
+    choice: "approve" | "deny";
+  } | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
 
   // Follow the conversation as it streams.
@@ -125,7 +143,12 @@ export function AgentDrawer({
       {session.context.length > 0 && (
         <div className="flex shrink-0 flex-wrap items-center gap-1.5 px-3 pb-1.5">
           {session.context.map((item) => (
-            <ContextChip key={item.id} sessionId={session.id} item={item} />
+            <ContextChip
+              key={item.id}
+              sessionId={session.id}
+              item={item}
+              onError={setError}
+            />
           ))}
         </div>
       )}
@@ -153,34 +176,27 @@ export function AgentDrawer({
       </div>
 
       {session.pending && (
-        <div className="flex shrink-0 items-center gap-2 border-t border-warning bg-surface-raised px-3 py-2">
-          <span className="min-w-0 flex-1 text-list text-foreground">
-            {session.pending.summary}
-          </span>
-          <Button
-            size="sm"
-            variant="subtle"
-            onClick={() =>
-              void deny(session.id, session.pending!.toolUseId, "Denied from the drawer.").catch(
-                (e: unknown) => setError(errorMessage(e)),
-              )
-            }
-          >
-            Don&apos;t
-          </Button>
-          <Button
-            size="sm"
-            variant="default"
-            onClick={() =>
-              void approve(session.id, session.pending!.toolUseId).catch((e: unknown) =>
-                setError(errorMessage(e)),
-              )
-            }
-          >
-            <Send size={11} strokeWidth={2} />
-            Send it
-          </Button>
-        </div>
+        <ApprovalBar
+          pending={session.pending}
+          answered={answered?.toolUseId === session.pending.toolUseId ? answered.choice : null}
+          onAnswer={(choice) => {
+            const toolUseId = session.pending!.toolUseId;
+            // Before the first `await`, so the bar says which button was pressed
+            // in the frame it was pressed in.
+            setAnswered({ toolUseId, choice });
+            setError(null);
+            const call =
+              choice === "approve"
+                ? approve(session.id, toolUseId)
+                : deny(session.id, toolUseId, "Denied from the drawer.");
+            void call.catch((e: unknown) => {
+              // The exact inverse: the answer never left, so the buttons come
+              // back and the reason goes in the footer.
+              setAnswered((current) => (current?.toolUseId === toolUseId ? null : current));
+              setError(errorMessage(e));
+            });
+          }}
+        />
       )}
 
       <footer className="flex h-9 shrink-0 items-center gap-2 border-t border-border px-3">
@@ -203,6 +219,56 @@ export function AgentDrawer({
         {error && <span className="shrink-0 text-micro text-danger">{error}</span>}
       </footer>
     </section>
+  );
+}
+
+/**
+ * The approval bar, and what it looks like once you have answered it.
+ *
+ * The answer stays on screen rather than the bar vanishing, because the bar is
+ * also the record of what was asked: replacing it with nothing would leave the
+ * drawer looking exactly as it did before the agent asked, and "did I press
+ * that?" is the question this whole change is about. Both buttons go quiet and
+ * the one that was chosen keeps its label with a spinner beside it, so the bar
+ * says which of the two was pressed and that it has not finished yet.
+ */
+function ApprovalBar({
+  pending,
+  answered,
+  onAnswer,
+}: {
+  pending: PendingApproval;
+  answered: "approve" | "deny" | null;
+  onAnswer: (choice: "approve" | "deny") => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-t border-warning bg-surface-raised px-3 py-2">
+      <span className="min-w-0 flex-1 text-list text-foreground">{pending.summary}</span>
+      <Button
+        size="sm"
+        variant="subtle"
+        disabled={answered !== null}
+        onClick={() => onAnswer("deny")}
+      >
+        {answered === "deny" && (
+          <LoaderCircle size={11} strokeWidth={2} className="animate-spin" />
+        )}
+        Don&apos;t
+      </Button>
+      <Button
+        size="sm"
+        variant="default"
+        disabled={answered !== null}
+        onClick={() => onAnswer("approve")}
+      >
+        {answered === "approve" ? (
+          <LoaderCircle size={11} strokeWidth={2} className="animate-spin" />
+        ) : (
+          <Send size={11} strokeWidth={2} />
+        )}
+        Send it
+      </Button>
+    </div>
   );
 }
 
@@ -230,7 +296,24 @@ function StatusLabel({ session }: { session: AgentSession }) {
 }
 
 /** The removable line: `Re: Series A data room · added to context`. */
-function ContextChip({ sessionId, item }: { sessionId: string; item: ContextItem }) {
+function ContextChip({
+  sessionId,
+  item,
+  onError,
+}: {
+  sessionId: string;
+  item: ContextItem;
+  onError: (message: string) => void;
+}) {
+  /*
+   * The chip goes now, and comes back if the call is refused.
+   *
+   * It used to wait for a `context` event to arrive from Rust, so clicking the
+   * × on a chip did nothing you could see — and the `.catch(() => {})` on the
+   * end meant a refusal did nothing you could see either, permanently.
+   */
+  const [removed, setRemoved] = useState(false);
+  if (removed) return null;
   return (
     <span className="group flex h-5 items-center gap-1 rounded-[var(--radius)] border border-border bg-surface pl-1.5 pr-1 text-micro text-muted-foreground">
       <Paperclip size={9} strokeWidth={2} className="shrink-0 text-faint-foreground" />
@@ -239,7 +322,13 @@ function ContextChip({ sessionId, item }: { sessionId: string; item: ContextItem
       <button
         type="button"
         aria-label={`Remove ${item.label} from context`}
-        onClick={() => void removeContext(sessionId, item.id).catch(() => {})}
+        onClick={() => {
+          setRemoved(true);
+          void removeContext(sessionId, item.id).catch((e: unknown) => {
+            setRemoved(false);
+            onError(errorMessage(e));
+          });
+        }}
         className="rounded-[var(--radius)] p-0.5 text-faint-foreground opacity-0 hover:text-foreground group-hover:opacity-100"
       >
         <X size={9} strokeWidth={2} />

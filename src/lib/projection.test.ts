@@ -1,11 +1,19 @@
 import { describe, expect, it } from "vitest";
-import type { Thread } from "@/types";
+import type { CalendarEvent, Thread } from "@/types";
 import {
+  applyEventGuess,
+  applyEventGuesses,
   applyGuess,
+  isPendingEvent,
   leavesMailbox,
   leavingIds,
+  pendingEventId,
+  placeholderEvent,
   project,
+  projectEvent,
+  settledEventGuesses,
   settledGuesses,
+  settledPendingEvents,
   suppressedIds,
   type ThreadGuess,
 } from "./projection";
@@ -332,5 +340,186 @@ describe("what the rail's badge subtracts", () => {
 
   it("does not count a star", () => {
     expect([...suppressedIds({ 1: { add: ["STARRED"], remove: [] } }, "INBOX")]).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The calendar half                                                           */
+/* -------------------------------------------------------------------------- */
+
+const NOON = Date.UTC(2026, 0, 15, 12, 0, 0);
+
+function block(id: number, over: Partial<CalendarEvent> = {}): CalendarEvent {
+  return {
+    id,
+    calendarId: "primary",
+    accountId: 1,
+    title: `Event ${id}`,
+    start: NOON,
+    end: NOON + 3_600_000,
+    allDay: false,
+    attendees: [],
+    ...over,
+  };
+}
+
+describe("what a calendar command claims", () => {
+  it("claims the answer for an RSVP", () => {
+    expect(projectEvent({ kind: "rsvp", eventId: 3, response: "accepted" })).toEqual({
+      3: { patch: { rsvp: "accepted" } },
+    });
+  });
+
+  it("claims the fields an update sets, and only those", () => {
+    const guesses = projectEvent({
+      kind: "updateEvent",
+      eventId: 3,
+      patch: { startTs: 10, endTs: 20, isAllDay: false },
+    });
+    expect(guesses).toEqual({ 3: { patch: { start: 10, end: 20, allDay: false } } });
+  });
+
+  /*
+   * A Meet link is minted by Google and read back, and "who hears about it" is
+   * not a fact about the event at all. A patch carrying only those claims
+   * nothing, and claiming nothing has to be `null` rather than an empty guess —
+   * an empty one would be a guess that can never be wrong and never retires.
+   */
+  it("claims nothing for a patch that only asks for a Meet link", () => {
+    expect(
+      projectEvent({ kind: "updateEvent", eventId: 3, patch: { conferencing: "meet" } }),
+    ).toBeNull();
+  });
+
+  it("claims the event is gone for a delete", () => {
+    expect(projectEvent({ kind: "deleteEvent", eventId: 3 })).toEqual({ 3: { gone: true } });
+  });
+
+  it("re-points a move rather than claiming the event went away", () => {
+    expect(
+      projectEvent({ kind: "moveEvent", eventId: 3, accountId: 2, calendarId: "work" }),
+    ).toEqual({ 3: { patch: { calendarId: "work", accountId: 2 } } });
+  });
+
+  it("claims nothing for a create, which has no id yet", () => {
+    expect(
+      projectEvent({
+        kind: "createEvent",
+        accountId: 1,
+        calendarId: "primary",
+        draft: {
+          title: "Standup",
+          startTs: 1,
+          endTs: 2,
+          isAllDay: false,
+          attendees: [],
+          recurrence: [],
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("claims nothing for a mail command", () => {
+    expect(projectEvent({ kind: "archive", threadIds: [1] })).toBeNull();
+  });
+});
+
+describe("an event with a guess on it", () => {
+  it("keeps its identity when the guess changes nothing", () => {
+    const event = block(1, { rsvp: "accepted" });
+    expect(applyEventGuess(event, { patch: { rsvp: "accepted" } })).toBe(event);
+  });
+
+  it("answers for the signed-in guest as well as for the event", () => {
+    const event = block(1, {
+      rsvp: "needsAction",
+      guests: [
+        { email: "me@example.test", isSelf: true, response: "needsAction" },
+        { email: "them@example.test", response: "accepted" },
+      ],
+    });
+    const next = applyEventGuess(event, { patch: { rsvp: "declined" } });
+    expect(next.rsvp).toBe("declined");
+    expect(next.guests?.[0]?.response).toBe("declined");
+    // And says nothing about anyone else.
+    expect(next.guests?.[1]?.response).toBe("accepted");
+  });
+
+  it("is dropped from the grid when the guess says it is gone", () => {
+    const rows = applyEventGuesses([block(1), block(2)], { 1: { gone: true } }, []);
+    expect(rows.map((e) => e.id)).toEqual([2]);
+  });
+
+  it("passes the whole window through untouched when nothing is pending", () => {
+    const events = [block(1), block(2)];
+    expect(applyEventGuesses(events, {}, [])).toBe(events);
+  });
+});
+
+describe("retiring an event guess", () => {
+  it("retires when the store says the same thing", () => {
+    const events = [block(1, { rsvp: "accepted" })];
+    expect(settledEventGuesses(events, { 1: { patch: { rsvp: "accepted" } } })).toEqual([1]);
+  });
+
+  it("holds on while the store still disagrees", () => {
+    const events = [block(1, { rsvp: "needsAction" })];
+    expect(settledEventGuesses(events, { 1: { patch: { rsvp: "accepted" } } })).toEqual([]);
+  });
+
+  it("holds a delete while the row is still there", () => {
+    expect(settledEventGuesses([block(1)], { 1: { gone: true } })).toEqual([]);
+  });
+
+  it("retires a delete once the row has gone", () => {
+    expect(settledEventGuesses([block(2)], { 1: { gone: true } })).toEqual([1]);
+  });
+});
+
+describe("a block drawn for a create", () => {
+  it("carries the draft, under an id nothing on Google could have", () => {
+    const id = pendingEventId();
+    expect(isPendingEvent(id)).toBe(true);
+    const drawn = placeholderEvent(
+      {
+        kind: "createEvent",
+        accountId: 4,
+        calendarId: "work",
+        draft: {
+          title: "Standup",
+          startTs: NOON,
+          endTs: NOON + 900_000,
+          isAllDay: false,
+          attendees: [{ name: "Someone", email: "someone@example.test" }],
+          recurrence: [],
+        },
+      },
+      id,
+    );
+    expect(drawn).toMatchObject({
+      id,
+      calendarId: "work",
+      accountId: 4,
+      title: "Standup",
+      start: NOON,
+      end: NOON + 900_000,
+    });
+  });
+
+  it("retires on the exact row the command layer minted", () => {
+    const pending = [{ event: block(-1, { title: "Standup" }), realId: 42 }];
+    expect(settledPendingEvents([block(42, { title: "Renamed by Google" })], pending)).toEqual([-1]);
+  });
+
+  it("retires on the slot when the source could not name an id", () => {
+    const pending = [{ event: block(-1, { title: "Standup" }), realId: null }];
+    expect(settledPendingEvents([block(9, { title: "Standup" })], pending)).toEqual([-1]);
+    expect(settledPendingEvents([block(9, { title: "Something else" })], pending)).toEqual([]);
+  });
+
+  it("is not drawn beside the row it was standing in for", () => {
+    const pending = [{ event: block(-1, { title: "Standup" }), realId: 42 }];
+    const rows = applyEventGuesses([block(42, { title: "Standup" })], {}, pending);
+    expect(rows.map((e) => e.id)).toEqual([42]);
   });
 });

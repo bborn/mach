@@ -4,6 +4,7 @@ import {
   Copy,
   ExternalLink,
   Layers,
+  LoaderCircle,
   Lock,
   MapPin,
   Paperclip,
@@ -1050,6 +1051,14 @@ export function EventModal({
                 disabled={busy || Boolean(timeError)}
                 onClick={submit}
               >
+                {/* The panel deliberately stays up until the write lands — it is
+                    holding everything that was typed, and a refused save has to
+                    have somewhere to put the reason. That makes the button the
+                    only thing on screen that can say the press was heard, and a
+                    control that only greys out says it too quietly: a disabled
+                    Save and a Save you have not pressed look the same at a
+                    glance. */}
+                {busy && <LoaderCircle size={11} strokeWidth={1.75} className="animate-spin" />}
                 {event ? "Save" : "Create"}
                 <Kbd keys="mod+enter" className="border-none bg-transparent px-0" />
               </Button>
