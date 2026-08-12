@@ -27,6 +27,7 @@ import {
   popOutComposerHeight,
   togglePopOut,
 } from "./composer-layout";
+import { replyTarget } from "./thread-cursor";
 import { noteSent } from "@/lib/contacts";
 import { clockTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -353,8 +354,21 @@ export function ComposerDock() {
     });
   }, []);
 
+  /**
+   * Open a composer for this conversation.
+   *
+   * `replyToId` is the message being answered, when the reader picked one —
+   * the cursor in the reading pane, or the item chosen from a message's own
+   * menu. Without it the newest message is the parent, which is what the strip
+   * below has always meant.
+   *
+   * A half-written draft still wins over both. There is one composer per
+   * conversation (see [[openDraft]]), so "reply to the fourth message" cannot
+   * mean "throw away the reply you are in the middle of writing"; the draft
+   * that exists is opened instead, answering whatever it already answers.
+   */
   const open = useCallback(
-    (kind: DraftKind) => {
+    (kind: DraftKind, replyToId?: number | null) => {
       if (threadId === null) return;
       void (async () => {
         // A half-written reply wins over a freshly prepared one: reopening a
@@ -364,7 +378,7 @@ export function ComposerDock() {
           openDraft(signed(existing));
           return;
         }
-        const prepared = await prepareDraft(threadId, kind).catch((error: unknown) => {
+        const prepared = await prepareDraft(threadId, kind, replyToId).catch((error: unknown) => {
           actions.setStatus(errorMessage(error), "error");
           return null;
         });
@@ -457,12 +471,19 @@ export function ComposerDock() {
   // drawer, through `actions.openArtifact`.
   useEffect(() => {
     const onRequest = (event: Event) => {
-      const detail = (event as CustomEvent<{ kind?: string; to?: string; draftId?: string }>)
-        .detail;
+      const detail = (
+        event as CustomEvent<{
+          kind?: string;
+          to?: string;
+          draftId?: string;
+          /** The message being answered, when the sender picked one. */
+          replyToId?: number;
+        }>
+      ).detail;
       const kind = detail?.kind ?? "reply";
       if (kind === "draft" && detail?.draftId) resume(detail.draftId);
       else if (kind === "new") openNew(detail?.to);
-      else open(kind as DraftKind);
+      else open(kind as DraftKind, detail?.replyToId);
     };
     window.addEventListener("mach:compose", onRequest);
     return () => window.removeEventListener("mach:compose", onRequest);
@@ -853,6 +874,14 @@ export function ComposerDock() {
      * is: ⇥ deliberately steps between the rail and the list rather than into
      * a half-written message, so a caret that has left the composer — one click
      * in the list does it — could otherwise only be put back with the mouse.
+     *
+     * **Which message they answer** is `replyTarget()`: the one the keyboard is
+     * on in the reading pane, and otherwise none, which `prepare` reads as the
+     * newest in the thread. That is the whole of "reply from any point in a
+     * conversation" on this side — the verb did not change, only what it is
+     * aimed at. See `thread-cursor.ts` for why the cursor is focus rather than
+     * state, and note the order here: an open composer still wins, because
+     * there is one per conversation and it is holding text.
      */
     {
       keys: COMPOSER_KEYS.reply,
@@ -860,7 +889,7 @@ export function ComposerDock() {
       description: "Reply",
       priority: 5,
       when: () => active,
-      handler: () => (visible ? focusComposer() : open("reply")),
+      handler: () => (visible ? focusComposer() : open("reply", replyTarget())),
     },
     {
       keys: COMPOSER_KEYS.replyAll,
@@ -868,7 +897,7 @@ export function ComposerDock() {
       description: "Reply all",
       priority: 5,
       when: () => active,
-      handler: () => (visible ? focusComposer() : open("replyAll")),
+      handler: () => (visible ? focusComposer() : open("replyAll", replyTarget())),
     },
     {
       keys: COMPOSER_KEYS.forward,
@@ -876,7 +905,7 @@ export function ComposerDock() {
       description: "Forward",
       priority: 5,
       when: () => active,
-      handler: () => (visible ? focusComposer() : open("forward")),
+      handler: () => (visible ? focusComposer() : open("forward", replyTarget())),
     },
     {
       keys: COMPOSER_KEYS.undoSend,
