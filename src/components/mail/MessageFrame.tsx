@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   containWideContent,
+  discloseLinkTargets,
   externalUrl,
+  CLAIM_ATTR,
+  type AnchorCandidate,
   frameDocument,
   nextFrameHeight,
   openExternal,
@@ -175,6 +178,11 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
       });
     }
 
+    // Before anything is measured: a disclosure is an inline box and changes
+    // what fits. Once per document rather than per resize, since the answer
+    // does not depend on the layout.
+    discloseLinkTargets(anchorCandidates(doc));
+
     doc.addEventListener("click", interceptNavigation, true);
     doc.addEventListener("auxclick", interceptNavigation, true);
     doc.addEventListener("submit", preventDefault, true);
@@ -268,6 +276,38 @@ function wideCandidates(doc: Document): WideCandidate[] {
   const tables = Array.from(doc.querySelectorAll("table")).reverse();
   const topLevel = doc.body ? Array.from(doc.body.children) : [];
   return [...tables, ...topLevel].map((element) => candidate(element, doc));
+}
+
+/**
+ * Every link in the document, as something [`discloseLinkTargets`] can judge.
+ *
+ * The disclosure is a sibling of the anchor and not a child of it: inside, it
+ * would be part of what a click hits, and the sender's own CSS — which reaches
+ * descendants of their anchor — would be able to style it out of existence.
+ * Outside, the only rule that matches it is the frame stylesheet's.
+ *
+ * Invariant 6: the element is created and inserted, never written as markup.
+ * `textContent` on the host, so a host that somehow contained markup would be
+ * text either way.
+ */
+function anchorCandidates(doc: Document): AnchorCandidate[] {
+  return Array.from(doc.querySelectorAll("a[href]")).map((element) => ({
+    get text() {
+      return element.textContent ?? "";
+    },
+    get href() {
+      return element.getAttribute("href");
+    },
+    get disclosed() {
+      return element.nextElementSibling?.hasAttribute(CLAIM_ATTR) ?? false;
+    },
+    disclose(host: string) {
+      const chip = doc.createElement("span");
+      chip.setAttribute(CLAIM_ATTR, "");
+      chip.textContent = `→ ${host}`;
+      element.parentNode?.insertBefore(chip, element.nextSibling);
+    },
+  }));
 }
 
 function candidate(element: Element, doc: Document): WideCandidate {
