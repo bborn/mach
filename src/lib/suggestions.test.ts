@@ -3,14 +3,19 @@ import {
   AS_WRITTEN_RETENTION,
   MAX_KEYED_STANCES,
   SUGGESTION_KEYS,
+  capLabel,
   caretAfter,
   loadSuggestion,
   loadSuggestionStats,
   recordOutcome,
+  resumeLabel,
   retention,
   sendOutcome,
+  spendLabel,
   stanceHtml,
+  EMPTY_BUDGET,
   EMPTY_STATS,
+  type SuggestionBudget,
 } from "./suggestions";
 import { htmlToPlainText } from "./email-html";
 
@@ -120,6 +125,57 @@ describe("outside Tauri", () => {
     await expect(loadSuggestion(1)).resolves.toBeNull();
     await expect(loadSuggestionStats()).resolves.toEqual(EMPTY_STATS);
     expect(() => recordOutcome("picked", { stanceIndex: 0 })).not.toThrow();
+  });
+});
+
+describe("the budget, as the panel reads it", () => {
+  const budget = (over: Partial<SuggestionBudget> = {}): SuggestionBudget => ({
+    ...EMPTY_BUDGET,
+    hourLimit: 20,
+    dayLimit: 50,
+    spendLimitUsd: 2,
+    ...over,
+  });
+
+  it("says nothing while nothing is capped", () => {
+    // Reporting "within limits" every time preferences opens would be the
+    // software talking about itself.
+    expect(capLabel(budget({ dayCount: 12, hourCount: 3 }))).toBeNull();
+  });
+
+  it("names the limit that stopped it and when it lifts", () => {
+    const now = new Date("2026-08-13T09:00:00").getTime();
+    const resumesAt = new Date("2026-08-13T09:42:00").getTime();
+    expect(capLabel(budget({ cappedBy: "hour", resumesAt }), now)).toMatch(/^Hourly limit · paused until /);
+    expect(capLabel(budget({ cappedBy: "day", resumesAt }), now)).toMatch(/^Daily limit · paused until /);
+    expect(capLabel(budget({ cappedBy: "spend", resumesAt }), now)).toMatch(
+      /^Daily spend limit · paused until /,
+    );
+  });
+
+  it("says which day, because a rolling window can lift tomorrow", () => {
+    // A bare "09:12" on a cap that lifts tomorrow morning invites exactly the
+    // wrong reading, and the daily window is twenty-four hours wide.
+    const now = new Date("2026-08-13T22:00:00").getTime();
+    const today = new Date("2026-08-13T23:30:00").getTime();
+    const tomorrow = new Date("2026-08-14T09:12:00").getTime();
+    expect(resumeLabel(today, now)).not.toContain("tomorrow");
+    expect(resumeLabel(tomorrow, now)).toContain("tomorrow");
+  });
+
+  it("names the limit alone when waiting would not help", () => {
+    // A limit of zero has no window to roll.
+    expect(capLabel(budget({ cappedBy: "hour", hourLimit: 0, resumesAt: null }))).toBe(
+      "Hourly limit",
+    );
+  });
+
+  it("shows no spend at all when no price was ever reported", () => {
+    // The subscription path. "$0.00" next to a day that really spent quota
+    // would be a number the app made up.
+    expect(spendLabel(budget({ spendUsd: null }))).toBeNull();
+    expect(spendLabel(budget({ spendUsd: 0.24 }))).toBe("$0.24");
+    expect(spendLabel(budget({ spendUsd: 0 }))).toBe("$0.00");
   });
 });
 

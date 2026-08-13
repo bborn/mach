@@ -90,7 +90,38 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 18,
         sql: M18_BULK_HEADERS,
     },
+    Migration {
+        version: 19,
+        sql: M19_SUGGESTION_SPEND,
+    },
 ];
+
+/// Migration 19 — what each generation cost, so the cap has something to count.
+///
+/// # Why these columns hang off the outcome rows
+///
+/// The outcome table is already the feature's ledger: one row per thing that
+/// happened, with a timestamp and an index on `(kind, at_ms)`. A generation is
+/// a thing that happened, so it is a row here rather than a table of its own —
+/// and the window queries the cap runs are then the same shape as the queries
+/// the hit rate already runs.
+///
+/// `cost_usd` is nullable and that is the point. Which backend answered decides
+/// whether there is a figure at all: Claude Code reports `total_cost_usd` with
+/// the answer, and `/v1/messages` reports only tokens, which are dollars only
+/// when the credential is a key rather than a subscription bearer. Writing `0.0`
+/// where nobody reported anything would say "this was free", which is the
+/// opposite of true. NULL says "not known", the dollar cap skips those rows, and
+/// the count cap — which is the primary one — does not need them.
+///
+/// No index on `at_ms` alone: every window query filters on `kind` first, and
+/// `idx_reply_suggestion_outcomes_kind` already leads with it.
+const M19_SUGGESTION_SPEND: &str = r#"
+ALTER TABLE reply_suggestion_outcomes ADD COLUMN cost_usd      REAL;
+ALTER TABLE reply_suggestion_outcomes ADD COLUMN input_tokens  INTEGER;
+ALTER TABLE reply_suggestion_outcomes ADD COLUMN output_tokens INTEGER;
+ALTER TABLE reply_suggestion_outcomes ADD COLUMN model         TEXT NOT NULL DEFAULT '';
+"#;
 
 /// Migration 18 — the four headers that say "this is a mailing list, and here
 /// is how to leave it".

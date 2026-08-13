@@ -79,7 +79,7 @@ use tokio::process::{Child, Command};
 use crate::google::BoxFuture;
 
 use super::brain::{Brain, BrainIo};
-use super::complete::CompletionRequest;
+use super::complete::{usage_of, Completion, CompletionRequest, Cost};
 use super::error::AgentError;
 use super::mcp::{McpServer, SERVER_NAME};
 
@@ -471,7 +471,7 @@ pub async fn complete_once(
     workspace: &Path,
     model: &str,
     request: &CompletionRequest,
-) -> Result<String, AgentError> {
+) -> Result<Completion, AgentError> {
     tokio::fs::create_dir_all(workspace).await.map_err(|e| {
         AgentError::transport(format!(
             "Mach could not prepare {} for Claude Code: {e}",
@@ -531,8 +531,8 @@ pub async fn complete_once(
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    match one_shot_text(&stdout) {
-        Ok(text) => Ok(text),
+    match one_shot_completion(&stdout) {
+        Ok(completion) => Ok(completion),
         // A run that produced no readable result *and* exited badly failed to
         // launch — a model name it does not know, a broken install, an expired
         // login — and stderr is the only place that says which.
@@ -545,13 +545,25 @@ pub async fn complete_once(
     }
 }
 
-/// The answer out of `--output-format json`.
+/// The answer out of `--output-format json`, and what the CLI said it cost.
 ///
 /// One JSON document, in principle. In practice the CLI is allowed to print a
 /// diagnostic to stdout before it, so a failed whole-buffer parse falls back to
 /// reading the first complete value from the first `{` rather than giving up —
 /// the same tolerance [`ClaudeCliBrain::apply`] extends to the stream.
-pub fn one_shot_text(stdout: &str) -> Result<String, AgentError> {
+///
+/// # Where the dollars come from
+///
+/// `total_cost_usd` is on the result document, so this path does not price
+/// tokens against a table the way the API path has to — it reads the number the
+/// program that made the call arrived at. That is better data, because a table
+/// goes stale the week a price moves and this does not.
+///
+/// It is still an estimate rather than an invoice: on a Claude subscription the
+/// run draws down a quota and the figure is what the same tokens would have cost
+/// on the API. That is the honest thing to show — it is the CLI's own number,
+/// and nothing here makes one up.
+pub fn one_shot_completion(stdout: &str) -> Result<Completion, AgentError> {
     let Some(event) = result_document(stdout) else {
         return Err(AgentError::Protocol(
             "Claude Code produced no result document".to_string(),
@@ -564,11 +576,35 @@ pub fn one_shot_text(stdout: &str) -> Result<String, AgentError> {
         });
     }
     match event.get("result").and_then(Value::as_str) {
-        Some(text) => Ok(text.to_string()),
+        Some(text) => Ok(Completion {
+            text: text.to_string(),
+            cost: one_shot_cost(&event),
+        }),
         None => Err(AgentError::Protocol(
             "Claude Code's result carried no text".to_string(),
         )),
     }
+}
+
+/// What the CLI said the run cost.
+///
+/// A negative or non-numeric `total_cost_usd` is absent rather than clamped: an
+/// implausible figure is a version of the CLI this build does not understand,
+/// and the count limit is what protects the owner when that happens.
+pub fn one_shot_cost(event: &Value) -> Cost {
+    let usd = event
+        .get("total_cost_usd")
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0);
+    Cost {
+        usd,
+        ..Cost::of(&usage_of(event))
+    }
+}
+
+/// The text alone, for callers with nothing to charge it to.
+pub fn one_shot_text(stdout: &str) -> Result<String, AgentError> {
+    one_shot_completion(stdout).map(|completion| completion.text)
 }
 
 fn result_document(stdout: &str) -> Option<Value> {
@@ -597,6 +633,29 @@ mod tests {
             one_shot_text(body).unwrap(),
             r#"[{"label":"Yes","body":"Tuesday works."}]"#
         );
+    }
+
+    #[test]
+    fn the_cli_reports_its_own_price_and_this_reads_it() {
+        // The reason the API's price table is not the whole story: on the path
+        // this app actually runs, the number comes back with the answer.
+        let body = r#"{"type":"result","subtype":"success","is_error":false,
+                       "result":"[]","total_cost_usd":0.0193,
+                       "usage":{"input_tokens":2100,"output_tokens":380,
+                                "cache_read_input_tokens":1024}}"#;
+        let completion = one_shot_completion(body).unwrap();
+        assert_eq!(completion.cost.usd, Some(0.0193));
+        assert_eq!(completion.cost.input_tokens, Some(3124));
+        assert_eq!(completion.cost.output_tokens, Some(380));
+    }
+
+    #[test]
+    fn a_run_that_reported_no_price_reports_none_rather_than_free() {
+        let body = r#"{"type":"result","result":"ok"}"#;
+        assert_eq!(one_shot_completion(body).unwrap().cost, Cost::default());
+        // And a figure that cannot be true is the same as no figure.
+        let odd = r#"{"type":"result","result":"ok","total_cost_usd":-1}"#;
+        assert_eq!(one_shot_completion(odd).unwrap().cost.usd, None);
     }
 
     #[test]

@@ -60,10 +60,15 @@ static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 ///
 /// Returns the stub, so a test can read back exactly how it was invoked.
 fn no_key_and_a_claude(reply: &str) -> Stub {
+    with_claude(Stub::new(reply))
+}
+
+/// The same, with a stub already built — for the tests that need a document
+/// this one would not write.
+fn with_claude(stub: Stub) -> Stub {
     std::env::remove_var(ENV_API_KEY);
     std::env::remove_var(ENV_AUTH_TOKEN);
 
-    let stub = Stub::new(reply);
     std::env::set_var(ENV_CLAUDE_BIN, &stub.exe);
 
     let available = Availability::probe();
@@ -99,6 +104,21 @@ impl Stub {
                 "subtype": "success",
                 "is_error": false,
                 "result": reply,
+            })
+            .to_string(),
+        )
+    }
+
+    /// A run that reports what it cost, the way the real CLI does.
+    fn costing(reply: &str, usd: f64, input: i64, output: i64) -> Stub {
+        Stub::with_document(
+            &json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "result": reply,
+                "total_cost_usd": usd,
+                "usage": { "input_tokens": input, "output_tokens": output },
             })
             .to_string(),
         )
@@ -525,4 +545,60 @@ async fn the_api_stays_available_when_it_is_the_one_that_was_asked_for() {
         "the explicitly chosen API backend was not the one used"
     );
     assert!(!stub.ran(), "Claude Code answered a request meant for the API");
+}
+
+/// What the run cost, on the path he is actually on.
+///
+/// The API path prices tokens against a table; this one does not have to. Claude
+/// Code reports `total_cost_usd` with the answer, so the figure in the ledger is
+/// the one the program that made the call arrived at, and a table going stale
+/// cannot make it wrong.
+#[tokio::test]
+async fn the_cli_s_own_price_is_what_reaches_the_ledger() {
+    let _guard = ENV.lock().await;
+    let stub = with_claude(Stub::costing(
+        &json!([{ "label": "Yes", "body": "Tuesday works." }]).to_string(),
+        0.0193,
+        2_100,
+        380,
+    ));
+
+    let (_temp, db, account_id) = seeded();
+    fire(&db, brain(Arc::new(Poisoned::default())), account_id);
+    settle_until(|| written(&db)).await;
+    assert!(stub.ran(), "Claude Code was never asked");
+
+    let (model, cost, input, output) = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT model, cost_usd, input_tokens, output_tokens
+                   FROM reply_suggestion_outcomes WHERE kind = 'generated'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<f64>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )?)
+        })
+        .expect("a completed CLI run must leave a generation row");
+
+    assert_eq!(cost, Some(0.0193), "the CLI's own figure did not reach the row");
+    assert_eq!(input, Some(2_100));
+    assert_eq!(output, Some(380));
+    assert_eq!(model, suggest::DEFAULT_MODEL);
+
+    // And the same figure is what the cap counts and the panel reads. The row
+    // was stamped off the wall clock, so the window has to be read against it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let budget = db.read(move |conn| suggest::budget::state(conn, now)).expect("budget");
+    assert_eq!(budget.day_count, 1);
+    assert_eq!(budget.day_priced, 1, "the CLI path is a priced path");
+    assert!((budget.day_spend_usd - 0.0193).abs() < 1e-9);
 }

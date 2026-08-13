@@ -25,7 +25,9 @@ import {
 import {
   EMPTY_STATS,
   WORTH_IT_RATE,
+  capLabel,
   loadSuggestionStats,
+  spendLabel,
   type SuggestionStats,
 } from "@/lib/suggestions";
 import { errorMessage } from "@/lib/ipc";
@@ -1191,7 +1193,7 @@ function AgentSettings({
               onChange={(event) => set("replySuggestionModel", event.target.value)}
             />
           </Field>
-          <SuggestionHitRate />
+          <SuggestionUsage />
         </>
       )}
     </>
@@ -1199,17 +1201,18 @@ function AgentSettings({
 }
 
 /**
- * How many of the written replies he actually sends.
+ * What it writes, what he sends, and what it has spent doing it.
  *
- * The one number that decides whether this feature is worth its cost, and the
- * only place it exists. It is here rather than nowhere because the alternative
- * is trusting an impression — and the impression of a feature that writes for
- * you is always better than the measurement.
+ * Two rows, read together. The rate is the one number that decides whether the
+ * feature is worth its cost; the budget row is what it cost, and — the reason
+ * it is here at all — the only place that says so when the cap has stopped
+ * writing replies. A feature that quietly stops is the specific failure this
+ * project has paid the most for, and a cap is a way to stop quietly.
  *
- * Absent until something has been suggested: a rate with no denominator is a
- * shape on screen that says nothing.
+ * Both rows are absent until there is something to say. A rate with no
+ * denominator and a count of nothing are shapes on screen that say nothing.
  */
-function SuggestionHitRate() {
+function SuggestionUsage() {
   const [stats, setStats] = useState<SuggestionStats>(EMPTY_STATS);
 
   useEffect(() => {
@@ -1222,21 +1225,46 @@ function SuggestionHitRate() {
     };
   }, []);
 
-  if (stats.asWrittenRate === null) return null;
-  const percent = Math.round(stats.asWrittenRate * 100);
-  const thin = stats.asWrittenRate < WORTH_IT_RATE;
+  const { budget } = stats;
+  const percent = stats.asWrittenRate === null ? null : Math.round(stats.asWrittenRate * 100);
+  const thin = stats.asWrittenRate !== null && stats.asWrittenRate < WORTH_IT_RATE;
+  const capped = capLabel(budget);
+  const spend = spendLabel(budget);
+  const showBudget = budget.dayLimit > 0 && (budget.dayCount > 0 || capped !== null);
 
   return (
-    <Field orientation="row">
-      <FieldLabel>Sent as written</FieldLabel>
-      <div className={cn("text-list tabular-nums", thin ? "text-danger" : "text-foreground")}>
-        {percent}%
-      </div>
-      <FieldDescription>
-        {stats.sentAsWritten} of {stats.suggested} written · {stats.picked} opened ·{" "}
-        {stats.sentEdited} rewritten · {stats.dismissed} declined
-      </FieldDescription>
-    </Field>
+    <>
+      {percent !== null && (
+        <Field orientation="row">
+          <FieldLabel>Sent as written</FieldLabel>
+          <div className={cn("text-list tabular-nums", thin ? "text-danger" : "text-foreground")}>
+            {percent}%
+          </div>
+          <FieldDescription>
+            {stats.sentAsWritten} of {stats.suggested} written · {stats.picked} opened ·{" "}
+            {stats.sentEdited} rewritten · {stats.dismissed} declined
+          </FieldDescription>
+        </Field>
+      )}
+
+      {showBudget && (
+        <Field orientation="row">
+          <FieldLabel>Last 24 hours</FieldLabel>
+          <div className={cn("text-list tabular-nums", capped ? "text-danger" : "text-foreground")}>
+            {budget.dayCount} of {budget.dayLimit}
+          </div>
+          <FieldDescription>
+            {capped ? (
+              <span className="text-danger">{capped}</span>
+            ) : (
+              [`${budget.hourCount} of ${budget.hourLimit} in the last hour`, spend]
+                .filter(Boolean)
+                .join(" · ")
+            )}
+          </FieldDescription>
+        </Field>
+      )}
+    </>
   );
 }
 

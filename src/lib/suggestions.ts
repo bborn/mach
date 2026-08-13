@@ -51,7 +51,39 @@ export type SuggestionOutcome =
   | "sentEdited"
   | "dismissed";
 
+/** Which limit stopped it. Mirrors `suggest::budget::Capped` in Rust. */
+export type SuggestionCap = "hour" | "day" | "spend";
+
+/**
+ * What the agent has generated lately, against what it is allowed.
+ *
+ * Both windows roll — "the last hour", not "since the hour struck" — so
+ * `resumesAt` is an exact instant rather than the top of something.
+ */
+export interface SuggestionBudget {
+  hourCount: number;
+  hourLimit: number;
+  dayCount: number;
+  dayLimit: number;
+  /**
+   * Dollars over the last day, or `null` when nothing reported a price.
+   *
+   * `null` is the normal case on a Claude subscription: the tokens are real and
+   * they draw down a quota, but no invoice exists for them, so a figure here
+   * would be one Rust made up. The count limits are what protect that path.
+   */
+  spendUsd: number | null;
+  spendLimitUsd: number;
+  /** Which limit is currently refusing, or `null`. */
+  cappedBy: SuggestionCap | null;
+  /** When the cap lifts, epoch ms, or `null` when nothing is capped. */
+  resumesAt: number | null;
+}
+
 export interface SuggestionStats {
+  /** Model calls made — always at least `suggested`, because a call that came
+   *  back with nothing usable still spent its tokens. */
+  generated: number;
   suggested: number;
   picked: number;
   sentAsWritten: number;
@@ -61,9 +93,22 @@ export interface SuggestionStats {
    *  is a denominator. */
   asWrittenRate: number | null;
   winningLabels: { label: string; count: number }[];
+  budget: SuggestionBudget;
 }
 
+export const EMPTY_BUDGET: SuggestionBudget = {
+  hourCount: 0,
+  hourLimit: 0,
+  dayCount: 0,
+  dayLimit: 0,
+  spendUsd: null,
+  spendLimitUsd: 0,
+  cappedBy: null,
+  resumesAt: null,
+};
+
 export const EMPTY_STATS: SuggestionStats = {
+  generated: 0,
   suggested: 0,
   picked: 0,
   sentAsWritten: 0,
@@ -71,6 +116,7 @@ export const EMPTY_STATS: SuggestionStats = {
   dismissed: 0,
   asWrittenRate: null,
   winningLabels: [],
+  budget: EMPTY_BUDGET,
 };
 
 /**
@@ -138,7 +184,59 @@ export function recordOutcome(
 
 export async function loadSuggestionStats(): Promise<SuggestionStats> {
   if (!isTauri()) return EMPTY_STATS;
-  return await call<SuggestionStats>("reply_suggestion_stats", {}).catch(() => EMPTY_STATS);
+  const stats = await call<SuggestionStats>("reply_suggestion_stats", {}).catch(() => null);
+  if (!stats) return EMPTY_STATS;
+  // A payload from a build that predates the budget still has a hit rate worth
+  // showing; missing spend is missing, not zero.
+  return { ...EMPTY_STATS, ...stats, budget: { ...EMPTY_BUDGET, ...stats.budget } };
+}
+
+/* -------------------------------------------------------------------------- */
+/* The budget, as words                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * When the cap lifts, short enough for a field description.
+ *
+ * The daily window rolls, so "until 09:12" can mean tomorrow — which is exactly
+ * the reading a bare time invites and exactly the wrong one. The day is named
+ * whenever it is not today.
+ */
+export function resumeLabel(resumesAt: number, now: number = Date.now()): string {
+  const at = new Date(resumesAt);
+  // `numeric` rather than `2-digit`: a zero-padded "04:58 PM" reads like a
+  // duration or a timestamp, and this is a time somebody glances at.
+  const time = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const midnight = new Date(now);
+  midnight.setHours(24, 0, 0, 0);
+  return resumesAt < midnight.getTime() ? time : `${time} tomorrow`;
+}
+
+/**
+ * The one line the panel shows when nothing is being written, and why.
+ *
+ * `null` when nothing is capped — there is no state to report, and reporting
+ * "within limits" every time somebody opens preferences would be the software
+ * talking about itself.
+ */
+export function capLabel(budget: SuggestionBudget, now: number = Date.now()): string | null {
+  const which =
+    budget.cappedBy === "hour"
+      ? "Hourly limit"
+      : budget.cappedBy === "day"
+        ? "Daily limit"
+        : budget.cappedBy === "spend"
+          ? "Daily spend limit"
+          : null;
+  if (!which) return null;
+  return budget.resumesAt === null
+    ? which
+    : `${which} · paused until ${resumeLabel(budget.resumesAt, now)}`;
+}
+
+/** Spend so far today, or nothing at all when no price was ever reported. */
+export function spendLabel(budget: SuggestionBudget): string | null {
+  return budget.spendUsd === null ? null : `$${budget.spendUsd.toFixed(2)}`;
 }
 
 /* -------------------------------------------------------------------------- */

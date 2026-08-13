@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | `reply_suggestions` | `threadId` | `{ stances, messageId, model }` or `null` |
 //! | `reply_suggestion_record` | `kind`, `stanceIndex?`, `stanceLabel?` | `{ ok }` |
-//! | `reply_suggestion_stats` | — | counters, the rate, and the winning labels |
+//! | `reply_suggestion_stats` | — | counters, the rate, the winning labels, and the budget |
 //!
 //! Three reads and one tiny write, all local. There is deliberately no command
 //! that *generates*: generation is the sync loop's, off the arrival of a
@@ -18,7 +18,7 @@
 use serde_json::{json, Value};
 use tauri::State;
 
-use crate::suggest::{store, Outcome};
+use crate::suggest::{budget, store, Outcome};
 
 use super::error::IpcError;
 use super::state::AppState;
@@ -84,16 +84,25 @@ pub async fn reply_suggestion_record(
     Ok(json!({ "ok": true }))
 }
 
-/// How the feature is doing. Local, and the only place the answer exists.
+/// How the feature is doing, and what it has spent. Local, and the only place
+/// either answer exists.
+///
+/// The budget rides along with the hit rate because they are read together and
+/// by the same panel: "is this worth its cost" and "what has it cost" are one
+/// question asked twice. `spendUsd` is `null` on the subscription path, where
+/// the tokens are real and the dollars are not — see [`crate::suggest::price`].
 #[tauri::command]
 pub async fn reply_suggestion_stats(state: State<'_, AppState>) -> Result<Value, IpcError> {
-    let (counters, labels) = state.db.read(|conn| {
+    let now = crate::suggest::now_ms();
+    let (counters, labels, budget) = state.db.read(move |conn| {
         let counters = store::counters(conn)?;
         let labels = store::winning_labels(conn, 5)?;
-        Ok((counters, labels))
+        let budget = budget::state(conn, now)?;
+        Ok((counters, labels, budget))
     })?;
 
     Ok(json!({
+        "generated": counters.generated,
         "suggested": counters.suggested,
         "picked": counters.picked,
         "sentAsWritten": counters.sent_as_written,
@@ -104,5 +113,17 @@ pub async fn reply_suggestion_stats(state: State<'_, AppState>) -> Result<Value,
             .into_iter()
             .map(|(label, count)| json!({ "label": label, "count": count }))
             .collect::<Vec<_>>(),
+        "budget": {
+            "hourCount": budget.hour_count,
+            "hourLimit": budget.limits.per_hour,
+            "dayCount": budget.day_count,
+            "dayLimit": budget.limits.per_day,
+            // Absent rather than zero when nothing reported a price. Zero would
+            // draw "$0.00" next to a day that spent a real amount of quota.
+            "spendUsd": (budget.day_priced > 0).then_some(budget.day_spend_usd),
+            "spendLimitUsd": budget.limits.usd_per_day,
+            "cappedBy": budget.capped().map(|c| c.as_str()),
+            "resumesAt": budget.resumes_at(),
+        },
     }))
 }

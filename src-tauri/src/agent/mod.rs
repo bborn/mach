@@ -35,6 +35,7 @@
 //! | [`config`] | `ANTHROPIC_API_KEY`, model, effort |
 //! | [`wire`] | the Messages API: request, SSE decoding, turn accumulation |
 //! | [`complete`] | one-shot, tool-less, unstreamed completions — the ghost text |
+//! | [`price`] | list prices, for the one path that reports tokens and not money |
 //! | [`tools`] | [`Command::catalogue`](crate::commands::Command::catalogue) → tool definitions, and execution |
 //! | [`plugin_tools`] | plugin actions → tools, attributed, with the approval policy they inherit |
 //! | [`context`] | what "this" means, and the system prompt |
@@ -74,6 +75,7 @@ pub mod error;
 pub mod gate;
 pub mod mcp;
 pub mod plugin_tools;
+pub mod price;
 pub mod session;
 pub mod tools;
 pub mod wire;

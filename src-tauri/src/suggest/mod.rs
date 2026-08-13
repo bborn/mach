@@ -4,14 +4,20 @@
 //!   sync::mail::incremental ──► suggest::plan ──► rule::earns_a_suggestion
 //!    (only on an already-      (one transaction)         │
 //!     synced account)                                    ▼
+//!                                              budget::state  ──► capped? say so
+//!                                              (the hour, the day)      │
+//!                                                        │              └─► log · ⌘,
+//!                                                        ▼
 //!                                              voice::examples  (his Sent mail, FTS5)
 //!                                                        │
 //!                                                        ▼
 //!                                              prompt + agent::Completer
 //!                                                (one call, a cheap model)
 //!                                                        │
-//!                                                        ▼
-//!                                              store::save  ──►  SQLite, and nowhere else
+//!                                                        ├─► store::save
+//!                                                        │     (SQLite, and nowhere else)
+//!                                                        └─► store::record_generation
+//!                                                              (tokens, and dollars if reported)
 //!
 //!   opening a thread ──► ipc::suggest ──► store::fresh_for_thread ──► the stance row
 //! ```
@@ -65,11 +71,31 @@
 //!
 //! One call per qualifying message, on Sonnet or Haiku — see [`model`]. Never
 //! Opus: this runs against every human message addressed to him, unattended, and
-//! the default must not be the expensive one. Bounded by [`MAX_PER_PASS`] and by
-//! the rule that a message is planned only once ever, and switched off entirely
-//! by the preference — which means *nothing generates* rather than *nothing
-//! displays*.
+//! the default must not be the expensive one.
+//!
+//! Four things bound it, and only the last of them bounds the *total*:
+//!
+//! | bound | what it stops |
+//! |---|---|
+//! | the preference | everything — off means nothing generates, not nothing displays |
+//! | [`rule::earns_a_suggestion`] | list mail, robots, and anything not addressed to him |
+//! | [`MAX_PER_PASS`] | a weekend's backlog going out in one burst |
+//! | [`budget`] | the total, per rolling hour and per rolling day |
+//!
+//! The first three were the whole story for a while, and they let a flood
+//! through: four a pass against a sixty-second poll is four a minute for as long
+//! as qualifying mail keeps arriving. [`budget`] is the cap on that, counted in
+//! generations because what runs out on the path this app actually takes is a
+//! subscription quota rather than money, and in dollars as well wherever dollars
+//! were reported.
+//!
+//! What each call cost is recorded — [`store::record_generation`], one row per
+//! completed call — because a cap you cannot see the approach of is a cap that
+//! surprises you. The figure comes from whichever backend answered:
+//! `total_cost_usd` off Claude Code's own result document, or the API's token
+//! counts against [`crate::ipc::agent::engine::price`].
 
+pub mod budget;
 pub mod prompt;
 pub mod rule;
 pub mod store;
@@ -77,22 +103,24 @@ pub mod voice;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use rusqlite::Connection;
 
 use crate::ipc::agent::engine::backend::{self, Availability, BackendPrefs};
 use crate::ipc::agent::engine::complete::{
-    completer_for, Completer, CompletionRequest, MAX_STRUCTURED_TOKENS,
+    completer_for, Completer, CompletionRequest, Cost, MAX_STRUCTURED_TOKENS,
 };
 use crate::ipc::agent::engine::wire::ModelTransport;
 use crate::db::{queries, sync_queries, Db, Result as DbResult};
 use crate::google::types as g;
 use crate::ipc::prefs;
 
+pub use budget::{Budget, Capped, Limits};
 pub use prompt::Stance;
 pub use rule::{earns_a_suggestion, Candidate, Decline};
-pub use store::{Counters, Outcome, Suggestion};
+pub use store::{Counters, Generation, Outcome, Suggestion};
 
 /// Everything an engine needs before it may write a reply suggestion.
 ///
@@ -146,11 +174,15 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
 /// suggested; there is no queue, because a queue would eventually drain into the
 /// same bill.
 ///
-/// This and the once-per-message rule in [`plan`] are the *whole* spend bound,
-/// and between them they are enough. A message is planned only while no row
-/// names it, so a forced sync pressed twenty times in a minute costs nothing
-/// after the first — which is what a wall-clock throttle would have been for,
-/// and it would have been a second answer to a question already answered.
+/// This and the once-per-message rule in [`plan`] bound one *pass*. They do not
+/// bound the total, and for a while this comment claimed they did.
+///
+/// Four a pass against a sixty-second poll is four a minute, sustained, for as
+/// long as qualifying mail keeps arriving — a few hundred generations from one
+/// bounce loop or one afternoon of somebody signing his address up to things.
+/// [`budget`] is the bound on the total; this stays because it is still the
+/// right shape for one pass, keeping a weekend's backlog from going out in a
+/// single burst even when the day's allowance would have covered it.
 ///
 /// Four still holds now that a generation can be a *process* rather than an
 /// HTTP request, but the reasoning changed and one thing had to be added. Four
@@ -253,24 +285,69 @@ pub struct Job {
     pub incoming: String,
 }
 
+/// What a pass decided to do, and what stopped it doing more.
+///
+/// A bare `Vec<Job>` cannot say the difference between "no mail earned one" and
+/// "mail earned one and the budget refused" — and those are the two states this
+/// feature must never confuse again. The whole reason it is a struct is so the
+/// second one reaches a log line and a preferences panel instead of looking
+/// exactly like a quiet morning.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    pub jobs: Vec<Job>,
+    /// Which limit refused, if one did. Set whenever a message earned a
+    /// suggestion and the budget would not pay for it — not merely whenever the
+    /// budget is exhausted, because a full budget on a day with no qualifying
+    /// mail has cost him nothing.
+    pub capped: Option<Capped>,
+    /// The budget as it stood when the pass was planned.
+    pub budget: Budget,
+}
+
 /// Which of a sweep's arrivals deserve a reply written for them.
 ///
 /// One read transaction, and the whole decision: the preference, the rule, the
-/// dedup, and the throttle. Split out from [`consider`] for the same reason
-/// [`crate::notify::plan`] is — it takes a connection and returns a value, with
-/// no network and no globals anywhere near it.
+/// dedup, the per-pass throttle, and the budget. Split out from [`consider`] for
+/// the same reason [`crate::notify::plan`] is — it takes a connection and
+/// returns a value, with no network and no globals anywhere near it.
+///
+/// # What happens to a message the cap skipped
+///
+/// Nothing. It is passed over and never reconsidered: no row names it, but the
+/// next pass's `arrived` list is the next pass's arrivals, so it is simply gone.
+///
+/// That is the intended behaviour rather than an omission. A queue would drain
+/// into the same spend an hour later, which is the thing the cap exists to
+/// prevent — and by then most of what it held would be stale anyway, because
+/// [`store::fresh_for_thread`] only shows a suggestion while it still answers
+/// the newest message in its conversation. The mail that loses a suggestion is
+/// the twenty-first in an hour, on a day busier than any he has had; the mail
+/// from a person he works with is the first few, and they are paid for.
 pub fn plan(
     conn: &Connection,
     account_id: i64,
     arrived: &[String],
     headers: &HashMap<String, Headers>,
-) -> DbResult<Vec<Job>> {
+    now_ms: i64,
+) -> DbResult<Plan> {
+    let budget = budget::state(conn, now_ms)?;
+    let empty = |budget: Budget| Plan {
+        jobs: Vec::new(),
+        capped: None,
+        budget,
+    };
+
     if arrived.is_empty() || !enabled(conn)? {
-        return Ok(Vec::new());
+        return Ok(empty(budget));
     }
     let Some((owner_name, owner_email)) = account(conn, account_id)? else {
-        return Ok(Vec::new());
+        return Ok(empty(budget));
     };
+
+    // The pass's ceiling is the tighter of the two: what one pass may do, and
+    // what the day and the hour have left.
+    let allowance = budget.allowance().min(MAX_PER_PASS);
+    let mut capped = None;
 
     let mut jobs = Vec::new();
     for gmail_message_id in arrived {
@@ -310,6 +387,14 @@ pub fn plan(
             continue;
         }
 
+        // It earned one. Whether it gets one is now a question of budget, and
+        // this is the only place that can tell the difference between "no mail
+        // deserved an answer" and "mail deserved an answer and was refused".
+        if jobs.len() >= allowance {
+            capped = budget.binding_at(jobs.len());
+            break;
+        }
+
         let conversation = conversation(conn, message.thread_id)?;
 
         jobs.push(Job {
@@ -329,7 +414,11 @@ pub fn plan(
             ),
         });
     }
-    Ok(jobs)
+    Ok(Plan {
+        jobs,
+        capped,
+        budget,
+    })
 }
 
 /// Write the stances for one job.
@@ -343,6 +432,9 @@ pub fn plan(
 /// that never earned any. But there is now an error *line*. A feature that is
 /// switched on, doing nothing, and saying nothing is the state this whole
 /// module spent its first day in.
+///
+/// A model that answers with nothing usable writes no suggestion row and still
+/// writes a *generation* row, because it still spent the call.
 pub async fn generate(
     db: &Db,
     completer: &dyn Completer,
@@ -371,8 +463,33 @@ pub async fn generate(
         MAX_STRUCTURED_TOKENS,
     );
 
-    let text = match completer.complete(model_id, &request).await {
-        Ok(text) => text,
+    let outcome = completer.complete(model_id, &request).await;
+
+    // Recorded before anything is decided about the answer, and recorded on the
+    // error path too. A request that reached the model and came back a 500 has
+    // spent whatever it spent; a ledger that only counted the useful calls would
+    // be exactly wrong about the afternoon a model was having trouble, which is
+    // the afternoon the cap most needs to work.
+    //
+    // A failure carries no figures — the error is a sentence, not a document —
+    // so those rows count against the call limit and not the dollar one. The
+    // count limit being the primary one is what makes that survivable.
+    let cost = match &outcome {
+        Ok(completion) => completion.cost,
+        Err(_) => Cost::default(),
+    };
+    let _ = db.write_background({
+        let generation = Generation {
+            model: model_id.to_string(),
+            cost_usd: cost.usd,
+            input_tokens: cost.input_tokens,
+            output_tokens: cost.output_tokens,
+        };
+        move |conn| store::record_generation(conn, &generation, now_ms)
+    });
+
+    let text = match outcome {
+        Ok(completion) => completion.text,
         Err(error) => {
             eprintln!(
                 "reply suggestions: {} could not write a reply on {model_id} — {error}",
@@ -434,10 +551,11 @@ pub fn consider(
     let db = db.clone();
 
     tokio::spawn(async move {
-        let Ok(jobs) = db.read(|conn| plan(conn, account_id, &arrived, &headers)) else {
+        let Ok(plan) = db.read(|conn| plan(conn, account_id, &arrived, &headers, now_ms())) else {
             return;
         };
-        if jobs.is_empty() {
+        announce_cap(&plan);
+        if plan.jobs.is_empty() {
             return;
         }
         let completer = match resolve_completer(&db, brain) {
@@ -448,7 +566,7 @@ pub fn consider(
             Err(error) => {
                 eprintln!(
                     "reply suggestions: {} message(s) went unanswered — {error}",
-                    jobs.len()
+                    plan.jobs.len()
                 );
                 return;
             }
@@ -459,13 +577,106 @@ pub fn consider(
 
         // Held for the whole pass rather than per job — see [`GENERATING`].
         let _permit = GENERATING.acquire().await;
-        for job in jobs {
-            generate(&db, completer.as_ref(), &model_id, &job, now_ms()).await;
+        for job in plan.jobs {
+            // Re-read between generations rather than trusting the plan's
+            // allowance all the way through. Two accounts syncing in the same
+            // tick are two `consider` tasks, each of which planned against a
+            // budget the other was about to spend; and the permit above means a
+            // pass can sit waiting while another one spends the hour. One
+            // indexed count per generation closes both of those to a single call
+            // of overrun instead of a whole pass.
+            let now = now_ms();
+            match db.read(move |conn| budget::state(conn, now)) {
+                Ok(budget) => {
+                    if let Some(capped) = budget.capped() {
+                        announce_cap(&Plan {
+                            jobs: Vec::new(),
+                            capped: Some(capped),
+                            budget,
+                        });
+                        break;
+                    }
+                }
+                // An unreadable ledger is not a licence to keep spending.
+                Err(_) => break,
+            }
+            generate(&db, completer.as_ref(), &model_id, &job, now).await;
         }
         // Cheap, and it is the only place that runs often enough to be worth
         // hanging the housekeeping on.
         let _ = db.write_background(|conn| store::purge_stale(conn));
     });
+}
+
+/// The last cap window this process has already complained about.
+///
+/// A flood is thousands of messages, and a log line per message would bury the
+/// one fact worth reading under the evidence for it. Keyed on when the cap lifts
+/// — which is a different instant for each window — so the *next* time it
+/// engages says so again, and the same hour does not.
+static ANNOUNCED_CAP_UNTIL: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Say, once per window, that mail is going unanswered and why.
+///
+/// This feature has form: it spent a day doing nothing because a failure went
+/// into a discarded `Result`, and a cap that engages silently would be the same
+/// mistake with a different cause. The preferences panel carries the standing
+/// state; this is for the case where nobody is looking at preferences, which is
+/// almost always.
+fn announce_cap(plan: &Plan) {
+    let Some(notice) = cap_notice(plan) else {
+        return;
+    };
+    // The dedup is here rather than in `cap_notice` so that what gets said and
+    // how often it gets said are two things, each testable on its own.
+    let Some(until) = plan.budget.resumes_at() else {
+        return;
+    };
+    if ANNOUNCED_CAP_UNTIL.swap(until, Ordering::Relaxed) == until {
+        return;
+    }
+    eprintln!("{notice}");
+}
+
+/// The line, or `None` when there is nothing to say.
+///
+/// Nothing to say covers two cases: no message was refused, and the limit is
+/// zero — which is somebody having switched the feature off by another name, and
+/// not news every hour for the rest of time.
+fn cap_notice(plan: &Plan) -> Option<String> {
+    let capped = plan.capped?;
+    let until = plan.budget.resumes_at()?;
+    let budget = &plan.budget;
+
+    let (used, limit, window) = match capped {
+        Capped::Hour => (budget.hour_count, budget.limits.per_hour, "hour"),
+        Capped::Day | Capped::Spend => (budget.day_count, budget.limits.per_day, "day"),
+    };
+    let spend = match capped {
+        Capped::Spend => format!(
+            " (${:.2} of ${:.2})",
+            budget.day_spend_usd, budget.limits.usd_per_day
+        ),
+        _ => String::new(),
+    };
+    Some(format!(
+        "mach: reply suggestions paused — {used} of {limit} in the last {window}{spend}. \
+         Mail arriving until {} gets none.",
+        stamp(until)
+    ))
+}
+
+/// A wall-clock time for a log line, in whatever the machine's zone is.
+///
+/// `chrono` is already a dependency; this is the only place in this module that
+/// needs a human-readable instant, and a raw epoch millisecond in a log line is
+/// a number somebody has to go and convert.
+fn stamp(ms: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_millis_opt(ms).single() {
+        Some(t) => t.format("%H:%M").to_string(),
+        None => ms.to_string(),
+    }
 }
 
 /// Which brain writes the replies, resolved exactly as ⌘K resolves it.
@@ -649,6 +860,93 @@ mod tests {
         let clipped = clip(body, 500);
         assert!(clipped.contains("My actual answer"));
         assert!(!clipped.contains("their earlier question"));
+    }
+
+    /// A budget read off a store holding `n` generations, each costing `cost`.
+    fn spent(n: usize, cost: Option<f64>) -> Budget {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::migrate(&mut conn).unwrap();
+        for _ in 0..n {
+            store::record_generation(
+                &conn,
+                &Generation {
+                    model: "claude-sonnet-5".into(),
+                    cost_usd: cost,
+                    input_tokens: Some(2_000),
+                    output_tokens: Some(400),
+                },
+                1_000,
+            )
+            .unwrap();
+        }
+        budget::state_with(&conn, Limits::default(), 2_000).unwrap()
+    }
+
+    #[test]
+    fn a_cap_that_refused_mail_produces_a_line() {
+        // The whole point: this must not be a thing that happens quietly.
+        let budget = spent(budget::MAX_PER_HOUR, Some(0.02));
+        assert_eq!(budget.capped(), Some(Capped::Hour));
+
+        let notice = cap_notice(&Plan {
+            jobs: Vec::new(),
+            capped: Some(Capped::Hour),
+            budget,
+        })
+        .expect("a refusal must say so");
+        assert!(notice.contains("paused"), "{notice}");
+        assert!(
+            notice.contains(&format!("{n} of {n}", n = budget::MAX_PER_HOUR)),
+            "{notice}"
+        );
+        assert!(notice.contains("hour"), "{notice}");
+        assert!(
+            !notice.contains('$'),
+            "a count cap has no money to report: {notice}"
+        );
+    }
+
+    #[test]
+    fn nothing_refused_says_nothing() {
+        let plan = Plan {
+            jobs: Vec::new(),
+            capped: None,
+            budget: Budget::empty(Limits::default()),
+        };
+        assert_eq!(cap_notice(&plan), None);
+    }
+
+    #[test]
+    fn a_limit_of_zero_is_not_news_every_hour() {
+        // Zero is somebody switching the feature off by another name. There is
+        // no window to roll and nothing to wait for, so there is nothing to say.
+        let plan = Plan {
+            jobs: Vec::new(),
+            capped: Some(Capped::Hour),
+            budget: Budget::empty(Limits {
+                per_hour: 0,
+                ..Limits::default()
+            }),
+        };
+        assert_eq!(cap_notice(&plan), None);
+    }
+
+    #[test]
+    fn the_spend_cap_names_the_money() {
+        // Three generations at Opus money: nowhere near either count limit, and
+        // straight through the dollar one. That is the case the dollar limit
+        // exists for, so the line has to say which number did it.
+        let budget = spent(3, Some(0.80));
+        assert_eq!(budget.capped(), Some(Capped::Spend));
+
+        let notice = cap_notice(&Plan {
+            jobs: Vec::new(),
+            capped: Some(Capped::Spend),
+            budget,
+        })
+        .expect("a spend cap must say so");
+        assert!(notice.contains("$2.40"), "{notice}");
+        assert!(notice.contains("$2.00"), "{notice}");
     }
 
     #[test]

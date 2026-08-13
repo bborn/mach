@@ -74,13 +74,28 @@ pub const BULK_CATEGORIES: [&str; 4] = [
 /// the part before the `@`, with `.`, `-`, `_` and `+` treated as separators, so
 /// `no-reply`, `no_reply`, `noreply+123` and `donotreply` all land and
 /// `norepli.co` does not.
-const NO_REPLY_PARTS: [&str; 12] = [
+/// `notifier` and `notify` are here on evidence rather than on principle: the
+/// single highest-volume sender in the owner's mailbox is
+/// `notifier@mail.rollbar.com` at 9,748 messages, up to 103 of them in one day,
+/// and `notification`/`notifications` did not catch it. Gmail files those under
+/// `CATEGORY_UPDATES`, so the category check was already declining them — but
+/// that check is Google's judgement rather than ours, and a rule that depends on
+/// somebody else's classifier for its biggest single case is one classifier
+/// change away from a flood.
+///
+/// Deliberately **not** `alert`/`alerts`. `alerts@cronitor.io` is the owner's
+/// highest-volume sender among mail that actually earns a suggestion, and
+/// whether an alert deserves an answer is a judgement about content — which is
+/// exactly what this predicate refuses to make.
+const NO_REPLY_PARTS: [&str; 14] = [
     "noreply",
     "no-reply",
     "donotreply",
     "do-not-reply",
     "notification",
     "notifications",
+    "notifier",
+    "notify",
     "mailer-daemon",
     "postmaster",
     "bounce",
@@ -274,6 +289,8 @@ pub fn is_no_reply(address: &str) -> bool {
                 | "donotreply"
                 | "notification"
                 | "notifications"
+                | "notifier"
+                | "notify"
                 | "postmaster"
                 | "bounce"
                 | "bounces"
@@ -433,6 +450,10 @@ mod tests {
             "mailer-daemon@example.org",
             "postmaster@example.org",
             "noreply+abc123@notion.so",
+            // The biggest single sender in his mailbox, and the one the list
+            // used to miss.
+            "notifier@mail.rollbar.com",
+            "notify@mail.notion.so",
         ] {
             let mut c = human();
             c.from_email = address.into();
@@ -445,8 +466,20 @@ mod tests {
     }
 
     #[test]
+    fn an_alerting_sender_is_still_a_candidate() {
+        // The rule declines machines, not topics. His highest-volume sender
+        // among mail that earns a suggestion is an alerting address, and
+        // whether an alert deserves an answer is the model's judgement to make.
+        for address in ["alerts@cronitor.io", "alert@example.org"] {
+            let mut c = human();
+            c.from_email = address.into();
+            assert_eq!(earns_a_suggestion(&c, ME), Ok(()), "{address}");
+        }
+    }
+
+    #[test]
     fn an_address_that_merely_contains_a_no_reply_word_is_a_person() {
-        for address in ["kate@bouncehouse.com", "notify.me@example.org", "rob@noreply.dev"] {
+        for address in ["kate@bouncehouse.com", "rob@noreply.dev"] {
             let mut c = human();
             c.from_email = address.into();
             assert_eq!(earns_a_suggestion(&c, ME), Ok(()), "{address} is a person");

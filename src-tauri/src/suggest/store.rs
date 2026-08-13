@@ -33,12 +33,20 @@ pub struct Suggestion {
     pub created_at: i64,
 }
 
-/// What can be recorded about a set of stances. Deliberately small: five
-/// numbers answer "is this feature paying for itself", and the sixth would be
-/// a number nobody acts on.
+/// What can be recorded about a set of stances.
+///
+/// Five of these are about what he did with a suggestion; the sixth,
+/// [`Outcome::Generated`], is about what it cost to make one. That distinction
+/// is why it is a separate kind rather than extra columns on `Suggested`: a
+/// model call that came back with nothing usable writes no suggestion and no
+/// `Suggested` row, and it still spent the tokens. Folding the two together
+/// would either lose that spend or quietly change what the hit rate divides by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// A set was written to disk. The denominator.
+    /// A model call completed. One per request that reached an answer, whether
+    /// or not the answer was usable — the spend ledger, and what the cap counts.
+    Generated,
+    /// A set was written to disk. The hit rate's denominator.
     Suggested,
     /// He pressed one and got a composer.
     Picked,
@@ -53,6 +61,7 @@ pub enum Outcome {
 impl Outcome {
     pub fn as_str(self) -> &'static str {
         match self {
+            Outcome::Generated => "generated",
             Outcome::Suggested => "suggested",
             Outcome::Picked => "picked",
             Outcome::SentAsWritten => "sentAsWritten",
@@ -63,6 +72,7 @@ impl Outcome {
 
     pub fn parse(value: &str) -> Option<Outcome> {
         match value {
+            "generated" => Some(Outcome::Generated),
             "suggested" => Some(Outcome::Suggested),
             "picked" => Some(Outcome::Picked),
             "sentAsWritten" => Some(Outcome::SentAsWritten),
@@ -73,9 +83,27 @@ impl Outcome {
     }
 }
 
+/// What one model call consumed.
+///
+/// `cost_usd` is `Option` and every caller has to say which it means. See
+/// [`super::price::cost_usd`] for the three ways it is legitimately absent; the
+/// short version is that on a subscription there are no dollars to record, and
+/// zero would be a lie about a call that really did spend something.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Generation {
+    pub model: String,
+    pub cost_usd: Option<f64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
 /// The counters, and the one ratio worth looking at.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Counters {
+    /// Model calls made. The spend denominator, and always at least
+    /// `suggested` — a call that answered with nothing counts here and not
+    /// there.
+    pub generated: i64,
     pub suggested: i64,
     pub picked: i64,
     pub sent_as_written: i64,
@@ -248,6 +276,33 @@ pub fn record(
     Ok(())
 }
 
+/// Note that a model call happened, and what it took.
+///
+/// Written for every completed call, including the ones whose answer was
+/// unusable — this is the row [`super::budget`] counts, and a cap that only
+/// counted the successes would let a model having a bad afternoon spend without
+/// limit.
+pub fn record_generation(
+    conn: &Connection,
+    generation: &Generation,
+    now_ms: i64,
+) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO reply_suggestion_outcomes
+             (kind, stance_index, stance_label, at_ms, model, cost_usd, input_tokens, output_tokens)
+         VALUES (?1, NULL, '', ?2, ?3, ?4, ?5, ?6)",
+        params![
+            Outcome::Generated.as_str(),
+            now_ms,
+            generation.model,
+            generation.cost_usd,
+            generation.input_tokens,
+            generation.output_tokens
+        ],
+    )?;
+    Ok(())
+}
+
 /// Every counter, in one pass.
 pub fn counters(conn: &Connection) -> DbResult<Counters> {
     let mut stmt =
@@ -260,6 +315,7 @@ pub fn counters(conn: &Connection) -> DbResult<Counters> {
     for row in rows {
         let (kind, count) = row?;
         match Outcome::parse(&kind) {
+            Some(Outcome::Generated) => counters.generated = count,
             Some(Outcome::Suggested) => counters.suggested = count,
             Some(Outcome::Picked) => counters.picked = count,
             Some(Outcome::SentAsWritten) => counters.sent_as_written = count,
@@ -541,8 +597,93 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_records_what_it_cost() {
+        let conn = db();
+        record_generation(
+            &conn,
+            &Generation {
+                model: "claude-sonnet-5".into(),
+                cost_usd: Some(0.0134),
+                input_tokens: Some(2_100),
+                output_tokens: Some(380),
+            },
+            77,
+        )
+        .unwrap();
+
+        let (model, cost, input, output, at): (String, Option<f64>, Option<i64>, Option<i64>, i64) =
+            conn.query_row(
+                "SELECT model, cost_usd, input_tokens, output_tokens, at_ms
+                   FROM reply_suggestion_outcomes WHERE kind = 'generated'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "claude-sonnet-5");
+        assert_eq!(cost, Some(0.0134));
+        assert_eq!(input, Some(2_100));
+        assert_eq!(output, Some(380));
+        assert_eq!(at, 77);
+        assert_eq!(counters(&conn).unwrap().generated, 1);
+    }
+
+    #[test]
+    fn a_generation_with_no_known_cost_stores_null_rather_than_zero() {
+        // The subscription path. A zero here would say the call was free, and
+        // the spend limit would then never notice anything.
+        let conn = db();
+        record_generation(
+            &conn,
+            &Generation {
+                model: "claude-sonnet-5".into(),
+                cost_usd: None,
+                input_tokens: Some(2_100),
+                output_tokens: Some(380),
+            },
+            77,
+        )
+        .unwrap();
+
+        let cost: Option<f64> = conn
+            .query_row(
+                "SELECT cost_usd FROM reply_suggestion_outcomes WHERE kind = 'generated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cost, None);
+        let priced: i64 = conn
+            .query_row(
+                "SELECT count(cost_usd) FROM reply_suggestion_outcomes",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(priced, 0, "an absent cost must not be counted as a figure");
+    }
+
+    #[test]
+    fn generating_does_not_move_the_hit_rate() {
+        // `generated` is about spend; `suggested` is about what reached him.
+        // A call that answered with nothing counts in the first and not the
+        // second, so the rate keeps meaning what it meant.
+        let conn = db();
+        for _ in 0..4 {
+            record_generation(&conn, &Generation::default(), 1).unwrap();
+        }
+        record(&conn, Outcome::Suggested, None, "", 1).unwrap();
+        record(&conn, Outcome::SentAsWritten, Some(0), "Say yes", 2).unwrap();
+
+        let counters = counters(&conn).unwrap();
+        assert_eq!(counters.generated, 4);
+        assert_eq!(counters.suggested, 1);
+        assert_eq!(counters.as_written_rate(), Some(1.0));
+    }
+
+    #[test]
     fn every_outcome_round_trips_through_its_name() {
         for outcome in [
+            Outcome::Generated,
             Outcome::Suggested,
             Outcome::Picked,
             Outcome::SentAsWritten,

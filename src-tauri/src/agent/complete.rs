@@ -141,6 +141,107 @@ pub fn completion_call(config: &AgentConfig, model: &str, request: &CompletionRe
     }
 }
 
+/// What one completion consumed, as the API reported it.
+///
+/// Every field is `Option` because "the response did not say" and "the response
+/// said zero" are different facts, and only the first of them is common — a
+/// stubbed transport, a proxy that strips `usage`, or a future response shape
+/// all produce absence rather than zero. Recording a zero for an answer nobody
+/// gave is how a spend ledger comes to under-report.
+///
+/// Cache fields are carried separately because they are priced differently:
+/// a cache read is a tenth of an input token, and a spend figure that charged
+/// them at full rate would over-report on exactly the path this feature uses
+/// most (the same system prompt, over and over).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_creation_input_tokens: Option<i64>,
+    pub cache_read_input_tokens: Option<i64>,
+}
+
+impl Usage {
+    /// Whether the response said anything at all about what this cost.
+    pub fn is_known(&self) -> bool {
+        self.input_tokens.is_some() || self.output_tokens.is_some()
+    }
+
+    /// Every input token, however it was billed.
+    pub fn total_input(&self) -> i64 {
+        self.input_tokens.unwrap_or(0)
+            + self.cache_creation_input_tokens.unwrap_or(0)
+            + self.cache_read_input_tokens.unwrap_or(0)
+    }
+}
+
+/// Read a `usage` block off whichever JSON document carries one.
+///
+/// Both backends have one and they agree on the field names: the API puts it at
+/// the top level of the `/v1/messages` response, and Claude Code puts it on its
+/// result document. Never an error — a body with no `usage` is a completion
+/// whose cost is unknown, which is a state this codebase can represent, and
+/// failing the whole generation because the accounting was missing would be the
+/// tail wagging the dog.
+pub fn usage_of(value: &Value) -> Usage {
+    let Some(usage) = value.get("usage") else {
+        return Usage::default();
+    };
+    let field = |name: &str| usage.get(name).and_then(Value::as_i64).filter(|n| *n >= 0);
+    Usage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        cache_creation_input_tokens: field("cache_creation_input_tokens"),
+        cache_read_input_tokens: field("cache_read_input_tokens"),
+    }
+}
+
+/// The same, off a response body that may not be JSON at all.
+pub fn completion_usage(body: &str) -> Usage {
+    serde_json::from_str::<Value>(body)
+        .map(|value| usage_of(&value))
+        .unwrap_or_default()
+}
+
+/// What one completion cost, in whichever units the backend that ran it knows.
+///
+/// The two backends report different things, and neither can be derived from the
+/// other:
+///
+/// | backend | tokens | dollars |
+/// |---|---|---|
+/// | [`ApiCompleter`] | in the `usage` block | priced by [`super::price`], and only on a key |
+/// | [`CliCompleter`] | in the `usage` block | `total_cost_usd`, off the CLI itself |
+///
+/// `usd` is `Option` and every producer has to say which it means. `None` is
+/// "nobody said", never "it was free" — see [`super::price::cost_usd`] for the
+/// ways the API path legitimately cannot answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Cost {
+    pub usd: Option<f64>,
+    /// Every input token, cached or not.
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+impl Cost {
+    /// The token half of a [`Usage`], with no opinion about money.
+    pub fn of(usage: &Usage) -> Cost {
+        Cost {
+            usd: None,
+            input_tokens: usage.is_known().then(|| usage.total_input()),
+            output_tokens: usage.output_tokens,
+        }
+    }
+}
+
+/// One answer, and what it took to get it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Completion {
+    pub text: String,
+    pub cost: Cost,
+}
+
 /// The text of a non-streamed `/v1/messages` response.
 ///
 /// Total: a body with no text blocks (a pure refusal, an empty turn) is an
@@ -193,6 +294,23 @@ pub async fn complete_as(
     model: &str,
     request: &CompletionRequest,
 ) -> Result<String, AgentError> {
+    complete_as_metered(transport, config, model, request)
+        .await
+        .map(|(text, _)| text)
+}
+
+/// The same again, and what the response said it consumed.
+///
+/// Split out rather than changing [`complete_as`] because ghost text has no use
+/// for the number — it fires on a keystroke and nothing anywhere records it —
+/// while reply suggestions run unattended against arriving mail and the number
+/// is the whole reason there is a cap.
+pub async fn complete_as_metered(
+    transport: &dyn ModelTransport,
+    config: &AgentConfig,
+    model: &str,
+    request: &CompletionRequest,
+) -> Result<(String, Usage), AgentError> {
     let mut rx = transport.send(completion_call(config, model, request)).await?;
 
     let mut body = Vec::new();
@@ -208,7 +326,11 @@ pub async fn complete_as(
         }
     }
 
-    completion_text(&String::from_utf8_lossy(&body))
+    let body = String::from_utf8_lossy(&body);
+    // Usage before text, so a body that is an error still reports what the
+    // attempt consumed — an API error after tokens were spent is still spend.
+    let usage = completion_usage(&body);
+    completion_text(&body).map(|text| (text, usage))
 }
 
 // ===========================================================================
@@ -223,12 +345,17 @@ pub async fn complete_as(
 ///
 /// It is deliberately *not* [`super::Brain`]. A brain gets tools, an approval
 /// gate, an event channel and a transcript; this gets a string.
+///
+/// It answers with a [`Completion`] rather than a `String` because the caller
+/// that must not know which backend it has is also the caller that has to write
+/// down what the call cost. Each side reports what it actually knows —
+/// [`Cost`] — and neither invents the other's number.
 pub trait Completer: Send + Sync {
     fn complete<'a>(
         &'a self,
         model: &'a str,
         request: &'a CompletionRequest,
-    ) -> BoxFuture<'a, Result<String, AgentError>>;
+    ) -> BoxFuture<'a, Result<Completion, AgentError>>;
 
     /// Which brain this is, for the sentence a failure logs.
     fn label(&self) -> String;
@@ -251,13 +378,22 @@ impl Completer for ApiCompleter {
         &'a self,
         model: &'a str,
         request: &'a CompletionRequest,
-    ) -> BoxFuture<'a, Result<String, AgentError>> {
-        Box::pin(complete_as(
-            self.transport.as_ref(),
-            &self.config,
-            model,
-            request,
-        ))
+    ) -> BoxFuture<'a, Result<Completion, AgentError>> {
+        Box::pin(async move {
+            let (text, usage) =
+                complete_as_metered(self.transport.as_ref(), &self.config, model, request).await?;
+            // The pricing lives here rather than at the caller because the
+            // credential does: `/v1/messages` reports tokens and never money,
+            // and whether those tokens have a dollar figure at all is a fact
+            // about the credential this completer is holding.
+            Ok(Completion {
+                text,
+                cost: Cost {
+                    usd: super::price::cost_usd(&self.config, model, &usage),
+                    ..Cost::of(&usage)
+                },
+            })
+        })
     }
 
     fn label(&self) -> String {
@@ -284,7 +420,7 @@ impl Completer for CliCompleter {
         &'a self,
         model: &'a str,
         request: &'a CompletionRequest,
-    ) -> BoxFuture<'a, Result<String, AgentError>> {
+    ) -> BoxFuture<'a, Result<Completion, AgentError>> {
         Box::pin(super::cli::complete_once(
             &self.exe,
             &self.workspace,
@@ -385,6 +521,40 @@ mod tests {
     fn an_empty_turn_is_an_empty_completion() {
         assert_eq!(completion_text(r#"{"content":[]}"#).unwrap(), "");
         assert_eq!(completion_text(r#"{}"#).unwrap(), "");
+    }
+
+    #[test]
+    fn usage_is_read_off_the_body() {
+        let body = r#"{"content":[],"usage":{"input_tokens":2100,"output_tokens":380,
+                       "cache_creation_input_tokens":0,"cache_read_input_tokens":1024}}"#;
+        let usage = completion_usage(body);
+        assert_eq!(usage.input_tokens, Some(2100));
+        assert_eq!(usage.output_tokens, Some(380));
+        assert_eq!(usage.cache_read_input_tokens, Some(1024));
+        assert_eq!(usage.total_input(), 3124);
+        assert!(usage.is_known());
+        assert_eq!(Cost::of(&usage).input_tokens, Some(3124));
+    }
+
+    #[test]
+    fn a_body_with_no_usage_reports_nothing_rather_than_zero() {
+        // The distinction the whole spend ledger rests on: a stub, a proxy that
+        // strips the block, or a shape nobody has seen yet must not be recorded
+        // as a free generation.
+        for body in [r#"{"content":[]}"#, "not json", r#"{"usage":{}}"#] {
+            let usage = completion_usage(body);
+            assert!(!usage.is_known(), "{body}");
+            assert_eq!(usage.input_tokens, None);
+            assert_eq!(usage.output_tokens, None);
+            assert_eq!(Cost::of(&usage), Cost::default(), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_nonsense_token_count_is_absent_rather_than_negative() {
+        let usage = completion_usage(r#"{"usage":{"input_tokens":-5,"output_tokens":"lots"}}"#);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
     }
 
     /// A transport that cannot possibly answer, so a test that gets a

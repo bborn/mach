@@ -42,6 +42,11 @@ const GMAIL_BASE: &str = "https://gmail.test/gmail/v1";
 const CALENDAR_BASE: &str = "https://calendar.test/calendar/v3";
 const ME: &str = "bruno@example.com";
 
+/// The clock the store tests plan against. Far enough past the epoch that a day
+/// can be subtracted from it without going negative, and fixed so a rolling
+/// window is something a test can reason about rather than race.
+const NOW: i64 = 1_800_000_000_000;
+
 // ===========================================================================
 // A scripted model
 // ===========================================================================
@@ -57,14 +62,33 @@ struct ScriptedModel {
 }
 
 impl ScriptedModel {
+    /// Answers with these stances, and reports what a real response would
+    /// report about what it consumed.
     fn new(stances: &[(&str, &str)]) -> Arc<Self> {
+        Self::with_usage(
+            stances,
+            Some(json!({ "input_tokens": 2_000, "output_tokens": 400 })),
+        )
+    }
+
+    /// The same, with the `usage` block absent — a proxy that strips it, or any
+    /// path that does not account. The generation still happened.
+    fn unmetered(stances: &[(&str, &str)]) -> Arc<Self> {
+        Self::with_usage(stances, None)
+    }
+
+    fn with_usage(stances: &[(&str, &str)], usage: Option<Value>) -> Arc<Self> {
         let items: Vec<Value> = stances
             .iter()
             .map(|(label, body)| json!({ "label": label, "body": body }))
             .collect();
         let text = serde_json::to_string(&items).unwrap();
+        let mut body = json!({ "content": [ { "type": "text", "text": text } ] });
+        if let Some(usage) = usage {
+            body["usage"] = usage;
+        }
         Arc::new(ScriptedModel {
-            body: json!({ "content": [ { "type": "text", "text": text } ] }).to_string(),
+            body: body.to_string(),
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -360,9 +384,23 @@ fn new_engine(db: &Db, gmail: Arc<FakeGmail>, model: Option<Arc<ScriptedModel>>)
     engine
 }
 
+/// The budget every test in this file runs under.
+///
+/// Far below the shipping defaults, because a test that had to generate fifty
+/// replies to prove the cap works would be a test nobody waits for. The counts
+/// are per-database and every test opens its own, so tightening them here
+/// changes what the cap tests can reach and nothing else — the other tests in
+/// this file make one call apiece.
+const TEST_PER_HOUR: usize = 6;
+const TEST_PER_DAY: usize = 8;
+
 /// The agent needs a credential to get as far as a request, and every request
 /// in this file is intercepted by [`ScriptedModel`] — so this is what makes the
 /// path reachable without a network. Set once for the whole binary.
+///
+/// The environment is process-wide and these tests run in parallel, so this is
+/// the only place any of them may write to it. A test that set a variable of its
+/// own would be setting it for whatever else happened to be running.
 fn configure_agent() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -381,6 +419,8 @@ fn configure_agent() {
         // network — the transport is scripted — and a host that cannot resolve
         // is the belt to that braces.
         std::env::set_var("MACH_AGENT_BASE_URL", "https://api.anthropic.invalid");
+        std::env::set_var(suggest::budget::ENV_PER_HOUR, TEST_PER_HOUR.to_string());
+        std::env::set_var(suggest::budget::ENV_PER_DAY, TEST_PER_DAY.to_string());
     });
 }
 
@@ -714,9 +754,11 @@ async fn generating_writes_a_row_and_a_counter_and_nothing_else() {
                 account_id,
                 &["incoming".to_string()],
                 &HashMap::from([("incoming".to_string(), Headers::default())]),
+                NOW,
             )
         })
-        .unwrap();
+        .unwrap()
+        .jobs;
     assert_eq!(jobs.len(), 1, "the message should have earned a suggestion");
     let job = &jobs[0];
     assert_eq!(job.correspondent, "Kate <kate@example.org>");
@@ -761,14 +803,10 @@ async fn a_model_that_answers_with_nothing_usable_writes_no_row() {
     let (_temp, db, account_id) = seeded();
     let jobs = db
         .read(|conn| {
-            suggest::plan(
-                conn,
-                account_id,
-                &["incoming".to_string()],
-                &HashMap::new(),
-            )
+            suggest::plan(conn, account_id, &["incoming".to_string()], &HashMap::new(), NOW)
         })
-        .unwrap();
+        .unwrap()
+        .jobs;
 
     struct Refusing;
     impl ModelTransport for Refusing {
@@ -805,16 +843,18 @@ async fn the_same_message_is_not_paid_for_twice() {
     let arrived = vec!["incoming".to_string()];
 
     let jobs = db
-        .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new()))
-        .unwrap();
+        .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new(), NOW))
+        .unwrap()
+        .jobs;
     let model = ScriptedModel::new(&[("Say yes", "Yes.")]);
     suggest::generate(&db, &over_the_api(model.clone()), "m", &jobs[0], 7).await;
 
     // A replayed history window reports the same id again.
     let again = db
-        .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new()))
+        .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new(), NOW))
         .unwrap();
-    assert!(again.is_empty(), "the same message was planned twice");
+    assert!(again.jobs.is_empty(), "the same message was planned twice");
+    assert_eq!(again.capped, None, "it was skipped as a duplicate, not capped");
 }
 
 #[tokio::test]
@@ -823,10 +863,10 @@ async fn the_preference_off_plans_nothing() {
     set_pref(&db, suggest::ENABLED_KEY, json!(false));
     let jobs = db
         .read(|conn| {
-            suggest::plan(conn, account_id, &["incoming".to_string()], &HashMap::new())
+            suggest::plan(conn, account_id, &["incoming".to_string()], &HashMap::new(), NOW)
         })
         .unwrap();
-    assert!(jobs.is_empty());
+    assert!(jobs.jobs.is_empty());
 }
 
 #[tokio::test]
@@ -870,9 +910,13 @@ async fn a_pass_never_plans_more_than_the_cap() {
 
     let arrived: Vec<String> = (0..20).map(|n| format!("bulk{n}")).collect();
     let jobs = db
-        .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new()))
+        .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new(), NOW))
         .unwrap();
-    assert_eq!(jobs.len(), suggest::MAX_PER_PASS);
+    assert_eq!(jobs.jobs.len(), suggest::MAX_PER_PASS);
+    assert_eq!(
+        jobs.capped, None,
+        "the per-pass throttle is not the budget, and must not be reported as it"
+    );
 }
 
 /// Picking a stance reads only from local storage. Proved by taking the model
@@ -942,4 +986,309 @@ async fn a_sent_stance_takes_its_suggestion_with_it() {
     assert_eq!(rows(&db), 0);
     let counters = db.read(|conn| store::counters(conn)).unwrap();
     assert_eq!(counters.sent_as_written, 1);
+}
+
+// ===========================================================================
+// The budget: what stops a flood, what it cost, and how anyone finds out
+// ===========================================================================
+
+/// Every generation on record, oldest first, as `(at_ms, cost_usd, in, out)`.
+fn generations(db: &Db) -> Vec<(i64, Option<f64>, Option<i64>, Option<i64>)> {
+    db.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT at_ms, cost_usd, input_tokens, output_tokens
+               FROM reply_suggestion_outcomes
+              WHERE kind = 'generated'
+              ORDER BY at_ms, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    })
+    .expect("generations")
+}
+
+/// Put `n` generations on the ledger at `at_ms`, as if the model had run.
+fn seed_generations(db: &Db, n: usize, at_ms: i64, cost: Option<f64>) {
+    db.write(|conn| {
+        for _ in 0..n {
+            store::record_generation(
+                conn,
+                &store::Generation {
+                    model: "claude-sonnet-5".into(),
+                    cost_usd: cost,
+                    input_tokens: Some(2_000),
+                    output_tokens: Some(400),
+                },
+                at_ms,
+            )?;
+        }
+        Ok(())
+    })
+    .expect("seed generations");
+}
+
+/// The failure the whole cap exists for, run rather than reasoned about.
+///
+/// Mail that qualifies keeps arriving, pass after pass, exactly as it would from
+/// a bounce loop or an afternoon of somebody signing his address up to things.
+/// Nothing else in the feature stops this: three a pass never reaches the
+/// per-pass throttle, every message is its own conversation so the dedup never
+/// fires, and every one of them is a person writing to him so the rule says yes
+/// to all of them. Without a budget the transport is asked once per message,
+/// for as long as the mail keeps coming.
+#[tokio::test]
+async fn a_flood_of_qualifying_mail_stops_at_the_cap() {
+    let temp = TempDb::new();
+    let db = temp.open();
+    let account_id = add_account(&db, ME);
+    let token = format!("tok-{account_id}");
+
+    let gmail = FakeGmail::new();
+    gmail.install(&token, Mailbox::new(ME));
+    let model = ScriptedModel::new(&[("Say you'll be there", "Tuesday works.")]);
+    let engine = new_engine(&db, Arc::clone(&gmail), Some(Arc::clone(&model)));
+
+    // A watermark, so everything after this is an arrival on a synced account.
+    engine.sync_once().await;
+    settle().await;
+    assert!(model.calls().is_empty());
+
+    let passes = 8;
+    let per_pass = 3;
+    for pass in 0..passes {
+        gmail.with(&token, |m| {
+            for n in 0..per_pass {
+                m.deliver(FakeMessage::human(
+                    &format!("flood-{pass}-{n}"),
+                    &format!("Sender{pass}x{n}"),
+                ));
+            }
+        });
+        engine.sync_once().await;
+        settle().await;
+    }
+
+    let uncapped = passes * per_pass;
+    assert!(
+        uncapped > TEST_PER_HOUR * 3,
+        "the flood must be much larger than the cap for this to prove anything"
+    );
+    assert_eq!(
+        model.calls().len(),
+        TEST_PER_HOUR,
+        "{uncapped} qualifying messages arrived and {} reached the model",
+        model.calls().len()
+    );
+    assert_eq!(
+        generations(&db).len(),
+        TEST_PER_HOUR,
+        "the ledger and the transport must agree about what was spent"
+    );
+    assert_eq!(draft_rows(&db), 0);
+}
+
+/// The same refusal, seen from the plan rather than the transport: what the cap
+/// turned away has to be legible afterwards, not merely absent.
+#[tokio::test]
+async fn hitting_the_cap_says_which_limit_and_when_it_lifts() {
+    let (_temp, db, account_id) = seeded();
+    seed_generations(&db, TEST_PER_HOUR, NOW - 60_000, Some(0.02));
+
+    let plan = db
+        .read(|conn| {
+            suggest::plan(conn, account_id, &["incoming".to_string()], &HashMap::new(), NOW)
+        })
+        .unwrap();
+
+    assert!(plan.jobs.is_empty(), "the budget is spent");
+    assert_eq!(
+        plan.capped,
+        Some(suggest::Capped::Hour),
+        "a message earned a suggestion and was refused — that must be sayable"
+    );
+    // Exactly when it lifts: an hour after the oldest generation still counted.
+    assert_eq!(
+        plan.budget.resumes_at(),
+        Some(NOW - 60_000 + suggest::budget::HOUR_MS)
+    );
+    assert_eq!(plan.budget.hour_count, TEST_PER_HOUR);
+    assert!((plan.budget.day_spend_usd - 0.02 * TEST_PER_HOUR as f64).abs() < 1e-9);
+}
+
+/// A full budget on a quiet morning is not the same event as a full budget with
+/// mail going unanswered, and only the second is worth saying out loud.
+#[tokio::test]
+async fn a_spent_budget_with_no_qualifying_mail_reports_nothing() {
+    let (_temp, db, account_id) = seeded();
+    seed_generations(&db, TEST_PER_HOUR, NOW - 60_000, Some(0.02));
+
+    // The one arrival is list mail, which the rule declines on its own.
+    let plan = db
+        .read(|conn| {
+            suggest::plan(
+                conn,
+                account_id,
+                &["incoming".to_string()],
+                &HashMap::from([(
+                    "incoming".to_string(),
+                    Headers {
+                        list_unsubscribe: Some("<https://example.org/u/1>".into()),
+                        ..Headers::default()
+                    },
+                )]),
+                NOW,
+            )
+        })
+        .unwrap();
+
+    assert!(plan.jobs.is_empty());
+    assert_eq!(
+        plan.capped, None,
+        "nothing was refused — the mail did not earn one in the first place"
+    );
+}
+
+/// The window rolls, and the same store that refused an hour ago allows again.
+#[tokio::test]
+async fn the_cap_lifts_when_its_window_rolls() {
+    let (_temp, db, account_id) = seeded();
+    let arrived = ["incoming".to_string()];
+
+    // Spent, one minute ago.
+    seed_generations(&db, TEST_PER_HOUR, NOW - 60_000, Some(0.02));
+    let refused = db
+        .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new(), NOW))
+        .unwrap();
+    assert!(refused.jobs.is_empty());
+    assert_eq!(refused.capped, Some(suggest::Capped::Hour));
+
+    // The identical store, asked a second after those fall out of the hour.
+    let later = NOW - 60_000 + suggest::budget::HOUR_MS + 1_000;
+    let allowed = db
+        .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new(), later))
+        .unwrap();
+    assert_eq!(allowed.jobs.len(), 1, "the hour rolled and it still refused");
+    assert_eq!(allowed.capped, None);
+    assert_eq!(allowed.budget.hour_count, 0);
+    assert_eq!(
+        allowed.budget.day_count,
+        TEST_PER_HOUR,
+        "still inside the day, which is the wider window"
+    );
+}
+
+/// What it cost is written down, in the two units that exist.
+#[tokio::test]
+async fn what_a_generation_cost_is_recorded() {
+    let (_temp, db, account_id) = seeded();
+    let jobs = db
+        .read(|conn| {
+            suggest::plan(conn, account_id, &["incoming".to_string()], &HashMap::new(), NOW)
+        })
+        .unwrap()
+        .jobs;
+
+    let model = ScriptedModel::new(&[("Say yes", "Yes.")]);
+    suggest::generate(
+        &db,
+        &over_the_api(model.clone()),
+        "claude-sonnet-5",
+        &jobs[0],
+        NOW,
+    )
+    .await;
+
+    let generations = generations(&db);
+    assert_eq!(generations.len(), 1);
+    let (at, cost, input, output) = generations[0];
+    assert_eq!(at, NOW);
+    assert_eq!(input, Some(2_000));
+    assert_eq!(output, Some(400));
+    // 2,000 in at $3 per million plus 400 out at $15 per million.
+    assert_eq!(cost, Some(0.012));
+
+    let counters = db.read(|conn| store::counters(conn)).unwrap();
+    assert_eq!(counters.generated, 1);
+    assert_eq!(counters.suggested, 1);
+}
+
+/// A response that accounted for nothing stores nothing, not zero.
+///
+/// The difference matters because zero is a claim: it says the call was free,
+/// and a day of free calls never trips a spend limit however much it really ate.
+#[tokio::test]
+async fn a_generation_with_no_usage_records_an_absent_cost() {
+    let (_temp, db, account_id) = seeded();
+    let jobs = db
+        .read(|conn| {
+            suggest::plan(conn, account_id, &["incoming".to_string()], &HashMap::new(), NOW)
+        })
+        .unwrap()
+        .jobs;
+
+    let model = ScriptedModel::unmetered(&[("Say yes", "Yes.")]);
+    suggest::generate(
+        &db,
+        &over_the_api(model.clone()),
+        "claude-sonnet-5",
+        &jobs[0],
+        NOW,
+    )
+    .await;
+
+    let generations = generations(&db);
+    assert_eq!(generations.len(), 1, "the call still happened");
+    assert_eq!(generations[0].1, None, "no price, rather than a free one");
+    assert_eq!(generations[0].2, None);
+
+    // And it still counts against the limit that needs no price.
+    let budget = db.read(|conn| suggest::budget::state(conn, NOW)).unwrap();
+    assert_eq!(budget.day_count, 1);
+    assert_eq!(budget.day_priced, 0);
+}
+
+/// A call that failed still spent whatever it spent, and still counts.
+///
+/// The afternoon a model is having trouble is exactly the afternoon a caller can
+/// run up a bill on nothing, so a ledger that recorded only the useful answers
+/// would be blind at the worst moment.
+#[tokio::test]
+async fn a_failed_call_still_counts_against_the_budget() {
+    let (_temp, db, account_id) = seeded();
+    let jobs = db
+        .read(|conn| {
+            suggest::plan(conn, account_id, &["incoming".to_string()], &HashMap::new(), NOW)
+        })
+        .unwrap()
+        .jobs;
+
+    struct Failing;
+    impl ModelTransport for Failing {
+        fn send<'a>(&'a self, _call: ModelCall) -> BoxFuture<'a, Result<ChunkStream, AgentError>> {
+            Box::pin(async move {
+                Err(AgentError::Api {
+                    status: 529,
+                    message: "overloaded".into(),
+                })
+            })
+        }
+    }
+
+    let stances = suggest::generate(
+        &db,
+        &over_the_api(Arc::new(Failing)),
+        "claude-sonnet-5",
+        &jobs[0],
+        NOW,
+    )
+    .await;
+    assert!(stances.is_empty());
+    assert_eq!(rows(&db), 0, "nothing usable came back");
+    assert_eq!(generations(&db).len(), 1, "and it still counted");
 }
