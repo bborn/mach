@@ -14,6 +14,8 @@ import {
   subscribeAsk,
   UNKNOWN_BACKEND,
   artifactAction,
+  eventWhen,
+  guestLine,
   loadBackendStatus,
   type AgentEvent,
   type AgentSession,
@@ -409,5 +411,66 @@ describe("artifacts", () => {
     expect(artifactAction({ kind: "event", eventId: 3, startMs: 0, label: "x" })).toBe(
       "Show event",
     );
+  });
+
+  it("keeps what a read surfaced, which is where the card's fields come from", () => {
+    // Reads carry an artifact now. This is the shape `get_event` sends, and
+    // every field past the ids is a line the model used to type out in prose.
+    let s = session();
+    s = reduceSession(s, {
+      type: "entry",
+      sessionId: s.id,
+      entry: {
+        role: "tool",
+        id: "tu-2",
+        name: "get_event",
+        summary: "Read “30 min meeting”",
+        state: "ok",
+        artifact: {
+          kind: "event",
+          eventId: 91,
+          startMs: 1_787_000_000_000,
+          endMs: 1_787_001_800_000,
+          label: "30 min meeting",
+          conferenceUrl: "https://meet.google.com/vht-epjb-pjd",
+          guests: ["Kerrie Kuiper"],
+          rsvp: "accepted",
+        },
+      },
+    });
+    const tool = s.entries[s.entries.length - 1];
+    if (tool.role !== "tool" || tool.artifact?.kind !== "event") {
+      throw new Error("the read line has to carry its event");
+    }
+    // The one the calendar has to be scrolled to.
+    expect(tool.artifact.startMs).toBe(1_787_000_000_000);
+    expect(tool.artifact.conferenceUrl).toBe("https://meet.google.com/vht-epjb-pjd");
+  });
+
+  it("states the day of an event rather than ageing it backwards from now", () => {
+    // `listTime` would call a meeting nine days out "Yesterday": it ages a
+    // stamp towards the past, and every event worth a card is in the future.
+    const start = Date.UTC(2026, 7, 20, 17, 0);
+    const line = eventWhen(
+      { kind: "event", eventId: 1, startMs: start, endMs: start + 1_800_000, label: "x" },
+      Date.UTC(2026, 7, 11),
+    );
+    expect(line).toContain("Thu Aug 20");
+    expect(line).not.toContain("Yesterday");
+
+    // A different year says so; an all-day event has no clock to show.
+    expect(
+      eventWhen({ kind: "event", eventId: 1, startMs: start, label: "x" }, Date.UTC(2025, 0, 1)),
+    ).toContain("2026");
+    expect(
+      eventWhen({ kind: "event", eventId: 1, startMs: start, allDay: true, label: "x" }),
+    ).toContain("All day");
+  });
+
+  it("counts the guests it did not name", () => {
+    expect(guestLine(["Ana", "Bo", "Cy", "Di"], 4)).toBe("Ana, Bo, Cy +1");
+    // Rust caps the list; the count is what makes the card honest about it.
+    expect(guestLine(["Ana", "Bo", "Cy"], 40)).toBe("Ana, Bo, Cy +37");
+    expect(guestLine([])).toBe("");
   });
 });

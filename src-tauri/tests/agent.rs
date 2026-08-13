@@ -29,7 +29,8 @@ use serde_json::{json, Value};
 
 use mach_lib::commands::{AccountClients, Command, CommandDispatcher, GoogleClients};
 use mach_lib::db::models::{
-    LabelType, NewAccount, NewCalendar, NewLabel, NewMessage, NewThread, Participant, RsvpStatus,
+    ConferenceEntry, EventConference, EventGuest, LabelType, NewAccount, NewCalendar, NewEvent,
+    NewLabel, NewMessage, NewThread, Participant, RsvpStatus,
 };
 use mach_lib::db::{queries, Db};
 use mach_lib::google::{
@@ -966,6 +967,12 @@ async fn the_context_the_owner_was_looking_at_reaches_the_model() {
     let system = body["system"][0]["text"].as_str().unwrap();
     assert!(system.contains("unix milliseconds"), "{system}");
 
+    // It also says that what it reads by id is drawn for him as a card. Without
+    // that sentence the drawer draws the event *and* the model prints the same
+    // fields underneath it in bullets, which is worse than either alone.
+    assert!(system.contains("drawn for him as a card"), "{system}");
+    assert!(system.contains("get_event"), "{system}");
+
     // And the tool list is the catalogue plus reads and compose.
     let names: Vec<&str> = body["tools"]
         .as_array()
@@ -976,6 +983,8 @@ async fn the_context_the_owner_was_looking_at_reaches_the_model() {
     assert!(names.contains(&"archive"));
     assert!(names.contains(&"get_thread"));
     assert!(names.contains(&"send_draft"));
+    // …including the one that turns "which of these seventeen" into a card.
+    assert!(names.contains(&tools::GET_EVENT_TOOL));
 
     // The attached line is visible on the session, so it can be shown and
     // removed.
@@ -1487,8 +1496,13 @@ async fn drafting_a_reply_hands_back_something_to_open() {
     assert!(outcome.mutated);
 }
 
+/// Reading one conversation is putting the owner in front of it.
+///
+/// This used to assert the opposite — that a read made nothing, so it carried
+/// nothing — and that was the bug. "Show me the event" came back as the row out
+/// of SQLite, retyped as bullet points with no way to click any of it.
 #[tokio::test]
-async fn a_read_produces_no_artifact_because_it_made_nothing() {
+async fn reading_one_thread_carries_the_conversation_it_read() {
     let harness = Harness::new("artifact-read");
     let (_account_id, thread_id) = seed(&harness.db);
 
@@ -1499,7 +1513,214 @@ async fn a_read_produces_no_artifact_because_it_made_nothing() {
     )
     .await
     .expect("read");
-    assert!(outcome.artifact.is_none());
+
+    match outcome.artifact.expect("a conversation is a thing, not a sentence") {
+        tools::Artifact::Thread {
+            thread_id: on_thread,
+            label,
+            from,
+            at_ms,
+            unread,
+            ..
+        } => {
+            assert_eq!(on_thread, thread_id);
+            assert_eq!(label, "Series A data room");
+            // The card's own line: who and when, without a second round trip
+            // to a store the drawer cannot reach.
+            assert_eq!(from.as_deref(), Some("Tawny Chen"));
+            assert_eq!(at_ms, Some(1_754_000_000_000));
+            assert!(unread);
+        }
+        other => panic!("expected a thread artifact, got {other:?}"),
+    }
+    // Nothing moved. A read is still a read.
+    assert!(!outcome.mutated);
+}
+
+/// A list is a list — except when it has one row in it.
+#[tokio::test]
+async fn a_list_carries_a_card_only_when_it_landed_on_one_row() {
+    let harness = Harness::new("artifact-list");
+    let (account_id, _thread_id) = seed(&harness.db);
+
+    let one = tools::execute(
+        &harness.tool_context(),
+        "search_threads",
+        &json!({ "query": "data room" }),
+    )
+    .await
+    .expect("searched");
+    match one.artifact.expect("one match is that conversation") {
+        tools::Artifact::Thread { label, .. } => assert_eq!(label, "Series A data room"),
+        other => panic!("expected a thread artifact, got {other:?}"),
+    }
+
+    // A second conversation, and the same search is a list again. Seventeen
+    // cards under one tool line is worse than the prose they replaced.
+    harness
+        .db
+        .write(|conn| {
+            queries::upsert_thread(
+                conn,
+                &NewThread {
+                    account_id,
+                    gmail_thread_id: "t-2".into(),
+                    participants: vec![Participant {
+                        name: Some("Dana Cho".into()),
+                        email: "dana@example.com".into(),
+                    }],
+                    subject: "Data room follow-up".into(),
+                    snippet: "one more thing about the data room".into(),
+                    last_message_at: 1_754_100_000_000,
+                    is_unread: false,
+                    message_count: 1,
+                    has_attachments: false,
+                    label_ids: vec!["INBOX".into()],
+                },
+            )
+        })
+        .expect("thread");
+    harness
+        .db
+        .write(|conn| {
+            queries::upsert_message(
+                conn,
+                &NewMessage {
+                    thread_id: 2,
+                    account_id,
+                    gmail_message_id: "m-2".into(),
+                    from: Participant {
+                        name: Some("Dana Cho".into()),
+                        email: "dana@example.com".into(),
+                    },
+                    subject: "Data room follow-up".into(),
+                    body_text: Some("one more thing about the data room".into()),
+                    snippet: "one more thing about the data room".into(),
+                    internal_date: 1_754_100_000_000,
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("message");
+
+    let many = tools::execute(
+        &harness.tool_context(),
+        "search_threads",
+        &json!({ "query": "data room" }),
+    )
+    .await
+    .expect("searched");
+    assert_eq!(many.payload["threads"].as_array().unwrap().len(), 2);
+    assert!(
+        many.artifact.is_none(),
+        "a list of two is a list, and the model picks one with get_thread"
+    );
+}
+
+/// The calendar's `get_thread`: the tool that exists so the model can say
+/// *this one* and the owner gets a card instead of a transcription.
+#[tokio::test]
+async fn get_event_carries_the_event_as_the_card_draws_it() {
+    let harness = Harness::new("artifact-event");
+    let (account_id, _thread_id) = seed(&harness.db);
+    add_calendar(&harness.db, account_id, "primary", "Alex", "owner");
+
+    let start = 1_787_000_000_000i64;
+    let event_id = harness
+        .db
+        .write(move |conn| {
+            queries::upsert_event(
+                conn,
+                &NewEvent {
+                    account_id,
+                    calendar_id: "primary".into(),
+                    google_event_id: "g-1".into(),
+                    title: "30 min meeting between Alex and Kerrie".into(),
+                    location: Some("Zoom".into()),
+                    start_ts: start,
+                    end_ts: start + 1_800_000,
+                    is_all_day: false,
+                    rsvp_status: Some(RsvpStatus::Accepted),
+                    guests: vec![
+                        EventGuest {
+                            email: "alex@example.com".into(),
+                            name: Some("Alex".into()),
+                            ..Default::default()
+                        },
+                        EventGuest {
+                            email: "kerrie@example.com".into(),
+                            ..Default::default()
+                        },
+                    ],
+                    conference: Some(EventConference {
+                        id: Some("vht-epjb-pjd".into()),
+                        name: Some("Google Meet".into()),
+                        entry_points: vec![ConferenceEntry {
+                            kind: "video".into(),
+                            uri: "https://meet.google.com/vht-epjb-pjd".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    status: "confirmed".into(),
+                    updated_at: 1_754_000_000_000,
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("event");
+
+    let outcome = tools::execute(
+        &harness.tool_context(),
+        tools::GET_EVENT_TOOL,
+        &json!({ "eventId": event_id }),
+    )
+    .await
+    .expect("read the event");
+
+    match outcome.artifact.expect("an event read by id is a card") {
+        tools::Artifact::Event {
+            event_id: on_event,
+            start_ms,
+            end_ms,
+            label,
+            location,
+            conference_url,
+            guests,
+            rsvp,
+            ..
+        } => {
+            assert_eq!(on_event, event_id);
+            // The grid shows a window; without this the card opens a week the
+            // event is not in.
+            assert_eq!(start_ms, start);
+            assert_eq!(end_ms, Some(start + 1_800_000));
+            assert_eq!(label, "30 min meeting between Alex and Kerrie");
+            assert_eq!(location.as_deref(), Some("Zoom"));
+            assert_eq!(
+                conference_url.as_deref(),
+                Some("https://meet.google.com/vht-epjb-pjd")
+            );
+            assert_eq!(guests, vec!["Alex", "kerrie@example.com"]);
+            assert_eq!(rsvp.as_deref(), Some("accepted"));
+        }
+        other => panic!("expected an event artifact, got {other:?}"),
+    }
+    assert!(!outcome.mutated);
+
+    // And the range read agrees with it, because one event in the range is the
+    // range answering with an object.
+    let listed = tools::execute(
+        &harness.tool_context(),
+        "list_events",
+        &json!({ "startMs": start - 3_600_000, "endMs": start + 3_600_000 }),
+    )
+    .await
+    .expect("listed");
+    match listed.artifact.expect("one event in the window is that event") {
+        tools::Artifact::Event { event_id: id, .. } => assert_eq!(id, event_id),
+        other => panic!("expected an event artifact, got {other:?}"),
+    }
 }
 
 /// The seam is not a special case for drafts: a created event carries one too,
@@ -1515,6 +1736,13 @@ fn an_artifact_survives_the_wire_with_its_ids_intact() {
             event_id: 42,
             start_ms: 1_775_000_000_000,
             label: "Coffee".into(),
+            end_ms: Some(1_775_003_600_000),
+            all_day: false,
+            location: None,
+            conference_url: None,
+            guests: vec!["Dana Cho".into()],
+            guest_count: None,
+            rsvp: None,
         }),
     };
     let json = serde_json::to_value(&entry).unwrap();
@@ -1522,6 +1750,11 @@ fn an_artifact_survives_the_wire_with_its_ids_intact() {
     assert_eq!(json["artifact"]["eventId"], 42);
     assert_eq!(json["artifact"]["startMs"], 1_775_000_000_000i64);
     assert_eq!(json["artifact"]["label"], "Coffee");
+    assert_eq!(json["artifact"]["endMs"], 1_775_003_600_000i64);
+    assert_eq!(json["artifact"]["guests"], json!(["Dana Cho"]));
+    // The empty halves are absent rather than null: the card tests presence.
+    assert!(json["artifact"].get("location").is_none());
+    assert!(json["artifact"].get("allDay").is_none());
 
     // A tool line that made nothing does not carry the key at all, rather than
     // carrying a null the frontend would have to test for.
@@ -1673,6 +1906,7 @@ async fn a_new_message_hands_back_a_draft_the_drawer_can_open() {
             thread_id,
             account_id: on_account,
             label,
+            ..
         } => {
             assert_eq!(
                 Some(draft_id.as_str()),

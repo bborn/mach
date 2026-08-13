@@ -179,6 +179,21 @@ export function AgentDock() {
 
   /* ------------------------------------------------------------- keystrokes */
 
+  const open = useMemo(
+    () => sessions.find((session) => session.id === openId) ?? null,
+    [sessions, openId],
+  );
+
+  /** The newest thing the open session surfaced — what ⌘⇧O opens. */
+  const latestArtifact = useMemo(() => {
+    if (!open) return null;
+    for (let i = open.entries.length - 1; i >= 0; i--) {
+      const entry = open.entries[i];
+      if (entry.role === "tool" && entry.artifact) return entry.artifact;
+    }
+    return null;
+  }, [open]);
+
   useKeyBindings([
     /*
      * The keyboard's own route to the divider.
@@ -224,6 +239,30 @@ export function AgentDock() {
       },
     },
     {
+      /*
+       * The keyboard's own route to the card.
+       *
+       * The card is an ordinary button in the drawer's tab order, which is how
+       * minimise, close and the approval buttons are reached — and that order
+       * is only enterable from inside the drawer's own input, because ⇥ is
+       * claimed by both modes everywhere else. A thing the agent put on screen
+       * should not need the pointer *or* a detour through a text field, so it
+       * gets a binding, exactly as the drawer's divider did.
+       *
+       * The newest artifact, because it is the one the answer is about.
+       */
+      keys: "shift+mod+o",
+      group: "Agent",
+      description: "Open what it found",
+      allowInInput: true,
+      when: () => latestArtifact !== null,
+      handler: () => {
+        if (!latestArtifact) return;
+        setOpenId(null);
+        actions.openArtifact(latestArtifact);
+      },
+    },
+    {
       keys: "escape",
       allowInInput: true,
       priority: 150,
@@ -233,11 +272,6 @@ export function AgentDock() {
   ]);
 
   /* ----------------------------------------------------------------- render */
-
-  const open = useMemo(
-    () => sessions.find((session) => session.id === openId) ?? null,
-    [sessions, openId],
-  );
 
   const close = useCallback((id: string) => {
     setOpenId((current) => (current === id ? null : current));

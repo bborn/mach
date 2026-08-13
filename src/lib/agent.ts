@@ -23,6 +23,7 @@
 import type { CalendarEvent, Thread, ThreadDetail } from "@/types";
 import type { PaletteContext, PaletteResolver, PaletteResult } from "./palette/resolver";
 import { isTauri, tauriTransport, toMachError } from "./ipc";
+import { monthShort, shortTime, timeRangeLabel, weekdayShort } from "./time";
 
 /* -------------------------------------------------------------------------- */
 /* Wire shapes                                                                 */
@@ -45,15 +46,21 @@ export interface ContextItem {
 }
 
 /**
- * Something a tool made, and enough to get to it.
+ * One object a tool put in front of the owner, with enough of it to draw.
  *
  * Mirrors `agent::tools::Artifact`. It exists because the drawer used to print
  * *"Drafted a reply…"* and leave the draft unreachable: prose is not an
- * affordance. A tool that brings something into being carries one of these, and
- * the drawer renders it as a button.
+ * affordance. It carries more than ids because reads carry one now too, and a
+ * read that surfaced an event was answered in bullet points — the title, the
+ * time, the guests, the Meet link, none of it clickable. Everything past the
+ * ids is what `ArtifactCard` draws.
+ *
+ * The fields past `label` are all optional, because a card has to render from
+ * whatever a build of Rust sent it: an artifact minted before one of them
+ * existed simply omits that line.
  *
  * The verb is the UI's, not Rust's — `label` is what the thing is called, and
- * `artifactAction` below decides what pressing it is called.
+ * `artifactAction` below decides what opening it is called.
  */
 export type Artifact =
   | {
@@ -62,11 +69,37 @@ export type Artifact =
       threadId?: number;
       accountId: number;
       label: string;
+      /** Who it is addressed to. */
+      to?: string[];
     }
-  | { kind: "thread"; threadId: number; label: string }
-  | { kind: "event"; eventId: number; startMs: number; label: string };
+  | {
+      kind: "thread";
+      threadId: number;
+      /** The subject. */
+      label: string;
+      from?: string;
+      atMs?: number;
+      accountEmail?: string;
+      unread?: boolean;
+    }
+  | {
+      kind: "event";
+      eventId: number;
+      startMs: number;
+      /** The title. */
+      label: string;
+      endMs?: number;
+      allDay?: boolean;
+      location?: string;
+      /** The video call — the one field on an event people click. */
+      conferenceUrl?: string;
+      guests?: string[];
+      /** How many guests there are, when more than `guests` lists. */
+      guestCount?: number;
+      rsvp?: string;
+    };
 
-/** What the button says. Labels, not sentences. */
+/** What opening it is called. Labels, not sentences. */
 export function artifactAction(artifact: Artifact): string {
   switch (artifact.kind) {
     case "draft":
@@ -76,6 +109,45 @@ export function artifactAction(artifact: Artifact): string {
     case "event":
       return "Show event";
   }
+}
+
+/**
+ * When an event is, in one line.
+ *
+ * Not `listTime`: that ages a timestamp *backwards* from now — an event nine
+ * days out comes back as "Yesterday" from it — and every event worth a card is
+ * in the future. So the day is stated, and the year only when it is not this
+ * one.
+ */
+export function eventWhen(
+  artifact: Extract<Artifact, { kind: "event" }>,
+  now: number = Date.now(),
+): string {
+  const start = new Date(artifact.startMs);
+  const sameYear = start.getFullYear() === new Date(now).getFullYear();
+  const day = `${weekdayShort(start)} ${monthShort(start)} ${start.getDate()}${
+    sameYear ? "" : ` ${start.getFullYear()}`
+  }`;
+  if (artifact.allDay) return `${day} · All day`;
+  const clock =
+    artifact.endMs != null && artifact.endMs > artifact.startMs
+      ? timeRangeLabel(artifact.startMs, artifact.endMs)
+      : shortTime(artifact.startMs);
+  return `${day} · ${clock}`;
+}
+
+/**
+ * Who is coming, as a card says it: a few names and a count for the rest.
+ *
+ * Empty string when there is nobody, so the caller drops the line rather than
+ * drawing "0 guests" — an event with no guests has nothing to say about them.
+ */
+export function guestLine(guests: string[] = [], total?: number): string {
+  if (guests.length === 0) return "";
+  const count = total ?? guests.length;
+  const shown = guests.slice(0, 3);
+  const rest = count - shown.length;
+  return rest > 0 ? `${shown.join(", ")} +${rest}` : shown.join(", ");
 }
 
 export type Entry =

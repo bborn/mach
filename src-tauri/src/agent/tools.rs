@@ -19,11 +19,16 @@
 //!
 //! # Reads
 //!
-//! `list_threads`, `search_threads`, `get_thread`, `list_events`,
+//! `list_threads`, `search_threads`, `get_thread`, `list_events`, `get_event`,
 //! `list_calendars`, `list_labels` and `list_accounts` are the local store,
 //! through [`crate::ipc::reads`]. They are the reason a session can answer
 //! "what did Tawny say about the data room?" rather than only archiving things.
 //! They touch nothing and never wait for approval.
+//!
+//! A read that surfaces one object carries an [`Artifact`], the same as a write
+//! does, so the drawer can draw it as a card instead of the model retyping the
+//! row as a bulleted list. `get_event` exists for that: it is the calendar's
+//! `get_thread`, and it is how the model says *this one* out of a list.
 //!
 //! `list_calendars` is also the half of `createEvent` that was missing. Every
 //! calendar write takes a `calendarId`, a user names a calendar rather than
@@ -140,6 +145,10 @@ pub const NEW_DRAFT_TOOL: &str = "draft_message";
 /// written to at all. It wrote the owner a list and asked him to make them
 /// himself.
 pub const LIST_CALENDARS_TOOL: &str = "list_calendars";
+
+/// One event, by id. The calendar's `get_thread`, and the way the model shows
+/// the owner a single event rather than describing one out of a list.
+pub const GET_EVENT_TOOL: &str = "get_event";
 
 /// Gmail filters. Listing is a read; the other two are standing rules.
 pub const LIST_FILTERS_TOOL: &str = "list_filters";
@@ -494,6 +503,18 @@ fn read_tools() -> Vec<Tool> {
             }),
         ),
         Tool::auto(
+            GET_EVENT_TOOL,
+            "One event by its eventId, with its guests, their answers and its video \
+             link. Call this for the event your answer is about: it is what shows the \
+             event to the user as a card they can open in the calendar.",
+            json!({
+                "type": "object",
+                "properties": { "eventId": { "type": "integer" } },
+                "required": ["eventId"],
+                "additionalProperties": false,
+            }),
+        ),
+        Tool::auto(
             LIST_CALENDARS_TOOL,
             "Every calendar, across every account, with the calendarId createEvent and \
              moveEvent need. A calendar the user names — \u{201c}Dad/Ben Schedule\u{201d}, \
@@ -741,21 +762,40 @@ impl ToolContext {
     }
 }
 
-/// Something a tool made, and enough to put the owner in front of it.
+/// One object a tool put in front of the owner, with enough of it to draw.
 ///
 /// # Why this is a shape and not a sentence
 ///
 /// The agent drafted a reply, the drawer printed *"Drafted a reply to the
 /// bookkeeper…"*, and the draft was unreachable from anywhere in the app. Prose
-/// is not an affordance. A tool that brings something into being — a draft, an
-/// event, a conversation it moved — hands back one of these instead, the drawer
-/// renders it as a button, and the artifact stops being orphaned.
+/// is not an affordance. A tool that surfaces something — a draft it wrote, an
+/// event it read, the one conversation a search landed on — hands back one of
+/// these instead, the drawer draws it as a card, and the object stops being
+/// orphaned.
+///
+/// # Reads carry one too
+///
+/// This started as "what a *write* made", and that restriction was the bug. Ask
+/// for an event and the model would print the row it had just read out of
+/// SQLite as a bulleted list: the title, the time, the guests, the Meet link,
+/// none of it clickable. A read tool that surfaces a specific object has put the
+/// owner in front of something exactly as a write has, so it carries an artifact
+/// on the same terms.
+///
+/// **One object, or none.** `get_thread` and `get_event` name one thing and
+/// always carry it. A tool that returns a list carries an artifact only when the
+/// list has exactly one row in it, because that is the only case where the
+/// answer is unambiguously *about* one object — seventeen cards for a week of
+/// calendar is worse than the prose it replaced. To show one specific thing, the
+/// model calls the singular tool for it; the system prompt says so.
 ///
 /// It is deliberately a small closed enum rather than a free-form link. Each
 /// variant is a thing the shell already knows how to open, so adding an
 /// affordance to a new tool is filling this in rather than teaching the UI a
-/// new kind of navigation. The label is what the artifact is *called*; the verb
-/// ("Open draft", "Show event") belongs to the UI, not to Rust.
+/// new kind of navigation. Everything past the ids is what the card *says* —
+/// carried on the wire rather than looked up in the frontend, because the object
+/// is very often outside the window the shell has loaded, which is the same
+/// reason `start_ms` is here.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Artifact {
@@ -767,17 +807,125 @@ pub enum Artifact {
         thread_id: Option<i64>,
         account_id: i64,
         label: String,
+        /// Who it is addressed to, as the card shows them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        to: Vec<String>,
     },
     /// A conversation worth landing on.
-    Thread { thread_id: i64, label: String },
-    /// A calendar entry the agent created. `start_ms` is carried because the
-    /// grid shows a window, and an event you cannot scroll to is as orphaned as
-    /// a draft you cannot open.
+    Thread {
+        thread_id: i64,
+        /// The subject.
+        label: String,
+        /// Who it is from — a display name where there is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// When it last moved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_email: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        unread: bool,
+    },
+    /// A calendar entry. `start_ms` is carried because the grid shows a window,
+    /// and an event you cannot scroll to is as orphaned as a draft you cannot
+    /// open.
     Event {
         event_id: i64,
         start_ms: i64,
+        /// The title.
         label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        all_day: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        /// The video call, which is the one field on an event people click.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conference_url: Option<String>,
+        /// Who is coming, names where there are names. Capped: the card shows a
+        /// few and counts the rest, and a fifty-guest all-hands must not put
+        /// fifty addresses on the wire to be truncated in the frontend.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        guests: Vec<String>,
+        /// How many there are in total, when more were dropped than sent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guest_count: Option<usize>,
+        /// The owner's own answer: `accepted`, `declined`, `tentative`, `needsAction`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rsvp: Option<String>,
     },
+}
+
+/// How many guests ride along on an event artifact. Six is more than a card
+/// shows and enough for the count line to be exact on an ordinary meeting.
+const CARD_GUESTS: usize = 6;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Artifact {
+    /// One stored event, as much of it as a card draws.
+    pub fn event(event: &crate::db::models::Event) -> Artifact {
+        // `guests` is the richer list and `attendees` is what an event Mach
+        // wrote itself carries; a reader takes whichever is populated.
+        let names: Vec<String> = if event.guests.is_empty() {
+            event.attendees.iter().map(short_name).collect()
+        } else {
+            event.guests.iter().map(guest_name).collect()
+        };
+        let total = names.len();
+        Artifact::Event {
+            event_id: event.id,
+            start_ms: event.start_ts,
+            label: event.title.clone(),
+            end_ms: Some(event.end_ts),
+            all_day: event.is_all_day,
+            location: non_empty(event.location.clone()),
+            conference_url: event
+                .conference
+                .as_ref()
+                .and_then(|c| c.video())
+                .map(|entry| entry.uri.clone()),
+            guests: names.into_iter().take(CARD_GUESTS).collect(),
+            guest_count: (total > CARD_GUESTS).then_some(total),
+            rsvp: event.rsvp_status.map(|status| status.as_str().to_string()),
+        }
+    }
+
+    /// One conversation, as much of it as a card draws.
+    pub fn thread(summary: &crate::db::models::ThreadSummary) -> Artifact {
+        Artifact::Thread {
+            thread_id: summary.id,
+            label: summary.subject.clone(),
+            from: summary.participants.first().map(short_name),
+            at_ms: Some(summary.last_message_at),
+            account_email: non_empty(Some(summary.account_email.clone())),
+            unread: summary.is_unread,
+        }
+    }
+}
+
+/// A person, as a card names them: the display name, or the address.
+fn short_name(p: &crate::db::models::Participant) -> String {
+    named(p.name.as_deref(), &p.email)
+}
+
+fn guest_name(g: &crate::db::models::EventGuest) -> String {
+    named(g.name.as_deref(), &g.email)
+}
+
+fn named(name: Option<&str>, email: &str) -> String {
+    match name.map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => email.to_string(),
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
 }
 
 /// What a tool run came to. `summary` is the one line the drawer shows.
@@ -797,6 +945,7 @@ pub async fn execute(ctx: &ToolContext, name: &str, input: &Value) -> Result<Too
         "search_threads" => search_threads(ctx, input),
         "get_thread" => get_thread(ctx, input),
         "list_events" => list_events(ctx, input),
+        GET_EVENT_TOOL => get_event(ctx, input),
         LIST_CALENDARS_TOOL => list_calendars(ctx, input),
         "list_labels" => list_labels(ctx, input),
         "list_accounts" => list_accounts(ctx),
@@ -845,11 +994,30 @@ async fn run_command(ctx: &ToolContext, name: &str, input: &Value) -> Result<Too
         _ => None,
     };
     let result = ctx.dispatcher.execute(command).await?;
+    // The stored row, so the card says what the event *is* — its guests, its
+    // video link, the end it was given — rather than only what was typed at it.
+    // The draft is the fallback for a row that cannot be read back.
     let artifact = created.and_then(|(title, start_ms)| {
-        result.applied.first().map(|event_id| Artifact::Event {
-            event_id: *event_id,
-            start_ms,
-            label: title,
+        let event_id = *result.applied.first()?;
+        let stored = ctx
+            .db
+            .read(|conn| crate::db::command_queries::event_by_id(conn, event_id))
+            .ok()
+            .flatten();
+        Some(match stored {
+            Some(event) => Artifact::event(&event),
+            None => Artifact::Event {
+                event_id,
+                start_ms,
+                label: title,
+                end_ms: None,
+                all_day: false,
+                location: None,
+                conference_url: None,
+                guests: Vec::new(),
+                guest_count: None,
+                rsvp: None,
+            },
         })
     });
     Ok(ToolOutcome {
@@ -878,13 +1046,26 @@ fn list_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentEr
         cursor: None,
     };
     let page = reads::list_threads(&ctx.db, &query).map_err(ipc_to_agent)?;
+    let artifact = only_thread(&page.items);
     let items: Vec<Value> = page.items.iter().map(thread_row).collect();
     Ok(ToolOutcome {
         summary: format!("{} conversations", items.len()),
         payload: json!({ "threads": items }),
         mutated: false,
-        artifact: None,
+        artifact,
     })
+}
+
+/// The card a list earns: one row, or nothing.
+///
+/// A mailbox with seventeen conversations in it is a list, and the drawer has
+/// no business drawing seventeen cards under one tool line. One row is the case
+/// where the list *is* the object.
+fn only_thread(items: &[crate::db::models::ThreadSummary]) -> Option<Artifact> {
+    match items {
+        [one] => Some(Artifact::thread(one)),
+        _ => None,
+    }
 }
 
 fn search_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
@@ -894,12 +1075,13 @@ fn search_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Agent
         .ok_or_else(|| AgentError::invalid("search_threads needs a query"))?;
     let page = reads::search_threads(&ctx.db, query, Some(limit_of(input, 20)))
         .map_err(ipc_to_agent)?;
+    let artifact = only_thread(&page.items);
     let items: Vec<Value> = page.items.iter().map(thread_row).collect();
     Ok(ToolOutcome {
         summary: format!("{} matches for \u{201c}{query}\u{201d}", items.len()),
         payload: json!({ "threads": items }),
         mutated: false,
-        artifact: None,
+        artifact,
     })
 }
 
@@ -944,7 +1126,8 @@ fn get_thread(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErro
             "messages": messages,
         }),
         mutated: false,
-        artifact: None,
+        // Naming one thread is putting the owner in front of it.
+        artifact: Some(Artifact::thread(&detail.thread)),
     })
 }
 
@@ -973,6 +1156,12 @@ fn list_events(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErr
     let start = required_i64(input, "startMs")?;
     let end = required_i64(input, "endMs")?;
     let events = reads::list_events(&ctx.db, start, end).map_err(ipc_to_agent)?;
+    // One event in the range is the range answering with an object. Seventeen
+    // is a list — see [`Artifact`], and `get_event` for how the model shows one.
+    let artifact = match events.as_slice() {
+        [one] => Some(Artifact::event(one)),
+        _ => None,
+    };
     let items: Vec<Value> = events
         .iter()
         .map(|e| {
@@ -992,7 +1181,67 @@ fn list_events(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErr
         summary: format!("{} events", items.len()),
         payload: json!({ "events": items }),
         mutated: false,
-        artifact: None,
+        artifact,
+    })
+}
+
+/// One event, by id — the calendar's `get_thread`.
+///
+/// It exists for the card. `list_events` answers "what is on Thursday" and
+/// cannot know which of the seventeen rows the reply is about; this is how the
+/// model says *this one*, and the owner gets something to click instead of a
+/// bulleted transcription of the row.
+fn get_event(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+    let event_id = required_i64(input, "eventId")?;
+    let event = ctx
+        .db
+        .read(|conn| crate::db::command_queries::event_by_id(conn, event_id))
+        .map_err(|e| AgentError::invalid(e.to_string()))?
+        .ok_or_else(|| AgentError::invalid(format!("no event {event_id} in the local store")))?;
+
+    let guests: Vec<Value> = if event.guests.is_empty() {
+        event.attendees.iter().map(participant).collect()
+    } else {
+        event
+            .guests
+            .iter()
+            .map(|g| {
+                json!({
+                    "who": super::context::who(&crate::db::models::Participant {
+                        name: g.name.clone(),
+                        email: g.email.clone(),
+                    }),
+                    "response": g.response.map(|r| r.as_str()),
+                    "optional": g.optional,
+                    "organizer": g.organizer,
+                })
+            })
+            .collect()
+    };
+
+    Ok(ToolOutcome {
+        summary: format!("Read \u{201c}{}\u{201d}", event.title),
+        payload: json!({
+            "eventId": event.id,
+            "accountId": event.account_id,
+            "calendarId": event.calendar_id,
+            "title": event.title,
+            "startMs": event.start_ts,
+            "endMs": event.end_ts,
+            "when": super::context::human_time(event.start_ts),
+            "isAllDay": event.is_all_day,
+            "location": event.location,
+            "description": event.description,
+            "guests": guests,
+            "rsvp": event.rsvp_status.map(|r| r.as_str()),
+            "conference": event
+                .conference
+                .as_ref()
+                .and_then(|c| c.video())
+                .map(|entry| entry.uri.clone()),
+        }),
+        mutated: false,
+        artifact: Some(Artifact::event(&event)),
     })
 }
 
@@ -1189,6 +1438,7 @@ fn drafted(saved: Value) -> ToolOutcome {
             thread_id: draft.get("threadId").and_then(Value::as_i64),
             account_id: draft.get("accountId").and_then(Value::as_i64).unwrap_or(0),
             label: subject.clone(),
+            to: recipients(&draft),
         });
 
     ToolOutcome {
@@ -1199,6 +1449,26 @@ fn drafted(saved: Value) -> ToolOutcome {
         mutated: true,
         artifact,
     }
+}
+
+/// Who a saved draft is addressed to, as the card names them.
+fn recipients(draft: &Value) -> Vec<String> {
+    draft
+        .get("to")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .map(|who| {
+                    named(
+                        who.get("name").and_then(Value::as_str),
+                        who.get("email").and_then(Value::as_str).unwrap_or_default(),
+                    )
+                })
+                .filter(|who| !who.is_empty())
+                .take(CARD_GUESTS)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Which account a message with nothing behind it is sent from.
