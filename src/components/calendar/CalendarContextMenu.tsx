@@ -456,7 +456,7 @@ export function buildEventItems(
     }
   };
 
-  push("Event", "Open the event", "Open", () => verbs.open(event));
+  push("Event", "Open", "Open", () => verbs.open(event));
 
   /*
    * Answering an invitation.
@@ -484,11 +484,11 @@ export function buildEventItems(
   }
 
   separate();
-  push("Event", "Copy the event", "Copy", () => verbs.copy(event));
+  push("Event", "Copy", "Copy", () => verbs.copy(event));
   // A duplicate lands on the same calendar, so it is a *create* there and a
   // read-only subscription refuses it — a round trip later, and in worse words.
   if (canCreate) {
-    push("Event", "Duplicate the event", "Duplicate", () => verbs.duplicate(event));
+    push("Event", "Duplicate", "Duplicate", () => verbs.duplicate(event));
   }
 
   separate();
@@ -498,7 +498,7 @@ export function buildEventItems(
 
   if (canEdit) {
     separate();
-    push("Event", "Delete the event", "Delete", () => verbs.remove(event), "danger");
+    push("Event", "Delete", "Delete", () => verbs.remove(event), "danger");
   }
 
   // A leading or trailing rule is a rule around nothing.

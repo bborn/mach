@@ -937,6 +937,7 @@ export function CalendarMode() {
       ...VIEWS.flatMap((view) => [
         {
           keys: view.keys,
+          alsoKeys: [view.alias],
           group: "Calendar",
           description: `${view.label} view`,
           when: () => active,
@@ -959,6 +960,7 @@ export function CalendarMode() {
       // the arrows moved to the events, below.
       {
         keys: "j",
+        alsoKeys: ["n"],
         group: "Calendar",
         description: "Next period",
         when: () => active,
@@ -967,6 +969,7 @@ export function CalendarMode() {
       { keys: "n", when: () => active, handler: () => actions.shiftPeriod(1) },
       {
         keys: "k",
+        alsoKeys: ["p"],
         group: "Calendar",
         description: "Previous period",
         when: () => active,
@@ -993,30 +996,37 @@ export function CalendarMode() {
       // and on into the next occupied day — while left and right cross to the
       // nearest event on another day at about the same time, which is how a
       // week of standups reads as a row rather than as seven separate columns.
+      //
+      // Three behaviours, six keys, three rows on the sheet: the arrow carries
+      // the description and names its Tab spelling through `alsoKeys`, so ⇧⇥
+      // is printed beside the ↑ that explains it rather than alone.
       {
-        keys: "tab",
+        keys: "down",
+        alsoKeys: ["tab"],
         group: "Calendar",
         description: "Next event",
         when: () => active,
-        handler: () => step(1),
+        handler: () => arrow("down"),
       },
+      { keys: "tab", when: () => active, handler: () => step(1) },
       {
-        keys: "shift+tab",
+        keys: "up",
+        alsoKeys: ["shift+tab"],
         group: "Calendar",
         description: "Previous event",
         when: () => active,
-        handler: () => step(-1),
+        handler: () => arrow("up"),
       },
+      { keys: "shift+tab", when: () => active, handler: () => step(-1) },
       {
-        keys: "down",
+        keys: "left",
+        alsoKeys: ["right"],
         group: "Calendar",
-        description: "Next event ↓ ↑, nearest event on another day ← →",
+        description: "Nearest event on another day",
         when: () => active,
-        handler: () => arrow("down"),
+        handler: () => arrow("left"),
       },
-      { keys: "up", when: () => active, handler: () => arrow("up") },
       { keys: "right", when: () => active, handler: () => arrow("right") },
-      { keys: "left", when: () => active, handler: () => arrow("left") },
 
       // Type to select. `/` is Gmail's search key and the palette claims it
       // globally at priority 200 — scoped `when: () => !open`, which is true
@@ -1053,8 +1063,9 @@ export function CalendarMode() {
       // Opening and editing the focused event.
       {
         keys: "e",
+        alsoKeys: ["enter"],
         group: "Event",
-        description: "Open the event",
+        description: "Open",
         when: () => active,
         handler: () => (ui.eventId === null ? step(1) : openEvent(ui.eventId)),
       },
@@ -1066,7 +1077,7 @@ export function CalendarMode() {
       {
         keys: "backspace",
         group: "Event",
-        description: "Delete the event",
+        description: "Delete",
         when: () => active,
         handler: withEvent(requestDelete),
       },
@@ -1078,59 +1089,62 @@ export function CalendarMode() {
 
       // Moving and resizing without a mouse. Shift slides the whole event,
       // Alt moves one edge — the same two gestures the pointer offers.
-      {
-        keys: "shift+down",
-        group: "Event",
-        description: "Move 15 minutes later",
-        when: () => active,
-        handler: () => nudgeSelected({ kind: "move", axis: "time", steps: 1 }),
-      },
+      //
+      // Four rows on the sheet rather than eight. Each is one idea with a
+      // direction, and on a grid where earlier is up the arrow says which way
+      // without the description spelling it out; "Move 15 minutes later" and
+      // "Start 15 minutes earlier" sat four rows apart and never read as the
+      // same family of gesture, which is what made this block the longest and
+      // least legible thing on the card.
       {
         keys: "shift+up",
+        alsoKeys: ["shift+down"],
         group: "Event",
-        description: "Move 15 minutes earlier",
+        description: "Move by 15 minutes",
         when: () => active,
         handler: () => nudgeSelected({ kind: "move", axis: "time", steps: -1 }),
       },
       {
-        keys: "shift+right",
-        group: "Event",
-        description: "Move to the next day",
+        keys: "shift+down",
         when: () => active,
-        handler: () => nudgeSelected({ kind: "move", axis: "day", days: 1 }),
+        handler: () => nudgeSelected({ kind: "move", axis: "time", steps: 1 }),
       },
       {
         keys: "shift+left",
+        alsoKeys: ["shift+right"],
         group: "Event",
-        description: "Move to the previous day",
+        description: "Move by a day",
         when: () => active,
         handler: () => nudgeSelected({ kind: "move", axis: "day", days: -1 }),
       },
       {
-        keys: "alt+down",
-        group: "Event",
-        description: "Make it 15 minutes longer",
+        keys: "shift+right",
         when: () => active,
-        handler: () => nudgeSelected({ kind: "resize", edge: "end", steps: 1 }),
+        handler: () => nudgeSelected({ kind: "move", axis: "day", days: 1 }),
       },
       {
         keys: "alt+up",
+        alsoKeys: ["alt+down"],
         group: "Event",
-        description: "Make it 15 minutes shorter",
+        description: "Move the end by 15 minutes",
         when: () => active,
         handler: () => nudgeSelected({ kind: "resize", edge: "end", steps: -1 }),
       },
       {
+        keys: "alt+down",
+        when: () => active,
+        handler: () => nudgeSelected({ kind: "resize", edge: "end", steps: 1 }),
+      },
+      {
         keys: "shift+alt+up",
+        alsoKeys: ["shift+alt+down"],
         group: "Event",
-        description: "Start 15 minutes earlier",
+        description: "Move the start by 15 minutes",
         when: () => active,
         handler: () => nudgeSelected({ kind: "resize", edge: "start", steps: -1 }),
       },
       {
         keys: "shift+alt+down",
-        group: "Event",
-        description: "Start 15 minutes later",
         when: () => active,
         handler: () => nudgeSelected({ kind: "resize", edge: "start", steps: 1 }),
       },
@@ -1144,7 +1158,7 @@ export function CalendarMode() {
       {
         keys: "mod+c",
         group: "Event",
-        description: "Copy the event",
+        description: "Copy",
         when: () => active,
         handler: withEvent(copyEvent),
       },
@@ -1164,7 +1178,7 @@ export function CalendarMode() {
       {
         keys: "shift+d",
         group: "Event",
-        description: "Duplicate the event",
+        description: "Duplicate",
         when: () => active,
         handler: withEvent(duplicate),
       },
@@ -1215,9 +1229,14 @@ export function CalendarMode() {
       // "switch mode" app-wide and on macOS ⌘<digit> means "switch view" in every
       // app on the platform. Visibility moves to a `v <digit>` sequence instead, in the
       // spirit of `g d`.
+      //
+      // The sheet group is "Visibility" rather than "Calendars": a heading a
+      // letter away from the "Calendar" heading three inches above it reads as
+      // a typo, and neither of these two rows is about the calendar you are
+      // looking at.
       ...Array.from({ length: 9 }, (_, i) => ({
         keys: `v ${i + 1}`,
-        group: i === 0 ? "Calendars" : undefined,
+        group: i === 0 ? "Visibility" : undefined,
         description: i === 0 ? "Show or hide calendar 1–9" : undefined,
         when: () => active,
         handler: () => toggleCalendarAt(i),
@@ -1235,7 +1254,7 @@ export function CalendarMode() {
       })),
       ...Array.from({ length: 5 }, (_, i) => ({
         keys: `s ${i + 1}`,
-        group: i === 0 ? "Calendars" : undefined,
+        group: i === 0 ? "Visibility" : undefined,
         description: i === 0 ? "Show only account 1–5" : undefined,
         when: () => active,
         handler: () => soloAccountAt(i),

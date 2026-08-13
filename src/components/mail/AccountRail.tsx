@@ -219,6 +219,7 @@ export function AccountRail() {
   useKeyBindings([
     {
       keys: "j",
+      alsoKeys: ["down"],
       group: "Sidebar",
       description: "Next mailbox",
       when: () => railActive,
@@ -226,6 +227,7 @@ export function AccountRail() {
     },
     {
       keys: "k",
+      alsoKeys: ["up"],
       group: "Sidebar",
       description: "Previous mailbox",
       when: () => railActive,
@@ -236,14 +238,14 @@ export function AccountRail() {
     {
       keys: "left",
       group: "Sidebar",
-      description: "Fold the section, or step out to it",
+      description: "Fold, or step out",
       when: () => railActive,
       handler: () => step("out"),
     },
     {
       keys: "right",
       group: "Sidebar",
-      description: "Unfold the section, or step into it",
+      description: "Unfold, or step in",
       when: () => railActive,
       handler: () => step("in"),
     },
@@ -262,7 +264,7 @@ export function AccountRail() {
     {
       keys: "enter",
       group: "Sidebar",
-      description: "Open, and hand the keyboard back to the list",
+      description: "Open, and back to the list",
       when: () => railActive,
       handler: () => {
         // A heading that only folds has nowhere to send you, so Enter folds it

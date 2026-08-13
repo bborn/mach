@@ -43,6 +43,7 @@ export function MailMode() {
     /* ------------------------------------------------------------- Mail --- */
     {
       keys: "j",
+      alsoKeys: ["down"],
       group: "Mail",
       description: "Next conversation",
       when: () => active,
@@ -50,6 +51,7 @@ export function MailMode() {
     },
     {
       keys: "k",
+      alsoKeys: ["up"],
       group: "Mail",
       description: "Previous conversation",
       when: () => active,
@@ -67,6 +69,7 @@ export function MailMode() {
     },
     {
       keys: "enter",
+      alsoKeys: ["o"],
       group: "Mail",
       description: "Open conversation",
       when: () => active,
@@ -98,6 +101,7 @@ export function MailMode() {
       // field — cc / bcc, attach, discard, pop out — and throwing the keyboard
       // out of a half-written message into the rail. See `keyboardInComposer`.
       keys: "tab",
+      alsoKeys: ["shift+tab"],
       group: "Mail",
       description: "Sidebar or list",
       when: () => mail && !keyboardInComposer(),
@@ -145,15 +149,14 @@ export function MailMode() {
     },
     {
       keys: "shift+j",
+      alsoKeys: ["shift+k"],
       group: "Selection",
-      description: "Extend down",
+      description: "Extend the selection",
       when: () => active,
       handler: () => actions.extendCursor(1),
     },
     {
       keys: "shift+k",
-      group: "Selection",
-      description: "Extend up",
       when: () => active,
       handler: () => actions.extendCursor(-1),
     },
