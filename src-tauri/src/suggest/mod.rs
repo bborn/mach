@@ -1,0 +1,551 @@
+//! Replies written before he arrives at the conversation.
+//!
+//! ```text
+//!   sync::mail::incremental ──► suggest::plan ──► rule::earns_a_suggestion
+//!    (only on an already-      (one transaction)         │
+//!     synced account)                                    ▼
+//!                                              voice::examples  (his Sent mail, FTS5)
+//!                                                        │
+//!                                                        ▼
+//!                                              prompt + agent::complete_as
+//!                                                (one call, a cheap model)
+//!                                                        │
+//!                                                        ▼
+//!                                              store::save  ──►  SQLite, and nowhere else
+//!
+//!   opening a thread ──► ipc::suggest ──► store::fresh_for_thread ──► the stance row
+//! ```
+//!
+//! # The three rules that shape everything here
+//!
+//! **A suggestion is not a draft.** Nothing in this module calls
+//! `drafts.create`, and nothing in it can: it has no Gmail client and no path to
+//! one. A stance becomes a Gmail draft at the moment he presses it and the
+//! ordinary composer runs, and not one instant before. The hazard is concrete —
+//! a Gmail draft appears on his phone and can be sent from it by a thumb — and
+//! the defence is structural rather than a rule somebody has to remember.
+//!
+//! **Nothing announces itself.** No banner, no badge, no toast. The stances are
+//! there when he arrives at the conversation and absent otherwise. A feature
+//! that interrupts to say it has an opinion has already cost more than it saves.
+//!
+//! **Stale beats wrong.** A conversation that has moved on since the stances
+//! were written gets none. See [`store::fresh_for_thread`] — the check is a
+//! comparison against the thread's own newest message, so there is no sweep to
+//! forget to run.
+//!
+//! # Why this is not a session
+//!
+//! [`crate::ipc::agent::engine::session`] is owner-driven: it opens the drawer, streams into
+//! a transcript, and parks on the approval desk for anything that touches
+//! another human. Every one of those is wrong here. This runs unattended, has
+//! nothing to show, needs no tools, and must never send. So it uses the narrower
+//! seam that already exists for ghost text —
+//! [`crate::ipc::agent::engine::complete::complete_as`]: one request, no tools, no stream,
+//! and a string back. The `Brain` trait is the wrong shape for that and always
+//! was; `complete` is what a one-shot structured completion is *for*.
+//!
+//! # Cost
+//!
+//! One call per qualifying message, on Sonnet or Haiku — see [`model`]. Never
+//! Opus: this runs against every human message addressed to him, unattended, and
+//! the default must not be the expensive one. Bounded by [`MAX_PER_PASS`] and by
+//! the rule that a message is planned only once ever, and switched off entirely
+//! by the preference — which means *nothing generates* rather than *nothing
+//! displays*.
+
+pub mod prompt;
+pub mod rule;
+pub mod store;
+pub mod voice;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rusqlite::Connection;
+
+use crate::ipc::agent::engine::complete::{complete_as, CompletionRequest, MAX_STRUCTURED_TOKENS};
+use crate::ipc::agent::engine::config::AgentConfig;
+use crate::ipc::agent::engine::wire::ModelTransport;
+use crate::db::{queries, sync_queries, Db, Result as DbResult};
+use crate::google::types as g;
+use crate::ipc::prefs;
+
+pub use prompt::Stance;
+pub use rule::{earns_a_suggestion, Candidate, Decline};
+pub use store::{Counters, Outcome, Suggestion};
+
+// ===========================================================================
+// Settings
+// ===========================================================================
+
+/// Whether the agent writes replies at all. **Default on** — he asked for this
+/// and should find it working. Off means nothing generates: no model call, no
+/// row, no cost.
+pub const ENABLED_KEY: &str = "replySuggestions";
+
+/// A model id, or `""` for the default. Free text for the same reason
+/// `agentModel` is: a list would be stale the week after it was written.
+pub const MODEL_KEY: &str = "replySuggestionModel";
+
+/// The environment override, for a machine rather than a person.
+pub const ENV_MODEL: &str = "MACH_SUGGEST_MODEL";
+
+/// Sonnet, not Opus and not Haiku.
+///
+/// The task is "write four sentences that sound like this specific person, given
+/// six examples of how he writes" — harder than finishing a clause, which is why
+/// this is not on the ghost-text model, and nowhere near hard enough to want the
+/// model that chains reads into an action somebody will be held to. It runs
+/// unattended against every human message addressed to him, so the default is
+/// the one that can be wrong cheaply.
+pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
+
+/// At most this many messages in one sync pass get a suggestion written.
+///
+/// A pass after a weekend can bring in a hundred qualifying messages, and paying
+/// for a hundred at once to answer conversations he will read over the following
+/// hour is the shape of a bill nobody expected. The rest are simply not
+/// suggested; there is no queue, because a queue would eventually drain into the
+/// same bill.
+///
+/// This and the once-per-message rule in [`plan`] are the *whole* spend bound,
+/// and between them they are enough. A message is planned only while no row
+/// names it, so a forced sync pressed twenty times in a minute costs nothing
+/// after the first — which is what a wall-clock throttle would have been for,
+/// and it would have been a second answer to a question already answered.
+pub const MAX_PER_PASS: usize = 4;
+
+/// The last few messages of a thread are the context; the rest is history.
+const CONVERSATION_DEPTH: usize = 4;
+
+/// How much of each earlier message goes in the prompt.
+const CONVERSATION_CHARS: usize = 1_200;
+
+/// Whether the feature is on. Absent means on.
+pub fn enabled(conn: &Connection) -> DbResult<bool> {
+    Ok(prefs::get(conn, ENABLED_KEY)?
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true))
+}
+
+/// The model to write on: the preference, then the environment, then Sonnet.
+///
+/// The preference wins over the environment, unlike ghost text, because the
+/// preference is the thing with a control in ⌘, and a variable exported into a
+/// shell should not silently outrank a switch he can see.
+pub fn model(conn: &Connection) -> DbResult<String> {
+    let stored = prefs::get(conn, MODEL_KEY)?
+        .and_then(|v| v.as_str().map(str::to_string))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if let Some(stored) = stored {
+        return Ok(stored);
+    }
+    Ok(std::env::var(ENV_MODEL)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string()))
+}
+
+// ===========================================================================
+// What one message needs before a model sees it
+// ===========================================================================
+
+/// The headers the rule reads, lifted off the wire response while they are still
+/// in hand. They are not on the message row — nothing else needs them — so they
+/// are carried from the sync loop rather than read back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Headers {
+    pub list_unsubscribe: Option<String>,
+    pub list_id: Option<String>,
+    pub precedence: Option<String>,
+    pub auto_submitted: Option<String>,
+    pub auto_response_suppress: Option<String>,
+}
+
+impl Headers {
+    /// Read them off a `users.messages.get` response.
+    pub fn of(message: &g::Message) -> Headers {
+        Headers {
+            list_unsubscribe: message.header("List-Unsubscribe"),
+            list_id: message.header("List-Id"),
+            precedence: message.header("Precedence"),
+            auto_submitted: message.header("Auto-Submitted"),
+            auto_response_suppress: message.header("X-Auto-Response-Suppress"),
+        }
+    }
+}
+
+/// One message the model is going to be asked about, with everything it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub account_id: i64,
+    pub thread_id: i64,
+    pub message_id: i64,
+    pub gmail_message_id: String,
+    pub owner_name: String,
+    pub owner_email: String,
+    /// The sender, rendered for the prompt: `Kate <kate@example.org>`.
+    pub correspondent: String,
+    /// Just the address, for the same-correspondent voice lookup.
+    pub correspondent_email: String,
+    pub subject: String,
+    /// The conversation up to and including this message, oldest first, as
+    /// `(who, what)`.
+    pub conversation: Vec<(String, String)>,
+    /// The message being answered, on its own.
+    pub incoming: String,
+}
+
+/// Which of a sweep's arrivals deserve a reply written for them.
+///
+/// One read transaction, and the whole decision: the preference, the rule, the
+/// dedup, and the throttle. Split out from [`consider`] for the same reason
+/// [`crate::notify::plan`] is — it takes a connection and returns a value, with
+/// no network and no globals anywhere near it.
+pub fn plan(
+    conn: &Connection,
+    account_id: i64,
+    arrived: &[String],
+    headers: &HashMap<String, Headers>,
+) -> DbResult<Vec<Job>> {
+    if arrived.is_empty() || !enabled(conn)? {
+        return Ok(Vec::new());
+    }
+    let Some((owner_name, owner_email)) = account(conn, account_id)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut jobs = Vec::new();
+    for gmail_message_id in arrived {
+        if jobs.len() == MAX_PER_PASS {
+            break;
+        }
+        let Some(message) = queries::message_by_gmail_id(conn, account_id, gmail_message_id)? else {
+            continue;
+        };
+        // Already answered — a replayed history window, or the same message
+        // reported by two records in one sweep.
+        if store::exists_for_message(conn, message.thread_id, message.id)? {
+            continue;
+        }
+
+        let labels =
+            sync_queries::message_labels(conn, account_id, gmail_message_id)?.unwrap_or_default();
+        let header = headers.get(gmail_message_id).cloned().unwrap_or_default();
+        let candidate = Candidate {
+            from_email: message.from.email.clone(),
+            to: message.to.iter().map(|p| p.email.clone()).collect(),
+            cc: message.cc.iter().map(|p| p.email.clone()).collect(),
+            labels,
+            list_unsubscribe: header.list_unsubscribe,
+            list_id: header.list_id,
+            precedence: header.precedence,
+            auto_submitted: header.auto_submitted,
+            auto_response_suppress: header.auto_response_suppress,
+            thread_has_own_message: thread_has_own_message(
+                conn,
+                message.thread_id,
+                message.id,
+                &owner_email,
+            )?,
+        };
+        if earns_a_suggestion(&candidate, &owner_email).is_err() {
+            continue;
+        }
+
+        let conversation = conversation(conn, message.thread_id)?;
+
+        jobs.push(Job {
+            account_id,
+            thread_id: message.thread_id,
+            message_id: message.id,
+            gmail_message_id: gmail_message_id.clone(),
+            owner_name: owner_name.clone(),
+            owner_email: owner_email.clone(),
+            correspondent: display(&message.from),
+            correspondent_email: message.from.email.clone(),
+            subject: message.subject.clone(),
+            conversation,
+            incoming: clip(
+                body_of(message.body_text.as_deref(), &message.snippet),
+                CONVERSATION_CHARS * 2,
+            ),
+        });
+    }
+    Ok(jobs)
+}
+
+/// Write the stances for one job.
+///
+/// Two reads and one call: his voice out of the store, the prompt, the model.
+/// Returns what was written, which is what the tests assert on and the caller
+/// ignores. A model that answers with nothing usable writes no row — there is no
+/// error state for a suggestion, because nothing is waiting for one.
+pub async fn generate(
+    db: &Db,
+    transport: &dyn ModelTransport,
+    config: &AgentConfig,
+    model_id: &str,
+    job: &Job,
+    now_ms: i64,
+) -> Vec<Stance> {
+    let job_examples = {
+        let account_id = job.account_id;
+        let owner = job.owner_email.clone();
+        let correspondent = job.correspondent_email.clone();
+        let topic = format!("{} {}", job.subject, job.incoming);
+        db.read(move |conn| voice::examples(conn, account_id, &owner, &correspondent, &topic))
+            .unwrap_or_default()
+    };
+
+    let request = CompletionRequest::structured(
+        prompt::system_prompt(&job.owner_name, &job.owner_email),
+        prompt::user_prompt(
+            &job.correspondent,
+            &job.subject,
+            &job.conversation,
+            &job.incoming,
+            &job_examples,
+        ),
+        MAX_STRUCTURED_TOKENS,
+    );
+
+    let Ok(text) = complete_as(transport, config, model_id, &request).await else {
+        return Vec::new();
+    };
+    let stances = prompt::parse_stances(&text);
+    if stances.is_empty() {
+        return Vec::new();
+    }
+
+    // The write and the counter together, so a crash between them cannot make
+    // the hit rate flatter than it should be.
+    let written = stances.clone();
+    let job = job.clone();
+    let model_id = model_id.to_string();
+    let _ = db.write_background(move |conn| {
+        store::save(
+            conn,
+            job.account_id,
+            job.thread_id,
+            job.message_id,
+            &job.gmail_message_id,
+            &written,
+            &model_id,
+            now_ms,
+        )?;
+        store::record(conn, Outcome::Suggested, None, "", now_ms)
+    });
+    stances
+}
+
+/// The sync loop's door in.
+///
+/// Returns immediately. Everything past the plan happens on a task of its own,
+/// because a mail client whose sync pass waits on a model is a mail client that
+/// stalls when Anthropic is slow — and there is nothing on screen that this is
+/// keeping waiting.
+pub fn consider(
+    db: &Db,
+    transport: Arc<dyn ModelTransport>,
+    account_id: i64,
+    arrived: &[String],
+    headers: HashMap<String, Headers>,
+) {
+    if arrived.is_empty() {
+        return;
+    }
+    let arrived = arrived.to_vec();
+    let db = db.clone();
+
+    tokio::spawn(async move {
+        let Ok(jobs) = db.read(|conn| plan(conn, account_id, &arrived, &headers)) else {
+            return;
+        };
+        if jobs.is_empty() {
+            return;
+        }
+        // Loaded after the plan says there is work: an account with no key
+        // should not be asked about one on every sync pass.
+        let Ok(config) = AgentConfig::load() else {
+            return;
+        };
+        let Ok(model_id) = db.read(model) else {
+            return;
+        };
+
+        for job in jobs {
+            generate(&db, transport.as_ref(), &config, &model_id, &job, now_ms()).await;
+        }
+        // Cheap, and it is the only place that runs often enough to be worth
+        // hanging the housekeeping on.
+        let _ = db.write_background(|conn| store::purge_stale(conn));
+    });
+}
+
+// ===========================================================================
+// Small readers
+// ===========================================================================
+
+fn account(conn: &Connection, account_id: i64) -> DbResult<Option<(String, String)>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT COALESCE(display_name, ''), email FROM accounts WHERE id = ?1",
+            [account_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?)
+}
+
+/// The last few messages of a conversation, oldest first, as `(who, what)`.
+///
+/// A dedicated query rather than [`queries::messages_for_thread`], which is the
+/// reading pane's read: it loads every message in the thread with its body and
+/// joins the invitation table, and a long conversation has hundreds. This wants
+/// four, and it is on a path that runs unattended after every sync pass.
+fn conversation(conn: &Connection, thread_id: i64) -> DbResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT from_name, from_email, COALESCE(body_text, ''), snippet
+           FROM messages
+          WHERE thread_id = ?1 AND is_draft = 0
+          ORDER BY internal_date DESC, id DESC
+          LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![thread_id, CONVERSATION_DEPTH as i64],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, email, body, snippet) = row?;
+        out.push((
+            display(&crate::db::models::Participant { name, email }),
+            clip(body_of(Some(body.as_str()), &snippet), CONVERSATION_CHARS),
+        ));
+    }
+    // Newest-first off the index, oldest-first into the prompt.
+    out.reverse();
+    Ok(out)
+}
+
+fn thread_has_own_message(
+    conn: &Connection,
+    thread_id: i64,
+    except: i64,
+    own_address: &str,
+) -> DbResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM messages
+              WHERE thread_id = ?1 AND id <> ?2 AND lower(from_email) = lower(?3)
+         )",
+        rusqlite::params![thread_id, except, own_address],
+        |row| row.get(0),
+    )?)
+}
+
+/// The text of a message, falling back to Gmail's own preview. An HTML-only
+/// message whose text has not been derived yet still has a snippet, and a
+/// snippet is enough to write a raincheck from.
+fn body_of<'a>(body_text: Option<&'a str>, snippet: &'a str) -> &'a str {
+    match body_text.map(str::trim) {
+        Some(text) if !text.is_empty() => text,
+        _ => snippet,
+    }
+}
+
+fn display(who: &crate::db::models::Participant) -> String {
+    match who.name.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => format!("{name} <{}>", who.email),
+        _ => who.email.clone(),
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    // The quoted history is dropped for the same reason it is dropped from a
+    // voice example: it is the model's own previous context, restated, and it
+    // crowds out the part that is new.
+    let trimmed = voice::for_voice(text).unwrap_or_else(|| text.trim().to_string());
+    if trimmed.chars().count() <= max {
+        return trimmed;
+    }
+    trimmed.chars().take(max).collect::<String>() + "…"
+}
+
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_model_is_neither_opus_nor_the_ghost_text_one() {
+        // The rule that costs money if it is ever broken, pinned by name.
+        assert!(!DEFAULT_MODEL.contains("opus"), "{DEFAULT_MODEL}");
+        assert!(
+            DEFAULT_MODEL.contains("sonnet") || DEFAULT_MODEL.contains("haiku"),
+            "{DEFAULT_MODEL}"
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_text_falls_back_to_its_snippet() {
+        assert_eq!(body_of(Some("the body"), "the snippet"), "the body");
+        assert_eq!(body_of(Some("   "), "the snippet"), "the snippet");
+        assert_eq!(body_of(None, "the snippet"), "the snippet");
+    }
+
+    #[test]
+    fn a_sender_is_rendered_with_their_name_when_there_is_one() {
+        use crate::db::models::Participant;
+        assert_eq!(
+            display(&Participant {
+                name: Some("Kate".into()),
+                email: "kate@example.org".into()
+            }),
+            "Kate <kate@example.org>"
+        );
+        assert_eq!(
+            display(&Participant {
+                name: Some("  ".into()),
+                email: "kate@example.org".into()
+            }),
+            "kate@example.org"
+        );
+    }
+
+    #[test]
+    fn clipping_drops_the_quoted_history() {
+        let body = "My actual answer, which is long enough to survive the voice trim.\n\n\
+                    > their earlier question\n> and more of it";
+        let clipped = clip(body, 500);
+        assert!(clipped.contains("My actual answer"));
+        assert!(!clipped.contains("their earlier question"));
+    }
+
+    #[test]
+    fn a_short_message_that_is_all_quote_still_reaches_the_model() {
+        // `for_voice` refuses it as a *voice example* — too short to teach
+        // anything — but it is the message being answered, so it must not
+        // vanish on the way into the prompt.
+        let clipped = clip("ok?", 500);
+        assert_eq!(clipped, "ok?");
+    }
+}

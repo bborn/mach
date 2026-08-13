@@ -57,6 +57,8 @@ describe("parsePreferences", () => {
         notificationsEnabled: false,
         notificationAccounts: { "7": false },
         badgeEnabled: false,
+        replySuggestions: false,
+        replySuggestionModel: "claude-haiku-4-5",
         agentBackend: "claudeCli",
         agentModel: "opus",
         agentCommand: "/usr/local/bin/my-agent",
@@ -74,11 +76,28 @@ describe("parsePreferences", () => {
       notificationsEnabled: false,
       notificationAccounts: { "7": false },
       badgeEnabled: false,
+      replySuggestions: false,
+      replySuggestionModel: "claude-haiku-4-5",
       agentBackend: "claudeCli",
       agentModel: "opus",
       agentCommand: "/usr/local/bin/my-agent",
       handoffTerminalApp: "iTerm",
     });
+  });
+
+  it("writes replies unless told not to", () => {
+    // The one preference he asked for by name, so the default is on. Off has to
+    // be a stored `false` rather than an absent row, and anything that is not a
+    // boolean is not an answer.
+    expect(DEFAULT_PREFERENCES.replySuggestions).toBe(true);
+    expect(parsePreferences({}).replySuggestions).toBe(true);
+    expect(parsePreferences({ replySuggestions: false }).replySuggestions).toBe(false);
+    expect(parsePreferences({ replySuggestions: "no" }).replySuggestions).toBe(true);
+    // The model is free text, trimmed, and `""` means the Rust default.
+    expect(parsePreferences({ replySuggestionModel: "  claude-haiku-4-5 " }).replySuggestionModel)
+      .toBe("claude-haiku-4-5");
+    expect(parsePreferences({ replySuggestionModel: 7 }).replySuggestionModel).toBe("");
+    expect(DEFAULT_PREFERENCES.replySuggestionModel).toBe("");
   });
 
   it("keeps the terminal application as typed, trimmed", () => {

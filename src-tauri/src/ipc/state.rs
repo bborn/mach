@@ -412,7 +412,15 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
     if let Ok(Some(interval)) = db.read(super::prefs::sync_interval) {
         sync_config.poll_interval = interval;
     }
+    // The running app is the one engine allowed to write reply suggestions, and
+    // it says so here rather than inheriting it. See
+    // [`SyncEngine::with_suggest_transport`] for why that is a decision rather
+    // than a default: an engine constructed by a test or a tool has no way to
+    // spend money by accident.
     let sync = Arc::new(SyncEngine::new(db.clone(), sync_clients, sync_config)?);
+    sync.set_suggest_transport(Arc::new(
+        super::agent::engine::wire::ReqwestModelTransport::new(),
+    ));
 
     // Deliberately *not* the Keychain read that used to be here. See
     // `restore_accounts_into`: doing it on this thread deadlocks the launch.

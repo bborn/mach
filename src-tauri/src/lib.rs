@@ -52,6 +52,8 @@ pub mod shell;
 /// The clock that brings a snoozed conversation back.
 pub mod snooze;
 pub mod staleness;
+/// Replies the agent writes before he arrives at the conversation.
+pub mod suggest;
 pub mod sync;
 
 use std::sync::Arc;
@@ -256,6 +258,9 @@ pub fn run() {
             ipc::agent::agent_backend_status,
             ipc::agent::agent_status,
             ipc::agent::agent_complete,
+            ipc::suggest::reply_suggestions,
+            ipc::suggest::reply_suggestion_record,
+            ipc::suggest::reply_suggestion_stats,
             ipc::plugins::plugin_sandbox,
             ipc::plugins::plugin_conformance,
             ipc::plugins::plugin_list,

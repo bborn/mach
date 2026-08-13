@@ -44,6 +44,16 @@ pub const DEFAULT_COMPLETION_MODEL: &str = "claude-haiku-4-5-20251001";
 pub const MAX_OUTPUT_TOKENS: u32 = 400;
 pub const DEFAULT_OUTPUT_TOKENS: u32 = 160;
 
+/// The ceiling for a *structured* one-shot — a caller in this process asking for
+/// a JSON document rather than a clause under a caret.
+///
+/// Separate from [`MAX_OUTPUT_TOKENS`] because the two limits are protecting
+/// against different things. That one exists because the webview is untrusted
+/// input and a completion that takes a second is not a completion. This one
+/// exists because three whole replies is a few thousand tokens and nothing is
+/// waiting on them — but a model that starts writing an essay should still stop.
+pub const MAX_STRUCTURED_TOKENS: u32 = 2_400;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionRequest {
     pub system: String,
@@ -60,6 +70,17 @@ impl CompletionRequest {
                 .filter(|n| *n > 0)
                 .unwrap_or(DEFAULT_OUTPUT_TOKENS)
                 .min(MAX_OUTPUT_TOKENS),
+        }
+    }
+
+    /// A one-shot whose answer is a document rather than a clause. Held to
+    /// [`MAX_STRUCTURED_TOKENS`]; the caller is in this process, not the
+    /// webview.
+    pub fn structured(system: String, prompt: String, max_tokens: u32) -> Self {
+        CompletionRequest {
+            system,
+            prompt,
+            max_tokens: max_tokens.clamp(1, MAX_STRUCTURED_TOKENS),
         }
     }
 }
@@ -136,14 +157,28 @@ pub fn completion_text(body: &str) -> Result<String, AgentError> {
     Ok(text)
 }
 
-/// Ask for one completion.
+/// Ask for one completion, on the ghost-text model.
 pub async fn complete(
     transport: &dyn ModelTransport,
     config: &AgentConfig,
     request: &CompletionRequest,
 ) -> Result<String, AgentError> {
-    let model = completion_model();
-    let mut rx = transport.send(completion_call(config, &model, request)).await?;
+    complete_as(transport, config, &completion_model(), request).await
+}
+
+/// The same, naming the model.
+///
+/// Ghost text is not the only thing in Mach that wants one request, no tools and
+/// no stream — reply suggestions want the same shape on a different model, and
+/// duplicating the SSE-free request path to change one string would have been
+/// the second way to call `/v1/messages`.
+pub async fn complete_as(
+    transport: &dyn ModelTransport,
+    config: &AgentConfig,
+    model: &str,
+    request: &CompletionRequest,
+) -> Result<String, AgentError> {
+    let mut rx = transport.send(completion_call(config, model, request)).await?;
 
     let mut body = Vec::new();
     while let Some(chunk) = rx.recv().await {

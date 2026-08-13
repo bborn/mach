@@ -43,7 +43,7 @@ pub mod status;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -505,6 +505,20 @@ struct Inner {
     /// Accounts with a pass in flight, whichever path started it. See
     /// [`AccountClaim`].
     in_flight: Mutex<HashSet<i64>>,
+    /// How [`crate::suggest`] reaches a model. Empty means this engine writes no
+    /// reply suggestions at all.
+    ///
+    /// Opt-in rather than defaulted so that constructing an engine cannot
+    /// quietly acquire the ability to spend money — a test, a fixture, a tool
+    /// that only wants a backfill, all get an engine that suggests nothing
+    /// unless somebody asks for one that does. `ipc::state::bootstrap` asks; see
+    /// [`SyncEngine::set_suggest_transport`].
+    ///
+    /// A `OnceLock` rather than a field or a `Mutex`: it is written once before
+    /// the loop starts and read on every pass, and "an engine that acquires the
+    /// ability to spend money halfway through a pass" is a thing nobody should
+    /// have to reason about.
+    suggest_transport: OnceLock<Arc<dyn crate::ipc::agent::engine::ModelTransport>>,
 }
 
 impl Inner {
@@ -540,9 +554,21 @@ impl SyncEngine {
                 limiter: Arc::new(Semaphore::new(request_concurrency)),
                 poll_interval_ms,
                 in_flight: Mutex::new(HashSet::new()),
+                suggest_transport: OnceLock::new(),
             }),
             loop_handle: Mutex::new(None),
         })
+    }
+
+    /// Let this engine write reply suggestions, through `transport`.
+    ///
+    /// Answerable once, and the first answer stands: `true` when this call is
+    /// the one that set it. Call it before [`SyncEngine::start`].
+    pub fn set_suggest_transport(
+        &self,
+        transport: Arc<dyn crate::ipc::agent::engine::ModelTransport>,
+    ) -> bool {
+        self.inner.suggest_transport.set(transport).is_ok()
     }
 
     /// Subscribe to progress. `Receiver::borrow()` is a synchronous read of the
@@ -847,6 +873,7 @@ async fn sync_account(inner: Arc<Inner>, account: Account, trigger: Trigger) -> 
                     cancel: inner.cancel.clone(),
                     report: report.clone(),
                     limiter: Arc::clone(&inner.limiter),
+                    suggest_transport: inner.suggest_transport.get().cloned(),
                 };
                 match sync.run().await {
                     Ok(n) => outcome.messages_written = n,

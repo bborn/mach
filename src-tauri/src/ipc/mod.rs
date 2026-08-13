@@ -55,6 +55,7 @@ pub mod prefs;
 pub mod reads;
 pub mod render;
 pub mod state;
+pub mod suggest;
 pub mod types;
 
 pub use error::IpcError;
