@@ -91,3 +91,46 @@ describe("the drawer's prose", () => {
     expect(html).not.toContain("**reply**");
   });
 });
+
+describe("what a tool surfaced", () => {
+  /** A `get_event` line, as the drawer receives it. */
+  const withEvent: Partial<AgentSession> = {
+    entries: [
+      { role: "user", text: "show me the event" },
+      {
+        role: "tool",
+        id: "t1",
+        name: "get_event",
+        summary: "Read “30 min meeting between Bruno and Kerrie”",
+        state: "ok",
+        artifact: {
+          kind: "event",
+          eventId: 91,
+          startMs: Date.UTC(2026, 7, 20, 17, 0),
+          endMs: Date.UTC(2026, 7, 20, 17, 30),
+          label: "30 min meeting between Bruno and Kerrie",
+          conferenceUrl: "https://meet.google.com/vht-epjb-pjd",
+          guests: ["Bruno Bornsztein", "Kerrie Kuiper"],
+        },
+      },
+    ],
+  };
+
+  it("draws it as a card under the tool line rather than a button on it", () => {
+    const html = markup(withEvent);
+    // The line still says what ran; the card says what it found.
+    expect(html).toContain("Read “30 min meeting between Bruno and Kerrie”");
+    expect(html).toContain("Thu Aug 20");
+    expect(html).toContain("Bruno Bornsztein, Kerrie Kuiper");
+    expect(html).toContain("Join");
+    // The old affordance was this, and only this.
+    expect(html).not.toContain(">Show event<");
+  });
+
+  it("still draws none of its own rules around it", () => {
+    // The card is bordered — it is a box in a drawer that has no others — and
+    // that must not become a second horizontal rule in the record.
+    expect(markup(withEvent).match(/border-t border-border/g)).toHaveLength(1);
+    expect(markup(withEvent)).not.toMatch(/\bborder-b\b/);
+  });
+});

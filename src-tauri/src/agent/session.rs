@@ -88,11 +88,13 @@ pub enum Entry {
         name: String,
         summary: String,
         state: ToolState,
-        /// What the call made, when it made something the owner can be put in
-        /// front of. The drawer renders it as a button; see [`Artifact`].
+        /// The one object the call put the owner in front of, when there was
+        /// one. The drawer draws it as a card; see [`Artifact`].
         ///
-        /// Absent on every read tool and on anything that only moved labels
-        /// around, which is why it is skipped rather than sent as null.
+        /// A read carries one too, where it surfaced a single identifiable
+        /// thing. Absent on a call that only moved labels around, and on a list
+        /// with more than one row in it — which is why it is skipped rather
+        /// than sent as null.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<Artifact>,
     },
