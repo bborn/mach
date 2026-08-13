@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use mach_lib::db::command_queries as cq;
 use mach_lib::db::models::*;
 use mach_lib::db::queries as q;
 use mach_lib::db::schema;
@@ -893,6 +894,222 @@ fn list_can_be_filtered_to_one_account_and_one_label() {
         unread_in_a1.iter().map(|r| r.subject.clone()).collect::<Vec<_>>(),
         vec!["from-one"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Archive and Snoozed: the mailboxes Gmail has no label for
+// ---------------------------------------------------------------------------
+
+/// A thread carrying exactly the labels given, rather than the helper's INBOX.
+fn labelled_thread(db: &Db, account_id: i64, gmail_id: &str, subject: &str, at: i64, labels: &[&str]) -> i64 {
+    let conn = db.writer();
+    q::upsert_thread(
+        &conn,
+        &NewThread {
+            account_id,
+            gmail_thread_id: gmail_id.to_string(),
+            participants: vec![],
+            subject: subject.to_string(),
+            snippet: String::new(),
+            last_message_at: at,
+            is_unread: false,
+            message_count: 1,
+            has_attachments: false,
+            label_ids: labels.iter().map(|l| l.to_string()).collect(),
+        },
+    )
+    .expect("upsert thread")
+}
+
+fn subjects(rows: &[ThreadSummary]) -> Vec<String> {
+    rows.iter().map(|r| r.subject.clone()).collect()
+}
+
+fn in_mailbox(db: &Db, label: &str) -> Vec<String> {
+    let conn = db.reader();
+    subjects(
+        &q::list_threads(
+            &conn,
+            &ThreadQuery {
+                label_id: Some(label.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+}
+
+/// Archive is the *absence* of a filing, so there is no row to seek to and it
+/// had no query at all: `ARCHIVE` reached the store as an ordinary Gmail label
+/// id, matched nothing, and the mailbox was empty for as long as it existed.
+#[test]
+fn archive_is_everything_filed_nowhere_else() {
+    let t = TempDb::new("archive");
+    let a = account(&t, "one@example.com", 0);
+
+    labelled_thread(&t, a, "t1", "in the inbox", 1_000, &["INBOX"]);
+    labelled_thread(&t, a, "t2", "archived, unlabelled", 2_000, &[]);
+    labelled_thread(&t, a, "t3", "archived, under a label", 3_000, &["Label_7"]);
+    labelled_thread(&t, a, "t4", "sent", 4_000, &["SENT"]);
+    labelled_thread(&t, a, "t5", "spam", 5_000, &["SPAM"]);
+    labelled_thread(&t, a, "t6", "trash", 6_000, &["TRASH"]);
+    labelled_thread(&t, a, "t7", "drafted", 7_000, &["DRAFT"]);
+    // Archived, then replied to and left in the inbox — still in the inbox.
+    labelled_thread(&t, a, "t8", "replied, still filed", 8_000, &["INBOX", "Label_7"]);
+
+    assert_eq!(
+        in_mailbox(&t, "ARCHIVE"),
+        vec!["archived, under a label", "archived, unlabelled"],
+        "in the mailbox, and in none of the places that are somewhere else"
+    );
+
+    // And the mailboxes it is defined against still answer for themselves.
+    assert_eq!(in_mailbox(&t, "INBOX"), vec!["replied, still filed", "in the inbox"]);
+    assert_eq!(in_mailbox(&t, "SENT"), vec!["sent"]);
+    assert_eq!(in_mailbox(&t, "TRASH"), vec!["trash"]);
+}
+
+/// The same asymmetry Drafts already has: `thread_labels` is rebuilt from the
+/// per-message union every pass and loses a `DRAFT` row Google has not been
+/// told about, so `messages.is_draft` is the durable half. Archive has to read
+/// it too, or a conversation you are part-way through answering shows up in
+/// both mailboxes.
+#[test]
+fn a_local_draft_keeps_a_thread_out_of_the_archive() {
+    let t = TempDb::new("archive-draft");
+    let a = account(&t, "one@example.com", 0);
+
+    let drafting = labelled_thread(&t, a, "t1", "answering this", 1_000, &[]);
+    labelled_thread(&t, a, "t2", "done with this", 2_000, &[]);
+
+    {
+        let conn = t.writer();
+        q::upsert_message(
+            &conn,
+            &NewMessage {
+                thread_id: drafting,
+                account_id: a,
+                gmail_message_id: "mach-draft:1".into(),
+                subject: "answering this".into(),
+                internal_date: 1_500,
+                is_draft: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    assert_eq!(in_mailbox(&t, "ARCHIVE"), vec!["done with this"]);
+    assert_eq!(in_mailbox(&t, "DRAFT"), vec!["answering this"]);
+}
+
+/// Snoozed has no Gmail label either — `Mach/Snoozed` is an ordinary user label
+/// whose id differs on every account — so the mailbox reads the wake row, which
+/// is the fact both halves of the design agree on.
+#[test]
+fn snoozed_reads_the_wake_row_and_leaves_the_archive_alone() {
+    let t = TempDb::new("snoozed");
+    let a = account(&t, "one@example.com", 0);
+
+    let sleeping = labelled_thread(&t, a, "t1", "back on tuesday", 1_000, &["Label_112"]);
+    labelled_thread(&t, a, "t2", "archived for good", 2_000, &[]);
+
+    {
+        let conn = t.writer();
+        cq::ensure_command_schema(&conn).unwrap();
+        cq::upsert_snooze(
+            &conn,
+            &cq::SnoozeRow {
+                thread_id: sleeping,
+                wake_at: 9_000,
+                snoozed_at: 1_100,
+                prior_label_ids: vec!["INBOX".into()],
+                prior_is_unread: false,
+            },
+        )
+        .unwrap();
+    }
+
+    assert_eq!(in_mailbox(&t, "SNOOZED"), vec!["back on tuesday"]);
+    assert_eq!(
+        in_mailbox(&t, "ARCHIVE"),
+        vec!["archived for good"],
+        "a conversation coming back is not one you filed away"
+    );
+}
+
+/// Archive narrows with the account rail, exactly as Sent and Trash do.
+#[test]
+fn archive_narrows_to_one_account() {
+    let t = TempDb::new("archive-account");
+    let a1 = account(&t, "one@example.com", 0);
+    let a2 = account(&t, "two@example.com", 1);
+
+    labelled_thread(&t, a1, "t1", "one's", 1_000, &[]);
+    labelled_thread(&t, a2, "t2", "two's", 2_000, &[]);
+
+    let conn = t.reader();
+    let rows = q::list_threads(
+        &conn,
+        &ThreadQuery {
+            account_id: Some(a1),
+            label_id: Some("ARCHIVE".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(subjects(&rows), vec!["one's"]);
+}
+
+/// Keyset pagination has to survive a mailbox whose membership is a predicate
+/// rather than an index seek — the cursor is still the last row's, not a count.
+#[test]
+fn archive_paginates_with_the_same_cursor_as_every_other_mailbox() {
+    let t = TempDb::new("archive-pages");
+    let a = account(&t, "one@example.com", 0);
+    for i in 0..10 {
+        // Every other conversation is still in the inbox, so the pages have to
+        // skip rows rather than walk a contiguous run.
+        let labels: &[&str] = if i % 2 == 0 { &[] } else { &["INBOX"] };
+        labelled_thread(&t, a, &format!("t{i}"), &format!("s{i}"), 1_000 + i as i64, labels);
+    }
+
+    let conn = t.reader();
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = q::list_threads(
+            &conn,
+            &ThreadQuery {
+                label_id: Some("ARCHIVE".into()),
+                limit: 2,
+                after: cursor,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        cursor = Some(page.last().unwrap().cursor());
+        seen.extend(page.into_iter().map(|r| r.subject));
+    }
+    assert_eq!(seen, vec!["s8", "s6", "s4", "s2", "s0"]);
+}
+
+/// What the empty list needs in order to tell "this mailbox is empty" from
+/// "nothing has arrived yet".
+#[test]
+fn any_threads_says_whether_the_store_has_been_filled() {
+    let t = TempDb::new("any-threads");
+    {
+        let conn = t.reader();
+        assert!(!q::any_threads(&conn).unwrap());
+    }
+    let a = account(&t, "one@example.com", 0);
+    thread(&t, a, "t1", "first", 1_000);
+    let conn = t.reader();
+    assert!(q::any_threads(&conn).unwrap());
 }
 
 // ---------------------------------------------------------------------------

@@ -301,6 +301,36 @@ describe("whether the guess takes the row out of the mailbox on screen", () => {
     // draft vanish from Drafts for a command about stars.
     expect(leavesMailbox({ add: ["STARRED"], remove: [] }, "DRAFT")).toBe(false);
   });
+
+  /*
+   * Archive's membership is a negative, so "did the guess remove ARCHIVE" is a
+   * question nothing can ever answer yes to. Filing the conversation anywhere
+   * is what takes it out.
+   */
+  describe("the archive, whose membership is an absence", () => {
+    it("takes a trashed row out of the archive", () => {
+      expect(leavesMailbox({ add: ["TRASH"], remove: [] }, "ARCHIVE")).toBe(true);
+    });
+
+    it("takes an unarchived row out of the archive", () => {
+      expect(leavesMailbox({ add: ["INBOX"], remove: [] }, "ARCHIVE")).toBe(true);
+    });
+
+    it("takes a row marked as spam out of the archive", () => {
+      expect(leavesMailbox({ add: ["SPAM"], remove: ["INBOX"] }, "ARCHIVE")).toBe(true);
+    });
+
+    it("keeps an archived row where it already is", () => {
+      // Archiving again, or starring, or reading. None of it files it anywhere.
+      expect(leavesMailbox({ add: [], remove: ["INBOX"] }, "ARCHIVE")).toBe(false);
+      expect(leavesMailbox({ add: ["STARRED"], remove: [] }, "ARCHIVE")).toBe(false);
+    });
+
+    it("puts a newly archived row into the archive", () => {
+      expect(entersMailbox({ add: [], remove: ["INBOX"] }, "ARCHIVE")).toBe(true);
+      expect(entersMailbox({ add: ["INBOX"], remove: [] }, "ARCHIVE")).toBe(false);
+    });
+  });
 });
 
 /**
@@ -341,6 +371,14 @@ describe("retiring a guess", () => {
     // Viewing a label the archived conversation still carries: its absence from
     // *this* list is not the thing the guess predicted.
     expect(settledGuesses([], { 1: { add: [], remove: ["INBOX"] } }, "Receipts")).toEqual([]);
+  });
+
+  it("retires a trash when the row is gone from the archive it left", () => {
+    // The archive's own version of the two above. No guess can ever "remove
+    // ARCHIVE", so the rule this used to inline left the guess pending for
+    // good — which is the never-retired hidden-id set all over again.
+    expect(settledGuesses([], { 1: { add: ["TRASH"], remove: [] } }, "ARCHIVE")).toEqual([1]);
+    expect(settledGuesses([], { 1: { add: ["STARRED"], remove: [] } }, "ARCHIVE")).toEqual([]);
   });
 
   it("holds on until the read state matches too", () => {

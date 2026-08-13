@@ -28,6 +28,34 @@ pub const MAX_PAGE_SIZE: u32 = 1000;
 /// whose membership this module answers from two places — see `list_threads`.
 pub const DRAFT_LABEL: &str = "DRAFT";
 
+/// Archive: everything the mailbox holds that is not filed anywhere else.
+///
+/// Not a Gmail label. Gmail has no `ARCHIVE` — archived means the *absence* of
+/// `INBOX`, and there is no row in `thread_labels` to seek to. The rail asked
+/// for one anyway and got an empty list back for as long as the mailbox has
+/// existed, which is the bug this id exists to fix: it is a question about the
+/// store, answered by [`mailbox_clause`], and it travels through the same
+/// `label_id` field as a real Gmail id so that every surface that already knows
+/// where it is — the rail, ⌘K, favorites, the title — needs no second concept.
+///
+/// Gmail's system ids are a fixed set and its user labels are all `Label_<n>`,
+/// so neither of these can collide with something Google might send.
+pub const ARCHIVE_MAILBOX: &str = "ARCHIVE";
+
+/// Snoozed: the same trick, over the table Mach keeps for it.
+///
+/// Gmail's API has no snooze at all, so Mach's own representation is the only
+/// one there is — a `snoozed_threads` row plus a per-account *user* label whose
+/// id differs on every account. Neither is something the rail could name, which
+/// is why this mailbox was as empty as Archive. The wake row is the durable
+/// fact and the one this asks about; see `commands::mail` for the whole design.
+pub const SNOOZED_MAILBOX: &str = "SNOOZED";
+
+/// Carrying any of these means a conversation is filed somewhere of its own,
+/// and so is not in the archive. Drafts appear here *and* in the local-draft
+/// check below, for the reason spelled out in `list_threads`.
+const FILED_ELSEWHERE: [&str; 5] = ["INBOX", "SENT", DRAFT_LABEL, "SPAM", "TRASH"];
+
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
@@ -137,6 +165,17 @@ pub fn delete_account(conn: &Connection, account_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Whether the store holds a conversation at all.
+///
+/// One row off the primary key, never a count: the caller only needs to tell
+/// "nothing has arrived yet" from "something has". See
+/// `ipc::state::AppState::store_empty` for what turns on it.
+pub fn any_threads(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS (SELECT 1 FROM threads)", [], |row| {
+        row.get::<_, i64>(0)
+    })? == 1)
+}
+
 /// Unread thread count per account, for the rail's badges. Accounts with
 /// nothing unread are simply absent.
 pub fn unread_counts(conn: &Connection) -> Result<Vec<UnreadCount>> {
@@ -237,7 +276,8 @@ fn map_thread(row: &Row<'_>) -> rusqlite::Result<ThreadSummary> {
 /// With `ThreadQuery::default()` this is every account interleaved by time,
 /// newest first — an index scan of `idx_threads_stream` with no sort step.
 /// Narrowing to one account switches it to `idx_threads_account_stream`;
-/// narrowing to a label seeks through `idx_thread_labels_label`.
+/// narrowing to a mailbox adds a membership test per candidate row, which
+/// [`mailbox_clause`] writes and which is always an index seek.
 ///
 /// Pagination is keyset, not offset: see `ThreadCursor` for why.
 pub fn list_threads(conn: &Connection, query: &ThreadQuery) -> Result<Vec<ThreadSummary>> {
@@ -251,33 +291,7 @@ pub fn list_threads(conn: &Connection, query: &ThreadQuery) -> Result<Vec<Thread
         sql.push_str(&format!(" AND t.account_id = ?{}", args.len()));
     }
     if let Some(label) = &query.label_id {
-        args.push(Value::Text(label.clone()));
-        let by_label = format!(
-            "EXISTS (SELECT 1 FROM thread_labels tl \
-              WHERE tl.thread_id = t.id AND tl.gmail_label_id = ?{})",
-            args.len()
-        );
-        // Drafts are the one mailbox the label set cannot answer on its own.
-        //
-        // `thread_labels` is derived: `sync_queries::recompute_thread` rebuilds
-        // it from the per-message label union on every pass, which is what
-        // makes a replayed history batch converge — and which also drops a
-        // `DRAFT` row written locally for a draft Google has not been told
-        // about yet. The draft appeared in the mailbox and then quietly left
-        // it again, which is the original bug wearing a different hat.
-        //
-        // `messages.is_draft` is the same fact from the durable side: set when
-        // Mach mirrors a draft locally (`compose::mirror`), and set by
-        // `sync::convert` from Gmail's own `DRAFT` label on the way in. Either
-        // is enough to be in Drafts. Indexed by migration 8.
-        if label == DRAFT_LABEL {
-            sql.push_str(&format!(
-                " AND ({by_label} OR EXISTS (SELECT 1 FROM messages m \
-                   WHERE m.thread_id = t.id AND m.is_draft = 1))"
-            ));
-        } else {
-            sql.push_str(&format!(" AND {by_label}"));
-        }
+        sql.push_str(&format!(" AND {}", mailbox_clause(label, &mut args)));
     }
     if query.unread_only {
         sql.push_str(" AND t.is_unread = 1");
@@ -308,6 +322,77 @@ pub fn list_threads(conn: &Connection, query: &ThreadQuery) -> Result<Vec<Thread
     let rows = stmt.query_map(params_from_iter(args.iter()), map_thread)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
+
+/// The `WHERE` fragment that decides whether a thread is in one mailbox.
+///
+/// Three of the mailboxes on the rail are not a row in `thread_labels`, and
+/// each is a different kind of not-a-row:
+///
+///  * **Drafts** is a label the store cannot be trusted to have.
+///    `thread_labels` is derived — `sync_queries::recompute_thread` rebuilds it
+///    from the per-message label union on every pass, which is what makes a
+///    replayed history batch converge, and which also drops a `DRAFT` row
+///    written locally for a draft Google has not been told about yet. The draft
+///    appeared in the mailbox and then quietly left it again.
+///    `messages.is_draft` is the same fact from the durable side: set when Mach
+///    mirrors a draft locally (`compose::mirror`), and set by `sync::convert`
+///    from Gmail's own `DRAFT` label on the way in. Either is enough.
+///  * **Archive** is a label that does not exist and never will. Archived means
+///    the *absence* of `INBOX`, so the question has to be asked as a negative:
+///    in the mailbox, and filed in none of the places that are somewhere else.
+///    Local drafts are excluded by the same second test Drafts is included by,
+///    so a conversation you are part-way through replying to sits in Drafts
+///    rather than in both.
+///  * **Snoozed** is a label whose id is different on every account
+///    (`Mach/Snoozed` is an ordinary user label), plus a local wake row. The
+///    wake row is the one both accounts and Gmail-web edits agree on.
+///
+/// Every branch is an index seek per candidate row, not a scan: the
+/// `thread_labels` primary key is `(thread_id, gmail_label_id)`, `snoozed_threads`
+/// is keyed by `thread_id`, and `idx_messages_draft` is partial on `is_draft = 1`.
+/// Measured against a 47k-thread store, the first page of Archive costs about a
+/// millisecond and the predicate over every row in the table costs about sixty.
+/// No new index earns its write cost here.
+fn mailbox_clause(label: &str, args: &mut Vec<Value>) -> String {
+    match label {
+        ARCHIVE_MAILBOX => format!(
+            "NOT EXISTS (SELECT 1 FROM thread_labels tl \
+               WHERE tl.thread_id = t.id AND tl.gmail_label_id IN ({})) \
+             AND NOT {LOCAL_DRAFT} AND NOT {SNOOZED}",
+            placeholders(&FILED_ELSEWHERE, args)
+        ),
+        SNOOZED_MAILBOX => SNOOZED.to_string(),
+        DRAFT_LABEL => format!("({} OR {LOCAL_DRAFT})", carries(label, args)),
+        _ => carries(label, args),
+    }
+}
+
+/// `EXISTS` over one Gmail label id, the ordinary case.
+fn carries(label: &str, args: &mut Vec<Value>) -> String {
+    args.push(Value::Text(label.to_string()));
+    format!(
+        "EXISTS (SELECT 1 FROM thread_labels tl \
+           WHERE tl.thread_id = t.id AND tl.gmail_label_id = ?{})",
+        args.len()
+    )
+}
+
+/// `?7, ?8, ?9` — one bound placeholder per value, appended to `args`.
+fn placeholders(values: &[&str], args: &mut Vec<Value>) -> String {
+    values
+        .iter()
+        .map(|value| {
+            args.push(Value::Text((*value).to_string()));
+            format!("?{}", args.len())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+const LOCAL_DRAFT: &str =
+    "EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id AND m.is_draft = 1)";
+
+const SNOOZED: &str = "EXISTS (SELECT 1 FROM snoozed_threads s WHERE s.thread_id = t.id)";
 
 /// Threads for one account, newest first. Sugar over `list_threads`.
 pub fn list_threads_for_account(

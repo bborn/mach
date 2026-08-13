@@ -29,6 +29,9 @@ function status(accounts: AccountSyncStatus[], overrides: Partial<SyncStatus> = 
     configurationError: null,
     needsReauthorization: [],
     missingScope: [],
+    // A store with mail in it, unless a test says otherwise. That is the
+    // ordinary case and the one the first-sync panel used to get wrong.
+    storeEmpty: false,
     ...overrides,
   };
 }
@@ -79,19 +82,48 @@ describe("the four empty states", () => {
     });
   });
 
-  it("shows sync progress while the first backfill is filling an empty list", () => {
+  it("shows sync progress while the first backfill is filling an empty store", () => {
     const state = mailboxState({
       ...base,
-      sync: status([account({ phase: "backfill", backfillDone: 120, backfillTotal: 61_204 })]),
+      sync: status([account({ phase: "backfill", backfillDone: 120, backfillTotal: 61_204 })], {
+        storeEmpty: true,
+      }),
     });
     expect(state.kind).toBe("syncing");
     expect(state.kind === "syncing" && state.progress.fraction).toBeCloseTo(120 / 61_204);
   });
 
   it("counts an account that has never finished a pass as syncing, not as empty", () => {
-    expect(mailboxState({ ...base, sync: status([account({ phase: "idle" })]) }).kind).toBe(
-      "syncing",
-    );
+    expect(
+      mailboxState({ ...base, sync: status([account({ phase: "idle" })], { storeEmpty: true }) })
+        .kind,
+    ).toBe("syncing");
+  });
+
+  /*
+   * The reported bug: G then A, an empty Archive, and a first-sync panel
+   * offering twelve months per account over a store holding 67,000 messages.
+   * A running pass explains an empty list only while nothing has landed at all.
+   */
+  it("does not claim a first sync for an empty mailbox in a store that has mail", () => {
+    expect(
+      mailboxState({
+        ...base,
+        filtered: true,
+        sync: status([
+          account({ phase: "incremental", lastSuccessAt: 10 }),
+          account({ accountId: 2, phase: "incremental", lastSuccessAt: 10 }),
+        ]),
+      }),
+    ).toEqual({ kind: "empty" });
+  });
+
+  it("does not claim a first sync mid-pass just because no pass has finished yet", () => {
+    // Every relaunch starts here — no account has completed a pass *in this
+    // run* — and the store is still full of last week's mail.
+    expect(
+      mailboxState({ ...base, sync: status([account({ phase: "backfill", backfillTotal: 100 })]) }),
+    ).toEqual({ kind: "empty" });
   });
 
   it("says empty only when the store is synced and this mailbox really is", () => {

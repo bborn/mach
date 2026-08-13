@@ -46,6 +46,18 @@ export interface MailboxInput {
   filtered?: boolean;
 }
 
+/**
+ * Whether nothing has ever landed in the store.
+ *
+ * `syncStatus.storeEmpty` is the store's own answer, so it is the one used.
+ * With no status at all there is nobody to ask, and the safe reading is that
+ * the store has mail: an empty list then says it is empty rather than promising
+ * mail that is never coming.
+ */
+function unfilled(input: MailboxInput): boolean {
+  return input.sync?.storeEmpty ?? false;
+}
+
 export function mailboxState(input: MailboxInput): MailboxState {
   // Missing credentials outrank everything, including "still loading": no
   // amount of waiting produces an account, so say so as soon as it is known.
@@ -66,7 +78,14 @@ export function mailboxState(input: MailboxInput): MailboxState {
   if (input.threadCount > 0) return { kind: "ready" };
 
   const progress = syncProgress(input.sync);
-  if (progress.active || neverSynced(input.sync)) return { kind: "syncing", progress };
+  // A running sync is not evidence that this list is empty *because* of the
+  // sync. Archive with no rows offered the first-sync panel — progress bar,
+  // twelve months per account, five accounts catching up — over a store holding
+  // 67,000 messages, because "no rows and a pass in flight" was the whole test.
+  // The first pass is only the explanation while nothing has landed at all.
+  if (unfilled(input) && (progress.active || neverSynced(input.sync))) {
+    return { kind: "syncing", progress };
+  }
   if (progress.errors.length > 0 && !input.filtered) {
     return { kind: "error", message: progress.errors[0]!.message };
   }

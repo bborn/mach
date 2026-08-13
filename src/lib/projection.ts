@@ -100,6 +100,17 @@ export const DRAFT = "DRAFT";
 const MEMBERSHIP: LabelId[] = [INBOX, TRASH, SPAM];
 
 /**
+ * The archive, which is not a label at all — see `mailboxes.ts`.
+ *
+ * Its membership is the absence of the three in `MEMBERSHIP`: a conversation is
+ * archived while it is in none of them. The store's definition also names
+ * `SENT` and `DRAFT`, and those are absent here for the same reason they never
+ * appear in a delta — no command in this app puts either on a conversation, so
+ * a rule about them would never fire.
+ */
+export const ARCHIVE = "ARCHIVE";
+
+/**
  * One conversation's worth of "this has happened, the store just does not say
  * so yet".
  *
@@ -341,6 +352,13 @@ function nextLabels(labels: LabelId[], guess: ThreadGuess): LabelId[] {
  * sentence rather than two that can drift.
  */
 export function leavesMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
+  // Archive is the one mailbox whose membership is a *negative*: a conversation
+  // is in it while it is filed nowhere else, so nothing can ever "remove
+  // ARCHIVE" and the rule above would keep a trashed row on screen for the
+  // 600ms until the refetch. What takes a row out of the archive is any command
+  // that files it somewhere — see `db::queries::mailbox_clause`, which asks the
+  // same question of SQLite.
+  if (labelId === ARCHIVE) return guess.add.some((l) => MEMBERSHIP.includes(l));
   return guess.remove.includes(labelId);
 }
 
@@ -362,6 +380,9 @@ export function leavesMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
  * rather than a property of the label set it leaves behind.
  */
 export function entersMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
+  // The mirror of the archive case above: a command that takes the conversation
+  // out of everywhere else is what puts it in the archive.
+  if (labelId === ARCHIVE) return guess.remove.some((l) => MEMBERSHIP.includes(l));
   return guess.add.includes(labelId);
 }
 
@@ -524,7 +545,12 @@ export function settledGuesses(
     const row = byId.get(id);
     if (row) {
       if (agrees(row, guess)) settled.push(id);
-    } else if (guess.remove.includes(labelId)) {
+    } else if (leavesMailbox(guess, labelId)) {
+      // Through `leavesMailbox` and not the inlined `remove.includes` it used
+      // to be, so "the row went" and "the list agrees it went" stay one
+      // sentence. They had already parted company for the archive, whose
+      // membership no `remove` can describe: a guess for a row trashed out of
+      // Archive matched neither branch and would never have retired.
       settled.push(id);
     }
   }

@@ -188,6 +188,14 @@ pub struct SyncStatusPayload {
     /// scope to `oauth::SCOPES` puts every account here at once.
     #[serde(default)]
     pub missing_scope: Vec<String>,
+    /// No conversation has ever landed in the store.
+    ///
+    /// The one fact that separates "this mailbox is empty" from "the first pass
+    /// has not filled the store yet". Without it the empty list read a running
+    /// sync as proof of the second, and offered a first-sync progress bar to a
+    /// store holding sixty-seven thousand messages.
+    #[serde(default)]
+    pub store_empty: bool,
 }
 
 /// What `begin_add_account()` hands back: a URL for the frontend to open and an
