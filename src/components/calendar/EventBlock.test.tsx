@@ -176,17 +176,17 @@ describe("hitSkirt", () => {
 
   it("brings a 30-minute block up to the minimum", () => {
     const height = blockHeight(30 * MINUTE);
-    expect(height).toBe(23);
+    expect(height).toBe(31);
     expect(height + 2 * hitSkirt(height)).toBeGreaterThanOrEqual(MIN_HIT_HEIGHT);
   });
 
   it("takes a 15-minute block as far as the overhang allows", () => {
     const height = blockHeight(15 * MINUTE);
-    expect(height).toBe(11);
-    // Not all the way to 32 — the ceiling is what keeps the grid under a
-    // quarter-hour meeting available to drag-create in.
+    expect(height).toBe(15);
+    // Not all the way to the minimum — the ceiling is what keeps the grid under
+    // a quarter-hour meeting available to drag-create in.
     expect(hitSkirt(height)).toBe(MAX_HIT_OVERHANG);
-    expect(height + 2 * hitSkirt(height)).toBe(27);
+    expect(height + 2 * hitSkirt(height)).toBe(31);
   });
 
   it("never reaches further than the overhang, however short the block", () => {
@@ -222,7 +222,7 @@ describe("what the grid draws", () => {
     const skirt = skirtOf(1);
     if (!skirt) throw new Error("a 15-minute block should carry a skirt");
     expect(painted.top - skirt.top).toBe(skirt.bottom - painted.bottom);
-    expect(skirt.bottom - skirt.top).toBe(11 + 2 * MAX_HIT_OVERHANG);
+    expect(skirt.bottom - skirt.top).toBe(blockHeight(15 * MINUTE) + 2 * MAX_HIT_OVERHANG);
   });
 
   it("puts every skirt under every painted block", () => {
@@ -245,9 +245,14 @@ describe("what the grid draws", () => {
 });
 
 describe("two short blocks in a row", () => {
-  /** 09:00–09:30 and 09:30–10:00: the case the report was about. */
+  /*
+   * 09:00–09:15 and 09:15–09:30. It was a pair of half-hours when a half-hour
+   * was 23px and wanted 5px a side. At 31px it wants one, which is too small a
+   * reach for the arbitration to be worth asserting — so the case moved to the
+   * shortest blocks there are, which are the ones that still overhang.
+   */
   function stacked() {
-    render([event(1, 9 * 60, 30), event(2, 9 * 60 + 30, 30)]);
+    render([event(1, 9 * 60, 15), event(2, 9 * 60 + 15, 15)]);
   }
 
   it("does not let the block above steal the block below's first pixels", () => {
@@ -261,7 +266,7 @@ describe("two short blocks in a row", () => {
     expect(above.bottom).toBeGreaterThan(lower.top);
 
     // Every one of these presses still has to land on the lower block.
-    for (const y of [lower.top, lower.top + 1, lower.top + 2, lower.top + 3]) {
+    for (const y of [lower.top, lower.top + 1, lower.top + 2]) {
       expect(resolveHit(y)?.id).toBe(2);
       expect(resolveHit(y)?.skirt).toBe(false);
     }
@@ -274,7 +279,7 @@ describe("two short blocks in a row", () => {
     if (!below) throw new Error("the lower block should carry a skirt");
     expect(below.top).toBeLessThan(upper.bottom);
 
-    for (const y of [upper.bottom - 1, upper.bottom - 2, upper.bottom - 3]) {
+    for (const y of [upper.bottom - 1, upper.bottom - 2]) {
       expect(resolveHit(y)?.id).toBe(1);
       expect(resolveHit(y)?.skirt).toBe(false);
     }
@@ -297,9 +302,10 @@ describe("two short blocks in a row", () => {
 
 describe("an isolated short block", () => {
   it("is a target of at least the minimum, top to bottom", () => {
+    const height = blockHeight(30 * MINUTE);
     render([event(1, 12 * 60 + 30, 30)]);
-    const first = resolveHit(12.5 * HOUR_HEIGHT - hitSkirt(23));
-    const beyond = resolveHit(12.5 * HOUR_HEIGHT + 23 + hitSkirt(23));
+    const first = resolveHit(12.5 * HOUR_HEIGHT - hitSkirt(height));
+    const beyond = resolveHit(12.5 * HOUR_HEIGHT + height + hitSkirt(height));
     expect(first?.id).toBe(1);
     // The bottom edge is exclusive, so one past the skirt is empty grid again.
     expect(beyond).toBeUndefined();
@@ -325,6 +331,8 @@ describe("resizing a 30-minute block", () => {
   });
 
   it("still leaves a 15-minute block without them, having no room", () => {
+    // 15px cannot hold two grab zones and a body between them. Moving it is
+    // still possible; resizing it needs the modal, or a taller scale.
     render([event(1, 9 * 60, 15)]);
     expect(body(1).node.querySelectorAll('[role="presentation"]')).toHaveLength(0);
   });

@@ -11,16 +11,36 @@
 
 import { HOUR, MINUTE } from "./time";
 
-/** 48px/hour makes a 30-minute meeting exactly 24px — one 15px line + padding. */
-export const HOUR_HEIGHT = 48;
+/**
+ * 64px/hour makes a 30-minute meeting 32px, which is a thing you can hit.
+ *
+ * It was 48, on the arithmetic that a 30-minute meeting is then exactly 24px —
+ * one 15px line plus padding, the smallest honest size that still reads. It
+ * does read; it is just small under a pointer, and a half-hour meeting is the
+ * most common length there is. A block's height is its duration, so the only
+ * lever that makes half-hours taller is the hour itself.
+ *
+ * The cost is the day: a 785px grid showed 16.4 hours and now shows 12.3.
+ * Every threshold below scales with this rather than restating 48, so the
+ * ladder in §5 still lines up if it moves again.
+ */
+export const HOUR_HEIGHT = 64;
 
 /**
- * The whole trick from §1: a 15-minute event is an 11px block whose 15px text
- * line deliberately overflows it. 17px (what this used to be) renders a
- * 15-minute event 40% taller than its duration, so it reads the same size as a
- * 21-minute one and the grid lies about its own geometry.
+ * A floor for events shorter than a quarter hour, and no higher than that.
+ *
+ * At 64px/hour a 15-minute event is exactly this tall, so the floor binds only
+ * below it. It was briefly 26, to make quarter-hours easier to hit, and that
+ * was wrong for a reason worth writing down: a floor taller than the slot the
+ * event occupies makes *consecutive* short events overlap, and the later one
+ * paints over the earlier. Two back-to-back fifteen-minute meetings covered
+ * each other by ten pixels.
+ *
+ * So height stays honest and the hit skirt does the reaching — a 15px block is
+ * a 31px target. That is the division of labour: the grid says how long
+ * something is, and the pointer is answered somewhere slightly larger.
  */
-export const MIN_BLOCK_HEIGHT = 11;
+export const MIN_BLOCK_HEIGHT = 15;
 
 /** 1px of air between vertically adjacent blocks, so they read as two cards. */
 export const BLOCK_GAP = 1;
@@ -361,9 +381,12 @@ export function blockPlan(
  * So the thresholds carry the gap too, and the ladder lines up with §5 again.
  */
 export function blockTier(height: number): BlockTier {
-  if (height >= 48 - BLOCK_GAP) return "full";
-  if (height >= 34 - BLOCK_GAP) return "twoLine";
-  if (height >= 24 - BLOCK_GAP) return "oneLine";
+  // Fractions of the hour rather than the pixel counts §5 was written with, so
+  // the ladder follows `HOUR_HEIGHT` instead of having to be restated whenever
+  // it moves: an hour, three quarters, a half.
+  if (height >= HOUR_HEIGHT - BLOCK_GAP) return "full";
+  if (height >= HOUR_HEIGHT * 0.708 - BLOCK_GAP) return "twoLine";
+  if (height >= HOUR_HEIGHT * 0.5 - BLOCK_GAP) return "oneLine";
   return "sliver";
 }
 

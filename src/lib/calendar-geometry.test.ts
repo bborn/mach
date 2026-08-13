@@ -22,29 +22,35 @@ import { HOUR, MINUTE } from "./time";
 const DAY_START = new Date(2026, 7, 3, 0, 0, 0, 0).getTime();
 
 describe("the measured grid", () => {
-  it("is 48px an hour, which is what makes 30 minutes 24px", () => {
-    expect(HOUR_HEIGHT).toBe(48);
-    expect(blockHeight(30 * MINUTE)).toBe(23); // 24 less the 1px stacking gap
+  it("is 64px an hour, which is what makes 30 minutes 32px", () => {
+    // It was 48, and a half-hour meeting came out 23px. That reads, and it is
+    // small under a pointer — reported twice. A block's height is its duration,
+    // so the hour is the only lever that reaches the most common meeting length
+    // there is.
+    expect(HOUR_HEIGHT).toBe(64);
+    expect(blockHeight(30 * MINUTE)).toBe(31); // 32 less the 1px stacking gap
   });
 
-  it("floors a block at 11px, not 17", () => {
-    // The whole point: a 15-minute event is 12px of duration and renders at
-    // 11px, not at 17 — at 17 it would look the same size as a 21-minute one.
-    expect(MIN_BLOCK_HEIGHT).toBe(11);
-    expect(blockHeight(15 * MINUTE)).toBe(11);
-    expect(blockHeight(5 * MINUTE)).toBe(11);
+  it("floors the shortest blocks where the hour cannot reach them", () => {
+    // The floor binds only below a quarter hour, which is exactly 15px here.
+    // Taller than the slot and consecutive short events overlap, the later one
+    // painting over the earlier; the hit skirt does the reaching instead.
+    expect(MIN_BLOCK_HEIGHT).toBe(15);
+    expect(blockHeight(15 * MINUTE)).toBe(15);
+    expect(blockHeight(5 * MINUTE)).toBe(15);
+    expect(blockHeight(15 * MINUTE)).toBeLessThan(blockHeight(30 * MINUTE));
   });
 
   it("keeps longer blocks exactly proportional", () => {
-    expect(blockHeight(HOUR)).toBe(47);
-    expect(blockHeight(2 * HOUR)).toBe(95);
-    expect(blockHeight(45 * MINUTE)).toBe(35);
+    expect(blockHeight(HOUR)).toBe(63);
+    expect(blockHeight(2 * HOUR)).toBe(127);
+    expect(blockHeight(45 * MINUTE)).toBe(47);
   });
 
   it("maps time to offset and back", () => {
     const noon = DAY_START + 12 * HOUR;
-    expect(offsetForTime(noon, DAY_START)).toBe(576);
-    expect(timeForOffset(576, DAY_START)).toBe(noon);
+    expect(offsetForTime(noon, DAY_START)).toBe(768);
+    expect(timeForOffset(768, DAY_START)).toBe(noon);
   });
 
   it("snaps to the quarter hour", () => {
@@ -59,8 +65,8 @@ describe("nowScrollTop", () => {
   const viewport = 500;
 
   it("puts now a quarter of the way down the viewport", () => {
-    const now = DAY_START + 14 * HOUR; // 2pm → 672px
-    expect(nowScrollTop(now, DAY_START, viewport)).toBe(672 - 125);
+    const now = DAY_START + 14 * HOUR; // 2pm → 896px
+    expect(nowScrollTop(now, DAY_START, viewport)).toBe(896 - 125);
   });
 
   it("never opens earlier than 06:30", () => {
@@ -95,13 +101,16 @@ describe("nowScrollTop", () => {
   });
 
   it("prefers the floor when the day's bottom would put it above it", () => {
-    // The evening case, with the default nine o'clock working day: 20:02 is
-    // 961px down, the viewport can only be scrolled to 377, and the floor is
-    // 408. `clamp` prefers its minimum when the range inverts, so the grid
-    // opens on the working day and runs to midnight — never above 08:30.
+    // The evening case, with the default nine o'clock working day. The range
+    // inverts when the window is tall enough that the day's bottom sits above
+    // the floor: at 64px/hour the day is 1536px, so a 1100px viewport can only
+    // scroll to 436 while the floor is 544. `clamp` prefers its minimum there,
+    // so the grid opens on the working day and runs to midnight, never above
+    // 08:30. (A 775px window no longer inverts at this scale, which is why the
+    // number moved — the case is the same one.)
     const evening = DAY_START + 20 * HOUR + 2 * MINUTE;
-    expect(clamp(961, 408, 377)).toBe(408);
-    expect(nowScrollTop(evening, DAY_START, 775, 8.5)).toBe(8.5 * HOUR_HEIGHT);
+    expect(clamp(1281, 544, 436)).toBe(544);
+    expect(nowScrollTop(evening, DAY_START, 1100, 8.5)).toBe(8.5 * HOUR_HEIGHT);
   });
 
   it("answers plausibly for a viewport of zero, which is the trap", () => {
@@ -129,13 +138,16 @@ describe("clamp", () => {
 
 describe("progressive degradation", () => {
   it("drops exactly one thing per step", () => {
-    expect(blockTier(47)).toBe("full");
-    expect(blockTier(46)).toBe("twoLine");
-    expect(blockTier(33)).toBe("twoLine");
-    expect(blockTier(32)).toBe("oneLine");
-    expect(blockTier(23)).toBe("oneLine");
-    expect(blockTier(22)).toBe("sliver");
-    expect(blockTier(11)).toBe("sliver");
+    // The ladder is fractions of the hour now rather than the pixel counts §5
+    // was written with, so it follows `HOUR_HEIGHT` instead of being restated
+    // every time the scale moves: an hour, three quarters, a half.
+    expect(blockTier(63)).toBe("full");
+    expect(blockTier(62)).toBe("twoLine");
+    expect(blockTier(45)).toBe("twoLine");
+    expect(blockTier(44)).toBe("oneLine");
+    expect(blockTier(31)).toBe("oneLine");
+    expect(blockTier(30)).toBe("sliver");
+    expect(blockTier(15)).toBe("sliver");
   });
 
   /**
@@ -154,21 +166,21 @@ describe("progressive degradation", () => {
   });
 
   it("shows location only in a full block, and only when there is one", () => {
-    expect(blockPlan(60, { hasLocation: true }).showLocation).toBe(true);
-    expect(blockPlan(60, { hasLocation: false }).showLocation).toBe(false);
-    expect(blockPlan(40, { hasLocation: true }).showLocation).toBe(false);
+    expect(blockPlan(80, { hasLocation: true }).showLocation).toBe(true);
+    expect(blockPlan(80, { hasLocation: false }).showLocation).toBe(false);
+    expect(blockPlan(50, { hasLocation: true }).showLocation).toBe(false);
   });
 
-  it("joins the time onto the title's line once the block is under 34px", () => {
-    expect(blockPlan(60).inlineTime).toBe(false);
-    expect(blockPlan(36).inlineTime).toBe(false);
-    expect(blockPlan(24).inlineTime).toBe(true);
-    expect(blockPlan(11).inlineTime).toBe(true);
+  it("joins the time onto the title's line once the block drops below three quarters of an hour", () => {
+    expect(blockPlan(80).inlineTime).toBe(false);
+    expect(blockPlan(48).inlineTime).toBe(false);
+    expect(blockPlan(32).inlineTime).toBe(true);
+    expect(blockPlan(15).inlineTime).toBe(true);
   });
 
   it("wraps the title only in a full block", () => {
-    expect(blockPlan(47).wrapTitle).toBe(true);
-    expect(blockPlan(46).wrapTitle).toBe(false);
+    expect(blockPlan(63).wrapTitle).toBe(true);
+    expect(blockPlan(62).wrapTitle).toBe(false);
   });
 
   it("uses two type sizes and no more", () => {
@@ -190,31 +202,31 @@ describe("progressive degradation", () => {
    * grid already says when it is, so the time is what a narrow block gives up.
    */
   it("drops the time and the location once the block is narrow", () => {
-    const roomy = blockPlan(60, { hasLocation: true, width: NARROW_BLOCK_WIDTH });
+    const roomy = blockPlan(80, { hasLocation: true, width: NARROW_BLOCK_WIDTH });
     expect(roomy.showTime).toBe(true);
     expect(roomy.showLocation).toBe(true);
 
-    const narrow = blockPlan(60, { hasLocation: true, width: NARROW_BLOCK_WIDTH - 1 });
+    const narrow = blockPlan(80, { hasLocation: true, width: NARROW_BLOCK_WIDTH - 1 });
     expect(narrow.showTime).toBe(false);
     expect(narrow.showLocation).toBe(false);
   });
 
   it("spends the line the time gave up on a third line of title", () => {
-    expect(blockPlan(60, { width: 200 }).titleLines).toBe(2);
-    expect(blockPlan(60, { width: 51 }).titleLines).toBe(3);
+    expect(blockPlan(80, { width: 200 }).titleLines).toBe(2);
+    expect(blockPlan(80, { width: 51 }).titleLines).toBe(3);
     // Only a full block ever wraps, narrow or not.
-    expect(blockPlan(24, { width: 51 }).titleLines).toBe(1);
+    expect(blockPlan(32, { width: 51 }).titleLines).toBe(1);
   });
 
   it("assumes room when no width is given", () => {
     expect(blockPlan(60, { hasLocation: true }).showTime).toBe(true);
-    expect(blockPlan(60, { hasLocation: true }).showLocation).toBe(true);
+    expect(blockPlan(80, { hasLocation: true }).showLocation).toBe(true);
   });
 
   it("lets only the sliver overflow its bounds, at a constant 15px line", () => {
-    expect(blockPlan(11).overflow).toBe(true);
-    expect(blockPlan(24).overflow).toBe(false);
-    expect(blockPlan(11).lineHeightPx).toBe(15);
+    expect(blockPlan(15).overflow).toBe(true);
+    expect(blockPlan(32).overflow).toBe(false);
+    expect(blockPlan(15).lineHeightPx).toBe(15);
     expect(blockPlan(96).lineHeightPx).toBe(15);
   });
 });

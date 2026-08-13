@@ -47,10 +47,10 @@ describe("moveResult", () => {
   });
 
   it("snaps the result to the quarter hour", () => {
-    // 96px is exactly two hours; 100px is 2h05m, which snaps back to 2h00.
-    expect(moveResult(origin(), 100, 0).start).toBe(NINE + 2 * HOUR);
-    // 108px is 2h15m and stays there.
-    expect(moveResult(origin(), 108, 0).start).toBe(NINE + 2 * HOUR + 15 * MINUTE);
+    // 128px is exactly two hours; 133px is 2h05m, which snaps back to 2h00.
+    expect(moveResult(origin(), 133, 0).start).toBe(NINE + 2 * HOUR);
+    // 144px is 2h15m and stays there.
+    expect(moveResult(origin(), 144, 0).start).toBe(NINE + 2 * HOUR + 15 * MINUTE);
   });
 
   it("snaps the outcome, not each increment, so a slow drag does not creep", () => {
