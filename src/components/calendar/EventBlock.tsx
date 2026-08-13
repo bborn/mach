@@ -2,8 +2,11 @@ import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
 import type { CalendarEvent } from "@/types";
 import type { ResizeEdge } from "@/lib/calendar-drag";
 import {
+  BLOCK_GAP,
   BLOCK_RADIUS,
   blockPlan,
+  hitSkirt,
+  Z_EVENT_HIT,
   type BlockPlan,
 } from "@/lib/calendar-geometry";
 import {
@@ -201,12 +204,19 @@ export interface EventBlockProps {
  * How much of a block the edge handles claim.
  *
  * Six pixels is Google's, and it is the largest number that still leaves the
- * middle of a 24px (30-minute) block draggable as a move. Below 24px there is
- * no room for three zones at all, so short blocks are move-only and are
+ * middle of a 24px (30-minute) block draggable as a move. Below that there is
+ * no room for three zones at all, so shorter blocks are move-only and are
  * resized from the keyboard or the modal instead.
+ *
+ * The floor carries the stacking gap for the same reason `blockTier` does: what
+ * gets rendered for a 30-minute event is 23px, not 24, because `blockHeight`
+ * has already taken the gap out. Comparing against the raw 24 therefore ruled
+ * out the most common meeting length there is — every 30-minute block in the
+ * week had no mouse resize at all, which is precisely the case this number was
+ * written to include.
  */
 const HANDLE_PX = 6;
-const HANDLE_MIN_HEIGHT = 24;
+const HANDLE_MIN_HEIGHT = 24 - BLOCK_GAP;
 
 /**
  * One timed event.
@@ -255,6 +265,12 @@ export function EventBlock({
 
   const showHandles = resizable && onGrab !== undefined && height >= HANDLE_MIN_HEIGHT;
 
+  // The transparent overhang that makes a short block aimable. `style.top` is a
+  // number everywhere the grid renders one; anything else has laid the block out
+  // some other way and can keep its own bounds.
+  const top = typeof style.top === "number" ? style.top : null;
+  const skirt = top === null ? 0 : hitSkirt(height);
+
   /*
    * The one place §1 and §6 collide.
    *
@@ -278,104 +294,183 @@ export function EventBlock({
       : undefined;
 
   return (
-    <button
-      type="button"
-      ref={blockRef}
-      // The keyboard cursor, said out loud. A screen reader stepping the week
-      // with the arrow keys otherwise has no way to know which block it is on,
-      // because nothing here ever takes DOM focus.
-      aria-current={selected ? "true" : undefined}
-      // `tabIndex={-1}` keeps blocks out of the browser's own tab order: Tab
-      // steps event-to-event through the keymap, in start order, which is the
-      // order the week reads in — not the order the DOM happens to be in.
-      tabIndex={-1}
-      data-selected={selected || undefined}
-      // Which event this rectangle is, for anything that has to work back from
-      // a pointer or from `ui.eventId` to a DOM node — the right-click menu is
-      // the only such thing today, and ⇧F10 anchors its popup to this element.
-      data-event-id={event.id}
+    <>
+      <button
+        type="button"
+        ref={blockRef}
+        // The keyboard cursor, said out loud. A screen reader stepping the week
+        // with the arrow keys otherwise has no way to know which block it is on,
+        // because nothing here ever takes DOM focus.
+        aria-current={selected ? "true" : undefined}
+        // `tabIndex={-1}` keeps blocks out of the browser's own tab order: Tab
+        // steps event-to-event through the keymap, in start order, which is the
+        // order the week reads in — not the order the DOM happens to be in.
+        tabIndex={-1}
+        data-selected={selected || undefined}
+        // Which event this rectangle is, for anything that has to work back from
+        // a pointer or from `ui.eventId` to a DOM node — the right-click menu is
+        // the only such thing today, and ⇧F10 anchors its popup to this element.
+        data-event-id={event.id}
+        onClick={onSelect}
+        onPointerDown={(pointer) => {
+          // Anything with its own handler (the two edges) has already stopped
+          // this; reaching here means the body was grabbed.
+          onGrab?.(pointer, "move", "end");
+        }}
+        onPointerEnter={onPointerEnter}
+        onPointerLeave={onPointerLeave}
+        title={`${event.title} · ${shortTime(event.start)}–${shortTime(event.end)}${
+          event.location ? ` · ${event.location}` : ""
+        }`}
+        className={cn(
+          "absolute text-left transition-[left,width,box-shadow,background-color] duration-[120ms] ease-out motion-reduce:transition-none",
+          plan.overflow ? "overflow-visible" : "overflow-hidden",
+          onGrab && "cursor-grab active:cursor-grabbing",
+        )}
+        style={{
+          borderRadius: BLOCK_RADIUS,
+          background: paint.background,
+          color: paint.color,
+          // The dragged block stays put and fades: the ghost is the thing under
+          // the pointer, and the hole it left is useful context for where it was.
+          // The fade lives in `faded()` now, in the paint rather than in
+          // `opacity`, so it cannot take the selection mark down with it.
+          opacity: paint.opacity,
+          // Selection is a halo on the outside; `:focus-visible` in globals.css
+          // draws its outline on the inside. Two different marks, so "the cursor
+          // is here" and "the browser focus is here" never read as one thing.
+          boxShadow: shadowFor(
+            ring,
+            selected,
+            false,
+            painted.selectionGap,
+            cascaded ? `-1px 0 0 0 ${painted.selectionGap}` : undefined,
+          ),
+          // A dashed border cannot be faked with an inset shadow; tentative
+          // events get a real one, inset so it does not change the geometry.
+          // A sliver has no room for one either — see `sliverOutline` above.
+          outline:
+            paint.borderStyle === "dashed" && !sliverOutline
+              ? `1px dashed ${paint.border}`
+              : undefined,
+          outlineOffset: paint.borderStyle === "dashed" && !sliverOutline ? -1 : undefined,
+          // 2px is the documented exception to the 4pt grid (see globals.css): a
+          // 30-minute block is 24px tall and holds one 15px line, so its vertical
+          // inset is 2 or it is zero. The horizontal inset is on the grid at 4,
+          // which also returns four pixels to the title in a crowded column.
+          padding: plan.tier === "full" || plan.tier === "twoLine" ? "2px 4px" : 0,
+          touchAction: onGrab ? "none" : undefined,
+          ...style,
+        }}
+      >
+        {plan.overflow ? (
+          <SliverLine
+            title={event.title}
+            time={time}
+            plan={plan}
+            paint={paint.timeColor}
+            // On an outlined sliver the hue is the whole signal, so it carries the
+            // title too — there is no border left to carry it.
+            titleColor={sliverOutline ? paint.timeColor : undefined}
+            strike={paint.strikethrough}
+          />
+        ) : (
+          <Stacked
+            event={event}
+            time={time}
+            plan={plan}
+            timeColor={paint.timeColor}
+            strike={paint.strikethrough}
+          />
+        )}
+
+        {showHandles && (
+          <>
+            <ResizeHandle edge="start" onGrab={onGrab} />
+            <ResizeHandle edge="end" onGrab={onGrab} />
+          </>
+        )}
+
+        {copies > 1 && <MergeMark count={copies} />}
+      </button>
+
+      {skirt > 0 && top !== null && (
+        <HitSkirt
+          eventId={event.id}
+          top={top - skirt}
+          height={height + 2 * skirt}
+          left={style.left}
+          width={style.width}
+          grabbable={onGrab !== undefined}
+          onSelect={onSelect}
+          onGrab={onGrab}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * The part of a short block you can hit but cannot see.
+ *
+ * A sibling of the block rather than a child of it, for two reasons: the block
+ * clips its own overflow above the sliver tier, and a child would sit inside the
+ * paint's stacking order rather than beneath everyone's. It carries the block's
+ * own left and width, so it only ever grows the target *vertically* — two events
+ * sharing an hour in side-by-side columns keep the boundary between them exactly
+ * where the pixels say it is.
+ *
+ * It answers a press the way the body does, so a drag started here moves the
+ * event. That is the affordance a 15-minute block most lacks: eleven pixels of
+ * colour with a six-pixel middle, and grabbing it accurately was a feat of aim.
+ *
+ * What it costs: the strip of empty grid within a few pixels of a short block no
+ * longer starts a drag-to-create. Google's 13px right-hand gutter is still clear
+ * on every column, which is the escape hatch §1 keeps for exactly this.
+ */
+function HitSkirt({
+  eventId,
+  top,
+  height,
+  left,
+  width,
+  grabbable,
+  onSelect,
+  onGrab,
+}: {
+  eventId: CalendarEvent["id"];
+  top: number;
+  height: number;
+  left: CSSProperties["left"];
+  width: CSSProperties["width"];
+  grabbable: boolean;
+  onSelect: () => void;
+  onGrab?: (
+    event: ReactPointerEvent,
+    kind: "move" | "resize",
+    edge: ResizeEdge,
+  ) => void;
+}) {
+  return (
+    <span
+      role="presentation"
+      // The right-click menu works back from the pointer to an event through
+      // this attribute, so the skirt answers a right-click too. It is second in
+      // the DOM, which leaves `querySelector` — how ⇧F10 finds the block to
+      // anchor its popup to — landing on the painted body as before.
+      data-event-id={eventId}
       onClick={onSelect}
-      onPointerDown={(pointer) => {
-        // Anything with its own handler (the two edges) has already stopped
-        // this; reaching here means the body was grabbed.
-        onGrab?.(pointer, "move", "end");
-      }}
-      onPointerEnter={onPointerEnter}
-      onPointerLeave={onPointerLeave}
-      title={`${event.title} · ${shortTime(event.start)}–${shortTime(event.end)}${
-        event.location ? ` · ${event.location}` : ""
-      }`}
-      className={cn(
-        "absolute text-left transition-[left,width,box-shadow,background-color] duration-[120ms] ease-out motion-reduce:transition-none",
-        plan.overflow ? "overflow-visible" : "overflow-hidden",
-        onGrab && "cursor-grab active:cursor-grabbing",
-      )}
+      onPointerDown={(pointer) => onGrab?.(pointer, "move", "end")}
+      className={cn("absolute", grabbable && "cursor-grab active:cursor-grabbing")}
       style={{
-        borderRadius: BLOCK_RADIUS,
-        background: paint.background,
-        color: paint.color,
-        // The dragged block stays put and fades: the ghost is the thing under
-        // the pointer, and the hole it left is useful context for where it was.
-        // The fade lives in `faded()` now, in the paint rather than in
-        // `opacity`, so it cannot take the selection mark down with it.
-        opacity: paint.opacity,
-        // Selection is a halo on the outside; `:focus-visible` in globals.css
-        // draws its outline on the inside. Two different marks, so "the cursor
-        // is here" and "the browser focus is here" never read as one thing.
-        boxShadow: shadowFor(
-          ring,
-          selected,
-          false,
-          painted.selectionGap,
-          cascaded ? `-1px 0 0 0 ${painted.selectionGap}` : undefined,
-        ),
-        // A dashed border cannot be faked with an inset shadow; tentative
-        // events get a real one, inset so it does not change the geometry.
-        // A sliver has no room for one either — see `sliverOutline` above.
-        outline:
-          paint.borderStyle === "dashed" && !sliverOutline
-            ? `1px dashed ${paint.border}`
-            : undefined,
-        outlineOffset: paint.borderStyle === "dashed" && !sliverOutline ? -1 : undefined,
-        // 2px is the documented exception to the 4pt grid (see globals.css): a
-        // 30-minute block is 24px tall and holds one 15px line, so its vertical
-        // inset is 2 or it is zero. The horizontal inset is on the grid at 4,
-        // which also returns four pixels to the title in a crowded column.
-        padding: plan.tier === "full" || plan.tier === "twoLine" ? "2px 4px" : 0,
-        touchAction: onGrab ? "none" : undefined,
-        ...style,
+        top,
+        height,
+        left,
+        width,
+        zIndex: Z_EVENT_HIT,
+        touchAction: grabbable ? "none" : undefined,
       }}
-    >
-      {plan.overflow ? (
-        <SliverLine
-          title={event.title}
-          time={time}
-          plan={plan}
-          paint={paint.timeColor}
-          // On an outlined sliver the hue is the whole signal, so it carries the
-          // title too — there is no border left to carry it.
-          titleColor={sliverOutline ? paint.timeColor : undefined}
-          strike={paint.strikethrough}
-        />
-      ) : (
-        <Stacked
-          event={event}
-          time={time}
-          plan={plan}
-          timeColor={paint.timeColor}
-          strike={paint.strikethrough}
-        />
-      )}
-
-      {showHandles && (
-        <>
-          <ResizeHandle edge="start" onGrab={onGrab} />
-          <ResizeHandle edge="end" onGrab={onGrab} />
-        </>
-      )}
-
-      {copies > 1 && <MergeMark count={copies} />}
-    </button>
+    />
   );
 }
 
