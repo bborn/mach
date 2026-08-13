@@ -74,6 +74,7 @@ import {
   entryLabel,
   googleCalendarUrl,
   joinUrl,
+  mapsUrl,
 } from "@/lib/calendar-links";
 import type { MergedEvent } from "@/lib/calendar-merge";
 import {
@@ -473,6 +474,9 @@ export function EventModal({
 
   const account = event ? accounts.find((a) => a.id === event.accountId) : null;
   const conference = event ? conferenceLink(event) : null;
+  // Read off the field rather than off the event, so an address pasted a second
+  // ago has its map without waiting for a save.
+  const map = mapsUrl(form.location);
   const color = colorFor(form.calendarId);
   const tone = event ? toneFor(event.rsvp) : "solid";
   const set = (patch: Partial<EventForm>) => setForm((current) => ({ ...current!, ...patch }));
@@ -766,14 +770,37 @@ export function EventModal({
               <MapPin size={11} strokeWidth={1.75} />
               Where
             </FieldLabel>
-            <Input
-              id={ids.location}
-              value={form.location}
-              placeholder="Add a place, or a call link"
-              aria-label="Location"
-              readOnly={!canEdit}
-              onChange={(e) => set({ location: e.target.value })}
-            />
+            {/* The button is beside the field rather than replacing the text,
+                because the text is still the answer to "where is this" for the
+                locations no map can take — a room, a floor, a person's desk.
+                It is an ordinary button in the row's tab order, one stop after
+                the field it is about, so ⇥ from the address reaches it.
+
+                Absent, not disabled, when the location is not a place: a greyed
+                Map on "Room 2" is a control promising something it will never
+                do. See `looksLikeAddress` for what counts. */}
+            <div className="flex min-w-0 items-center gap-1">
+              <Input
+                id={ids.location}
+                value={form.location}
+                placeholder="Add a place, or a call link"
+                aria-label="Location"
+                readOnly={!canEdit}
+                className="min-w-0 flex-1"
+                onChange={(e) => set({ location: e.target.value })}
+              />
+              {map && (
+                <Button
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => onOpenExternal(map)}
+                  title="Open in Google Maps"
+                >
+                  <MapPin size={12} strokeWidth={1.75} />
+                  Map
+                </Button>
+              )}
+            </div>
           </Field>
 
           <Field orientation="row">

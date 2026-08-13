@@ -47,7 +47,7 @@ import {
   rulesFor,
   type EventForm,
 } from "@/lib/calendar-edit";
-import { googleCalendarUrl } from "@/lib/calendar-links";
+import { googleCalendarUrl, mapsUrl } from "@/lib/calendar-links";
 import { usePeriodWheel } from "./use-period-wheel";
 import {
   DAY,
@@ -927,6 +927,33 @@ export function CalendarMode() {
   );
 
   /**
+   * ⇧M — the address on the block, on a map.
+   *
+   * The grid itself grows nothing clickable for this. A block is a single
+   * `<button>` that is also a drag handle, a resize target and, since the hit
+   * skirt landed, a rectangle larger than the one it paints; a second control
+   * nested inside it would be invalid markup, unreachable by keyboard (blocks
+   * are `tabIndex={-1}` so that ⇥ steps event-to-event in start order), and
+   * drawn over the one truncated line the tallest tier gives the location. So
+   * the grid reaches this the way it reaches every other verb about the
+   * selected event: a key, and the same key's item in the right-click menu.
+   *
+   * `mapsUrl` refuses anything that is not a place, including a conference URL
+   * sitting in `location`, which already has its own button in the modal.
+   */
+  const openMap = useCallback(
+    (event: CalendarEvent) => {
+      const url = mapsUrl(event.location);
+      if (!url) {
+        actions.setStatus("No address on that event", "info");
+        return;
+      }
+      openExternal(url);
+    },
+    [actions, openExternal],
+  );
+
+  /**
    * The event as it is *drawn*, which is what a click or the cursor is on.
    *
    * The same fallback `nudgeSelected` uses: an optimistic move is in the
@@ -961,10 +988,11 @@ export function CalendarMode() {
       duplicate,
       copy: copyEvent,
       openInGoogle,
+      openMap,
       rsvp: (event, response) => rsvp(event.id, response),
       createAt: (slot) => openCreate(slot),
     }),
-    [copyEvent, duplicate, openCreate, openEvent, openInGoogle, requestDelete, rsvp],
+    [copyEvent, duplicate, openCreate, openEvent, openInGoogle, openMap, requestDelete, rsvp],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -1276,6 +1304,16 @@ export function CalendarMode() {
         when: () => active,
         handler: withEvent(openInGoogle),
       },
+      // ⇧M, because M is already Month. It sits with the shifted letters the
+      // rest of this group uses — ⇧C creates, ⇧D duplicates — and neither
+      // Gmail nor Google Calendar has a key for this to match.
+      {
+        keys: "shift+m",
+        group: "Event",
+        description: "Map the address",
+        when: () => active,
+        handler: withEvent(openMap),
+      },
 
       {
         keys: "z",
@@ -1390,6 +1428,7 @@ export function CalendarMode() {
       openCreate,
       openEvent,
       openInGoogle,
+      openMap,
       requestDelete,
       createOpen,
       arrow,

@@ -392,7 +392,10 @@ const EVENT_SEEDS: EventSeed[] = [
   // Wednesday
   ["c1", "Standup", 2, 9, 0.25],
   ["c1", "Shopify partner review", 2, 9.5, 0.5],
-  ["c4", "Lunch — Deb (trust docs)", 2, 12, 1, "Café Lume"],
+  // The one fixture location that is a street address rather than a room or a
+  // provider's name. `looksLikeAddress` is the difference between this event
+  // and "Clinic" two rows up, and the fixture window is where that is looked at.
+  ["c4", "Lunch — Deb (trust docs)", 2, 12, 1, "Café Lume, 1668 Marshall St NE, Minneapolis, MN 55413"],
   ["c1", "Interview: staff eng (B)", 2, 13, 1],
   ["c2", "OKR draft 2 walkthrough", 2, 13, 0.75],
   ["c5", "Warehouse cost review", 2, 13.5, 1],

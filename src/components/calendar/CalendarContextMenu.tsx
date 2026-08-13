@@ -11,6 +11,7 @@ import {
   timeForOffset,
 } from "@/lib/calendar-geometry";
 import { nextSlot } from "@/lib/calendar-edit";
+import { mapsUrl } from "@/lib/calendar-links";
 import { MINUTE, shortTime, startOfDay } from "@/lib/time";
 import {
   ContextMenu,
@@ -94,6 +95,8 @@ export interface CalendarVerbs {
   /** Mach's own clipboard, for ⌘V onto another day. */
   copy: (event: CalendarEvent) => void;
   openInGoogle: (event: CalendarEvent) => void;
+  /** The address on the event, on a map. Says so when there is not one. */
+  openMap: (event: CalendarEvent) => void;
   rsvp: (event: CalendarEvent, response: Rsvp) => void;
   createAt: (slot: Slot) => void;
 }
@@ -492,6 +495,14 @@ export function buildEventItems(
   }
 
   separate();
+  // Gated on the location as well as on the binding, the way the RSVP items are
+  // gated on there being an invitation to answer. The key stays live on every
+  // event so it can be found in the sheet and say what is missing; a menu has
+  // no such duty, and an item that can only report "no address" is noise on the
+  // three events in four that have none.
+  if (mapsUrl(event.location)) {
+    push("Event", "Map the address", "Map", () => verbs.openMap(event));
+  }
   push("Event", "Open in Google Calendar", "Open in Google Calendar", () =>
     verbs.openInGoogle(event),
   );

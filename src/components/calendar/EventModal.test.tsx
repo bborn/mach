@@ -261,3 +261,98 @@ describe("the call", () => {
     expect(text()).toContain("Removing the call retires this link");
   });
 });
+
+/**
+ * The address, as somewhere you can be shown.
+ *
+ * The location was inert text: select it, copy it, paste it into Maps. What is
+ * checked here is that the control appears exactly where an address is and
+ * nowhere else, that it is a real button in the tab order rather than a click
+ * handler on a span, and that what it opens is a URL this app built rather than
+ * the attacker-controlled text it was built from.
+ */
+describe("the address", () => {
+  const ADDRESS = "Twin Ignition Startup Garage, 1317 Marshall St NE, Minneapolis, MN 55413, USA";
+
+  it("offers a map on an event with a street address", () => {
+    const opened: string[] = [];
+    mount({
+      target: { mode: "view", event: { ...MEETING, location: ADDRESS } },
+      onOpenExternal: (url) => opened.push(url),
+    });
+
+    const [map] = buttons("Map");
+    expect(map, "an address gets a Map control").toBeDefined();
+    // Keyboard-reachable by being an ordinary button: no negative tabindex, no
+    // `<div onClick>`. ⇥ out of the location field lands on it.
+    expect(map!.tagName).toBe("BUTTON");
+    expect(map!.tabIndex).toBeGreaterThanOrEqual(0);
+
+    click("Map");
+    expect(opened).toEqual([
+      "https://www.google.com/maps/search/?api=1&query=" +
+        "Twin%20Ignition%20Startup%20Garage%2C%201317%20Marshall%20St%20NE%2C" +
+        "%20Minneapolis%2C%20MN%2055413%2C%20USA",
+    ]);
+  });
+
+  it("offers nothing on a location no map can take", () => {
+    // A fresh id each time, or the modal keeps the form it already built —
+    // it keys on the event so a background sync cannot clear a field mid-edit.
+    for (const [id, location] of [undefined, "", "Room 2"].entries()) {
+      mount({ target: { mode: "view", event: { ...MEETING, id: id + 1, location } } });
+      expect(buttons("Map")).toHaveLength(0);
+      // The location is still in the field — it is the answer to "where", just
+      // not one a map can show.
+      const field = document.querySelector('input[aria-label="Location"]') as HTMLInputElement;
+      expect(field.value).toBe(location ?? "");
+    }
+  });
+
+  it("leaves a conference link in the location to the Join button it already has", () => {
+    mount({
+      target: {
+        mode: "view",
+        event: { ...MEETING, location: "https://meet.google.com/abc-defg-hij" },
+      },
+    });
+    expect(buttons("Map")).toHaveLength(0);
+    expect(text()).toContain("Join Google Meet");
+  });
+
+  it("never navigates to the location text, however it is shaped", () => {
+    const opened: string[] = [];
+    // Both halves: a bare scheme gets no control at all, and a payload smuggled
+    // into something address-shaped still comes out as an https Maps search.
+    mount({
+      target: { mode: "view", event: { ...MEETING, location: "javascript:alert(1)" } },
+      onOpenExternal: (url) => opened.push(url),
+    });
+    expect(buttons("Map")).toHaveLength(0);
+
+    // A different id, or the form is not rebuilt: the modal keys its state on
+    // the event it points at, so that a background sync cannot clear a field
+    // mid-edit.
+    mount({
+      target: {
+        mode: "view",
+        event: { ...MEETING, id: 2, location: "123 Main Street, javascript:alert(1)" },
+      },
+      onOpenExternal: (url) => opened.push(url),
+    });
+    click("Map");
+    expect(opened).toHaveLength(1);
+    const parsed = new URL(opened[0]!);
+    expect(parsed.protocol).toBe("https:");
+    expect(parsed.hostname).toBe("www.google.com");
+    expect(opened[0]).not.toContain("javascript:");
+  });
+
+  it("finds the map as the address is typed, without waiting for a save", () => {
+    mount({ target: { mode: "create", start: NINE, end: NINE + HALF_HOUR } });
+    expect(buttons("Map")).toHaveLength(0);
+
+    type('input[aria-label="Location"]', ADDRESS);
+    expect(buttons("Map")).toHaveLength(1);
+  });
+});
