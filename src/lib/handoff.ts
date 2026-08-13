@@ -309,11 +309,12 @@ export function isKeywordOnly(query: string): boolean {
  * His instruction, as typed. Empty when the query is only the word that found
  * the row.
  *
- * The empty case is a refusal, not a default: `LaunchPlan::prepare` says "say
- * what you want done" and the dialog shows it. That is the correct end for a
- * handoff with no sentence in it — the alternative, which shipped, was handing
- * a whole mail thread to an agent with tools under the instruction `hando`, and
- * the agent on the other end had to stop and ask what that meant.
+ * Empty is never launched: the alternative, which shipped, was handing a whole
+ * mail thread to an agent with tools under the instruction `hando`, and the
+ * agent on the other end had to stop and ask what that meant. What it *is* is
+ * the ordinary way in — the row is on top from the first letter, so ⏎ lands
+ * there before the sentence exists — so the dialog opens its own field for it
+ * rather than refusing. See `HandoffDialog`.
  */
 export function noteFromQuery(query: string): string {
   return isKeywordOnly(query) ? "" : stripPrefix(query);
@@ -390,9 +391,10 @@ export const handoffResolver: PaletteResolver = {
             id: `command:handoff:${target.id}`,
             kind: "command",
             title: `Hand off to ${target.name}`,
-            // The row is up before there is anything to send, so it says what
-            // is missing rather than describing a target he cannot use yet.
-            meta: note ? describeTarget(target) : "type what you want done",
+            // The same description whether or not a sentence has been typed:
+            // choosing the row without one opens the field for it, so there is
+            // nothing here to warn about.
+            meta: describeTarget(target),
             // One point apart so the ranking above survives the sort.
             score: score - index,
             run: () => openHandoff(target.id, note),
@@ -420,12 +422,28 @@ export const handoffResolver: PaletteResolver = {
 
 const EDITOR_TITLE = "handoff targets";
 
+/** Where the second word of [`EDITOR_TITLE`] begins. */
+const EDITOR_SECOND_WORD = EDITOR_TITLE.indexOf(" ") + 1;
+
+/**
+ * How well a query is asking for the *editor* rather than for a handoff.
+ *
+ * The two are one prefix apart, and the editor used to win the moment three
+ * characters matched — so typing `handoff`, which is the word for the thing
+ * itself, put "Handoff targets…" above every target at 1000 against their 950.
+ * Configuring the list outranked using it, for the query that names it.
+ *
+ * A query is only reaching for the editor once it has begun to say *targets*.
+ * Up to that point the word belongs to the targets, and the editor stays
+ * offered underneath them rather than disappearing: it is still the right row
+ * for someone who typed `handoff` and meant to go and add one.
+ */
 function editorScore(query: string): number {
   const explicit = query.startsWith(">");
   const q = stripPrefix(query).toLowerCase();
   if (!q) return explicit ? 480 : 0;
-  if (q.length >= 3 && EDITOR_TITLE.startsWith(q)) return 1000;
-  return 0;
+  if (q.length < 3 || !EDITOR_TITLE.startsWith(q)) return 0;
+  return q.length > EDITOR_SECOND_WORD ? 1000 : 900;
 }
 
 /* -------------------------------------------------------------------------- */
