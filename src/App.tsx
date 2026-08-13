@@ -7,6 +7,7 @@ import { MachProvider, useMach } from "@/hooks/useMach";
 import { cn } from "@/lib/utils";
 import { StatusBar } from "@/components/chrome/StatusBar";
 import { Toast } from "@/components/chrome/Toast";
+import { CopyView } from "@/components/chrome/CopyView";
 import { HeldUpdate } from "@/components/chrome/HeldUpdate";
 import { TitleBar } from "@/components/chrome/TitleBar";
 import { CalendarMode } from "@/components/calendar/CalendarMode";
@@ -348,6 +349,9 @@ function Shell() {
           Rust, at the navigation layer, where there is no component to tell —
           this is what carries that back to the toast. */}
       <LinkFailures />
+      {/* Renders nothing. ⌘⌥C and its ⌘K row, in the one place the shell and
+          the keymap are both in scope. */}
+      <CopyView />
       <CommandPalette />
       <ShortcutSheet
         open={shortcuts !== null}

@@ -29,6 +29,8 @@
 //! to set. See [`config`].
 
 pub mod auth;
+/// The system pasteboard, for ⌘⌥C.
+pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod db;
@@ -263,6 +265,7 @@ pub fn run() {
             ipc::agent::agent_start,
             ipc::agent::agent_sessions,
             ipc::agent::agent_send,
+            ipc::agent::copy_context_text,
             ipc::agent::agent_backend_status,
             ipc::agent::agent_status,
             ipc::agent::agent_complete,

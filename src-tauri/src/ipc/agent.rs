@@ -5,6 +5,7 @@
 //! | `agent_start` | `prompt`, `context?` | [`SessionSnapshot`] |
 //! | `agent_sessions` | `sessionId?` | `SessionSnapshot[]` |
 //! | `agent_send` | `sessionId`, `action?`, `message?`, `toolUseId?`, `reason?`, `itemId?` | `{ ok }` or a snapshot |
+//! | `copy_context_text` | `context` | `{ chars, truncated }` — the same block, onto the clipboard |
 //! | `agent_backend_status` | — | which brain would answer, and what else is available |
 //! | `agent_status` | — | `{ configured, message, model, completionModel }` |
 //! | `agent_complete` | `system`, `prompt`, `maxTokens?` | `{ text }` |
@@ -72,7 +73,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use engine::complete::{complete, completion_model, CompletionRequest};
 use engine::config::AgentConfig;
-use engine::context::ContextItem;
+use engine::context::{Audience, ContextItem};
 use engine::session::{AgentEngine, Input, SessionEmitter, SessionEvent, SessionSnapshot};
 use engine::wire::ReqwestModelTransport;
 use engine::AgentError;
@@ -210,6 +211,43 @@ pub async fn agent_backend_status(
         "claudePath": available.claude.map(|p| p.to_string_lossy().to_string()),
         "apiKey": available.api_key,
         "message": message,
+    }))
+}
+
+/// The context block the agent would be given, put on the clipboard instead.
+///
+/// Not a second serialiser and deliberately so: this is
+/// [`engine::context::render_for`] with [`Audience::Clipboard`] rather than
+/// [`Audience::Model`], so what lands on the clipboard and what reaches the
+/// model can only ever differ in how much of a conversation they carry — never
+/// in what the app thinks "this" is.
+///
+/// A local read and a pasteboard write, and nothing else. It takes no
+/// `AppHandle` and never builds the engine: there is no network, no credential
+/// and no session involved in turning rows into text. Nothing logs the text —
+/// see `crate::clipboard` for why the write is here rather than in the webview.
+///
+/// `chars` is `0` when the view had nothing in it, in which case the pasteboard
+/// is left alone: a keystroke that empties the clipboard would be worse than a
+/// keystroke that does nothing. `truncated` says a message was left behind, so
+/// the toast can say so too.
+///
+/// ```json
+/// { "chars": 4213, "truncated": false }
+/// ```
+#[tauri::command]
+pub async fn copy_context_text(
+    state: State<'_, AppState>,
+    context: Vec<ContextItem>,
+) -> Result<Value, IpcError> {
+    let rendered = engine::context::render_for(&state.db, &context, Audience::Clipboard)?;
+    if rendered.text.trim().is_empty() {
+        return Ok(json!({ "chars": 0, "truncated": false }));
+    }
+    crate::clipboard::write(&rendered.text).map_err(IpcError::internal)?;
+    Ok(json!({
+        "chars": rendered.text.chars().count(),
+        "truncated": rendered.truncated,
     }))
 }
 

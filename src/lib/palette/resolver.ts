@@ -21,6 +21,7 @@ import type { MailboxTarget } from "@/lib/mailboxes";
 import { fuzzyScore } from "./score";
 import { feedbackResolver } from "@/lib/feedback";
 import { agentResolver } from "@/lib/agent";
+import { copyViewResolver } from "@/lib/copy-view";
 import { pluginResolver } from "@/lib/plugins/palette";
 // Re-exported so every existing importer keeps working; it lives in its own
 // module because `plugins/palette.ts` needs it and this file imports *from*
@@ -244,6 +245,7 @@ function rank<T>(items: { value: T; score: number }[], limit = LOCAL_LIMIT) {
 // keystroke, and one careless plugin would make ⌘K feel broken.
 const resolvers: PaletteResolver[] = [
   feedbackResolver,
+  copyViewResolver,
   commandResolver,
   pluginResolver,
   mailboxResolver,

@@ -42,6 +42,7 @@ import { cn } from "@/lib/utils";
 import { BareInput } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SEARCH_EVENT, type SearchEventDetail } from "@/components/search/palette";
+import { publishSearch } from "@/lib/copy-view";
 import { ThreadRow } from "./ThreadRow";
 
 /** A page of results. Big enough that ⌘↓ has somewhere to go, small enough to be instant. */
@@ -106,6 +107,22 @@ export function SearchView({ children }: { children: ReactNode }) {
     setError(null);
     input.current?.blur();
   }, []);
+
+  /*
+   * What ⌘⌥C copies while a search is up.
+   *
+   * The query and the results live here and nowhere else — that is the point of
+   * this file — so a copy standing in a search would otherwise report the
+   * mailbox underneath, which is not what is on screen. Published rather than
+   * lifted into `useMach`: the copy path is the only thing outside this
+   * component that has ever needed to know, and one exported setter is a
+   * smaller seam than a field in the app's reducer. Null while closed, so the
+   * mailbox is the answer again the moment Escape is pressed.
+   */
+  useEffect(() => {
+    publishSearch(open && query.trim() ? { query, results } : null);
+    return () => publishSearch(null);
+  }, [open, query, results]);
 
   /* ---------------------------------------------------------------- ⌘K ---- */
 

@@ -204,6 +204,48 @@ describe("what “this” means", () => {
     expect(day?.detail).toMatch(/unix milliseconds \d+ to \d+/);
   });
 
+  it("leaves the rows on screen out unless they are asked for", () => {
+    // The agent has search_threads and pays for every line on every turn.
+    const items = contextFor({ ...mailView, visibleThreads: [thread] });
+    expect(items.some((i) => i.id === "listing")).toBe(false);
+  });
+
+  it("attaches the rows on screen when they are", () => {
+    const items = contextFor({ ...mailView, visibleThreads: [thread] }, { listing: true });
+    const listing = items.find((i) => i.id === "listing");
+    expect(listing?.label).toBe("1 conversation in view");
+    expect(listing?.detail).toContain("Tawny Chen");
+    expect(listing?.detail).toContain("Series A data room");
+    expect(listing?.detail).toContain("(2 messages)");
+    expect(listing?.detail).toContain("Any chance you can send the link?");
+  });
+
+  it("caps a long list and says how many it left off", () => {
+    const many = Array.from({ length: 200 }, (_, i) => ({ ...thread, id: i + 1 }));
+    const items = contextFor({ ...mailView, visibleThreads: many }, { listing: true });
+    const listing = items.find((i) => i.id === "listing");
+    expect(listing?.label).toBe("200 conversations in view");
+    expect(listing?.detail).toContain("and 140 more further down the list");
+    expect(listing?.detail?.split("\n").length).toBeLessThan(70);
+  });
+
+  it("attaches the events inside the range on screen, and nothing outside it", () => {
+    const elsewhere: CalendarEvent = { ...event, id: 43, title: "Next month", start: 1_760_000_000_000, end: 1_760_003_600_000 };
+    const items = contextFor(
+      {
+        ...mailView,
+        mode: "calendar",
+        calendarView: "week",
+        visibleEvents: [event, elsewhere],
+      },
+      { listing: true },
+    );
+    const listing = items.find((i) => i.id === "listing");
+    expect(listing?.label).toBe("1 event in view");
+    expect(listing?.detail).toContain("Partner meeting");
+    expect(listing?.detail).not.toContain("Next month");
+  });
+
   it("carries ids separately from labels, so a stale label cannot mislead", () => {
     const items = contextFor({ ...mailView, threadId: 11, openThread: thread });
     // Rust resolves the id against the store; the label is only what the owner

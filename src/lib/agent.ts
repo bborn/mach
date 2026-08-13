@@ -302,7 +302,30 @@ export interface ShellView {
   selectedEvent?: CalendarEvent | null;
   /** The search the list is filtered by, when there is one. */
   search?: string;
+  /** The rows on screen — the mailbox's list, or the search's results. */
+  visibleThreads?: readonly Thread[];
+  /** The events inside the range the calendar is showing. */
+  visibleEvents?: readonly CalendarEvent[];
 }
+
+export interface ContextOptions {
+  /**
+   * Attach the rows on screen as well as the thing that is selected.
+   *
+   * Off for the agent, which holds `search_threads` and `list_events` and can
+   * fetch a list far more precisely than a dump of forty subject lines would
+   * describe one — and would pay for those forty lines on every turn.
+   *
+   * On for ⌘⌥C, where the opposite is true twice over. Whoever receives that
+   * text has no tools at all, and "what am I looking at" standing in a mailbox
+   * genuinely *is* the list: a copy that answered with one line naming the
+   * mailbox would be a copy not worth pressing.
+   */
+  listing?: boolean;
+}
+
+/** How many rows a listing carries before it becomes a data dump. */
+const LISTING_ROWS = 60;
 
 /**
  * What "this" means, right now.
@@ -316,7 +339,7 @@ export interface ShellView {
  * Rust resolves against the store. They are separate on purpose, so a stale
  * label can never make the agent act on the wrong thread.
  */
-export function contextFor(view: ShellView): ContextItem[] {
+export function contextFor(view: ShellView, options: ContextOptions = {}): ContextItem[] {
   const items: ContextItem[] = [];
 
   if (view.mode === "mail") {
@@ -355,6 +378,13 @@ export function contextFor(view: ShellView): ContextItem[] {
         detail: `Viewing the mailbox ${view.mailboxName ?? view.labelId} (labelId ${view.labelId}).`,
       });
     }
+
+    // Only when nothing is open. A conversation in the reading pane *is* the
+    // thing on screen; the list beside it is where he came from. Copying both
+    // put forty unrelated subject lines around the one conversation he meant,
+    // and they were most of the payload.
+    const listing = options.listing && view.threadId == null ? threadListing(view) : null;
+    if (listing) items.push(listing);
     return items;
   }
 
@@ -376,7 +406,82 @@ export function contextFor(view: ShellView): ContextItem[] {
       `The calendar is showing the ${view.calendarView} of ${rangeLabel(view)} — ` +
       `unix milliseconds ${range.start} to ${range.end}.`,
   });
+
+  // Same rule as mail: a selected event is the answer, and the rest of the
+  // week is not what he pointed at.
+  const listing = options.listing && view.eventId == null ? eventListing(view, range) : null;
+  if (listing) items.push(listing);
   return items;
+}
+
+/**
+ * The conversations on screen, one line each.
+ *
+ * Sender, subject, date and the snippet Gmail already trimmed — which is the
+ * row as it is drawn, and enough to triage from. Nothing here reads a message
+ * body: the bodies belong to whichever conversation is *open*, and Rust renders
+ * that one from the store.
+ */
+function threadListing(view: ShellView): ContextItem | null {
+  const rows = view.visibleThreads ?? [];
+  if (rows.length === 0) return null;
+
+  const shown = rows.slice(0, LISTING_ROWS);
+  const where = view.search?.trim()
+    ? `matching "${view.search.trim()}"`
+    : `in ${view.mailboxName ?? view.labelId}`;
+
+  const lines = shown.map((thread, index) => {
+    const who = thread.participants[0]?.name || thread.participants[0]?.email || "unknown";
+    const when = new Date(thread.timestamp).toISOString().slice(0, 10);
+    const count = thread.messageCount > 1 ? ` (${thread.messageCount} messages)` : "";
+    return `${index + 1}. ${who} — ${thread.subject}${count} — ${when} — ${thread.snippet}`;
+  });
+  if (rows.length > shown.length) {
+    lines.push(`… and ${rows.length - shown.length} more further down the list.`);
+  }
+
+  return {
+    id: "listing",
+    kind: "selection",
+    label: `${rows.length} conversation${rows.length === 1 ? "" : "s"} in view`,
+    detail: `The ${rows.length} conversations ${where}, newest first:\n${lines.join("\n")}`,
+  };
+}
+
+/** The events inside the range on screen, one line each. */
+function eventListing(view: ShellView, range: { start: number; end: number }): ContextItem | null {
+  const rows = (view.visibleEvents ?? [])
+    .filter((event) => event.end > range.start && event.start < range.end)
+    .slice()
+    .sort((a, b) => a.start - b.start);
+  if (rows.length === 0) return null;
+
+  const shown = rows.slice(0, LISTING_ROWS);
+  const lines = shown.map((event) => {
+    const start = new Date(event.start);
+    const day = start.toISOString().slice(0, 10);
+    const time = event.allDay
+      ? "all day"
+      : `${clock(event.start)}–${clock(event.end)}`;
+    const where = event.location ? ` @ ${event.location}` : "";
+    return `- ${day} ${time} — ${event.title}${where}`;
+  });
+  if (rows.length > shown.length) {
+    lines.push(`… and ${rows.length - shown.length} more in this range.`);
+  }
+
+  return {
+    id: "listing",
+    kind: "selection",
+    label: `${rows.length} event${rows.length === 1 ? "" : "s"} in view`,
+    detail: `The ${rows.length} events in the range on screen:\n${lines.join("\n")}`,
+  };
+}
+
+function clock(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 function threadSubject(thread: ThreadDetail | Thread | null | undefined): string | undefined {

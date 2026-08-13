@@ -37,7 +37,7 @@ use mach_lib::google::{
     BoxFuture, HttpRequest, HttpResponse, HttpTransport, StaticTokenProvider, TransportError,
 };
 use mach_lib::ipc::agent::engine::config::{AgentConfig, Credential};
-use mach_lib::ipc::agent::engine::context::ContextItem;
+use mach_lib::ipc::agent::engine::context::{render, render_for, Audience, ContextItem};
 use mach_lib::ipc::agent::engine::error::AgentError;
 use mach_lib::ipc::agent::engine::session::{
     AgentEngine, Entry, Input, SessionEmitter, SessionEvent, SessionSnapshot, SessionStatus,
@@ -2441,4 +2441,227 @@ fn the_tool_the_catalogue_names_exists() {
         tools::find("list_calendars").is_some(),
         "and the tool it names has to be on the surface"
     );
+}
+
+// ===========================================================================
+// the clipboard flavour of the context block
+// ===========================================================================
+
+/// One more reply on the thread, written the way a mail client writes one: the
+/// new sentence, an attribution line, and the whole history quoted underneath.
+fn seed_reply(db: &Db, account_id: i64, thread_id: i64, n: i64, history: &str) -> String {
+    let new = format!("Reply number {n} - the only sentence here that is new.");
+    let body = format!(
+        "{new}\n\nOn Tue, 5 Aug 2026 at 15:04 Tawny Chen <tawny@example.com> wrote:\n{history}"
+    );
+    db.write(|conn| {
+        queries::upsert_message(
+            conn,
+            &NewMessage {
+                thread_id,
+                account_id,
+                gmail_message_id: format!("m-r{n}"),
+                from: Participant {
+                    name: Some("Tawny Chen".into()),
+                    email: "tawny@example.com".into(),
+                },
+                subject: "Series A data room".into(),
+                body_text: Some(body.clone()),
+                snippet: new.clone(),
+                internal_date: 1_754_000_000_000 + n * 60_000,
+                ..Default::default()
+            },
+        )
+    })
+    .expect("reply");
+    body
+}
+
+fn thread_context(thread_id: i64) -> Vec<ContextItem> {
+    vec![ContextItem {
+        id: format!("thread:{thread_id}"),
+        kind: "thread".into(),
+        label: "Series A data room".into(),
+        thread_id: Some(thread_id),
+        event_id: None,
+        detail: None,
+    }]
+}
+
+/// ⌘⌥C on an open conversation puts *the conversation* on the clipboard — every
+/// message, not the three the model gets — and puts each sentence there once
+/// rather than once per reply that quoted it.
+#[test]
+fn the_clipboard_gets_the_whole_conversation_with_its_quoted_tails_removed() {
+    let temp = TempDb::new("clipcopy");
+    let (account_id, thread_id) = seed(&temp.db);
+
+    let mut history = String::from("> Any chance you can send the data room link?");
+    for n in 1..=6 {
+        let body = seed_reply(&temp.db, account_id, thread_id, n, &history);
+        history = body
+            .lines()
+            .map(|line| format!("> {line}\n"))
+            .collect::<String>();
+    }
+
+    let clipboard =
+        render_for(&temp.db, &thread_context(thread_id), Audience::Clipboard).expect("rendered");
+
+    // Every message, oldest first — the model's three-message window does not
+    // apply to a payload nobody can call get_thread against.
+    for n in 1..=6 {
+        assert!(
+            clipboard
+                .text
+                .contains(&format!("Reply number {n} - the only sentence here that is new.")),
+            "message {n} missing:\n{}",
+            clipboard.text
+        );
+    }
+    assert!(!clipboard.text.contains("not shown"), "{}", clipboard.text);
+    assert!(!clipboard.truncated);
+
+    // And once each. With quotes kept, reply 1's sentence would appear five
+    // more times inside the tails of replies 2..6.
+    let repeats = clipboard.text.matches("Reply number 1 -").count();
+    assert_eq!(repeats, 1, "quoted history came through:\n{}", clipboard.text);
+    assert!(
+        !clipboard.text.contains("> Any chance you can send"),
+        "{}",
+        clipboard.text
+    );
+
+    // It is addressed by him, not about him: the model's wording would read as
+    // a third party describing him to whoever he pastes this to.
+    assert!(clipboard.text.contains("This is what I am looking at"));
+
+    // The model's block is unchanged by any of this.
+    let model = render(&temp.db, &thread_context(thread_id)).expect("rendered");
+    assert!(model.contains("What the owner is looking at right now"));
+    assert!(
+        model.contains("4 earlier message(s) not shown"),
+        "the model still gets three and a pointer at get_thread:\n{model}"
+    );
+}
+
+/// A conversation too big for the ceiling stops, and says where — in the text
+/// and on the flag the toast reads. Silent truncation is the failure mode.
+#[test]
+fn a_conversation_over_the_ceiling_says_what_it_left_behind() {
+    let temp = TempDb::new("clipcap");
+    let (account_id, thread_id) = seed(&temp.db);
+
+    // 40 × ~5k characters of new text, which is past the 60k ceiling well
+    // before the last message.
+    let filler = "x".repeat(5_000);
+    for n in 1..=40i64 {
+        temp.db
+            .write(|conn| {
+                queries::upsert_message(
+                    conn,
+                    &NewMessage {
+                        thread_id,
+                        account_id,
+                        gmail_message_id: format!("m-big{n}"),
+                        from: Participant {
+                            name: Some("Tawny Chen".into()),
+                            email: "tawny@example.com".into(),
+                        },
+                        subject: "Series A data room".into(),
+                        body_text: Some(format!("message {n}\n{filler}")),
+                        snippet: format!("message {n}"),
+                        internal_date: 1_754_000_000_000 + n * 60_000,
+                        ..Default::default()
+                    },
+                )
+            })
+            .expect("message");
+    }
+
+    let clipboard =
+        render_for(&temp.db, &thread_context(thread_id), Audience::Clipboard).expect("rendered");
+
+    assert!(clipboard.truncated, "the toast has to be able to say so");
+    assert!(
+        clipboard.text.contains("more message(s) left out"),
+        "and the text has to say it in place"
+    );
+    assert!(
+        clipboard.text.chars().count() < 70_000,
+        "{} characters",
+        clipboard.text.chars().count()
+    );
+    // The block is still well formed, so it parses wherever it is pasted.
+    assert!(clipboard.text.ends_with("</context>\n\n"));
+}
+
+/// The surfaces that are not a conversation still copy something. A selected
+/// event and the listing the frontend attached both come back as text rather
+/// than as an empty clipboard.
+#[test]
+fn the_surfaces_that_are_not_a_conversation_still_copy_something() {
+    let temp = TempDb::new("clipsurfaces");
+    let (account_id, _thread_id) = seed(&temp.db);
+
+    temp.db
+        .write(|conn| {
+            queries::upsert_calendar(
+                conn,
+                &NewCalendar {
+                    account_id,
+                    calendar_id: "primary".into(),
+                    summary: Some("Alex".into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("calendar");
+
+    let event_id = temp
+        .db
+        .write(|conn| {
+            queries::upsert_event(
+                conn,
+                &mach_lib::db::models::NewEvent {
+                    account_id,
+                    calendar_id: "primary".into(),
+                    google_event_id: "e-1".into(),
+                    title: "Partner meeting".into(),
+                    start_ts: 1_754_000_000_000,
+                    end_ts: 1_754_003_600_000,
+                    location: Some("Room 4".into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("event");
+
+    let items = vec![
+        ContextItem {
+            id: format!("event:{event_id}"),
+            kind: "event".into(),
+            label: "Partner meeting".into(),
+            thread_id: None,
+            event_id: Some(event_id),
+            detail: None,
+        },
+        ContextItem {
+            id: "listing".into(),
+            kind: "selection".into(),
+            label: "2 events in view".into(),
+            thread_id: None,
+            event_id: None,
+            detail: Some("2 events in view:\n- 09:00 Standup\n- 15:00 Partner meeting".into()),
+        },
+    ];
+
+    let rendered = render_for(&temp.db, &items, Audience::Clipboard).expect("rendered");
+    assert!(rendered.text.contains("Partner meeting"));
+    assert!(rendered.text.contains("Room 4"));
+    // The listing the frontend attached comes through verbatim, which is what
+    // makes "the mailbox I am looking at" copyable at all.
+    assert!(rendered.text.contains("2 events in view"));
+    assert!(rendered.text.contains("- 09:00 Standup"));
+    assert!(!rendered.truncated);
 }
