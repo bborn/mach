@@ -52,6 +52,11 @@ Working, and what I read my mail in every day:
   send delay, week start, working hours and sync interval.
 - An in-app agent that runs on the Claude Code CLI by default and needs no API
   key. See [`docs/agent-backends.md`](docs/agent-backends.md).
+- Suggested replies: on a thread somebody has asked you something in, the reply
+  bar offers two stances with the whole reply already written behind each, drawn
+  from your own sent mail so they sound like you. They stay in local SQLite —
+  nothing reaches Gmail's drafts until you pick one — and the app keeps count of
+  how often you send one roughly as written.
 - A sandboxed plugin runtime. See [`PLUGINS.md`](PLUGINS.md).
 
 Expect rough edges: nothing packaged, nothing that updates itself, no onboarding
@@ -59,12 +64,12 @@ past "add an account", and marketing mail that renders like a ransom note more
 often than I'd like. `cargo test` and `bunx vitest run` are the whole safety net
 — there is no end-to-end suite.
 
-One feature will not work for you out of the box. `⌘K → Send feedback` captures
-the window, lets you annotate it, and files the result as a task for a coding
-agent to pick up. It shells out to the author's own task runner, a `ty` binary
-found on `PATH` or via `MACH_TY_BIN`, which you probably do not have. Without it
-the command reports that it could not file the task. The capture and annotation
-half works regardless.
+`⌘K → Send feedback` captures the window, lets you scribble on the screenshot,
+and drops the result in `.feedback/inbox/` as a brief for a coding agent — the
+view you were in, what you annotated, the commit you were on. Point a session at
+that directory and it can pick items up as you file them; that is how most of
+this got fixed. (`MACH_FEEDBACK_SINK=taskyou` sends them to the author's own task
+runner instead, which needs a `ty` binary you probably do not have.)
 
 ## You must bring your own Google OAuth app
 
