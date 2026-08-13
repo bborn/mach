@@ -391,14 +391,27 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
     // should share one connection pool.
     let transport: Arc<dyn HttpTransport> = Arc::new(ReqwestTransport::new());
 
-    let dispatcher = Arc::new(CommandDispatcher::new(
+    // …and a second, separate one for unsubscribe requests. It is not a missed
+    // opportunity to share a pool: the transport above is built for Google,
+    // whose redirects, response sizes and certificates are not adversarial, and
+    // a `List-Unsubscribe` URL is a string a stranger put in a message. See
+    // `unsub::http` for the six settings that differ.
+    //
+    // A build that cannot construct it still boots. The one-click path then
+    // refuses with a sentence rather than falling back to the Google client,
+    // which is the safe direction to fail in.
+    let dispatcher = CommandDispatcher::new(
         db.clone(),
         Arc::new(ManagedClients::new(
             db.clone(),
             Arc::clone(&transport),
             tokens.clone(),
         )),
-    )?);
+    )?;
+    let dispatcher = Arc::new(match crate::unsub::http::UnsubTransport::new() {
+        Ok(unsub) => dispatcher.with_unsub_http(Arc::new(unsub)),
+        Err(_) => dispatcher,
+    });
 
     let sync_tokens = tokens.clone();
     let sync_clients = Arc::new(TransportClients::new(Arc::clone(&transport), move |account| {

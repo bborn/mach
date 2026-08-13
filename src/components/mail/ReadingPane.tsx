@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Archive, Bookmark, Clock, CornerUpLeft, PencilLine } from "lucide-react";
+import { Archive, Bookmark, Clock, CornerUpLeft, MailX, PencilLine, ShieldAlert } from "lucide-react";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { ACCOUNT_BG } from "@/lib/colors";
@@ -20,6 +20,7 @@ import {
   moveMessageCursor,
   replyTarget,
 } from "./thread-cursor";
+import { unsubscribeAction } from "./unsubscribe-offer";
 import { PluginViews } from "@/components/plugins/PluginView";
 
 /**
@@ -235,6 +236,10 @@ export function ReadingPane() {
   // on this thread rather than preparing a fresh one (`ComposerDock.open`), so
   // while one exists "Reply" is the wrong word for the button that answers.
   const pendingDraft = messages.find((message) => message.isDraft) ?? null;
+  // Which message carries the offer, and what the button says about it. The
+  // same function `actions.unsubscribe` resolves through, so the label and the
+  // gesture cannot disagree about which sender they mean.
+  const unsubscribe = unsubscribeAction(messages);
 
   return (
     <>
@@ -282,6 +287,31 @@ export function ReadingPane() {
             <Button size="icon" title="Archive (e)" onClick={actions.archiveSelected}>
               <Archive size={14} strokeWidth={1.75} />
             </Button>
+            {/*
+              Only for a conversation that has an offer, which is a small
+              minority of them. A permanently present, permanently disabled
+              button would be four more pixels of chrome on every thread of two
+              people talking, explaining a feature neither of them needs.
+
+              The two faces are not two shades of the same thing. `Unsubscribe`
+              writes to the sender; `Report spam` tells Google. Which one is
+              offered is Rust's answer, not this pane's — see `unsubscribeAction`.
+            */}
+            {unsubscribe && (
+              <Button
+                size="icon"
+                data-testid="unsubscribe-action"
+                title={unsubscribe.label}
+                aria-label={unsubscribe.label}
+                onClick={actions.unsubscribe}
+              >
+                {unsubscribe.offer.offer === "unsubscribe" ? (
+                  <MailX size={14} strokeWidth={1.75} />
+                ) : (
+                  <ShieldAlert size={14} strokeWidth={1.75} />
+                )}
+              </Button>
+            )}
             {/*
               `b`, not `h`. Both keys snooze — `h` is the Superhuman habit this
               app shipped with and still answers to — but `b` is Gmail's, it is

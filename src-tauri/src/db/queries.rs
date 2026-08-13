@@ -470,6 +470,8 @@ fn map_message(row: &Row<'_>) -> rusqlite::Result<Message> {
         is_unread: row.get(17)?,
         is_draft: row.get(18)?,
         mach_draft_id: row.get(23)?,
+        // Filled in only by `ipc::reads::get_thread`. See the field's docs.
+        unsubscribe: None,
         // The half that came off this row. The event half is `None` until
         // `messages_for_thread` looks it up — see `invitation_event`.
         invitation: row.get::<_, Option<String>>(24)?.map(|uid| MessageInvitation {
@@ -661,9 +663,10 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
                                in_reply_to, references_header, from_name, from_email,
                                to_json, cc_json, bcc_json, subject, body_html, body_text,
                                snippet, internal_date, is_unread, is_draft, reply_to,
-                               body_text_flowed, body_text_delsp)
+                               body_text_flowed, body_text_delsp,
+                               list_unsubscribe, list_unsubscribe_post, list_id, precedence)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21)
+                 ?20, ?21, ?22, ?23, ?24, ?25)
          ON CONFLICT(account_id, gmail_message_id) DO UPDATE SET
              thread_id         = excluded.thread_id,
              rfc822_message_id = excluded.rfc822_message_id,
@@ -683,7 +686,15 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
              is_draft          = excluded.is_draft,
              reply_to          = excluded.reply_to,
              body_text_flowed  = excluded.body_text_flowed,
-             body_text_delsp   = excluded.body_text_delsp
+             body_text_delsp   = excluded.body_text_delsp,
+             -- COALESCE, not excluded: a re-sync arriving with a metadata-only
+             -- response would otherwise wipe headers a full fetch had already
+             -- stored, and we-were-never-told is a worse answer than a
+             -- slightly stale one.
+             list_unsubscribe      = COALESCE(excluded.list_unsubscribe, list_unsubscribe),
+             list_unsubscribe_post = COALESCE(excluded.list_unsubscribe_post, list_unsubscribe_post),
+             list_id               = COALESCE(excluded.list_id, list_id),
+             precedence            = COALESCE(excluded.precedence, precedence)
          RETURNING id",
         params![
             new.thread_id,
@@ -707,6 +718,10 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
             people_to_json(&new.reply_to),
             new.body_text_flowed,
             new.body_text_delsp,
+            new.list_unsubscribe,
+            new.list_unsubscribe_post,
+            new.list_id,
+            new.precedence,
         ],
         |row| row.get(0),
     )?;

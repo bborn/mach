@@ -58,6 +58,7 @@ describe("the mail action keys", () => {
       star: vi.fn(),
       trash: vi.fn(),
       reportSpam: vi.fn(),
+      unsubscribe: vi.fn(),
       favorite: vi.fn(),
       undo: vi.fn(),
     };
@@ -182,6 +183,47 @@ describe("the mail action keys", () => {
     }
   });
 
+  /* ----------------------------------------------------- unsubscribe --- */
+
+  it("unsubscribes on ⌘⇧U", () => {
+    expect(keymap.handle(press("u", { metaKey: true, shiftKey: true }))).toBe(true);
+    expect(handlers.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+   * The reason it wears two modifiers, asserted rather than left in a comment.
+   * `u` and ⇧U are Gmail's mark-as-unread, and this is the one action in the
+   * app with no inverse — a stray letter must not reach it.
+   */
+  it("does not unsubscribe on a bare u or ⇧U", () => {
+    expect(keymap.handle(press("u"))).toBe(false);
+    expect(keymap.handle(press("u", { shiftKey: true }))).toBe(false);
+    expect(handlers.unsubscribe).not.toHaveBeenCalled();
+  });
+
+  it("does not unsubscribe while the keyboard is out of the list", () => {
+    active = false;
+    expect(keymap.handle(press("u", { metaKey: true, shiftKey: true }))).toBe(false);
+    expect(handlers.unsubscribe).not.toHaveBeenCalled();
+  });
+
+  it("publishes the unsubscribe key to the help sheet, spelled as a shortcut", () => {
+    const binding = mailActionBindings({ active: () => true, mail: () => true }, handlers).find(
+      (b) => b.group === "Actions" && b.description === "Unsubscribe",
+    );
+
+    expect(binding, "the context menu and the palette look this pair up").toBeDefined();
+    expect(binding?.keys).toBe("mod+shift+u");
+    /*
+     * A description is the sheet's left-hand column, and the key glyphs are
+     * drawn from `keys` in the column beside it. One that spelled its own
+     * modifiers — "Unsubscribe (⌘⇧U)" — would print them twice, and one that
+     * said " then " would claim a chord this binding is not.
+     */
+    expect(binding?.description).not.toMatch(/[⌘⇧⌥⌃↵⌫]/);
+    expect(binding?.description).not.toContain(" then ");
+  });
+
   /* ------------------------------------------------------------ snooze --- */
 
   it("opens the picker on b rather than snoozing outright", () => {
@@ -267,7 +309,16 @@ describe("the mail action keys", () => {
     )
       .filter((b) => b.description)
       .map((b) => b.keys);
-    expect(documented).toEqual(["e", "b", "s", "#", "!", "shift+f", "z"]);
+    expect(documented).toEqual([
+      "e",
+      "b",
+      "s",
+      "#",
+      "!",
+      "mod+shift+u",
+      "shift+f",
+      "z",
+    ]);
   });
 });
 

@@ -116,8 +116,14 @@ export interface ToastAction {
   word: string;
   /** The whole sentence: "Undo archived 3 conversations". */
   title: string;
-  /** The binding, shown so the shortcut is learned by using the button. */
-  keys: string;
+  /**
+   * The binding, shown so the shortcut is learned by using the button.
+   *
+   * Absent for a button that has no key. ⌘Z and ⇧⌘Z are how the toast teaches
+   * its own shortcuts, and a `Kbd` printed beside a button that answers to
+   * nothing would teach a key that does not exist.
+   */
+  keys?: string;
   run: () => void;
 }
 
@@ -220,7 +226,9 @@ export function ToastCard({
           )}
         >
           {action.word}
-          <Kbd keys={action.keys} className="border-transparent bg-transparent text-accent" />
+          {action.keys && (
+            <Kbd keys={action.keys} className="border-transparent bg-transparent text-accent" />
+          )}
         </button>
       )}
 
@@ -378,11 +386,15 @@ export function Toast({ children }: { children?: ReactNode }) {
    * stack no longer has.
    */
   const action: ToastAction | null =
-    offer === "undo" && undoLabel
-      ? { word: "Undo", title: undoLabel, keys: "mod+z", run: actions.undo }
-      : offer === "redo" && redoLabel
-        ? { word: "Redo", title: redoLabel, keys: "shift+mod+z", run: actions.redo }
-        : null;
+    // A button the message brought with it wins: it is the one thing that can
+    // still be done about *this* message, and the stack knows nothing about it.
+    run.status?.action
+      ? run.status.action
+      : offer === "undo" && undoLabel
+        ? { word: "Undo", title: undoLabel, keys: "mod+z", run: actions.undo }
+        : offer === "redo" && redoLabel
+          ? { word: "Redo", title: redoLabel, keys: "shift+mod+z", run: actions.redo }
+          : null;
 
   return (
     <ToastLayer

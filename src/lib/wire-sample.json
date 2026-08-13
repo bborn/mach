@@ -166,7 +166,11 @@
         "email": "alex@example.com",
         "name": "Alex Rivera"
       }
-    ]
+    ],
+    "unsubscribe": {
+      "method": "oneClick",
+      "offer": "unsubscribe"
+    }
   },
   "thread": {
     "accountColourIndex": 2,

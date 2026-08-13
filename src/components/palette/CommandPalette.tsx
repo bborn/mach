@@ -54,6 +54,14 @@ const COMMANDS: PaletteCommand[] = [
     keywords: "spam junk phishing report block",
   },
   {
+    id: "unsubscribe",
+    title: "Unsubscribe",
+    // Glyphs, like every other hint in this list: the column is plain text, so
+    // "mod+shift+u" would print as those nine characters beside "⇧⌘R".
+    hint: "⇧⌘U",
+    keywords: "unsubscribe newsletter list mailing opt out",
+  },
+  {
     id: "favorite-view",
     title: "Favorite this mailbox",
     hint: "⇧F",
@@ -208,6 +216,10 @@ export function CommandPalette() {
           return actions.archiveSelected();
         case "report-spam":
           return actions.reportSpamSelected();
+        // Reads the open conversation for itself, exactly as the key does, and
+        // says so quietly when there is nothing to unsubscribe from.
+        case "unsubscribe":
+          return actions.unsubscribe();
         case "snooze":
           // Hands over to the picker rather than committing a time of its own.
           // The reducer's `snooze` case shuts this palette on the way out, so

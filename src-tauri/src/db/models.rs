@@ -388,6 +388,14 @@ pub struct Message {
     /// open conversation drop that row in the same frame rather than waiting for
     /// the write and the refetch behind it. See `useMach`'s `draftSent`.
     pub mach_draft_id: Option<String>,
+    /// What may honestly be offered about this message's `List-Unsubscribe`.
+    ///
+    /// Filled in by [`crate::ipc::reads::get_thread`] and by nothing else — it
+    /// costs two sender lookups per message that carries the header, which the
+    /// thread list has no use for. Absent everywhere else, and absent for
+    /// almost every message anywhere. See [`crate::unsub`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsubscribe: Option<crate::unsub::Offer>,
     pub attachments: Vec<Attachment>,
 }
 
@@ -419,6 +427,22 @@ pub struct NewMessage {
     pub internal_date: i64,
     pub is_unread: bool,
     pub is_draft: bool,
+    /// `List-Unsubscribe`, `List-Unsubscribe-Post`, `List-Id` and `Precedence`,
+    /// exactly as the sender wrote them.
+    ///
+    /// Stored rather than parsed, because the parse is a security decision and
+    /// belongs in one place — [`crate::unsub::target`] — where it can be
+    /// changed without a migration. `None` means the header was absent *or*
+    /// that this row predates migration 18; the two are indistinguishable and
+    /// both read as "no unsubscribe on offer".
+    ///
+    /// Every writer that is not the sync loop leaves all four `None`. A message
+    /// Mach composed has no list headers, and a mirrored draft is not a
+    /// newsletter.
+    pub list_unsubscribe: Option<String>,
+    pub list_unsubscribe_post: Option<String>,
+    pub list_id: Option<String>,
+    pub precedence: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

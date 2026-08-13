@@ -86,7 +86,40 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 17,
         sql: M17_REPLY_SUGGESTIONS,
     },
+    Migration {
+        version: 18,
+        sql: M18_BULK_HEADERS,
+    },
 ];
+
+/// Migration 18 — the four headers that say "this is a mailing list, and here
+/// is how to leave it".
+///
+/// They were read off the wire and thrown away until now: [`crate::suggest`]
+/// looks at `List-Unsubscribe` and `Precedence` while the response is still in
+/// hand, and carries them to its own decision in a struct rather than a column,
+/// because nothing needed them a second time.
+///
+/// In-app unsubscribe needs them a second time. The decision to offer the
+/// action is made when a conversation is opened, from rows — the UI never waits
+/// on Google, so re-fetching the message to read its headers is not available.
+///
+/// `NULL` reads as "we were never told", the same rule migrations 5 and 11 set.
+/// That is not the same as "there is no unsubscribe": every message stored
+/// before this migration has `NULL` here whatever it actually carried, so the
+/// affordance appears on mail synced from now on and on nothing older. A
+/// backfill would mean one `messages.get` per message against a 61,000-message
+/// store, which is a bigger decision than this migration.
+///
+/// Indexed on nothing. The only query is by `messages.id`, which is the primary
+/// key, and a partial index over the handful of newsletters in a mailbox would
+/// cost more to maintain than the lookups it saves.
+const M18_BULK_HEADERS: &str = r#"
+ALTER TABLE messages ADD COLUMN list_unsubscribe      TEXT;
+ALTER TABLE messages ADD COLUMN list_unsubscribe_post TEXT;
+ALTER TABLE messages ADD COLUMN list_id               TEXT;
+ALTER TABLE messages ADD COLUMN precedence            TEXT;
+"#;
 
 /// Migration 17 — the stances the agent has written for a conversation, and
 /// what happened to them.

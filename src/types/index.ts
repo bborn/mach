@@ -131,7 +131,31 @@ export interface Message {
    * `db::models::MessageInvitation`.
    */
   invitation?: Invitation;
+  /**
+   * What may honestly be offered about this message's `List-Unsubscribe`.
+   *
+   * Absent for almost every message. Computed in Rust by `unsub::rule` — an
+   * unsubscribe confirms to the sender that the address is live and read, so it
+   * is only offered for bulk mail from a sender the store already believes in.
+   * When the header is there but nothing vouches for the sender, the honest
+   * offer is Gmail's spam report instead.
+   */
+  unsubscribe?: UnsubscribeOffer;
 }
+
+/**
+ * The two honest answers, and the reason each was reached.
+ *
+ * `offer` is the discriminant on the wire as well as here, so the shape a
+ * component switches on is the shape Rust serialized. `method` says how the
+ * unsubscribe would be made: `oneClick` is the RFC 8058 POST, `mail` is a
+ * message to the address the header names, and `link` is a page only the sender
+ * can complete — which is why `link` is the one the app will not dispatch a
+ * command for. See `useMach`'s `unsubscribe`.
+ */
+export type UnsubscribeOffer =
+  | { offer: "unsubscribe"; method: "oneClick" | "mail" | "link" }
+  | { offer: "reportSpam"; reason: "notBulkMail" | "unknownSender" };
 
 /**
  * A calendar invitation, joined to the event on the local calendar.

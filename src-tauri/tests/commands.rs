@@ -2176,11 +2176,11 @@ fn every_command_variant_appears_in_the_catalogue() {
     for expected in [
         "archive", "unarchive", "markRead", "star", "label", "reportSpam", "notSpam", "trash",
         "untrash", "snooze", "unsnooze", "rsvp", "createEvent", "updateEvent", "deleteEvent",
-        "moveEvent",
+        "moveEvent", "unsubscribe",
     ] {
         assert!(kinds.contains(&expected), "{expected} missing from catalogue");
     }
-    assert_eq!(kinds.len(), 16);
+    assert_eq!(kinds.len(), 17);
     // Every spec is serialisable, which is what makes it an agent tool schema.
     let json = serde_json::to_value(catalogue).unwrap();
     assert!(json.is_array());

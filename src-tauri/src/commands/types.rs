@@ -416,6 +416,34 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notify: Option<Notify>,
     },
+
+    /// Leave the mailing list a message came from. **No inverse.**
+    ///
+    /// It is the one command in this vocabulary that breaks the contract in the
+    /// module doc, and it breaks it in both directions: it writes nothing
+    /// locally, and it cannot be undone. Both follow from what it is — a
+    /// message to a stranger's server saying "stop", which no later message can
+    /// take back.
+    ///
+    /// It is a command anyway, for two reasons that are worth the exception.
+    /// The catalogue is the agent's tool list, and "unsubscribe me from this"
+    /// is a thing to be able to ask for. And [`CommandResult`] already carries
+    /// the truthful-failure shape this needs — `ok`, a sentence, and a
+    /// [`CommandFailure`](super::CommandFailure) naming what refused — so
+    /// routing it here means a sender that returns `500` surfaces through
+    /// exactly the machinery a Gmail refusal does, rather than through a second
+    /// one built for this feature.
+    ///
+    /// Addressed by message rather than by thread because the headers are
+    /// per-message: a thread can hold two newsletters, and a digest from March
+    /// can name an endpoint that has since moved.
+    ///
+    /// Whether the message may be unsubscribed from at all is not the caller's
+    /// decision. [`crate::unsub::rule`] is re-run here from the store, so a
+    /// stale UI — or an agent asking for the wrong thing — cannot turn this
+    /// into a confirmation that his address is live.
+    #[serde(rename_all = "camelCase")]
+    Unsubscribe { message_id: i64 },
 }
 
 impl Command {
@@ -438,6 +466,7 @@ impl Command {
             Command::UpdateEvent { .. } => "updateEvent",
             Command::DeleteEvent { .. } => "deleteEvent",
             Command::MoveEvent { .. } => "moveEvent",
+            Command::Unsubscribe { .. } => "unsubscribe",
         }
     }
 
@@ -463,6 +492,11 @@ impl Command {
             // A create has no id until it has run; `CommandResult::applied`
             // carries the row it made.
             Command::CreateEvent { .. } => Vec::new(),
+            // Deliberately empty rather than the message id. Every caller of
+            // this reads it as *thread* ids — the selection to re-select, the
+            // rows to roll back — and a message id in that position would be a
+            // silent type confusion against a table that has both.
+            Command::Unsubscribe { .. } => Vec::new(),
         }
     }
 

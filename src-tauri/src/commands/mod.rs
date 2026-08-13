@@ -39,6 +39,7 @@
 //! | [`mail`] | the label-delta engine, batching, snooze |
 //! | [`drafts`] | discarding a draft, which no label delta can express |
 //! | [`calendar`] | RSVP, and the event write path (create/update/delete/move) |
+//! | [`unsubscribe`] | leaving a mailing list, and why it is a command at all |
 //! | [`catalogue`] | the self-describing schema |
 //!
 //! `mail`'s module docs carry the batching and snooze decisions in full.
@@ -51,6 +52,8 @@ pub mod error;
 pub mod filters;
 pub mod mail;
 pub mod types;
+/// Leaving a mailing list. The one command with no local write and no inverse.
+pub mod unsubscribe;
 
 use std::sync::Arc;
 
@@ -80,6 +83,13 @@ pub struct CommandDispatcher {
     pub(crate) user_id: String,
     pub(crate) snooze_label_name: String,
     pub(crate) max_batch_message_ids: usize,
+    /// The client for unsubscribe requests, which is **not** the one the rest
+    /// of the app uses — see [`crate::unsub::http`] for the six settings that
+    /// differ and why each one does. `None` in a build or a test that has not
+    /// supplied one; a one-click unsubscribe then refuses rather than reaching
+    /// for the Google transport, whose redirect and timeout policy is written
+    /// for a server we trust.
+    pub(crate) unsub_http: Option<Arc<dyn crate::google::HttpTransport>>,
     /// Accounts whose OAuth grant turned out to be too narrow for something
     /// that was attempted through this dispatcher. See [`filters::ScopeNotices`]
     /// for why it hangs here rather than on the application state.
@@ -97,7 +107,14 @@ impl CommandDispatcher {
             snooze_label_name: mail::DEFAULT_SNOOZE_LABEL.to_string(),
             max_batch_message_ids: mail::DEFAULT_MAX_BATCH_MESSAGE_IDS,
             scope_notices: Arc::new(ScopeNotices::default()),
+            unsub_http: None,
         })
+    }
+
+    /// Supply the hardened client that unsubscribe requests go out on.
+    pub fn with_unsub_http(mut self, http: Arc<dyn crate::google::HttpTransport>) -> Self {
+        self.unsub_http = Some(http);
+        self
     }
 
     pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
@@ -172,6 +189,9 @@ impl CommandDispatcher {
                     notify.unwrap_or_default(),
                 )
                 .await
+            }
+            Command::Unsubscribe { message_id } => {
+                unsubscribe::execute(self, message_id).await
             }
             other => mail::execute(self, &other).await,
         }
