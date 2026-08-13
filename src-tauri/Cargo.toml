@@ -50,7 +50,6 @@ base64 = "0.23.1"
 ammonia = "4.1.4"
 mail-builder = "0.4.4"
 mail-parser = "0.11.5"
-tauri-plugin-shell = "2.3.5"
 # The system save panel, for "Save attachment as…". Registered at runtime from
 # `ipc::attachments` rather than in the builder chain — see `save_panel`.
 tauri-plugin-dialog = "2"
