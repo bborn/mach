@@ -28,10 +28,25 @@
 //! JSON document, so this module needs neither the SSE decoder nor the turn
 //! accumulator — it collects the chunks and parses once.
 
+//! # Two ways to reach a model, one shape
+//!
+//! Everything above describes `POST /v1/messages`, which was the only way this
+//! module could reach a model and is the wrong *default* for this app: Mach's
+//! agent runs on the Claude Code CLI and needs no API key, so a one-shot that
+//! could only go over HTTP could only run for somebody holding a credential the
+//! app does not otherwise ask for. [`Completer`] is the seam that fixes that —
+//! same request, same string back, and the caller does not know which of the
+//! two answered.
+
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::google::BoxFuture;
+
+use super::backend::Backend;
 use super::config::AgentConfig;
 use super::error::AgentError;
 use super::wire::{api_message, call_headers, ModelCall, ModelTransport};
@@ -196,6 +211,121 @@ pub async fn complete_as(
     completion_text(&String::from_utf8_lossy(&body))
 }
 
+// ===========================================================================
+// Whichever way this machine reaches a model
+// ===========================================================================
+
+/// One structured completion, however this machine reaches a model.
+///
+/// Object-safe and future-boxing for the same reason [`super::Brain`] is: the
+/// two implementations are an HTTPS request and a child process, and the caller
+/// — an unattended pass over newly arrived mail — must not know which it has.
+///
+/// It is deliberately *not* [`super::Brain`]. A brain gets tools, an approval
+/// gate, an event channel and a transcript; this gets a string.
+pub trait Completer: Send + Sync {
+    fn complete<'a>(
+        &'a self,
+        model: &'a str,
+        request: &'a CompletionRequest,
+    ) -> BoxFuture<'a, Result<String, AgentError>>;
+
+    /// Which brain this is, for the sentence a failure logs.
+    fn label(&self) -> String;
+}
+
+/// `POST /v1/messages`, for an owner who has configured a key.
+pub struct ApiCompleter {
+    config: AgentConfig,
+    transport: Arc<dyn ModelTransport>,
+}
+
+impl ApiCompleter {
+    pub fn new(config: AgentConfig, transport: Arc<dyn ModelTransport>) -> ApiCompleter {
+        ApiCompleter { config, transport }
+    }
+}
+
+impl Completer for ApiCompleter {
+    fn complete<'a>(
+        &'a self,
+        model: &'a str,
+        request: &'a CompletionRequest,
+    ) -> BoxFuture<'a, Result<String, AgentError>> {
+        Box::pin(complete_as(
+            self.transport.as_ref(),
+            &self.config,
+            model,
+            request,
+        ))
+    }
+
+    fn label(&self) -> String {
+        format!("the Anthropic API ({})", self.config.base_url)
+    }
+}
+
+/// `claude --print`, which is what this app runs on.
+pub struct CliCompleter {
+    exe: PathBuf,
+    /// Where the child runs. Mach's own directory beside the database — never
+    /// the owner's home directory, and never a bundled app's `/`.
+    workspace: PathBuf,
+}
+
+impl CliCompleter {
+    pub fn new(exe: PathBuf, workspace: PathBuf) -> CliCompleter {
+        CliCompleter { exe, workspace }
+    }
+}
+
+impl Completer for CliCompleter {
+    fn complete<'a>(
+        &'a self,
+        model: &'a str,
+        request: &'a CompletionRequest,
+    ) -> BoxFuture<'a, Result<String, AgentError>> {
+        Box::pin(super::cli::complete_once(
+            &self.exe,
+            &self.workspace,
+            model,
+            request,
+        ))
+    }
+
+    fn label(&self) -> String {
+        format!("Claude Code ({})", self.exe.display())
+    }
+}
+
+/// The completer a resolved backend implies.
+///
+/// `model` is not taken from the backend: a one-shot names its own, and the
+/// agent's model is the expensive one.
+pub fn completer_for(
+    backend: Backend,
+    transport: Arc<dyn ModelTransport>,
+    workspace: PathBuf,
+) -> Result<Box<dyn Completer>, AgentError> {
+    match backend {
+        Backend::ClaudeCli { exe, .. } => Ok(Box::new(CliCompleter::new(exe, workspace))),
+        Backend::AnthropicApi(config) => Ok(Box::new(ApiCompleter::new(*config, transport))),
+        // A custom command implements the *session* contract in
+        // `docs/agent-backends.md` — a tool server, a stream of events, an
+        // approval round trip. There is no one-shot in it, and inventing a
+        // second contract for a program somebody else wrote is worse than
+        // saying so. This is the whole reason `completer_for` returns a
+        // `Result`.
+        Backend::Command { program, .. } => Err(AgentError::MissingApiKey(format!(
+            "Preferences ask for a custom agent command ({}), which answers ⌘K but cannot write \
+             a reply on its own — the contract in docs/agent-backends.md is a session, not a \
+             one-shot. Choose Claude Code or the Anthropic API in Preferences → Agent, or switch \
+             written replies off.",
+            program.display()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::config::Credential;
@@ -255,6 +385,52 @@ mod tests {
     fn an_empty_turn_is_an_empty_completion() {
         assert_eq!(completion_text(r#"{"content":[]}"#).unwrap(), "");
         assert_eq!(completion_text(r#"{}"#).unwrap(), "");
+    }
+
+    /// A transport that cannot possibly answer, so a test that gets a
+    /// completer out of `completer_for` is testing the mapping and nothing else.
+    struct NoTransport;
+
+    impl ModelTransport for NoTransport {
+        fn send<'a>(
+            &'a self,
+            _call: ModelCall,
+        ) -> BoxFuture<'a, Result<super::super::wire::ChunkStream, AgentError>> {
+            Box::pin(async { Err(AgentError::transport("no network here")) })
+        }
+    }
+
+    /// The rule this whole seam exists for: the CLI is a completer, so a
+    /// machine with `claude` on it and no credential anywhere can still write
+    /// a reply.
+    #[test]
+    fn a_claude_code_backend_is_a_completer_without_a_credential() {
+        let backend = Backend::ClaudeCli {
+            exe: PathBuf::from("/nowhere/claude"),
+            model: Some("opus".to_string()),
+        };
+        let completer =
+            completer_for(backend, Arc::new(NoTransport), PathBuf::from("/tmp/mach-agent"))
+                .expect("Claude Code is a completer");
+        assert!(completer.label().starts_with("Claude Code"));
+    }
+
+    #[test]
+    fn a_custom_command_is_not_a_completer_and_says_why() {
+        let backend = Backend::Command {
+            program: PathBuf::from("/usr/local/bin/my-agent"),
+            args: Vec::new(),
+        };
+        let error = completer_for(backend, Arc::new(NoTransport), PathBuf::from("/tmp/mach-agent"))
+            .err()
+            .expect("a custom command has no one-shot");
+        match error {
+            AgentError::MissingApiKey(message) => {
+                assert!(message.contains("my-agent"), "{message}");
+                assert!(message.contains("docs/agent-backends.md"), "{message}");
+            }
+            other => panic!("expected a named refusal, got {other:?}"),
+        }
     }
 
     #[test]

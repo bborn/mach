@@ -33,6 +33,25 @@ something you did not choose to spend.
 backend's own default. The two backends do not agree on what a model is called,
 so there is no list to pick from.
 
+## Written replies use the same backend
+
+Preferences → Agent → **Replies** writes a reply for qualifying inbound mail,
+and it resolves a backend exactly as ⌘K does. Two differences, both about
+money:
+
+- it ignores **Model** and uses **Reply model** instead, which defaults to
+  `claude-sonnet-5`. It runs unattended against every human message addressed
+  to you, so `opus` in the drawer must not become `opus` in your inbox;
+- `command` cannot do it. That contract is a session — a tool server, a stream
+  of events, an approval round trip — and a reply is one prompt and one string
+  back. Preferences says so under the toggle, and the log says so when a pass
+  would have written something.
+
+On Claude Code it is `claude --print` with `--tools ""`, no MCP server, and
+`--no-session-persistence`. The prompt goes on stdin. One generation takes
+about seven seconds and, at list prices, a little over a cent; on a
+subscription it comes out of the plan.
+
 ## How a backend reaches your mail
 
 It doesn't. It reaches *Mach*, and Mach reaches your mail.

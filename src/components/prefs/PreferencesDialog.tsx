@@ -1166,6 +1166,17 @@ function AgentSettings({
           checked={prefs.replySuggestions}
           onChange={(on) => set("replySuggestions", on)}
         />
+        {/*
+          The one state the "Runs on" line above does not already cover.
+          Written replies use the same backend ⌘K does, so a machine with no
+          brain at all already says so up there, in red, once. A custom command
+          is different: it answers ⌘K perfectly well and cannot write a reply,
+          because the contract in docs/agent-backends.md is a session. Named
+          only while it is true, and never as a status line.
+        */}
+        {prefs.agentBackend === "command" && (
+          <FieldDescription>Not available with a custom command</FieldDescription>
+        )}
       </Field>
 
       {prefs.replySuggestions && (
