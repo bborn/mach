@@ -141,7 +141,7 @@ pub struct MailSync {
     /// except the running app — means this pass writes no reply suggestions,
     /// which is what a test, a fixture or a tool that only wants a backfill
     /// should get.
-    pub suggest_transport: Option<Arc<dyn crate::ipc::agent::engine::ModelTransport>>,
+    pub suggest_brain: Option<crate::suggest::SuggestBrain>,
 }
 
 impl MailSync {
@@ -806,7 +806,7 @@ impl MailSync {
         if voice == Voice::Announce {
             crate::notify::announce(&self.db, account_id, &arrived);
 
-            if let Some(transport) = self.suggest_transport.as_ref() {
+            if let Some(brain) = self.suggest_brain.as_ref() {
                 let headers = arrived
                     .iter()
                     .filter_map(|id| {
@@ -817,7 +817,7 @@ impl MailSync {
                     .collect();
                 crate::suggest::consider(
                     &self.db,
-                    Arc::clone(transport),
+                    brain.clone(),
                     account_id,
                     &arrived,
                     headers,

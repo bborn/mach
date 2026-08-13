@@ -7,7 +7,7 @@
 //!                                              voice::examples  (his Sent mail, FTS5)
 //!                                                        │
 //!                                                        ▼
-//!                                              prompt + agent::complete_as
+//!                                              prompt + agent::Completer
 //!                                                (one call, a cheap model)
 //!                                                        │
 //!                                                        ▼
@@ -41,9 +41,25 @@
 //! another human. Every one of those is wrong here. This runs unattended, has
 //! nothing to show, needs no tools, and must never send. So it uses the narrower
 //! seam that already exists for ghost text —
-//! [`crate::ipc::agent::engine::complete::complete_as`]: one request, no tools, no stream,
-//! and a string back. The `Brain` trait is the wrong shape for that and always
-//! was; `complete` is what a one-shot structured completion is *for*.
+//! [`crate::ipc::agent::engine::complete::Completer`]: one request, no tools, no
+//! stream, and a string back. The `Brain` trait is the wrong shape for that and
+//! always was; `complete` is what a one-shot structured completion is *for*.
+//!
+//! # Which brain writes it
+//!
+//! Whichever one ⌘K would use, resolved the same way — see
+//! [`crate::ipc::agent::engine::backend::resolve`]. That is a correction, not a
+//! flourish: this shipped reaching only `POST /v1/messages`, so on the machine
+//! it was built for — Claude Code installed, no `ANTHROPIC_API_KEY` anywhere —
+//! every qualifying message since the morning it landed failed at
+//! [`AgentConfig::load`] before a model saw it, and `consider` threw the error
+//! away. Nothing was written and nothing was said. Both halves of that are
+//! fixed here: the CLI is now a way to reach a model, and every way of failing
+//! to reach one reaches the log with a reason.
+//!
+//! The *model* is this module's own ([`model`]), never the agent's: the
+//! preference that says `opus` for the drawer must not silently become the
+//! model that answers every inbound email.
 //!
 //! # Cost
 //!
@@ -60,12 +76,15 @@ pub mod store;
 pub mod voice;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rusqlite::Connection;
 
-use crate::ipc::agent::engine::complete::{complete_as, CompletionRequest, MAX_STRUCTURED_TOKENS};
-use crate::ipc::agent::engine::config::AgentConfig;
+use crate::ipc::agent::engine::backend::{self, Availability, BackendPrefs};
+use crate::ipc::agent::engine::complete::{
+    completer_for, Completer, CompletionRequest, MAX_STRUCTURED_TOKENS,
+};
 use crate::ipc::agent::engine::wire::ModelTransport;
 use crate::db::{queries, sync_queries, Db, Result as DbResult};
 use crate::google::types as g;
@@ -74,6 +93,24 @@ use crate::ipc::prefs;
 pub use prompt::Stance;
 pub use rule::{earns_a_suggestion, Candidate, Decline};
 pub use store::{Counters, Outcome, Suggestion};
+
+/// Everything an engine needs before it may write a reply suggestion.
+///
+/// One value rather than two arguments because the two are one decision: this
+/// engine is the running app, and it is allowed to spend. A test, a fixture or
+/// a tool that only wants a backfill has no [`SuggestBrain`] and therefore no
+/// way to reach a model at all — see
+/// [`SyncEngine::set_suggest_brain`](crate::sync::SyncEngine::set_suggest_brain).
+#[derive(Clone)]
+pub struct SuggestBrain {
+    /// The Anthropic HTTP path. Used only when that is the backend the owner's
+    /// preferences and machine actually resolve to; on the default — Claude
+    /// Code — nothing touches it.
+    pub transport: Arc<dyn ModelTransport>,
+    /// Where a backend that spawns a process may run. Mach's own directory
+    /// beside the database, the same one ⌘K's sessions use.
+    pub workspace: PathBuf,
+}
 
 // ===========================================================================
 // Settings
@@ -114,7 +151,24 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
 /// names it, so a forced sync pressed twenty times in a minute costs nothing
 /// after the first — which is what a wall-clock throttle would have been for,
 /// and it would have been a second answer to a question already answered.
+///
+/// Four still holds now that a generation can be a *process* rather than an
+/// HTTP request, but the reasoning changed and one thing had to be added. Four
+/// sequential `claude` runs are four node processes in a row, each a couple of
+/// seconds of startup on top of the model call — call it a minute and a half of
+/// background work for a busy pass. The default sync gap is sixty seconds, so
+/// two passes could overlap, and nothing here bounded how many children were
+/// alive at once. [`GENERATING`] does: one at a time, machine-wide.
 pub const MAX_PER_PASS: usize = 4;
+
+/// One generation at a time, machine-wide.
+///
+/// A pass holds this for its whole run, so a second pass arriving while the
+/// first is still writing waits rather than doubling the number of live
+/// children. Waiting rather than skipping, because a message is only ever
+/// considered once: a skipped message is a message that never gets a reply,
+/// and there is nothing on screen this is keeping waiting.
+static GENERATING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// The last few messages of a thread are the context; the rest is history.
 const CONVERSATION_DEPTH: usize = 4;
@@ -282,12 +336,16 @@ pub fn plan(
 ///
 /// Two reads and one call: his voice out of the store, the prompt, the model.
 /// Returns what was written, which is what the tests assert on and the caller
-/// ignores. A model that answers with nothing usable writes no row — there is no
-/// error state for a suggestion, because nothing is waiting for one.
+/// ignores.
+///
+/// There is still no error *state* for a suggestion — nothing is waiting for
+/// one, and a conversation with no stances looks exactly like a conversation
+/// that never earned any. But there is now an error *line*. A feature that is
+/// switched on, doing nothing, and saying nothing is the state this whole
+/// module spent its first day in.
 pub async fn generate(
     db: &Db,
-    transport: &dyn ModelTransport,
-    config: &AgentConfig,
+    completer: &dyn Completer,
     model_id: &str,
     job: &Job,
     now_ms: i64,
@@ -313,11 +371,25 @@ pub async fn generate(
         MAX_STRUCTURED_TOKENS,
     );
 
-    let Ok(text) = complete_as(transport, config, model_id, &request).await else {
-        return Vec::new();
+    let text = match completer.complete(model_id, &request).await {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!(
+                "reply suggestions: {} could not write a reply on {model_id} — {error}",
+                completer.label()
+            );
+            return Vec::new();
+        }
     };
     let stances = prompt::parse_stances(&text);
     if stances.is_empty() {
+        // Usually a refusal, or a model that answered in prose instead of the
+        // document it was asked for. Cheap to say, and the alternative is a
+        // feature that bills and produces nothing without a trace.
+        eprintln!(
+            "reply suggestions: {model_id} answered with nothing usable for message {}",
+            job.gmail_message_id
+        );
         return Vec::new();
     }
 
@@ -350,7 +422,7 @@ pub async fn generate(
 /// keeping waiting.
 pub fn consider(
     db: &Db,
-    transport: Arc<dyn ModelTransport>,
+    brain: SuggestBrain,
     account_id: i64,
     arrived: &[String],
     headers: HashMap<String, Headers>,
@@ -368,22 +440,61 @@ pub fn consider(
         if jobs.is_empty() {
             return;
         }
-        // Loaded after the plan says there is work: an account with no key
-        // should not be asked about one on every sync pass.
-        let Ok(config) = AgentConfig::load() else {
-            return;
+        let completer = match resolve_completer(&db, brain) {
+            Ok(completer) => completer,
+            // The line this feature shipped without. A brain that cannot be
+            // resolved is not a quiet no-op: it is every message this pass
+            // qualified, dropped, for a reason that names its own remedy.
+            Err(error) => {
+                eprintln!(
+                    "reply suggestions: {} message(s) went unanswered — {error}",
+                    jobs.len()
+                );
+                return;
+            }
         };
         let Ok(model_id) = db.read(model) else {
             return;
         };
 
+        // Held for the whole pass rather than per job — see [`GENERATING`].
+        let _permit = GENERATING.acquire().await;
         for job in jobs {
-            generate(&db, transport.as_ref(), &config, &model_id, &job, now_ms()).await;
+            generate(&db, completer.as_ref(), &model_id, &job, now_ms()).await;
         }
         // Cheap, and it is the only place that runs often enough to be worth
         // hanging the housekeeping on.
         let _ = db.write_background(|conn| store::purge_stale(conn));
     });
+}
+
+/// Which brain writes the replies, resolved exactly as ⌘K resolves it.
+///
+/// Two departures from the drawer's resolution, both about money:
+///
+/// - **the model is dropped.** `agentModel` is the owner talking about the
+///   drawer, where `opus` is a reasonable answer; this runs unattended against
+///   every human message addressed to him, and [`model`] — Sonnet by default —
+///   is the only model it may name.
+/// - **nothing is pinned.** [`backend::resolve`] takes an optional
+///   [`AgentConfig`](crate::ipc::agent::engine::config::AgentConfig) for callers
+///   that want a specific one without exporting a variable. There is no such
+///   caller here, so the API path is only ever reached through a credential the
+///   owner actually configured.
+///
+/// Resolved after the plan says there is work: a machine with no brain should
+/// not be asked about one on every sync pass, only on the passes where it would
+/// have mattered.
+fn resolve_completer(
+    db: &Db,
+    brain: SuggestBrain,
+) -> Result<Box<dyn Completer>, crate::ipc::agent::engine::AgentError> {
+    let prefs = BackendPrefs {
+        model: None,
+        ..BackendPrefs::load(db)
+    };
+    let backend = backend::resolve(&prefs, &Availability::probe(), None)?;
+    completer_for(backend, brain.transport, brain.workspace)
 }
 
 // ===========================================================================

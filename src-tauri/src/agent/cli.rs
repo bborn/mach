@@ -53,8 +53,22 @@
 //! the second message and costs a process that has to be kept alive, watched,
 //! and killed correctly across every path a session can end on. For a drawer
 //! where a person types one sentence at a time, that is a bad trade.
+//!
+//! # The same door, without the session
+//!
+//! [`complete_once`] is `claude --print` with no tools, no MCP server and no
+//! resume: one prompt in, one answer out. Reply suggestions need that shape and
+//! nothing else, and before it existed they went out over
+//! [`complete_as`](super::complete::complete_as) — the Anthropic HTTP path —
+//! which on a machine with no API key failed instantly and said nothing. A
+//! feature whose whole premise is "you already pay for Claude Code" cannot
+//! reach the model only through the credential you do not have.
+//!
+//! It shares this module with [`ClaudeCliBrain`] on purpose: every flag above
+//! that decides what the CLI may touch has to be decided the same way here, and
+//! two files would eventually disagree about one of them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -65,6 +79,7 @@ use tokio::process::{Child, Command};
 use crate::google::BoxFuture;
 
 use super::brain::{Brain, BrainIo};
+use super::complete::CompletionRequest;
 use super::error::AgentError;
 use super::mcp::{McpServer, SERVER_NAME};
 
@@ -420,4 +435,195 @@ fn first_line(text: &str) -> String {
         .chars()
         .take(300)
         .collect()
+}
+
+// ===========================================================================
+// One shot
+// ===========================================================================
+
+/// How long one unattended completion may take before the child is killed.
+///
+/// Nothing is on screen waiting for this, so the number is not a latency
+/// budget — it is the point past which a wedged process is a wedged process. A
+/// Sonnet answer of three short replies lands in seconds; two minutes is
+/// generous for a loaded machine and short enough that a stuck child cannot
+/// hold the one-at-a-time permit through a whole afternoon.
+pub const ONE_SHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One prompt, one answer, no session.
+///
+/// The flags are the session's minus everything a session needs and this does
+/// not: no `--mcp-config` (and `--strict-mcp-config` so none of the owner's own
+/// servers load either), no `--allowedTools`, no `--resume`. `--tools ""` and
+/// `--setting-sources ""` carry the same meaning they do above, and matter more
+/// here — this runs unattended, off an inbound email, with nobody watching.
+///
+/// `--no-session-persistence` is the one flag with no counterpart in a session:
+/// a suggestion is thrown away if it is not used, and writing a transcript to
+/// disk for every qualifying message that ever arrives would leave a growing
+/// pile of files nobody will ever open.
+///
+/// The prompt goes on stdin for the same reason it does in a session: it is his
+/// mail, and an argument vector is public. The *system* prompt does go in the
+/// argument vector — it is Mach's own text, the same for every message.
+pub async fn complete_once(
+    exe: &Path,
+    workspace: &Path,
+    model: &str,
+    request: &CompletionRequest,
+) -> Result<String, AgentError> {
+    tokio::fs::create_dir_all(workspace).await.map_err(|e| {
+        AgentError::transport(format!(
+            "Mach could not prepare {} for Claude Code: {e}",
+            workspace.display()
+        ))
+    })?;
+
+    let mut command = Command::new(exe);
+    command
+        .current_dir(workspace)
+        .arg("--print")
+        .args(["--output-format", "json"])
+        .args(["--system-prompt", &request.system])
+        .args(["--tools", ""])
+        .arg("--strict-mcp-config")
+        .args(["--setting-sources", ""])
+        .arg("--disable-slash-commands")
+        .arg("--no-session-persistence")
+        .args(["--model", model])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().map_err(|e| {
+        AgentError::MissingApiKey(format!(
+            "Mach could not start Claude Code at {}: {e}. Check that it is still installed, \
+             or choose a different agent backend in Preferences → Agent.",
+            exe.display()
+        ))
+    })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(request.prompt.as_bytes())
+            .await
+            .map_err(|e| AgentError::transport(format!("could not send the prompt: {e}")))?;
+        drop(stdin);
+    }
+
+    // `wait_with_output` owns the child, so the timeout branch drops it — and
+    // `kill_on_drop` is what turns that into a dead process rather than an
+    // orphan holding a model call open.
+    let output = match tokio::time::timeout(ONE_SHOT_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            return Err(AgentError::transport(format!(
+                "could not read Claude Code's output: {e}"
+            )))
+        }
+        Err(_) => {
+            return Err(AgentError::transport(format!(
+                "Claude Code did not answer within {} seconds",
+                ONE_SHOT_TIMEOUT.as_secs()
+            )))
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match one_shot_text(&stdout) {
+        Ok(text) => Ok(text),
+        // A run that produced no readable result *and* exited badly failed to
+        // launch — a model name it does not know, a broken install, an expired
+        // login — and stderr is the only place that says which.
+        Err(_) if !output.status.success() => Err(AgentError::transport(format!(
+            "Claude Code exited with {}: {}",
+            output.status.code().unwrap_or(-1),
+            first_line(&String::from_utf8_lossy(&output.stderr))
+        ))),
+        Err(error) => Err(error),
+    }
+}
+
+/// The answer out of `--output-format json`.
+///
+/// One JSON document, in principle. In practice the CLI is allowed to print a
+/// diagnostic to stdout before it, so a failed whole-buffer parse falls back to
+/// reading the first complete value from the first `{` rather than giving up —
+/// the same tolerance [`ClaudeCliBrain::apply`] extends to the stream.
+pub fn one_shot_text(stdout: &str) -> Result<String, AgentError> {
+    let Some(event) = result_document(stdout) else {
+        return Err(AgentError::Protocol(
+            "Claude Code produced no result document".to_string(),
+        ));
+    };
+    if event.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return Err(AgentError::Api {
+            status: 200,
+            message: result_error(&event),
+        });
+    }
+    match event.get("result").and_then(Value::as_str) {
+        Some(text) => Ok(text.to_string()),
+        None => Err(AgentError::Protocol(
+            "Claude Code's result carried no text".to_string(),
+        )),
+    }
+}
+
+fn result_document(stdout: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(stdout.trim()) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+    let start = stdout.find('{')?;
+    serde_json::Deserializer::from_str(&stdout[start..])
+        .into_iter::<Value>()
+        .next()?
+        .ok()
+        .filter(Value::is_object)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_result_field_is_the_answer() {
+        let body = r#"{"type":"result","subtype":"success","is_error":false,
+                       "result":"[{\"label\":\"Yes\",\"body\":\"Tuesday works.\"}]"}"#;
+        assert_eq!(
+            one_shot_text(body).unwrap(),
+            r#"[{"label":"Yes","body":"Tuesday works."}]"#
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_before_the_document_is_stepped_over() {
+        let body = "warning: something\n{\"type\":\"result\",\"result\":\"ok\"}\n";
+        assert_eq!(one_shot_text(body).unwrap(), "ok");
+    }
+
+    #[test]
+    fn a_failed_run_is_an_error_with_the_cli_s_own_sentence() {
+        let body = r#"{"type":"result","is_error":true,"result":"Invalid model name"}"#;
+        match one_shot_text(body) {
+            Err(AgentError::Api { message, .. }) => assert_eq!(message, "Invalid model name"),
+            other => panic!("expected an API error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nothing_readable_is_a_protocol_error_rather_than_an_empty_answer() {
+        assert!(matches!(one_shot_text(""), Err(AgentError::Protocol(_))));
+        assert!(matches!(
+            one_shot_text("command not found"),
+            Err(AgentError::Protocol(_))
+        ));
+        assert!(matches!(
+            one_shot_text(r#"{"type":"result"}"#),
+            Err(AgentError::Protocol(_))
+        ));
+    }
 }

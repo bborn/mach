@@ -30,11 +30,12 @@ use mach_lib::google::{
     BoxFuture, HttpRequest, HttpResponse, HttpTransport, RetryPolicy, StaticTokenProvider,
     TokenProvider, TransportError,
 };
+use mach_lib::ipc::agent::engine::complete::ApiCompleter;
 use mach_lib::ipc::agent::engine::config::{AgentConfig, Credential};
 use mach_lib::ipc::agent::engine::error::AgentError;
 use mach_lib::ipc::agent::engine::wire::{ChunkStream, ModelCall, ModelTransport};
 use mach_lib::ipc::prefs;
-use mach_lib::suggest::{self, store, Headers, Stance};
+use mach_lib::suggest::{self, store, Headers, Stance, SuggestBrain};
 use mach_lib::sync::{SyncConfig, SyncEngine, TransportClients};
 
 const GMAIL_BASE: &str = "https://gmail.test/gmail/v1";
@@ -83,6 +84,14 @@ impl ModelTransport for ScriptedModel {
             Ok(rx)
         })
     }
+}
+
+/// The Anthropic path, which is what every test in this file scripts. The
+/// Claude Code path has a test binary of its own — `tests/suggest_cli.rs` —
+/// because "no API key configured" cannot be true in the same process as
+/// `configure_agent`.
+fn over_the_api(transport: Arc<dyn ModelTransport>) -> ApiCompleter {
+    ApiCompleter::new(test_config(), transport)
 }
 
 fn test_config() -> AgentConfig {
@@ -343,7 +352,10 @@ fn new_engine(db: &Db, gmail: Arc<FakeGmail>, model: Option<Arc<ScriptedModel>>)
     .with_retry_policy(RetryPolicy::none());
     let engine = SyncEngine::new(db.clone(), Arc::new(clients), mail_config()).expect("engine");
     if let Some(model) = model {
-        engine.set_suggest_transport(model);
+        engine.set_suggest_brain(SuggestBrain {
+            transport: model,
+            workspace: std::env::temp_dir().join("mach-suggest-tests"),
+        });
     }
     engine
 }
@@ -354,6 +366,14 @@ fn new_engine(db: &Db, gmail: Arc<FakeGmail>, model: Option<Arc<ScriptedModel>>)
 fn configure_agent() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        // **Not optional.** The backend resolves to Claude Code whenever a
+        // `claude` executable can be found, and the machine running these tests
+        // is very likely to have one — so without this, "a human message gets
+        // stances" would spawn the real CLI and spend the owner's subscription
+        // once per test run. The empty string is `find_claude`'s documented way
+        // of saying there is none. The Claude Code path is exercised against a
+        // stub binary in `tests/suggest_cli.rs`.
+        std::env::set_var("MACH_CLAUDE_BIN", "");
         if std::env::var("ANTHROPIC_API_KEY").is_err() {
             std::env::set_var("ANTHROPIC_API_KEY", "test-key");
         }
@@ -707,8 +727,7 @@ async fn generating_writes_a_row_and_a_counter_and_nothing_else() {
     ]);
     let stances = suggest::generate(
         &db,
-        model.as_ref(),
-        &test_config(),
+        &over_the_api(model.clone()),
         "claude-sonnet-5",
         job,
         7,
@@ -766,8 +785,14 @@ async fn a_model_that_answers_with_nothing_usable_writes_no_row() {
         }
     }
 
-    let stances =
-        suggest::generate(&db, &Refusing, &test_config(), "claude-sonnet-5", &jobs[0], 7).await;
+    let stances = suggest::generate(
+        &db,
+        &over_the_api(Arc::new(Refusing)),
+        "claude-sonnet-5",
+        &jobs[0],
+        7,
+    )
+    .await;
     assert!(stances.is_empty());
     assert_eq!(rows(&db), 0);
     let counters = db.read(|conn| store::counters(conn)).unwrap();
@@ -783,7 +808,7 @@ async fn the_same_message_is_not_paid_for_twice() {
         .read(|conn| suggest::plan(conn, account_id, &arrived, &HashMap::new()))
         .unwrap();
     let model = ScriptedModel::new(&[("Say yes", "Yes.")]);
-    suggest::generate(&db, model.as_ref(), &test_config(), "m", &jobs[0], 7).await;
+    suggest::generate(&db, &over_the_api(model.clone()), "m", &jobs[0], 7).await;
 
     // A replayed history window reports the same id again.
     let again = db
