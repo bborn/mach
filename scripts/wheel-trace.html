@@ -1,0 +1,129 @@
+<!doctype html>
+<!--
+  Record what the trackpad actually sends.
+
+  `src/lib/calendar-gesture.ts` is calibrated against streams that were written
+  by hand from a description of how macOS momentum behaves. This page replaces
+  the description with a measurement. Open it in Safari — the same engine the
+  app's window runs, on the same trackpad — swipe across the grey box, and copy
+  the result into `src/lib/calendar-gesture.test.ts`.
+
+      open -a Safari scripts/wheel-trace.html
+
+  Safari and not Chrome, because the numbers a wheel event carries are the
+  engine's translation of an NSEvent and the two engines translate differently.
+  It is still not the app: a page with nothing to render never blocks its main
+  thread, so nothing here is ever coalesced, and the fat merged events a real
+  re-render produces will not appear. What it does capture is the shape of the
+  hand and of the momentum tail, which is what the constants are about.
+-->
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wheel trace</title>
+<style>
+  body {
+    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin: 0;
+    padding: 24px;
+    background: #1c1c1e;
+    color: #e5e5e7;
+  }
+  h1 { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
+  p { margin: 0 0 16px; color: #8e8e93; }
+  #pad {
+    height: 220px;
+    display: grid;
+    place-items: center;
+    border: 1px dashed #48484a;
+    border-radius: 8px;
+    color: #8e8e93;
+    overscroll-behavior: contain;
+    margin-bottom: 16px;
+  }
+  #out {
+    white-space: pre;
+    overflow: auto;
+    max-height: 60vh;
+    background: #000;
+    border-radius: 8px;
+    padding: 12px;
+    margin: 0;
+  }
+  button { font: inherit; margin-right: 8px; }
+</style>
+
+<h1>Wheel trace</h1>
+<p>Swipe across the box. A gesture ends after 400ms of quiet.</p>
+<div id="pad">swipe here</div>
+<p><button id="clear">Clear</button><span id="summary"></span></p>
+<pre id="out"></pre>
+
+<script>
+  const pad = document.getElementById("pad");
+  const out = document.getElementById("out");
+  const summary = document.getElementById("summary");
+
+  let samples = [];
+  let timer = null;
+
+  pad.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      samples.push({
+        dx: event.deltaX,
+        dy: event.deltaY,
+        mode: event.deltaMode,
+        t: event.timeStamp,
+        ctrl: event.ctrlKey,
+      });
+      clearTimeout(timer);
+      timer = setTimeout(report, 400);
+    },
+    { passive: false },
+  );
+
+  document.getElementById("clear").addEventListener("click", () => {
+    samples = [];
+    out.textContent = "";
+    summary.textContent = "";
+  });
+
+  function report() {
+    if (samples.length === 0) return;
+    const first = samples[0].t;
+    const last = samples[samples.length - 1].t;
+    const gaps = samples.slice(1).map((s, i) => s.t - samples[i].t);
+
+    // The form `replay()` in calendar-gesture.test.ts takes: travel along the
+    // dominant axis, and milliseconds since the previous event.
+    const total = samples.reduce(
+      (acc, s) => ({ x: acc.x + Math.abs(s.dx), y: acc.y + Math.abs(s.dy) }),
+      { x: 0, y: 0 },
+    );
+    const axis = total.x >= total.y ? "dx" : "dy";
+    const pairs = samples.map((s, i) => {
+      const gap = i === 0 ? 0 : Math.round((s.t - samples[i - 1].t) * 10) / 10;
+      const magnitude = Math.round(Math.abs(s[axis]) * 10) / 10;
+      return `  [${magnitude}, ${gap}],`;
+    });
+
+    summary.textContent =
+      `${samples.length} events · ${Math.round(last - first)}ms · ` +
+      `axis ${axis} · travel ${Math.round(total[axis === "dx" ? "x" : "y"])}px · ` +
+      `median gap ${median(gaps).toFixed(1)}ms · max gap ${Math.max(...gaps).toFixed(1)}ms`;
+
+    out.textContent =
+      `// ${summary.textContent}\n` +
+      `// deltaMode ${samples[0].mode}, ctrlKey ${samples[0].ctrl}\n` +
+      `[\n${pairs.join("\n")}\n]\n\n` +
+      `// raw, in case the pairs threw away something that mattered\n` +
+      JSON.stringify(samples, null, 1);
+  }
+
+  function median(values) {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  }
+</script>
