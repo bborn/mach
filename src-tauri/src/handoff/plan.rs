@@ -265,10 +265,11 @@ impl LaunchPlan {
         tag: &str,
     ) -> Result<LaunchPlan, HandoffError> {
         super::target::validate(target)?;
+        // The boundary, not the interface. Nothing may hand a thread to an agent
+        // under no instruction — but the dialog never arrives here empty any
+        // more: it opens a field for the sentence instead of showing a refusal.
         if note.trim().is_empty() {
-            return Err(HandoffError::NothingToSay(
-                "say what you want done — a handoff is your sentence, not just the mail".into(),
-            ));
+            return Err(HandoffError::NothingToSay("no instruction".into()));
         }
 
         let dir = PathBuf::from(expand_home(target.dir.trim()));

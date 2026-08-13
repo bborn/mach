@@ -98,6 +98,39 @@ describe("the ⌘K entry point", () => {
     }
   });
 
+  /**
+   * The handoff rows the palette would show, in the order it would show them.
+   *
+   * `resolve` concatenates in resolver-priority order and leaves the rows in
+   * the order each resolver pushed them; the score is what orders them inside
+   * a kind when they are rendered. Asserting on `resolve`'s own order would
+   * pass whatever the scores said, which is the thing under test here.
+   */
+  const ranked = (query: string) =>
+    resolve(context(query))
+      .filter((r) => r.id.startsWith("command:handoff"))
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+  it("ranks the targets above the editor for the word that names them", () => {
+    // `handoff` is a prefix of `handoff targets`, and the editor used to take
+    // 1000 against the targets' 950 the moment three characters matched — so
+    // the row for *configuring* the list beat every row for *using* it, on the
+    // query that is the feature's own name. Only "hand off" with a space, which
+    // is not a prefix of the title, reached a target.
+    for (const query of ["hand", "handoff", "handoff "]) {
+      expect(ranked(query)[0]?.id, query).toBe("command:handoff:t1");
+    }
+  });
+
+  it("gives the editor the query once it reaches for “targets”", () => {
+    // Still reachable by name — it just has to be asked for.
+    expect(ranked("handoff ta")[0]?.id).toBe("command:handoff-targets");
+  });
+
+  it("keeps the editor offered underneath, for someone with none set up", () => {
+    expect(ranked("handoff").map((r) => r.id)).toContain("command:handoff-targets");
+  });
+
   it("puts the target he named first", () => {
     setTargets([target(), target({ id: "t2", name: "Mach" })]);
     const rows = rankTargets("fix the palette in mach please", [target(), target({ id: "t2", name: "Mach" })]);
