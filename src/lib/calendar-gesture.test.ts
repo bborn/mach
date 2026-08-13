@@ -56,6 +56,34 @@ function flick(
 }
 
 /**
+ * A stream written out event by event, for the cases where the exact numbers
+ * are the point and a generator would hide them.
+ *
+ * `[magnitude, gap]` pairs: how far the fingers moved along the axis, and how
+ * long since the previous event. The perpendicular drift rides along at the
+ * same 10% every real gesture has.
+ */
+function replay(
+  start: number,
+  axis: "x" | "y",
+  direction: 1 | -1,
+  events: readonly (readonly [number, number])[],
+): WheelSample[] {
+  let clock = start;
+  return events.map(([magnitude, gap]) => {
+    clock += gap;
+    const along = magnitude * direction;
+    const across = magnitude * 0.1;
+    return {
+      deltaX: axis === "x" ? along : across,
+      deltaY: axis === "x" ? across : along,
+      deltaMode: 0,
+      timeStamp: clock,
+    };
+  });
+}
+
+/**
  * A long two-finger vertical scroll with sideways drift. The drift is small per
  * event and always in the same direction, so over a scroll this long it adds up
  * to several hundred pixels sideways — far past any single-event threshold.
@@ -187,6 +215,101 @@ describe("horizontal swipes in week and day view", () => {
     const resumeAt = first[first.length - 1].timeStamp + 250;
     const second = flick(resumeAt, { axis: "x", direction: 1, peak: 26 });
     expect(run([...first, ...second], WEEK)).toEqual([1, 1]);
+  });
+
+  it("moves one period when the fingers are still speeding up as the step fires", () => {
+    // The bug Bruno reported: one swipe, two weeks.
+    //
+    // 42px goes by on the third event, while the hand is still accelerating —
+    // a flick reaches its top speed around 100ms in, and the trigger is met
+    // long before that. Everything after the third event is therefore a *rise*,
+    // and a rise used to be the whole signal for "the fingers came back down
+    // for a second swipe". The sixth event, 120px, cleared twice the 53px
+    // recorded right after the step and paged a second week from one movement.
+    //
+    // The magnitudes are a 120px/frame flick with a six-frame ramp and a 6%
+    // per frame decay. Anything from about 120px/frame up did this, which on a
+    // 120Hz display means anything from about 60.
+    const stream = replay(1000, "x", 1, [
+      [3.3, 16],
+      [13.3, 16],
+      [30.0, 16], // 46.6px accumulated — the step fires here
+      [53.3, 16], // still climbing
+      [83.3, 16],
+      [120.0, 16], // the top of the flick, and the old second week
+      [112.8, 16],
+      [106.0, 16],
+      [99.7, 16],
+      [93.7, 16],
+      [88.1, 16],
+      [82.8, 16],
+      [77.8, 16],
+      [73.1, 16],
+    ]);
+    expect(run(stream, WEEK)).toEqual([1]);
+  });
+
+  it("moves one period when the tail arrives coalesced behind the step's own re-render", () => {
+    // Firing a step re-renders a week of blocks, which blocks the main thread,
+    // and WebKit answers a busy main thread by coalescing the wheel events it
+    // could not deliver. Six frames of a decaying tail arrive as one event
+    // carrying six frames of travel: a sixfold jump in magnitude, and no change
+    // at all in how fast the fingers were moving.
+    const stream = replay(1000, "x", 1, [
+      [5, 16],
+      [20, 16],
+      [45, 16], // fires
+      [66, 16],
+      [80, 16],
+      [286, 96], // six frames of tail, merged
+      [70, 16],
+      [66, 16],
+      [62, 16],
+      [58, 16],
+    ]);
+    expect(run(stream, WEEK)).toEqual([1]);
+  });
+
+  it("moves one period on a 120Hz stream, where every delta is halved", () => {
+    // A ProMotion MacBook samples twice as often and reports half as much each
+    // time, so the ramp is spread over twice the events. Nothing about the hand
+    // changed, and nothing about the answer may either.
+    const magnitudes: (readonly [number, number])[] = [];
+    for (let i = 1; i <= 12; i += 1) magnitudes.push([60 * (i / 12) ** 2, 8]);
+    for (let m = 60 * 0.97; m > 0.1; m *= 0.97) magnitudes.push([m, 8]);
+    expect(run(replay(1000, "x", 1, magnitudes), WEEK)).toEqual([1]);
+  });
+
+  it("moves two periods for two flicks a tenth of a second apart", () => {
+    // The constraint the fix is not allowed to break. The fingers land again
+    // 112ms after the first flick began, which cancels its momentum where it
+    // stands, and the second flick's own ramp starts 32ms after that. The speed
+    // falling away from the first flick's peak and then climbing again is the
+    // only thing separating them — there is no quiet gap to read.
+    const stream = replay(1000, "x", 1, [
+      [3.3, 16],
+      [13.3, 16],
+      [30.0, 16],
+      [53.3, 16],
+      [83.3, 16],
+      [120.0, 16],
+      [3.3, 48], // fingers back on the glass
+      [13.3, 16],
+      [30.0, 16],
+      [53.3, 16],
+      [83.3, 16],
+      [120.0, 16],
+      [112.8, 16],
+      [106.0, 16],
+    ]);
+    expect(run(stream, WEEK)).toEqual([1, 1]);
+  });
+
+  it("moves one period for a slow deliberate drag with no momentum behind it", () => {
+    // Below a velocity macOS spins up no momentum at all, so the stream simply
+    // stops when the fingers do. Nothing here ever rises, so nothing re-arms.
+    const magnitudes: (readonly [number, number])[] = Array.from({ length: 30 }, () => [6, 16]);
+    expect(run(replay(1000, "x", 1, magnitudes), WEEK)).toEqual([1]);
   });
 
   it("takes over its own events so the webview cannot navigate back", () => {
