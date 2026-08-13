@@ -314,7 +314,7 @@ impl HttpMethod {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     /// Fully built, including the query string.
@@ -329,6 +329,38 @@ impl HttpRequest {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Hand-written because `headers` always carries `Authorization: Bearer <the
+/// account's live access token>`. Every other type that holds credential
+/// material writes its own `Debug` — see `auth::tokens::Secret` — and this one
+/// holds the same value one indirection later, on the struct that a transport
+/// is most likely to print when something goes wrong.
+///
+/// The header *names* are kept. Knowing a request carried an `Authorization`
+/// is what a debugging session needs; knowing its value never is.
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const SENSITIVE: &[&str] = &["authorization", "cookie", "proxy-authorization"];
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                let shown = if SENSITIVE.iter().any(|s| name.eq_ignore_ascii_case(s)) {
+                    "<redacted>"
+                } else {
+                    value.as_str()
+                };
+                (name.as_str(), shown)
+            })
+            .collect();
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .field("body", &self.body.as_ref().map(|b| format!("{} bytes", b.len())))
+            .finish()
     }
 }
 

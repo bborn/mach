@@ -168,12 +168,27 @@ pub async fn attachment_open(
     let file = materialise(&state, attachment_id).await?;
 
     // Checked here rather than only at fetch time: the refusal is about handing
-    // the path to LaunchServices, and that is what this command does.
+    // the path to LaunchServices, and that is what this command does. It is
+    // also checked on a cache hit, which is the case that matters — the second
+    // open of an attachment does no fetching at all, so a check that lived on
+    // the download path would run exactly once and then never again.
     if names::is_dangerous(&file.filename, &file.mime_type) {
         return Err(refused(format!(
             "Mach will not open {} — it is a program, not a document. Save it and open it \
              from Finder if you are sure.",
             file.filename
+        )));
+    }
+
+    // The same question asked of the bytes. Both halves of `is_dangerous` read
+    // something the sender wrote; this reads what the sender sent, which is the
+    // only way to catch a part named `invoice`, declared `application/pdf`, and
+    // carrying a Mach-O header.
+    if let Some(what) = head_of(&file.path).as_deref().and_then(names::sniff_executable) {
+        return Err(refused(format!(
+            "Mach will not open {} — whatever it is called, it is {}. Save it and open it \
+             from Finder if you are sure.",
+            file.filename, what
         )));
     }
 
@@ -466,6 +481,22 @@ fn matches_content_id(part: &AttachmentMeta, content_id: &str) -> bool {
         Some(id) => id == content_id || id.eq_ignore_ascii_case(content_id),
         None => false,
     }
+}
+
+/// The first few bytes of a file, for [`names::sniff_executable`].
+///
+/// Reads the head rather than the file: the magic numbers are four bytes, the
+/// attachment may be 64 MiB, and a read failure is not a reason to refuse — an
+/// unreadable file will fail at `open_path` a moment later with a better error.
+fn head_of(path: &str) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::with_capacity(8);
+    // `take` rather than one `read`: a single `read` is allowed to return short
+    // even when more is available, and a short read here would silently mean
+    // "not a program".
+    file.take(8).read_to_end(&mut head).ok()?;
+    Some(head)
 }
 
 /// A cached inline image, if the file is still one we would serve.

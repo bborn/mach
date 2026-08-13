@@ -318,15 +318,33 @@ pub fn extension_of(name: &str) -> Option<String> {
 const DANGEROUS_EXTENSIONS: &[&str] = &[
     // macOS
     "app", "command", "workflow", "action", "scpt", "scptd", "applescript", "osascript",
-    "terminal", "inetloc", "webloc", "fileloc", "dmg", "pkg", "mpkg", "prefpane", "kext",
-    "dylib", "so", "bundle", "saver", "qlgenerator", "component", "plugin",
+    "terminal", "term", "inetloc", "webloc", "fileloc", "dmg", "pkg", "mpkg", "prefpane",
+    "kext", "dylib", "so", "bundle", "saver", "qlgenerator", "component", "plugin",
+    "appex", "xpc", "framework", "shortcut",
+    // macOS, the ones that are not programs but hand the system something it
+    // acts on with the user's authority.
+    //
+    // `mobileconfig` is the important one. It is a small XML file with a
+    // friendly name; double-clicking it opens System Settings at the profile
+    // installer, and an installed profile can add a root certificate, point
+    // every connection through a proxy, or enrol the machine in somebody else's
+    // MDM. It is the standard macOS phishing payload precisely because it looks
+    // like a settings file rather than a program.
+    //
+    // `xip` is a signed archive macOS expands and can execute from — how Xcode
+    // ships — and the rest are mountable images, siblings of the `.dmg` and
+    // `.iso` already here.
+    "mobileconfig", "xip", "sparseimage", "sparsebundle", "cdr", "smi",
     // Windows
     "exe", "com", "scr", "bat", "cmd", "pif", "msi", "msp", "msc", "cpl", "dll", "sys",
-    "ps1", "ps1xml", "psc1", "psm1", "vb", "vbs", "vbe", "js", "jse", "ws", "wsf", "wsc",
-    "wsh", "hta", "reg", "lnk", "url", "chm", "jar", "gadget", "inf", "scf", "shs",
+    "ps1", "ps1xml", "psc1", "psm1", "vb", "vbs", "vbe", "vbscript", "js", "mjs", "cjs",
+    "jse", "ws", "wsf", "wsc", "wsh", "hta", "reg", "lnk", "url", "chm", "jar", "jnlp",
+    "gadget", "inf", "scf", "shs", "settingcontent-ms", "appx", "msix", "appxbundle",
+    "diagcab", "application",
     // Unix-ish
     "sh", "bash", "zsh", "csh", "ksh", "fish", "run", "out", "elf", "bin", "deb", "rpm",
-    "appimage", "desktop", "service", "py", "pyc", "pl", "rb", "php", "lua",
+    "appimage", "desktop", "service", "py", "pyw", "pyc", "pyz", "pl", "rb", "php", "lua",
+    "tcl",
     // Disk images. Not executable themselves, but mounting one is how an
     // installer or a `.lnk` chain arrives, and nobody sends a raw `.iso` to
     // someone who wanted to read it.
@@ -394,6 +412,61 @@ pub fn is_dangerous(filename: &str, mime_type: &str) -> bool {
         .trim()
         .to_ascii_lowercase();
     DANGEROUS_MIME_TYPES.contains(&mime.as_str())
+}
+
+/// Is the *file* a program, whatever its name and its declared type say?
+///
+/// # Why this exists when [`is_dangerous`] already runs
+///
+/// Both halves of [`is_dangerous`] read something the sender wrote: the
+/// extension they chose and the `Content-Type` they declared. A part named
+/// `invoice`, with no extension, declared `application/pdf`, carrying a Mach-O
+/// binary passes both. This is the one check that reads what the sender
+/// actually *sent*.
+///
+/// # What it is worth, stated plainly
+///
+/// Less than it looks, on macOS, and it is worth being honest about why. The
+/// cache writes one file with mode 0644, so there is no execute bit for a
+/// double click to use, and LaunchServices dispatches on the extension — which
+/// [`is_dangerous`] has already read. So this does not close a hole so much as
+/// remove a class of surprise: a file whose first four bytes are a program
+/// header is not a document, and Mach should not be the thing that hands it to
+/// the operating system to guess about.
+///
+/// # Polyglots
+///
+/// This reads the front of the file, because the front is what every loader
+/// reads. A Mach-O with a zip trailer appended is caught; a real zip with a
+/// program appended is not, and cannot be — that file *is* a zip, and opening
+/// it unarchives rather than executes. Anything stronger would mean parsing
+/// container formats, which is a much larger attack surface than the one it
+/// would be defending.
+///
+/// Text formats are deliberately absent. A `.txt` that opens with `#!` is a
+/// code snippet somebody was sent, and refusing to open it in TextEdit would be
+/// a false positive on the common case in exchange for nothing.
+pub fn sniff_executable(bytes: &[u8]) -> Option<&'static str> {
+    const MACH_O: &[[u8; 4]] = &[
+        [0xFE, 0xED, 0xFA, 0xCE], // 32-bit, big-endian magic
+        [0xCE, 0xFA, 0xED, 0xFE], // 32-bit, little-endian
+        [0xFE, 0xED, 0xFA, 0xCF], // 64-bit
+        [0xCF, 0xFA, 0xED, 0xFE],
+        [0xCA, 0xFE, 0xBA, 0xBE], // universal binary (and a Java class file,
+        [0xBE, 0xBA, 0xFE, 0xCA], // which is also a program)
+    ];
+
+    let head = bytes.get(..4)?;
+    if MACH_O.iter().any(|magic| head == magic) {
+        return Some("a program");
+    }
+    if head == b"\x7fELF" {
+        return Some("a Linux program");
+    }
+    if head.starts_with(b"MZ") {
+        return Some("a Windows program");
+    }
+    None
 }
 
 /// The raster image types an inline `cid:` part is allowed to be.

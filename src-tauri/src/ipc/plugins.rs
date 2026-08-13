@@ -101,8 +101,16 @@ pub fn plugin_sandbox(state: State<'_, AppState>) -> SandboxAssets {
 #[tauri::command]
 pub fn plugin_conformance(
     state: State<'_, AppState>,
-    report: ConformanceReport,
+    mut report: ConformanceReport,
 ) -> Result<(), IpcError> {
+    // The verdict is re-derived here from the rows the probe returned, rather
+    // than taken as the frontend computed it. Never upgraded — a report the
+    // frontend already called a failure stays one — only downgraded, so the
+    // question "may untrusted code run" is answered by the evidence on the
+    // side of the boundary that enforces it. See
+    // `ConformanceReport::evidence_supports_a_pass`.
+    report.ok = report.ok && report.evidence_supports_a_pass();
+
     // Written to the data directory as well as held in memory: the probe is
     // evidence, and evidence that only exists inside a running window cannot be
     // read after the window is gone. `scripts/qa` and CI both read this file.
