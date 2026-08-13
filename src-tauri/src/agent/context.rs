@@ -59,24 +59,147 @@ pub struct ContextItem {
 const INLINE_MESSAGES: usize = 3;
 const INLINE_BODY_CHARS: usize = 2_000;
 
+/// Longer than anything a person typed, short enough that one runaway
+/// newsletter cannot spend the whole payload on itself.
+const CLIPBOARD_BODY_CHARS: usize = 8_000;
+
+/// The ceiling on a whole clipboard payload, in characters.
+///
+/// Somewhere around fifteen thousand tokens: inside every chat box worth
+/// pasting into, and past the point where more mail makes the answer better.
+/// What matters more than the exact number is that hitting it is *said* — in
+/// the text, at the point it stops, and in the toast.
+const CLIPBOARD_TOTAL_CHARS: usize = 60_000;
+
+/// Who a rendered block is for.
+///
+/// Same items, same resolution against the store; what differs is how much of a
+/// conversation comes out and what the text says where it stops.
+///
+/// The agent's block is small on purpose — it holds `get_thread`, so three
+/// messages is almost always the whole ask and the rest is one tool call away.
+/// A block on its way to the clipboard has no second call to make: what is not
+/// in the text does not exist for whoever receives it. So it carries every
+/// message up to a ceiling, and names what it left behind when it hits one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    /// The model at the other end of a session.
+    Model,
+    /// A chat window somewhere else, by way of ⌘⌥C.
+    Clipboard,
+}
+
+impl Audience {
+    fn opening(self) -> &'static str {
+        match self {
+            Audience::Model => "<context>\nWhat the owner is looking at right now:\n",
+            // Read by somebody who has never heard of Mach, and addressed *by*
+            // the owner rather than about him.
+            Audience::Clipboard => {
+                "<context>\nThis is what I am looking at in my mail and calendar client:\n"
+            }
+        }
+    }
+
+    fn inline_messages(self) -> usize {
+        match self {
+            Audience::Model => INLINE_MESSAGES,
+            Audience::Clipboard => usize::MAX,
+        }
+    }
+
+    fn body_chars(self) -> usize {
+        match self {
+            Audience::Model => INLINE_BODY_CHARS,
+            Audience::Clipboard => CLIPBOARD_BODY_CHARS,
+        }
+    }
+
+    fn total_chars(self) -> usize {
+        match self {
+            Audience::Model => usize::MAX,
+            Audience::Clipboard => CLIPBOARD_TOTAL_CHARS,
+        }
+    }
+
+    /// What to say where the text stops short.
+    fn truncated_hint(self) -> &'static str {
+        match self {
+            Audience::Model => "call get_thread for the rest",
+            Audience::Clipboard => "the rest of this message was not copied",
+        }
+    }
+}
+
+/// A rendered block, and whether anything was left out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rendered {
+    pub text: String,
+    /// True when a body was clipped or a message did not fit under the ceiling.
+    /// The caller says so out loud; the text says so in place.
+    pub truncated: bool,
+}
+
+/// How much room is left, and whether anything has been dropped for want of it.
+struct Budget {
+    remaining: usize,
+    trimmed: bool,
+}
+
+impl Budget {
+    fn take(&mut self, chars: usize) -> bool {
+        if chars > self.remaining {
+            self.trimmed = true;
+            return false;
+        }
+        self.remaining -= chars;
+        true
+    }
+}
+
 /// The `<context>` block prepended to the first user message.
 ///
 /// Empty when nothing is attached — an unadorned question must not arrive
 /// wrapped in ceremony.
 pub fn render(db: &Db, items: &[ContextItem]) -> Result<String, AgentError> {
-    if items.is_empty() {
-        return Ok(String::new());
-    }
-
-    let mut out = String::from("<context>\nWhat the owner is looking at right now:\n");
-    for item in items {
-        out.push_str(&render_item(db, item)?);
-    }
-    out.push_str("</context>\n\n");
-    Ok(out)
+    Ok(render_for(db, items, Audience::Model)?.text)
 }
 
-fn render_item(db: &Db, item: &ContextItem) -> Result<String, AgentError> {
+/// The same block, at the budget its reader deserves. See [`Audience`].
+pub fn render_for(
+    db: &Db,
+    items: &[ContextItem],
+    audience: Audience,
+) -> Result<Rendered, AgentError> {
+    if items.is_empty() {
+        return Ok(Rendered {
+            text: String::new(),
+            truncated: false,
+        });
+    }
+
+    let mut budget = Budget {
+        remaining: audience.total_chars(),
+        trimmed: false,
+    };
+
+    let mut out = String::from(audience.opening());
+    for item in items {
+        out.push_str(&render_item(db, item, audience, &mut budget)?);
+    }
+    out.push_str("</context>\n\n");
+    Ok(Rendered {
+        text: out,
+        truncated: budget.trimmed,
+    })
+}
+
+fn render_item(
+    db: &Db,
+    item: &ContextItem,
+    audience: Audience,
+    budget: &mut Budget,
+) -> Result<String, AgentError> {
     let mut out = format!("\n[{}] {}\n", item.kind, item.label);
 
     if let Some(thread_id) = item.thread_id {
@@ -90,18 +213,35 @@ fn render_item(db: &Db, item: &ContextItem) -> Result<String, AgentError> {
                 ));
                 out.push_str(&format!("subject: {}\n", detail.thread.subject));
                 let total = detail.messages.len();
-                let skipped = total.saturating_sub(INLINE_MESSAGES);
+                let skipped = total.saturating_sub(audience.inline_messages());
                 if skipped > 0 {
                     out.push_str(&format!(
                         "({skipped} earlier message(s) not shown — call get_thread for the full conversation)\n"
                     ));
                 }
+
+                // Oldest first, and the ceiling bites at the *end*: a
+                // conversation cut off before its most recent message would be
+                // the one shape of truncation that changes what it says.
+                let mut written = 0usize;
+                let showing = total - skipped;
                 for message in detail.messages.iter().skip(skipped) {
-                    out.push_str(&format!(
+                    let block = format!(
                         "\n--- from {} at {}\n{}\n",
                         who(&message.from),
                         human_time(message.internal_date),
-                        clip(&body_of(message), INLINE_BODY_CHARS)
+                        clip(&body_of(message), audience.body_chars(), audience, budget)
+                    );
+                    if !budget.take(block.chars().count()) {
+                        break;
+                    }
+                    out.push_str(&block);
+                    written += 1;
+                }
+                let dropped = showing - written;
+                if dropped > 0 {
+                    out.push_str(&format!(
+                        "\n[{dropped} more message(s) left out — this copy stops at {CLIPBOARD_TOTAL_CHARS} characters]\n"
                     ));
                 }
             }
@@ -151,11 +291,36 @@ fn render_item(db: &Db, item: &ContextItem) -> Result<String, AgentError> {
     Ok(out)
 }
 
+/// What a message *says*, with the history it was quoting on top of taken off.
+///
+/// A ten-reply thread rendered whole with its quotes carries the first message
+/// ten times, and every message after it nine, eight, seven times over. That is
+/// most of the payload and none of the information, which matters for a model
+/// paying by the token and matters again for a paste into somebody else's chat
+/// box. `render/quotes` is the same splitter the reading pane collapses with, so
+/// what gets copied is what he can see without expanding anything.
+///
+/// Both paths fall back to the unsplit body when the split leaves nothing: a
+/// bare forward is *all* quote, and a message rendered as an empty string would
+/// be a worse answer than a redundant one.
 fn body_of(message: &crate::db::models::Message) -> String {
     match (&message.body_text, &message.body_html) {
-        (Some(text), _) if !text.trim().is_empty() => crate::render::quotes::split_text(text).new,
+        (Some(text), _) if !text.trim().is_empty() => {
+            let split = crate::render::quotes::split_text(text);
+            if split.new.trim().is_empty() {
+                text.clone()
+            } else {
+                split.new
+            }
+        }
         (_, Some(html)) if !html.trim().is_empty() => {
-            crate::render::text::from_sanitized(&crate::render::render_html(html).html)
+            let split = crate::render::quotes::split_html(html);
+            let source = if split.new.trim().is_empty() {
+                html.as_str()
+            } else {
+                split.new.as_str()
+            };
+            crate::render::text::from_sanitized(&crate::render::render_html(source).html)
         }
         _ => message.snippet.clone(),
     }
@@ -171,13 +336,14 @@ pub fn who(p: &crate::db::models::Participant) -> String {
     }
 }
 
-fn clip(text: &str, max: usize) -> String {
+fn clip(text: &str, max: usize, audience: Audience, budget: &mut Budget) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= max {
         return trimmed.to_string();
     }
+    budget.trimmed = true;
     let head: String = trimmed.chars().take(max).collect();
-    format!("{head}\n… [truncated — call get_thread for the rest]")
+    format!("{head}\n… [truncated — {}]", audience.truncated_hint())
 }
 
 /// `Tue 12 Aug 2026, 09:30` in the owner's timezone. Used in prompts and in the
