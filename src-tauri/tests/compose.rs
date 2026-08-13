@@ -4519,3 +4519,400 @@ fn the_repair_collapses_duplicate_mirrors_and_drops_the_ones_nothing_owns() {
     assert_eq!(draft_rows(&db, thread).len(), 1);
 }
 
+// ================================================= header injection
+
+// A header ends at a CRLF, so any CR or LF in a value that becomes one ends it
+// early and starts another — chosen by whoever supplied the value. Against the
+// pinned `mail-builder 0.4.4` this worked through the subject, the address
+// headers, `In-Reply-To`, an attachment's `Content-Type` and its `Content-ID`.
+//
+// These tests assert on the *emitted message*, not on the guard. A test that a
+// filter removes `\r\n` proves the filter works; only a test that no second
+// header appears in the bytes proves the hole is shut, and that is the one that
+// keeps working if the defence is ever rewritten.
+//
+// The subject has a length-dependent edge that makes it easy to miss.
+// `mail-builder` writes a *short* all-ASCII subject byte for byte and RFC 2047
+// encodes a long one, because `get_encoding_type(text, is_inline = true, ..)`
+// matches its `is_inline && ch == b'\n'` arm before the arm that would force
+// encoding, and a long subject escapes only by tripping a separate fold check.
+// So the short subject is the exploitable one, and it is covered by name.
+
+/// Every header name in the block, ignoring folded continuation lines.
+fn header_names(bytes: &[u8]) -> Vec<String> {
+    headers_of(bytes)
+        .lines()
+        .filter(|line| !line.starts_with(' ') && !line.starts_with('\t'))
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.trim().to_ascii_lowercase())
+        .collect()
+}
+
+/// A message with nothing wrong with it, for one field at a time to be spoiled.
+fn clean_outgoing() -> Outgoing {
+    Outgoing {
+        from: Mailbox::named("Alex Rivera", "alex@example.com"),
+        to: vec![Mailbox::named("Sam Patel", "sam@partner.com")],
+        cc: vec![],
+        bcc: vec![],
+        subject: "Lunch".into(),
+        text: "ok".into(),
+        html: "<p>ok</p>".into(),
+        attachments: vec![],
+        in_reply_to: None,
+        references: vec![],
+        message_id: "m1@example.com".into(),
+        date_ms: NOW,
+    }
+}
+
+/// The property under test: `build_rfc822` either refuses, or emits a header
+/// block carrying no header the caller did not ask for.
+///
+/// Refusing is what it does — the choice is argued in `mime.rs` — but the
+/// assertion is written on the output so it survives that choice changing.
+fn assert_cannot_smuggle_a_header(label: &str, msg: &Outgoing) {
+    let bytes = match build_rfc822(msg) {
+        Err(e) => {
+            assert!(
+                !e.to_string().is_empty(),
+                "{label}: refused with nothing to tell the sender"
+            );
+            return;
+        }
+        Ok(bytes) => bytes,
+    };
+
+    let names = header_names(&bytes);
+    for smuggled in ["bcc", "x-mach-injected"] {
+        assert!(
+            !names.iter().any(|n| n == smuggled),
+            "{label}: a {smuggled:?} header appeared that nobody asked for\n\
+             headers: {names:?}\n{}",
+            headers_of(&bytes)
+        );
+    }
+    assert!(
+        !headers_of(&bytes).contains("attacker@evil.example"),
+        "{label}: the attacker's address reached the header block\n{}",
+        headers_of(&bytes)
+    );
+}
+
+/// The three spellings of a line break, plus the NUL that ends a string for
+/// whatever parses it next.
+const BREAKS: &[(&str, &str)] = &[
+    ("CRLF", "\r\n"),
+    ("bare LF", "\n"),
+    ("bare CR", "\r"),
+    ("LF CR", "\n\r"),
+    ("NUL then CRLF", "\0\r\n"),
+];
+
+#[test]
+fn a_short_subject_cannot_carry_a_second_header() {
+    // The exploitable case. Before the guard, `mail-builder` wrote this one
+    // verbatim and the message left with a `Bcc` the owner never typed.
+    for (name, brk) in BREAKS {
+        let mut msg = clean_outgoing();
+        msg.subject = format!("Re: hi{brk}Bcc: attacker@evil.example{brk}X-Mach-Injected: yes");
+        assert_cannot_smuggle_a_header(&format!("short subject, {name}"), &msg);
+    }
+}
+
+#[test]
+fn a_long_subject_cannot_carry_a_second_header_either() {
+    // Safe before the guard, but only by accident: long enough to trip
+    // `mail-builder`'s fold check and get RFC 2047 encoded. A fix that leans on
+    // that accident is not a fix, so the long case sits next to the short one.
+    for (name, brk) in BREAKS {
+        let mut msg = clean_outgoing();
+        msg.subject = format!(
+            "{}{brk}Bcc: attacker@evil.example{brk}X-Mach-Injected: yes",
+            "A".repeat(120)
+        );
+        assert_cannot_smuggle_a_header(&format!("long subject, {name}"), &msg);
+    }
+}
+
+#[test]
+fn a_subject_that_decodes_to_a_line_break_stays_one_header() {
+    // An encoded-word the *receiver* decodes back into a CRLF, and the raw
+    // `=0D=0A` spelling of the same thing. These are legal subject text, so they
+    // send — what they may not do is reach the wire as bytes a second parse
+    // could split on.
+    for spelling in [
+        "=?us-ascii?Q?hi=0D=0ABcc:_attacker@evil.example?=",
+        "=?utf-8?B?aGkNCkJjYzogYXR0YWNrZXJAZXZpbC5leGFtcGxl?=",
+        "hi=0D=0ABcc: attacker@evil.example",
+    ] {
+        let mut msg = clean_outgoing();
+        msg.subject = spelling.to_string();
+        let bytes = build_rfc822(&msg).expect("an encoded-word subject is still sendable");
+        assert!(
+            !header_names(&bytes).iter().any(|n| n == "bcc"),
+            "{spelling:?} produced a Bcc header:\n{}",
+            headers_of(&bytes)
+        );
+        let head = headers_of(&bytes);
+        for line in head.lines() {
+            assert!(
+                !line.starts_with("Bcc:"),
+                "the subject folded into something that reads as a header:\n{head}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_recipient_address_cannot_carry_a_second_header() {
+    for (name, brk) in BREAKS {
+        for field in ["to", "cc", "bcc"] {
+            let mut msg = clean_outgoing();
+            let hostile = Mailbox::new(format!(
+                "sam@partner.com{brk}Bcc: attacker@evil.example{brk}X-Mach-Injected: yes"
+            ));
+            match field {
+                "to" => msg.to = vec![hostile],
+                "cc" => msg.cc = vec![hostile],
+                _ => msg.bcc = vec![hostile],
+            }
+            assert_cannot_smuggle_a_header(&format!("{field} address, {name}"), &msg);
+        }
+    }
+}
+
+#[test]
+fn a_recipient_address_cannot_smuggle_a_second_mailbox() {
+    // No line break needed: `render_mailbox` wraps the address in `<…>`, so a
+    // `>` closes it early and what follows is read as another recipient.
+    for hostile in [
+        "sam@partner.com>, <attacker@evil.example",
+        "sam@partner.com>,<attacker@evil.example",
+        "sam@partner.com>; <attacker@evil.example",
+    ] {
+        let mut msg = clean_outgoing();
+        msg.to = vec![Mailbox::new(hostile)];
+        let built = build_rfc822(&msg);
+        assert!(
+            built.is_err(),
+            "{hostile:?} was accepted:\n{}",
+            headers_of(&built.unwrap())
+        );
+    }
+}
+
+#[test]
+fn a_display_name_cannot_carry_a_second_header() {
+    for (name, brk) in BREAKS {
+        let mut msg = clean_outgoing();
+        msg.to = vec![Mailbox::named(
+            format!("Sam Patel{brk}Bcc: attacker@evil.example{brk}X-Mach-Injected: yes"),
+            "sam@partner.com",
+        )];
+        assert_cannot_smuggle_a_header(&format!("To display name, {name}"), &msg);
+
+        let mut msg = clean_outgoing();
+        msg.from = Mailbox::named(
+            format!("Alex Rivera{brk}Bcc: attacker@evil.example"),
+            "alex@example.com",
+        );
+        assert_cannot_smuggle_a_header(&format!("From display name, {name}"), &msg);
+    }
+}
+
+#[test]
+fn a_from_address_cannot_carry_a_second_header() {
+    for (name, brk) in BREAKS {
+        let mut msg = clean_outgoing();
+        msg.from = Mailbox::new(format!(
+            "alex@example.com{brk}Bcc: attacker@evil.example{brk}X-Mach-Injected: yes"
+        ));
+        assert_cannot_smuggle_a_header(&format!("From address, {name}"), &msg);
+    }
+}
+
+#[test]
+fn a_threading_id_cannot_carry_a_second_header() {
+    for (name, brk) in BREAKS {
+        let mut msg = clean_outgoing();
+        msg.in_reply_to = Some(format!(
+            "a@b>{brk}Bcc: attacker@evil.example{brk}X-Mach-Injected: <c@d"
+        ));
+        assert_cannot_smuggle_a_header(&format!("In-Reply-To, {name}"), &msg);
+
+        let mut msg = clean_outgoing();
+        msg.references = vec![format!(
+            "a@b>{brk}Bcc: attacker@evil.example{brk}X-Mach-Injected: <c@d"
+        )];
+        assert_cannot_smuggle_a_header(&format!("References, {name}"), &msg);
+
+        let mut msg = clean_outgoing();
+        msg.message_id = format!("a@b>{brk}Bcc: attacker@evil.example{brk}X-Mach-Injected: <c@d");
+        assert_cannot_smuggle_a_header(&format!("Message-ID, {name}"), &msg);
+    }
+}
+
+#[test]
+fn attachment_metadata_cannot_carry_a_second_header() {
+    use compose::mime::OutgoingAttachment;
+
+    let hostile = "\r\nBcc: attacker@evil.example\r\nX-Mach-Injected: yes";
+    let base = OutgoingAttachment {
+        filename: "notes.pdf".into(),
+        mime_type: "application/pdf".into(),
+        bytes: vec![1, 2, 3],
+        inline: false,
+        content_id: "cid1".into(),
+    };
+
+    for spoil in ["filename", "content type", "content id"] {
+        for inline in [false, true] {
+            let mut file = base.clone();
+            file.inline = inline;
+            match spoil {
+                "filename" => file.filename = format!("notes{hostile}.pdf"),
+                "content type" => file.mime_type = format!("application/pdf{hostile}"),
+                _ => file.content_id = format!("cid1{hostile}"),
+            }
+            let mut msg = clean_outgoing();
+            msg.attachments = vec![file];
+
+            // The part headers sit below the message header block, so the whole
+            // message is searched rather than just `headers_of`.
+            if let Ok(bytes) = build_rfc822(&msg) {
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !text.contains("attacker@evil.example"),
+                    "attachment {spoil} (inline={inline}) smuggled a header:\n{text}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn refusing_a_message_says_which_field_was_wrong() {
+    // Failure has to be visible, and actionable with it: a message he cannot
+    // send and cannot diagnose is its own kind of broken.
+    let mut msg = clean_outgoing();
+    msg.subject = "hi\r\nBcc: attacker@evil.example".into();
+    let error = build_rfc822(&msg).expect_err("a subject with a CRLF is refused");
+    let text = error.to_string();
+    assert!(text.contains("subject"), "does not name the field: {text}");
+    assert_eq!(error.kind(), "invalid", "{text}");
+
+    let mut msg = clean_outgoing();
+    msg.to = vec![Mailbox::new("sam@partner.com\r\nBcc: attacker@evil.example")];
+    let text = build_rfc822(&msg)
+        .expect_err("a To address with a CRLF is refused")
+        .to_string();
+    assert!(text.contains("To"), "does not name the field: {text}");
+}
+
+#[test]
+fn a_clean_message_is_not_caught_by_any_of_this() {
+    // The guard is worthless if ordinary mail trips it. Accents, a comma in a
+    // name, a long subject, a real threading chain, a file with punctuation.
+    use compose::mime::OutgoingAttachment;
+
+    let bytes = build_rfc822(&Outgoing {
+        from: Mailbox::named("José García", "jose@example.com"),
+        to: vec![
+            Mailbox::named("Patel, Sam", "sam@partner.com"),
+            Mailbox::new("bare@partner.com"),
+        ],
+        cc: vec![Mailbox::named("Ana Ruiz", "ana@socio.es")],
+        bcc: vec![Mailbox::new("archive@example.com")],
+        subject: format!("Re: {} — año, ¿sí?", "a long subject line ".repeat(6)),
+        text: "hola".into(),
+        html: "<p>hola</p>".into(),
+        attachments: vec![OutgoingAttachment {
+            filename: "año, informe (final).pdf".into(),
+            mime_type: "application/pdf".into(),
+            bytes: vec![1, 2, 3],
+            inline: false,
+            content_id: "cid-1.abc@example.com".into(),
+        }],
+        in_reply_to: Some("<parent@example.com>".into()),
+        references: vec!["<root@example.com>".into(), "parent@example.com".into()],
+        message_id: "new@example.com".into(),
+        date_ms: NOW,
+    })
+    .expect("ordinary mail still builds");
+
+    let names = header_names(&bytes);
+    for expected in ["from", "to", "cc", "bcc", "subject", "in-reply-to", "references"] {
+        assert!(names.iter().any(|n| n == expected), "missing {expected}: {names:?}");
+    }
+}
+
+#[test]
+fn a_hostile_parent_does_not_break_the_reply_button() {
+    // The other half of "refuse rather than repair": a value Mach lifts out of
+    // somebody else's message is cleaned where it is derived, so a sender cannot
+    // make the reply unsendable by putting a CRLF in a header the owner has no
+    // control over. The injected text survives as text, in the subject field,
+    // where he can see it.
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "alex@example.com", Some("Alex Rivera"));
+    let thread = seed_thread(&db, account, "Invoice");
+    seed_message(
+        &db,
+        thread,
+        account,
+        "gmsg-1",
+        person("Mallory", "mallory@evil.example"),
+        vec![person("Alex Rivera", "alex@example.com")],
+        vec![],
+        "Invoice\r\nBcc: attacker@evil.example",
+        "<parent@evil.example>\r\nBcc: attacker@evil.example",
+        None,
+        "pay me",
+    );
+
+    let bytes = built_bytes(&db, &reply_draft(&db, thread, DraftKind::Reply, "no"));
+    let head = headers_of(&bytes);
+    assert!(
+        !header_names(&bytes).iter().any(|n| n == "bcc"),
+        "the reply carried a Bcc:\n{head}"
+    );
+    // The parent's Message-ID was malformed, so it is dropped rather than
+    // written: a threading hint lost, which beats a header invented.
+    assert!(
+        !header_names(&bytes).iter().any(|n| n == "in-reply-to"),
+        "a malformed parent id was written anyway:\n{head}"
+    );
+    // Not merely refused — still sendable. The injected text is on the Subject
+    // line, as text, which is where he can see it and delete it.
+    assert!(
+        head.lines()
+            .any(|l| l.starts_with("Subject:") && l.contains("Bcc: attacker@evil.example")),
+        "the injected text should stay visible in the subject:\n{head}"
+    );
+    assert!(
+        !head.lines().any(|l| l.starts_with("Bcc:")),
+        "it became a header instead:\n{head}"
+    );
+}
+
+#[test]
+fn a_hostile_parent_subject_flattens_rather_than_failing() {
+    let replied = reply_subject("Invoice\r\nBcc: attacker@evil.example");
+    assert!(!replied.contains('\r') && !replied.contains('\n'), "{replied:?}");
+    assert!(replied.starts_with("Re: Invoice"), "{replied:?}");
+    assert!(replied.contains("Bcc: attacker@evil.example"), "{replied:?}");
+
+    let forwarded = forward_subject("Invoice\nBcc: attacker@evil.example");
+    assert!(!forwarded.contains('\n'), "{forwarded:?}");
+
+    let mut msg = clean_outgoing();
+    msg.subject = replied;
+    let bytes = build_rfc822(&msg).expect("the reply is still sendable");
+    assert!(
+        !header_names(&bytes).iter().any(|n| n == "bcc"),
+        "{}",
+        headers_of(&bytes)
+    );
+}
+
