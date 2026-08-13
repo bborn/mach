@@ -168,22 +168,28 @@ describe("horizontal swipes in week and day view", () => {
     expect(run(stream, WEEK)).toEqual([1]);
   });
 
-  it("moves four periods for four quick flicks", () => {
-    // Each flick is cut short by the next one: the fingers land again ~230ms
-    // in, macOS cancels the momentum, and a fresh ramp begins. That is the
-    // stream a person paging forward quickly actually produces.
+  it("moves one period for four flicks thrown with no pause between them", () => {
+    // This asserted four until a real capture killed the rule that produced
+    // them. Each flick is cut short by the next: the fingers land again ~230ms
+    // in, macOS cancels the momentum, a fresh ramp begins, and no gap in the
+    // stream ever reaches `TAIL_MS`. By the only rule that survived his trace
+    // that is one gesture, so it is one period.
+    //
+    // This is the cost of the fix and it is a real one — paging quickly now
+    // needs a beat between swipes. It is the side to err on: overshooting means
+    // going back, which is what he reported. Restoring it needs a captured
+    // *double* swipe to calibrate against, which we do not have.
     const stream: WheelSample[] = [];
     for (let index = 0; index < 4; index += 1) {
       stream.push(...flick(1000 + index * 230, { axis: "x", direction: 1 }).slice(0, 14));
     }
-    expect(run(stream, WEEK)).toEqual([1, 1, 1, 1]);
+    expect(run(stream, WEEK)).toEqual([1]);
   });
 
-  it("moves four periods even when the flicks run together with no quiet gap", () => {
-    // The worst case for the idle timer: the next flick starts before the last
-    // tail has finished, so every event in the stream is under 130ms from its
-    // neighbour and the whole thing is one gesture by that measure. Only the
-    // rise out of the decaying floor separates them.
+  it("moves one period when the flicks run together with no quiet gap at all", () => {
+    // The same thing at its most extreme: the next flick starts before the last
+    // tail has finished, so every event is under 130ms from its neighbour and
+    // the whole stream is unambiguously one gesture.
     const stream: WheelSample[] = [];
     let clock = 1000;
     for (let index = 0; index < 4; index += 1) {
@@ -191,7 +197,7 @@ describe("horizontal swipes in week and day view", () => {
       stream.push(...one);
       clock = one[one.length - 1].timeStamp + FRAME;
     }
-    expect(run(stream, WEEK)).toEqual([1, 1, 1, 1]);
+    expect(run(stream, WEEK)).toEqual([1]);
   });
 
   it("moves one period when the app stalls in the middle of the tail", () => {
@@ -208,11 +214,12 @@ describe("horizontal swipes in week and day view", () => {
   });
 
   it("still moves on a deliberate second swipe after the tail has died away", () => {
-    // The tail runs out, a quarter second of nothing, then a modest swipe. The
-    // pause is shorter than the one that clears a fired gesture, so this leans
-    // entirely on the rise out of the momentum floor.
+    // The tail runs out, silence, then a modest swipe. Silence is now the whole
+    // of what separates two swipes, so the pause has to clear `TAIL_MS` — which
+    // is the contract this test exists to hold: a second swipe he actually
+    // waited for must move a second period.
     const first = flick(1000, { axis: "x", direction: 1 });
-    const resumeAt = first[first.length - 1].timeStamp + 250;
+    const resumeAt = first[first.length - 1].timeStamp + 600;
     const second = flick(resumeAt, { axis: "x", direction: 1, peak: 26 });
     expect(run([...first, ...second], WEEK)).toEqual([1, 1]);
   });
@@ -280,12 +287,10 @@ describe("horizontal swipes in week and day view", () => {
     expect(run(replay(1000, "x", 1, magnitudes), WEEK)).toEqual([1]);
   });
 
-  it("moves two periods for two flicks a tenth of a second apart", () => {
-    // The constraint the fix is not allowed to break. The fingers land again
-    // 112ms after the first flick began, which cancels its momentum where it
-    // stands, and the second flick's own ramp starts 32ms after that. The speed
-    // falling away from the first flick's peak and then climbing again is the
-    // only thing separating them — there is no quiet gap to read.
+  it("moves one period for two flicks a tenth of a second apart", () => {
+    // Two flicks 112ms apart, the second cancelling the first's momentum with
+    // no quiet gap anywhere. Every rule that told these apart also told his real
+    // swipe apart from itself eight times over, so they are one gesture now.
     const stream = replay(1000, "x", 1, [
       [3.3, 16],
       [13.3, 16],
@@ -293,7 +298,7 @@ describe("horizontal swipes in week and day view", () => {
       [53.3, 16],
       [83.3, 16],
       [120.0, 16],
-      [3.3, 48], // fingers back on the glass
+      [3.3, 48], // fingers back on the glass, and indistinguishable from noise
       [13.3, 16],
       [30.0, 16],
       [53.3, 16],
@@ -302,7 +307,52 @@ describe("horizontal swipes in week and day view", () => {
       [112.8, 16],
       [106.0, 16],
     ]);
-    expect(run(stream, WEEK)).toEqual([1, 1]);
+    expect(run(stream, WEEK)).toEqual([1]);
+  });
+
+  it("moves one period for the swipe he actually captured", () => {
+    /*
+     * Not a model of a trackpad — his, through `scripts/wheel-trace.html`, in
+     * Safari, which is the engine the app's webview is. 144 events, 1313ms,
+     * 2245px of travel, median gap 8ms, one swipe.
+     *
+     * Every synthetic fixture in this file agreed the recogniser was right
+     * before this arrived. It moved **eight** periods, five of them inside the
+     * first 121ms — before his fingers had left the glass. The finger half of
+     * the stream is why: `41, 10, 24, 5, 31, 5, 25, 3, 20`, a factor of ten
+     * between neighbours, because a finger is not a ramp and the sampling is
+     * not even. Every rule that watched for the stream to wind down and climb
+     * again read each of those troughs as a fresh swipe.
+     *
+     * The tail was always the easy half: a clean decay from 55 to 1 over about
+     * 1.2 seconds, gapping by at most 66ms, which is what `TAIL_MS` clears.
+     */
+    const captured: [number, number][] = [
+      [1, 0], [3, 8], [1, 7], [4, 2], [3, 4], [6, 4], [4, 4], [8, 4], [4, 4], [13, 5],
+      [6, 7], [24, 1], [10, 4], [35, 4], [12, 4], [29, 5], [7, 4], [41, 4], [10, 6], [24, 2],
+      [5, 4], [31, 5], [5, 4], [25, 4], [3, 4], [20, 4], [19, 9], [8, 4], [7, 4], [44, 13],
+      [53, 9], [55, 7], [54, 8], [55, 9], [53, 10], [53, 6], [50, 8], [50, 9], [50, 9], [47, 8],
+      [46, 8], [45, 9], [45, 9], [43, 7], [43, 13], [40, 4], [40, 9], [38, 7], [38, 9], [36, 8],
+      [34, 9], [34, 8], [32, 8], [32, 9], [30, 9], [29, 7], [28, 8], [28, 9], [27, 14], [26, 2],
+      [25, 8], [23, 9], [23, 9], [22, 8], [21, 8], [21, 8], [19, 9], [19, 8], [18, 8], [17, 9],
+      [17, 9], [17, 7], [15, 8], [15, 9], [13, 9], [13, 8], [13, 8], [12, 9], [11, 9], [11, 7],
+      [11, 8], [11, 9], [10, 9], [10, 7], [9, 9], [9, 9], [8, 8], [8, 8], [8, 8], [8, 10],
+      [7, 7], [7, 8], [7, 8], [7, 9], [6, 9], [6, 7], [5, 8], [5, 10], [5, 8], [5, 8],
+      [4, 8], [4, 9], [4, 9], [4, 7], [4, 12], [4, 5], [3, 9], [3, 7], [3, 8], [3, 10],
+      [3, 8], [3, 8], [3, 8], [3, 9], [3, 8], [3, 8], [3, 8], [2, 10], [2, 7], [2, 8],
+      [2, 8], [2, 10], [2, 8], [2, 8], [2, 8], [2, 9], [2, 8], [2, 8], [2, 8], [3, 18],
+      [2, 17], [2, 18], [2, 15], [2, 17], [1, 16], [1, 17], [1, 17], [1, 16], [1, 17], [1, 16],
+      [1, 34], [1, 33], [1, 34], [1, 66],
+    ];
+    expect(run(replay(1000, "x", 1, captured), WEEK)).toEqual([1]);
+  });
+
+  it("moves two periods for two of those, with a pause between them", () => {
+    // The other half of the contract: a second swipe he waited for still pages.
+    const one: [number, number][] = [[3, 8], [13, 8], [30, 8], [53, 8], [83, 8], [120, 8]];
+    const first = replay(1000, "x", 1, one);
+    const second = replay(first[first.length - 1].timeStamp + 600, "x", 1, one);
+    expect(run([...first, ...second], WEEK)).toEqual([1, 1]);
   });
 
   it("moves one period for a slow deliberate drag with no momentum behind it", () => {
@@ -360,12 +410,12 @@ describe("month view", () => {
     expect(run(flick(1000, { axis: "x", direction: 1 }), MONTH)).toEqual([1]);
   });
 
-  it("moves four months for four quick vertical flicks", () => {
+  it("moves one month for four vertical flicks with no pause between them", () => {
     const stream: WheelSample[] = [];
     for (let index = 0; index < 4; index += 1) {
       stream.push(...flick(1000 + index * 230, { axis: "y", direction: 1 }).slice(0, 14));
     }
-    expect(run(stream, MONTH)).toEqual([1, 1, 1, 1]);
+    expect(run(stream, MONTH)).toEqual([1]);
   });
 
   it("moves one month for a long steady drag, not one per event", () => {

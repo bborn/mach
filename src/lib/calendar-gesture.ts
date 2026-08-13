@@ -25,34 +25,26 @@
  *     to anything, the gesture has been vertical for a hundred events. macOS
  *     locks axes for the same reason.
  *
- *  3. **One movement rises once, then only decays.** After a step fires, the
- *     gesture watches speed — pixels per millisecond, not pixels per event —
- *     and remembers the fastest it has been and the slowest it has been since.
- *     A second gesture is the speed winding down from that peak and then
- *     climbing back out of the trough, which is what fingers landing on the
- *     glass looks like: macOS cancels the momentum, the stream restarts from
- *     small deltas and grows. Four quick flicks page four weeks that way, while
- *     a single flick's forty-event tail pages one.
+ *  3. **A gesture that has fired is finished.** Nothing later in the stream can
+ *     make it move a second period. Only silence — `TAIL_MS` of it — starts the
+ *     next gesture, so a second period costs a second swipe.
  *
- *     Each half of that replaces something that was wrong.
+ *     Two cleverer rules stood here first, and a captured trace killed both.
+ *     Each watched for the stream to wind down and then climb again, on the
+ *     theory that momentum decays and only fingers can accelerate: the first
+ *     measured per-event magnitude, the second measured speed. Both statements
+ *     about momentum are true. Neither is true of a hand still on the glass.
  *
- *     *Why speed.* Per-event magnitude is a property of the sampling rather
- *     than of the hand, and the sampling moves. WebKit coalesces wheel events
- *     when the main thread is busy — and the main thread is busy immediately
- *     after a step fires, because the calendar is re-rendering a whole period —
- *     so the tail arrives as fewer, fatter events. Six frames of a decaying
- *     tail merged into one event is a sixfold jump in magnitude and no change
- *     at all in speed. The same goes for a 120Hz display, which halves every
- *     delta and doubles every count.
+ *     The capture is 144 events, 1313ms, 2245px, one swipe. Its finger half
+ *     reads `41, 10, 24, 5, 31, 5, 25, 3, 20` — alternating by a factor of ten,
+ *     event to event, because a finger is not a ramp and the sampling is not
+ *     even. Every one of those troughs-and-doubles is a re-arm. That trace moved
+ *     **eight** periods, five of them before the hand had left the trackpad.
  *
- *     *Why only after the peak.* The trigger fires as soon as 42px have gone by,
- *     which on a fast flick is two or three events in — while the finger is
- *     still accelerating. The rest of that ramp is a rise, and a rise is
- *     exactly the signal that used to mean "a second swipe". One flick, two
- *     weeks. So a rise counts for nothing until the speed has first fallen
- *     away from its peak: a new peak drags the trough up with it, and while
- *     the hand is still speeding up the two are equal and no re-arm is
- *     possible.
+ *     So the rule is stated rather than inferred, and it is the owner's: never
+ *     more than one period per swipe. The cost is a second flick thrown inside
+ *     the first one's momentum being swallowed, and that is the right side to
+ *     err on — overshooting means going back, which is the thing he reported.
  *
  * Everything here is pure — samples in, a step out — which is the only way to
  * test the momentum handling, since the thing being tested is a sequence of
@@ -97,21 +89,13 @@ export interface GestureAxes {
 export interface WheelGesture {
   /** `timeStamp` of the last sample, for the idle gap that ends a gesture. */
   readonly last: number;
-  /** Travel accumulated since the gesture began, or since it last re-armed. */
+  /** Travel accumulated since the gesture began. */
   readonly x: number;
   readonly y: number;
   /** The axis this gesture belongs to; null until the travel says which. */
   readonly axis: "x" | "y" | null;
-  /** True once a step has fired. Everything after is momentum until re-arm. */
+  /** True once a step has fired. Everything after it is swallowed. */
   readonly fired: boolean;
-  /** Fastest this gesture has moved, in px/ms. Only meaningful once fired. */
-  readonly peak: number;
-  /**
-   * Slowest it has moved since that peak, in px/ms — the trough a second
-   * gesture has to climb out of. A new peak resets it to the peak's own speed,
-   * so a hand that is still accelerating has no trough to climb out of at all.
-   */
-  readonly floor: number;
   /** Decided from the first sample of the gesture and held for its duration. */
   readonly device: WheelDevice | null;
   /** When a step last fired, which rate-limits the wheel across gestures. */
@@ -136,8 +120,6 @@ export const IDLE_GESTURE: WheelGesture = {
   y: 0,
   axis: null,
   fired: false,
-  peak: 0,
-  floor: Number.POSITIVE_INFINITY,
   device: null,
   emitted: Number.NEGATIVE_INFINITY,
 };
@@ -151,25 +133,25 @@ const IDLE_MS = 130;
 
 /**
  * How much quiet a gesture that has already moved a period needs before it
- * counts as over.
+ * counts as over — and, since there is no re-arm, the whole of what separates
+ * one swipe from the next.
  *
- * A momentum tail is a second of events, and anything that blocks the main
- * thread mid-tail — a slow commit, a garbage collection — puts a hole in the
- * stream that `IDLE_MS` reads as the end of one gesture and the start of
- * another. What comes out the far side of such a hole is one fat coalesced
- * event carrying every frame the stall swallowed, which clears `TRIGGER_PX`
- * without trying: the original bug wearing a disguise. A headless run with a
- * stalling renderer stopped for 350ms at a stretch and turned one flick into
- * four that way.
+ * It is a gap between two events, not a clock on the gesture: however long a
+ * tail runs it moves one period, because length does not end a gesture. Only
+ * silence does.
  *
- * This is a gap between two events, not a clock on the gesture: however long a
- * tail runs, it moves one period, because nothing about the length of the
- * stream ends it. Only silence does. The number is set above any stall that is
- * not already a bug of its own, and making it longer costs nothing, because
- * rapid flicking never relied on this timer — two flicks in quick succession
- * are separated by the re-arm rule, not by silence.
+ * Two things set the number from opposite sides. Below it, anything that blocks
+ * the main thread mid-tail — a slow commit, a garbage collection — puts a hole
+ * in the stream, and what comes out the far side is one fat coalesced event
+ * carrying every frame the stall swallowed, which clears `TRIGGER_PX` without
+ * trying. A headless run with a stalling renderer managed 350ms holes. Above
+ * it, every millisecond is dead time after a tail ends, where a second swipe
+ * does nothing and the app feels broken.
+ *
+ * The captured trace never gaps by more than 66ms while it is running, so half
+ * a second sits clear of both edges.
  */
-const TAIL_MS = 800;
+const TAIL_MS = 500;
 
 /** Nominal sizes for the two non-pixel delta modes. */
 const LINE_PX = 16;
@@ -188,30 +170,7 @@ const AXIS_RATIO = 1.4;
 /** Travel along the committed axis that counts as a swipe. */
 const TRIGGER_PX = 42;
 
-/**
- * A re-arm has to clear all three of these.
- *
- * `REARM_SETTLE` is the one that separates a second swipe from the back half of
- * the first: the speed has to have dropped a fifth below its peak before a rise
- * means anything. A hand that is still accelerating never satisfies it, because
- * a new peak resets the trough to itself.
- *
- * `REARM_FACTOR` then asks the rise to double the trough, which a tail decaying
- * a few percent a frame cannot do, and `REARM_SPEED` puts an absolute floor
- * under it so that the last dying pixels of a tail, where the trough is near
- * zero and doubling it means nothing, cannot re-arm on noise. 0.2px/ms is about
- * 3px in a 60Hz frame.
- */
-const REARM_SETTLE = 0.8;
-const REARM_FACTOR = 2;
-const REARM_SPEED = 0.2;
 
-/**
- * A gap this long is a hole in the stream rather than the next frame. Two and a
- * half frames at 60Hz, five at 120Hz — above any real spacing and below the
- * pause between two flicks.
- */
-const STALL_MS = 40;
 
 /**
  * First-sample magnitude that marks a mouse wheel. A trackpad ramps up from
@@ -311,7 +270,7 @@ export function feedWheel(
 
   return base.device === "wheel"
     ? notch(base, { now, dy, gap }, axes)
-    : swipe(base, { now, dx, dy, gap: now - base.last }, axes);
+    : swipe(base, { now, dx, dy }, axes);
 }
 
 function notch(
@@ -337,55 +296,35 @@ function notch(
 
 function swipe(
   base: WheelGesture,
-  { now, dx, dy, gap }: { now: number; dx: number; dy: number; gap: number },
+  { now, dx, dy }: { now: number; dx: number; dy: number },
   axes: GestureAxes,
 ): WheelOutcome {
-  let start = base;
-  // Pixels per millisecond. A gesture's first event has nothing to measure
-  // from, so its gap is infinite and its speed comes out zero — the honest
-  // answer, and the conservative one: a gesture with no measured peak can
-  // never re-arm, and picks one up from its second event.
-  const speed = Math.hypot(dx, dy) / Math.max(gap, 1);
+  const start = base;
 
   if (start.fired) {
-    // An event that arrives after a hole in the stream is not evidence about
-    // anything. Whether the hole swallowed the frames it covers or merged them
-    // into this one event decides whether its magnitude and its speed mean what
-    // they usually mean, and there is no way to tell from here which happened.
-    // So it moves neither the peak nor the trough, and it moves no period. The
-    // next few evenly-spaced events say what is going on.
-    if (gap > STALL_MS) {
-      return { gesture: { ...start, last: now }, step: 0, claimed: claims(start.axis, axes) };
-    }
-
-    const settled = start.peak > 0 && start.floor <= start.peak * REARM_SETTLE;
-    const rising = speed > Math.max(REARM_SPEED, start.floor * REARM_FACTOR);
-
-    if (!settled || !rising) {
-      // Still one movement. A faster event moves the peak and takes the trough
-      // with it, so the rest of a ramp can never look like a second swipe; a
-      // slower one deepens the trough the next swipe will have to climb out of.
-      const tracked =
-        speed > start.peak
-          ? { ...start, peak: speed, floor: speed }
-          : { ...start, floor: Math.min(start.floor, speed) };
-      return {
-        gesture: { ...tracked, last: now },
-        step: 0,
-        claimed: claims(start.axis, axes),
-      };
-    }
-    // Wound down and now climbing again, which one movement does not do. The
-    // fingers are back on the glass, so this is a second gesture wearing the
-    // first one's clothes: start it over from this event's travel.
-    start = {
-      ...start,
-      x: 0,
-      y: 0,
-      axis: null,
-      fired: false,
-      peak: 0,
-      floor: Number.POSITIVE_INFINITY,
+    // A gesture that has fired is finished. Nothing in the rest of the stream
+    // can make it fire again; only silence starts the next one.
+    //
+    // Two cleverer rules stood here and both were wrong on a real trackpad, so
+    // this one is stated rather than inferred. The first read per-event
+    // magnitude, and the second read speed, each looking for the stream to wind
+    // down and climb again on the theory that momentum cannot climb. Both are
+    // true of momentum and neither is true of *fingers*: a captured swipe of
+    // his — 144 events, 1313ms, 2245px — alternates hard while the hand is
+    // still on the glass, `41, 10, 24, 5, 31, 5, 25, 3, 20`, because a finger
+    // is not a ramp. Every one of those troughs-then-doubles reads as a second
+    // swipe. That trace moved **eight** periods, five of them before his
+    // fingers had even left.
+    //
+    // So there is no re-arm. One swipe is one period, and a second period costs
+    // a second swipe — which is what he asked for, and is the only rule the
+    // capture supports. The cost is a second flick thrown inside the first
+    // one's momentum being swallowed; overshoot is the worse failure, since
+    // landing two weeks out means going back.
+    return {
+      gesture: { ...start, last: now },
+      step: 0,
+      claimed: claims(start.axis, axes),
     };
   }
 
@@ -411,7 +350,7 @@ function swipe(
   }
 
   return {
-    gesture: { ...gesture, fired: true, peak: speed, floor: speed, emitted: now },
+    gesture: { ...gesture, fired: true, emitted: now },
     step: travel > 0 ? 1 : -1,
     claimed,
   };
