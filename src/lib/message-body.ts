@@ -504,6 +504,16 @@ img{max-width:100%;height:auto;border:0}
 img[data-mach-tracker]{display:none!important}
 table{max-width:100%}
 a{color:var(--accent,currentColor)}
+/* An anchor whose href the sanitizer refused — a javascript: or data: URL, or
+   a relative one — keeps its text, because the text is the message. It should
+   not keep the look of something that goes somewhere: a link that is blue and
+   underlined and does nothing when clicked is the dead click invariant 9 is
+   about, and here it is dead for a reason the reader is entitled to see. */
+a:not([href]){color:inherit;text-decoration:none}
+/* Where a link really goes, when its text says otherwise — see [linkClaim].
+   Sits beside the anchor, never inside it, so it is not part of what a click
+   hits and cannot itself be styled by the sender. */
+[${CLAIM_ATTR}]{display:inline;font-size:0.85em;line-height:1;white-space:nowrap;color:var(--muted-foreground,currentColor);border:1px solid var(--border,currentColor);border-radius:0.25em;padding:0 0.3em;margin-left:0.3em;vertical-align:baseline}
 blockquote{margin:0.5rem 0;padding-left:0.75rem;border-left:2px solid var(--border,currentColor)}
 /* A log or a code block keeps its lines: reflowing a stack trace to the width
    of the pane is not preserving it. It scrolls inside itself instead, which is
@@ -542,16 +552,26 @@ export interface FrameDocumentOptions {
  * The CSP lands as a `<meta http-equiv>` because a `srcdoc` frame has no
  * response headers of its own.
  *
- * # Known gap: the inherited policy
+ * # The inherited policy
  *
  * An `about:srcdoc` document inherits its creator's policy container, so the
  * app-level CSP in `tauri.conf.json` applies *as well as* this one and the
  * effective policy is the intersection. That is the right direction for every
- * directive here except one: the app policy's `img-src` is
- * `'self' asset: http://asset.localhost data: blob:`, which does not include
- * `https:`, so "load remote images" will render nothing in the packaged app
- * until `https:` is added to that list. `tauri.conf.json` is outside this
- * unit's ownership, so the change is not made here.
+ * directive here: this policy is the stricter of the two everywhere, so the
+ * intersection is this policy.
+ *
+ * It used to be one directive off. The app policy's `img-src` did not carry
+ * `https:`, so "load remote images" widened a policy that was still being
+ * narrowed above it and rendered nothing at all in the packaged app. It carries
+ * `https:` now, and that is the only coupling: `tauri.conf.json` cannot be
+ * loosened past what this function asks for without breaking images, and cannot
+ * be tightened past it without breaking them either.
+ *
+ * The app policy has no plain `http:`, so a message image served over http does
+ * not load in either mode. Old mail with an http logo shows a gap where the
+ * picture was. That is a real fidelity cost and it stays: a cleartext fetch to
+ * a sender-chosen host is the one request shape where the reader's IP and the
+ * fact of the read are visible to more than the sender.
  */
 export function frameDocument({
   html,
@@ -879,6 +899,235 @@ export function externalUrl(href: string | null | undefined): string | null {
     return null;
   }
   return EXTERNAL_SCHEMES.has(parsed.protocol) ? parsed.href : null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Where a link actually goes                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The one attack on this surface the sanitizer cannot touch.
+ *
+ * Everything else in this module is about stopping a message *doing* something.
+ * A phishing link does nothing: it is a well-formed `https:` anchor, it survives
+ * every rule above intact, and it has to — the reader asked to be shown their
+ * mail, and a link is mail. What makes it work is that the reader is shown the
+ * anchor's *text* and the browser is given its `href`, and nothing in a mail
+ * client insists those agree.
+ *
+ * A browser has a status bar for this. A message frame cannot have one: it has
+ * no script (invariant 1), so no hover handler runs inside it, and WebKit will
+ * not run one attached from the parent either — the same measurement that moved
+ * link opening into `ipc::render::link_guard`. So the disclosure has to be in
+ * the document, put there before the reader looks at it.
+ *
+ * # What is disclosed, and what deliberately is not
+ *
+ * Only when the link *makes a claim that is false*:
+ *
+ * 1. The anchor text is itself a URL or a bare domain, and it names a different
+ *    site than the `href` does. `<a href="https://evil.example/">paypal.com</a>`
+ *    is the whole of the classic attack.
+ * 2. The `href`'s host contains a punycode label (`xn--`). A homograph domain
+ *    renders as the name it is imitating and there is no reading of the text
+ *    that would tell the reader otherwise. This one is disclosed whatever the
+ *    text says.
+ *
+ * `<a href="https://links.example.net/x">Update your payment method</a>` is not
+ * disclosed, and that is the point. Marketing mail is nothing but redirectors
+ * behind prose, and a client that flagged all of them would be teaching the
+ * reader to ignore the flag by the third newsletter of the morning. A link that
+ * claims nothing cannot be lying.
+ */
+export interface LinkClaim {
+  /** The host to show the reader — always the one the click would really go to. */
+  readonly host: string;
+  /** Why it is being shown. Only used by tests and by the comment above. */
+  readonly reason: "mismatch" | "punycode";
+}
+
+/**
+ * Suffixes under which the registrable domain is three labels rather than two.
+ *
+ * Not the public suffix list: shipping and updating that is a dependency, and
+ * getting it wrong in the *missing* direction only costs a disclosure that is
+ * not made. These are the ones that turn up in real mail. `co.uk` is the one
+ * that matters — without it `evil.co.uk` and `hsbc.co.uk` compare equal.
+ */
+const MULTI_LABEL_SUFFIXES = new Set([
+  "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "sch.uk", "nhs.uk",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au",
+  "co.nz", "co.za", "co.in", "co.jp", "co.kr", "co.il", "co.th", "co.id",
+  "com.br", "com.mx", "com.ar", "com.cn", "com.tr", "com.sg", "com.hk",
+  "com.tw", "com.my", "com.ph", "com.pl", "com.ua", "com.vn", "com.eg",
+]);
+
+/**
+ * Top-level domains a *bare* piece of link text is allowed to be read as a
+ * domain name under.
+ *
+ * Without this, ordinary link text gets mistaken for a hostname and disclosed
+ * for nothing: `README.md`, `setup.sh` and `notes.io` are all a label, a dot and
+ * two letters. Every one of those is a false alarm on a link that was telling
+ * the truth, and false alarms are the failure mode this whole feature has to
+ * avoid.
+ *
+ * Text carrying an explicit `https://` or a leading `www.` skips this list
+ * entirely — that text is not ambiguous, it is a URL.
+ *
+ * The cost is a real one and worth naming: a bare-domain phish under a TLD not
+ * on this list is not disclosed. The list covers where the reader's money and
+ * accounts actually are, which is where the attack pays.
+ */
+const TEXT_DOMAIN_TLDS = new Set([
+  "com", "net", "org", "edu", "gov", "mil", "int", "info", "biz", "name",
+  "io", "co", "ai", "app", "dev", "cloud", "tech", "online", "site", "xyz",
+  "shop", "store", "live", "news", "blog", "link", "email", "bank", "finance",
+  "pay", "money", "cash", "credit", "insurance", "security", "support", "help",
+  "uk", "de", "fr", "jp", "cn", "ru", "nl", "ca", "au", "br", "in", "it",
+  "es", "se", "no", "dk", "fi", "ch", "at", "be", "pl", "pt", "ie", "nz",
+  "mx", "kr", "tw", "hk", "sg", "za", "il", "tr", "ua", "eu", "us",
+]);
+
+/** Host with a leading `www.` removed, lowercased. Never a trailing dot. */
+function bareHost(host: string): string {
+  const lower = host.trim().toLowerCase().replace(/\.+$/, "");
+  return lower.startsWith("www.") ? lower.slice(4) : lower;
+}
+
+/**
+ * The part of a host two different subdomains of one site share.
+ *
+ * `mail.example.com` and `click.example.com` are the same site; `example.com`
+ * and `example.com.evil.ru` are not, and the second is exactly what the naive
+ * "does the href contain the text" check would wave through.
+ */
+export function registrableDomain(host: string): string {
+  const labels = bareHost(host).split(".").filter(Boolean);
+  if (labels.length <= 2) return labels.join(".");
+  const lastTwo = labels.slice(-2).join(".");
+  return MULTI_LABEL_SUFFIXES.has(lastTwo)
+    ? labels.slice(-3).join(".")
+    : lastTwo;
+}
+
+/** Does this host carry a punycode label — i.e. is it a name that isn't ASCII? */
+function isPunycode(host: string): boolean {
+  return host
+    .toLowerCase()
+    .split(".")
+    .some((label) => label.startsWith("xn--"));
+}
+
+/**
+ * The host the anchor's *text* claims to go to, or `null` when it claims nothing.
+ *
+ * Runs through the URL parser rather than a regex once it has a candidate, so
+ * the comparison below is between two hosts the same parser produced — which is
+ * what makes a homograph in the text normalize to punycode and stop matching
+ * the name it is imitating.
+ */
+export function claimedHost(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 2048) return null;
+
+  /*
+   * Whitespace inside the text is only forgiven for something that already
+   * announced itself as a URL, where it is a long href wrapped across lines.
+   *
+   * Forgiving it everywhere is what turns a sentence into a false alarm:
+   * "Buy now — only at shop.com" closes up into one token, the URL parser reads
+   * the whole thing as a host, IDNA turns the dash and the words into a
+   * punycode label ending in `.com`, and a link that was telling the truth gets
+   * a warning on it.
+   */
+  const explicit = /^https?:\/\//i.test(trimmed);
+  if (!explicit && /\s/.test(trimmed)) return null;
+  const candidate = explicit ? trimmed.replace(/\s+/g, "") : `https://${trimmed}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  const host = bareHost(parsed.hostname);
+  // A URL parser accepts far more than a person writing a domain name means.
+  // `mailto:x@y.com` parses; so does a single word. Require something shaped
+  // like a hostname before treating the text as a claim at all.
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host)) return null;
+
+  if (explicit || trimmed.toLowerCase().startsWith("www.")) return host;
+  const tld = host.slice(host.lastIndexOf(".") + 1);
+  return TEXT_DOMAIN_TLDS.has(tld) ? host : null;
+}
+
+/**
+ * What, if anything, to tell the reader about where this link goes.
+ *
+ * `null` for the overwhelming majority of links, including every link in
+ * ordinary marketing mail — see [`LinkClaim`] for why that is the requirement
+ * rather than a shortfall.
+ */
+export function linkClaim(text: string, href: string | null | undefined): LinkClaim | null {
+  const url = externalUrl(href);
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  // Only a web link can misrepresent a destination this way. `mailto:` and
+  // `tel:` show their target in the text or they show nothing.
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+
+  const host = bareHost(parsed.hostname);
+  if (!host) return null;
+  if (isPunycode(host)) return { host, reason: "punycode" };
+
+  const claimed = claimedHost(text);
+  if (!claimed) return null;
+  return registrableDomain(claimed) === registrableDomain(host)
+    ? null
+    : { host, reason: "mismatch" };
+}
+
+/** Marks a disclosure this pass added, so the CSS can style it and we can skip it. */
+export const CLAIM_ATTR = "data-mach-link-host";
+
+/**
+ * One anchor the disclosure pass may annotate.
+ *
+ * Structural rather than a DOM type, for the same reason [`WideCandidate`] and
+ * [`BlockedImage`] are: the decision is the part worth testing, and the test
+ * suite runs without a WebView.
+ */
+export interface AnchorCandidate {
+  readonly text: string;
+  readonly href: string | null;
+  /** Already annotated by an earlier pass over the same document. */
+  readonly disclosed: boolean;
+  /** Put the real host next to the link, as text. Never as markup. */
+  disclose(host: string): void;
+}
+
+/**
+ * Annotate every link whose text disagrees with where it goes.
+ *
+ * Idempotent, because `MessageFrame` runs its DOM passes again on every resize.
+ * Returns how many anchors were annotated.
+ */
+export function discloseLinkTargets(anchors: Iterable<AnchorCandidate>): number {
+  let disclosed = 0;
+  for (const anchor of anchors) {
+    if (anchor.disclosed) continue;
+    const claim = linkClaim(anchor.text, anchor.href);
+    if (!claim) continue;
+    anchor.disclose(claim.host);
+    disclosed += 1;
+  }
+  return disclosed;
 }
 
 /* -------------------------------------------------------------------------- */

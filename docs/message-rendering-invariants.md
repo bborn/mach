@@ -34,7 +34,10 @@ five mailboxes. Assume the sender knows exactly how the sanitizer works.
    is inline styles — which is exactly why the CSS scrubber exists underneath.
 
    Note this is the *message frame* policy, and is stricter than the app-level
-   CSP in `tauri.conf.json`.
+   CSP in `tauri.conf.json`. A `srcdoc` document inherits its creator's policy
+   container, so the two intersect. `tauri.conf.json`'s `img-src` must keep
+   `https:` for "load remote images" to render anything; it has no plain
+   `http:`, so an http image in old mail does not load in either mode.
 
 ## Handling sanitizer output
 
@@ -92,6 +95,36 @@ five mailboxes. Assume the sender knows exactly how the sanitizer works.
    re-parses a string, because the strings in there are the sender's and the
    sanitizer has already had its one look at them.
 
+## The attack the sanitizer cannot touch
+
+10. **A link whose text names a different site than its `href` has to say so.**
+
+    Everything above is about stopping a message *doing* something. A phishing
+    link does nothing: it is a well-formed `https:` anchor, and it survives every
+    rule here intact because it has to — the reader asked to be shown their mail
+    and a link is mail. What makes it work is that the reader is shown the
+    anchor's text and the browser is given its `href`.
+
+    A browser has a status bar for this. A message frame cannot: no script runs
+    inside it (invariant 1) and WebKit will not run a hover listener attached
+    from the parent either, for the same reason it will not run the click one.
+    So the disclosure is put in the document before the reader looks at it, by
+    the parent, as an element — invariant 6 applies.
+
+    Two cases only, and the second half of that sentence is the requirement:
+
+    - the anchor's text is itself a URL or a bare domain naming a different
+      registrable domain than the `href`;
+    - the `href`'s host carries a punycode label, whatever the text says, since
+      a homograph renders as the name it is imitating.
+
+    `<a href="https://links.example.net/x">Update your payment method</a>` is
+    **not** disclosed. Marketing mail is nothing but redirectors behind prose,
+    and flagging those teaches the reader to ignore the flag by the third
+    newsletter of the morning. A link that claims nothing cannot be lying.
+
+    `linkClaim` in `src/lib/message-body.ts` is the whole decision.
+
 ## Behaviour
 
 7. **Auto-expand when new content is empty.** A body that is entirely quoted is
@@ -113,6 +146,20 @@ five mailboxes. Assume the sender knows exactly how the sanitizer works.
 - A `data:image/png` payload that is really something else is not
   content-sniffed. No network and no script execution in `<img>` context; the
   CSP `img-src` is the backstop.
+- A message link pointing at one of the app's own hosts — `localhost`,
+  `127.0.0.1`, `*.localhost` — is not external by `is_external_link`, so
+  `link_guard` lets it through instead of opening it, and nothing answers the
+  new-window request it becomes. That is a dead click, which invariant 9 says
+  must not happen. It is left alone because the hook cannot tell a message
+  frame's navigation from the app's own, and the app's own initial load in
+  development *is* `http://localhost`. Nothing worse than the dead click is
+  reachable: the frame's CSP is `default-src 'none'`, so no subresource fetch to
+  those hosts is possible, and every anchor carries `target="_blank"`.
+- The link disclosure's registrable-domain comparison is a short suffix list,
+  not the public suffix list. Getting it wrong can only cost a disclosure that
+  is not made, never a false one.
+- A bare-domain phish under a TLD outside `TEXT_DOMAIN_TLDS` is not disclosed.
+  The list is what keeps `README.md` and `setup.sh` from being read as domains.
 - Quote *attribution* detection is English-only (`On … wrote:`,
   `-----Original Message-----`). Non-English mail falls back to structural
   markers (`gmail_quote`, `blockquote type=cite`, Outlook ids), which covers
