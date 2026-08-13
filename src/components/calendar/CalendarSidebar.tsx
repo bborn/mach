@@ -5,6 +5,7 @@ import { useUiSession } from "@/components/prefs/PreferencesProvider";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { calendarFill, calendarInk, type CalendarColor } from "@/lib/calendar-palette";
+import { sameSolo, type Solo } from "@/lib/calendar-solo";
 import { cn } from "@/lib/utils";
 import { formatBinding } from "@/lib/keymap";
 import type { CalendarVisibility } from "@/lib/prefs";
@@ -21,9 +22,14 @@ interface SidebarProps {
   hidden: CalendarId[];
   colorFor: (id: CalendarId) => CalendarColor;
   dark: boolean;
-  soloAccount: AccountId | null;
+  /** What is soloed right now, account or calendar. See `lib/calendar-solo`. */
+  solo: Solo | null;
   onToggle: (id: CalendarId) => void;
-  onSolo: (id: AccountId | null) => void;
+  /**
+   * "Solo this." Whether that starts, moves or clears the solo is `nextSolo`'s
+   * decision, in the shell, so the rail and the keyboard cannot disagree.
+   */
+  onSolo: (target: Solo) => void;
   settings: CalendarSettings;
   onSettings: (next: CalendarSettings) => void;
 }
@@ -81,7 +87,7 @@ export function CalendarSidebar({
   hidden,
   colorFor,
   dark,
-  soloAccount,
+  solo,
   onToggle,
   onSolo,
   settings,
@@ -161,7 +167,7 @@ export function CalendarSidebar({
     <aside className="flex w-52 shrink-0 flex-col gap-2 overflow-y-auto border-r border-border bg-surface px-2 py-2">
       {groups.map(({ account, rows }, accountIndex) => {
         const isCollapsed = collapsed.includes(account.id);
-        const soloed = soloAccount === account.id;
+        const soloed = sameSolo(solo, { kind: "account", id: account.id });
         return (
           <div key={account.id} className="flex flex-col">
             <div className="flex items-center gap-1">
@@ -192,7 +198,8 @@ export function CalendarSidebar({
               {accountIndex < 5 && account.id >= 0 && (
                 <button
                   type="button"
-                  onClick={() => onSolo(soloed ? null : account.id)}
+                  onClick={() => onSolo({ kind: "account", id: account.id })}
+                  aria-pressed={soloed}
                   title={`${soloed ? "Show every account" : "Show only this account"} (${formatBinding(`s ${accountIndex + 1}`)})`}
                   className={cn(
                     "shrink-0 rounded-[3px] px-1 text-micro",
@@ -213,9 +220,11 @@ export function CalendarSidebar({
                   row={row}
                   accounts={accounts}
                   off={hidden.includes(row.calendar.id)}
+                  soloed={sameSolo(solo, { kind: "calendar", id: row.calendar.id })}
                   colorFor={colorFor}
                   dark={dark}
                   onToggle={onToggle}
+                  onSolo={onSolo}
                   onHide={hide}
                 />
               ))}
@@ -257,43 +266,70 @@ export function CalendarSidebar({
 }
 
 /**
- * One calendar's row: the toggle, and the × that takes it out of the list.
+ * One calendar's row: the toggle, the `solo` chip, and the × that takes it out
+ * of the list.
  *
- * Two buttons rather than one button with a second gesture on it. A row that
- * did one thing on click and another on some modifier would be a control with
- * an invisible half, and the modifier would be the half nobody found; two
- * buttons are two tab stops, two accessible names, and Space works on both.
+ * # Three buttons, and one of them also answers a modifier
  *
- * The × is drawn at zero opacity until the row is hovered or the button itself
- * is focused. It is in the accessibility tree and in the tab order throughout —
- * `opacity`, not `display` — so this is a way of keeping fifteen ×s off a rail
- * that has to stay readable, and not a way of hiding the control from anyone
- * arriving on it by keyboard.
+ * This used to read "two buttons rather than one button with a second gesture
+ * on it", and the reasoning still holds where it was aimed: a control whose
+ * second half exists only as ⌥-click is a control with an invisible half, and
+ * the modifier is the half nobody finds. So solo is a button — its own tab
+ * stop, its own accessible name, Space works on it — and it carries the same
+ * word the account heading above it already uses.
+ *
+ * ⌥-click on the row is then an accelerator for a thing that is already on
+ * screen, which is a different proposition from being the only way in. It is
+ * the gesture audio software has used for solo for thirty years and the one
+ * Google Calendar offers as "Display this only", and its keyboard twin is ⌥
+ * with the calendar's own digit — the same modifier, so the two are one thing
+ * to remember rather than two.
+ *
+ * # Faded, not absent
+ *
+ * `solo` and the × are drawn at zero opacity until the row is hovered or the
+ * button itself is focused. Both are in the accessibility tree and in the tab
+ * order throughout — `opacity`, not `display` — so this keeps thirty small
+ * controls off a rail that has to stay readable without hiding anything from
+ * someone arriving by keyboard.
+ *
+ * The soloed row is the exception: its chip stays lit and accent-filled with
+ * the pointer nowhere near it, because while one calendar is soloed the way
+ * back has to be visible without hunting for it.
  */
 function CalendarRowView({
   row,
   accounts,
   off,
+  soloed,
   colorFor,
   dark,
   onToggle,
+  onSolo,
   onHide,
 }: {
   row: CalendarRow;
   accounts: Account[];
   off: boolean;
+  soloed: boolean;
   colorFor: (id: CalendarId) => CalendarColor;
   dark: boolean;
   onToggle: (id: CalendarId) => void;
+  onSolo: (target: Solo) => void;
   onHide: (row: CalendarRow) => void;
 }) {
   const calendar = row.calendar;
   const label = calendarLabel(calendar);
+  const solo = () => onSolo({ kind: "calendar", id: calendar.id });
+  // ⌥ plus the calendar's own digit, which is what `CalendarMode` binds. Out
+  // past the ninth calendar there is no digit left, so the chip's tooltip drops
+  // the parenthetical rather than naming a key that does nothing.
+  const soloKeys = row.slot >= 0 && row.slot < 9 ? ` (${formatBinding(`alt+${row.slot + 1}`)})` : "";
   return (
     <div className="group flex items-center rounded-[3px] pl-4 pr-1 hover:bg-row-hover">
       <button
         type="button"
-        onClick={() => onToggle(calendar.id)}
+        onClick={(event) => (event.altKey ? solo() : onToggle(calendar.id))}
         // A row is a toggle, so it says so. The swatch is the state
         // indicator and a swatch cannot be read aloud.
         aria-pressed={!off}
@@ -339,6 +375,21 @@ function CalendarRowView({
         >
           {label}
         </span>
+      </button>
+      <button
+        type="button"
+        onClick={solo}
+        aria-pressed={soloed}
+        aria-label={soloed ? "Show every calendar" : `Show only ${label}`}
+        title={`${soloed ? "Show every calendar" : "Show only this calendar"}${soloKeys}`}
+        className={cn(
+          "shrink-0 rounded-[3px] px-1 text-micro focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          soloed
+            ? "bg-accent text-accent-foreground"
+            : "text-faint-foreground opacity-0 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100",
+        )}
+      >
+        solo
       </button>
       <button
         type="button"

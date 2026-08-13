@@ -1,6 +1,6 @@
 import { AlertTriangle, ChevronLeft, ChevronRight, Mail, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AccountId, CalendarEvent, CalendarId, EventId, Rsvp } from "@/types";
+import type { CalendarEvent, CalendarId, EventId, Rsvp } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useMach, viewRange, type CalendarView } from "@/hooks/useMach";
 import { usePreferences } from "@/components/prefs/PreferencesProvider";
@@ -17,6 +17,13 @@ import type { KeyBinding } from "@/lib/keymap";
 import { assignHues, FALLBACK_FILLS, fallbackFill, type CalendarColor } from "@/lib/calendar-palette";
 import { assignCalendarColors } from "@/lib/colors";
 import { mergeDuplicates, type MergedEvent } from "@/lib/calendar-merge";
+import {
+  accountSoloAt,
+  calendarSoloAt,
+  nextSolo,
+  soloEvents,
+  type Solo,
+} from "@/lib/calendar-solo";
 import {
   arrowCursor,
   inReadingOrder,
@@ -102,7 +109,17 @@ export function CalendarMode() {
   const contacts = useContacts();
 
   const [settings, setSettings] = useState<CalendarSettings>(() => loadSettings());
-  const [soloAccount, setSoloAccount] = useState<AccountId | null>(null);
+  /*
+   * The solo, and it is state rather than a preference on purpose.
+   *
+   * "Just show me this one" is a gesture you make and undo inside a minute. A
+   * solo that outlived a quit would come back the next morning as four accounts
+   * of calendars that appear to have vanished, with the only explanation a chip
+   * on one row of a rail you have no reason to be reading — which is the failure
+   * mode, not the feature. So it dies with the window, the way the account solo
+   * it extends always has.
+   */
+  const [solo, setSolo] = useState<Solo | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [createSeed, setCreateSeed] = useState<string | undefined>(undefined);
   const [dateOpen, setDateOpen] = useState(false);
@@ -212,14 +229,16 @@ export function CalendarMode() {
    * only three of five commands wrote to.
    */
   const inRange = useMemo(() => {
-    const soloed = soloAccount;
-    return visibleEvents.filter((event) => {
+    // `soloEvents` hands `visibleEvents` straight back when nothing is soloed,
+    // so the ordinary path is the filter below and nothing else. A *calendar*
+    // solo is the one case that reads `allEvents` — the whole projection, an
+    // unticked calendar included — see the note in `lib/calendar-solo`.
+    return soloEvents(solo, visibleEvents, allEvents).filter((event) => {
       if (event.start >= rangeEnd || event.end <= rangeStart) return false;
-      if (soloed !== null && event.accountId !== soloed) return false;
       if (!settings.showDeclined && event.rsvp === "declined") return false;
       return true;
     });
-  }, [visibleEvents, rangeStart, rangeEnd, soloAccount, settings.showDeclined]);
+  }, [visibleEvents, allEvents, rangeStart, rangeEnd, solo, settings.showDeclined]);
 
   const merged = useMemo(
     () =>
@@ -818,13 +837,33 @@ export function CalendarMode() {
     [calendars, dispatch],
   );
 
+  /*
+   * The one place a solo is decided, whatever asked for it.
+   *
+   * The rail's chips, ⌥-click on a row, `s <digit>` and ⌥<digit> all arrive
+   * here with a target and nothing else; `nextSolo` says whether that starts,
+   * moves or clears the solo. Before this the toggle was written twice — once
+   * in the sidebar's `onClick` and once in the key handler — which is two
+   * chances to disagree about what pressing solo on the soloed thing does.
+   */
+  const applySolo = useCallback((target: Solo) => {
+    setSolo((current) => nextSolo(current, target));
+  }, []);
+
   const soloAccountAt = useCallback(
     (index: number) => {
-      const account = accounts[index];
-      if (!account) return;
-      setSoloAccount((current) => (current === account.id ? null : account.id));
+      const target = accountSoloAt(accounts, index);
+      if (target) applySolo(target);
     },
-    [accounts],
+    [accounts, applySolo],
+  );
+
+  const soloCalendarAt = useCallback(
+    (index: number) => {
+      const target = calendarSoloAt(calendars, index);
+      if (target) applySolo(target);
+    },
+    [calendars, applySolo],
   );
 
   const openExternal = useCallback(
@@ -1240,6 +1279,33 @@ export function CalendarMode() {
         when: () => active,
         handler: () => soloAccountAt(i),
       })),
+      /*
+       * ⌥1–9 solos one calendar, and the modifier is the point.
+       *
+       * The rail's gesture is ⌥-click, so the keyboard twin is ⌥ with the
+       * calendar's own digit — the same modifier and the same number `v <digit>`
+       * already counts, which makes the pair one thing to remember instead of
+       * two unrelated chords. A sequence would have matched the shape of
+       * `v <digit>` and `s <digit>` more closely; it would also have had to be
+       * `s v <digit>` to stay unambiguous, and "S then V then 1" is wider than
+       * the shortcut sheet's key column and no easier to reach.
+       *
+       * ⌥<digit> is layout-independent here where ⇧⌘<digit> is not: the
+       * dispatcher reads the physical `Digit1` off `event.code` when Alt is
+       * held, because Option remaps the US number row to ¡™£¢∞§¶•ª. See
+       * `tokenFromEvent`.
+       *
+       * The composer dock binds the same keys for its tab strip at priority
+       * 110, and keeps them: while you are writing a message the number row is
+       * about composers, not about calendars.
+       */
+      ...Array.from({ length: 9 }, (_, i) => ({
+        keys: `alt+${i + 1}`,
+        group: i === 0 ? "Calendars" : undefined,
+        description: i === 0 ? "Show only calendar 1–9" : undefined,
+        when: () => active,
+        handler: () => soloCalendarAt(i),
+      })),
     ],
     [
       active,
@@ -1263,6 +1329,7 @@ export function CalendarMode() {
       finderOpen,
       openFinder,
       soloAccountAt,
+      soloCalendarAt,
       step,
       toggleCalendarAt,
       ui.eventId,
@@ -1422,9 +1489,9 @@ export function CalendarMode() {
           hidden={ui.hiddenCalendars}
           colorFor={colorFor}
           dark={dark}
-          soloAccount={soloAccount}
+          solo={solo}
           onToggle={(id) => dispatch({ type: "toggleCalendar", calendarId: id })}
-          onSolo={setSoloAccount}
+          onSolo={applySolo}
           settings={settings}
           onSettings={setSettings}
         />
