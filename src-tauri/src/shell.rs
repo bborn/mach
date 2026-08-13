@@ -79,6 +79,26 @@ pub fn is_qa_instance() -> bool {
     std::env::var_os("MACH_DATA_DIR").is_some()
 }
 
+/// Whether this QA instance is one the *owner* asked to see.
+///
+/// The invisibility below exists to stop an agent's window stealing the
+/// keyboard from the person using the machine. It is the right default and it
+/// is why several agents can drive real windows all day without anyone
+/// noticing. It is also absolute, and that turned out to be a hole: asked for a
+/// seeded instance to take screenshots in, he could not reach the window at all
+/// — no Dock tile, nothing in ⌘⇥, and `System Events` cannot so much as
+/// enumerate an `Accessory` process, so it cannot be raised from outside
+/// either.
+///
+/// So there is one way out, and it is deliberately not the default: a person
+/// setting `MACH_QA_FOREGROUND=1` on the command line is asking for a window
+/// they can use. Nothing an agent runs sets it, and the brief every agent is
+/// given forbids it — the protection is unchanged for the case it was built
+/// for.
+fn qa_wants_foreground() -> bool {
+    std::env::var("MACH_QA_FOREGROUND").is_ok_and(|v| v == "1")
+}
+
 /// Makes a QA instance invisible to the person using the machine.
 ///
 /// Two things are needed, and one alone is not enough. `Accessory` keeps the
@@ -96,8 +116,12 @@ pub fn apply_qa_policy<R: Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()>
         return Ok(());
     }
 
+    let foreground = qa_wants_foreground();
+
     #[cfg(target_os = "macos")]
-    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    if !foreground {
+        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    }
 
     // Labelled "main" so `capabilities/default.json` applies — capabilities are
     // keyed on the label, and a differently-named window silently loses its
@@ -106,7 +130,7 @@ pub fn apply_qa_policy<R: Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()>
         .title("Mach (QA)")
         .inner_size(1440.0, 900.0)
         .visible(true)
-        .focused(false)
+        .focused(foreground)
         .build()?;
 
     Ok(())

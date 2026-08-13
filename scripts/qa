@@ -625,7 +625,12 @@ cmd_up() {
     # Read at runtime by `qa::dev::apply`. The compiled-in devUrl is 1420 for
     # everybody, so without this a QA instance would load the owner's server —
     # and the app refuses to start rather than do that silently.
-    export MACH_DEV_URL="$(dev_url)"
+    #
+    # A caller may set it, and one reason to is `?fixtures`: the real window
+    # rendering invented mail, which is the only way to photograph the app for
+    # publication without photographing somebody's real inbox. The port is still
+    # checked below, so a hand-written value cannot aim at 1420 either.
+    export MACH_DEV_URL="${MACH_DEV_URL:-$(dev_url)}"
     exec "$LAUNCH_BIN" >"$LOG" 2>&1
   ) &
   echo $! >"$PIDFILE"
