@@ -1,13 +1,15 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type RefObject,
 } from "react";
 import { Image as ImageIcon, Paperclip, X } from "lucide-react";
-import { useKeyBindings } from "@/hooks/useKeymap";
+import { useKeyBindings, useKeymap } from "@/hooks/useKeymap";
+import { OVERLAY_KEY_FLOOR } from "@/lib/keymap";
 import { useGhostText } from "@/hooks/useGhostText";
 import { Kbd } from "@/components/ui/kbd";
 import { GhostHint, GhostText } from "@/components/ui/ghost";
@@ -55,6 +57,19 @@ interface ComposerProps {
   onSend: (scheduleAt?: number) => void;
   onClose: () => void;
   onDiscard: () => void;
+  /**
+   * The question is being asked about this draft, so the footer becomes it.
+   *
+   * A discard cannot be undone, so it is asked about — and the asking used to
+   * be a bar on the composer's *top* edge, roughly 460px above the control
+   * that raised it. From the writer's side, pressing `discard` painted nothing
+   * anywhere near his eye or his pointer, which reads as the click having
+   * missed. The answer belongs where the question was asked, so it is the
+   * footer's other state rather than a row of its own.
+   */
+  confirmingDiscard?: boolean;
+  /** Keep the draft: the answer that leaves everything exactly as it was. */
+  onKeepDraft?: () => void;
   /** Open the file panel. `inline` asks for the images to go in the body. */
   onAttach: (inline?: boolean) => void;
   onRemoveAttachment: (attachmentId: string) => void;
@@ -177,6 +192,8 @@ export function Composer({
   onSend,
   onClose,
   onDiscard,
+  confirmingDiscard = false,
+  onKeepDraft,
   onAttach,
   onRemoveAttachment,
   onSetInline,
@@ -255,6 +272,90 @@ export function Composer({
     onPopOut?.(editor.current?.caret() ?? null);
   }, [onPopOut]);
 
+  /* -------------------------------------------------------- the question */
+
+  const keymap = useKeymap();
+  const keepButton = useRef<HTMLButtonElement>(null);
+  /**
+   * What had the caret when the question was asked.
+   *
+   * The answer has to be reachable by keyboard, so the safe button takes
+   * focus — and a confirmation that takes the caret out of a half-written
+   * message and does not put it back is the bug it was meant to prevent,
+   * wearing a different hat. This is the way back.
+   */
+  const askedFrom = useRef<HTMLElement | null>(null);
+  /**
+   * And *where* in the message it was, if that is where it was.
+   *
+   * Focus and caret are two different things to give back. WebKit hands a
+   * contenteditable back at character zero however far into the paragraph the
+   * writer had got, so keeping only the element means Keep drops them at the
+   * top of their own draft and the next word they type lands there. An offset,
+   * for the reason `initialCaret` takes one — see `caret-offset.ts`.
+   */
+  const askedAt = useRef<number | null>(null);
+
+  /*
+   * A question about something unrecoverable owns the keyboard while it is up.
+   *
+   * Focus is on a button rather than in the message, so `isTypingTarget` is
+   * false and every shell binding — `e` archives, `x` ticks a row — would be
+   * live behind a question the writer has not answered yet. The claim silences
+   * everything below the overlay floor, which is the same thing every dialog in
+   * the app does through `Overlay`. The composer's own keys sit at or above
+   * that floor and survive: ⇧⌘⌫ again is the second press that means it.
+   *
+   * A layout effect, for the reason the overlay uses one: the claim has to be
+   * in force before anything can be typed at the row that has just appeared.
+   */
+  useLayoutEffect(() => {
+    if (!confirmingDiscard) return;
+    return keymap.claimKeyboard();
+  }, [confirmingDiscard, keymap]);
+
+  useEffect(() => {
+    if (!confirmingDiscard) return;
+    const had = document.activeElement as HTMLElement | null;
+    // Not the button this is about to focus: in StrictMode the effect runs
+    // twice on mount, and the second pass would record its own answer.
+    if (had !== keepButton.current) {
+      askedFrom.current = had;
+      // Read while the caret is still in the message. A moment later it is on
+      // a button and there is nothing left to read.
+      askedAt.current = editor.current?.caret() ?? null;
+    }
+    keepButton.current?.focus();
+  }, [confirmingDiscard]);
+
+  /**
+   * Keep the draft, and give the caret back where it was.
+   *
+   * An address field can have itself back directly — an input restores its own
+   * selection, and there are forty characters in it either way. The message
+   * cannot: it goes through the editor's handle, because Squire has to be
+   * *told* it has focus (see `focusAndAnnounce`) and because the offset is the
+   * only part of "where it was" that survives the round trip.
+   */
+  const keep = useCallback(() => {
+    onKeepDraft?.();
+    const was = askedFrom.current;
+    const at = askedAt.current;
+    askedFrom.current = null;
+    askedAt.current = null;
+    // A field by its tag rather than by `isContentEditable`, which is the same
+    // call `isTypingTarget` makes and the only one jsdom can answer.
+    const tag = was?.tagName?.toUpperCase();
+    const field =
+      was?.isConnected &&
+      was.closest?.("[data-mach-composer]") &&
+      (tag === "INPUT" || tag === "TEXTAREA")
+        ? was
+        : null;
+    if (field) field.focus();
+    else editor.current?.focus(at);
+  }, [onKeepDraft]);
+
   /* ------------------------------------------------------------ completion */
 
   const setField = (which: "to" | "cc" | "bcc") => (value: string) => {
@@ -277,6 +378,16 @@ export function Composer({
     active: !busy && !isReply && focus === "subject" && caretAtEnd,
   });
 
+  /*
+   * `!confirmingDiscard` on the keys below, and it is not redundant with the
+   * claim above.
+   *
+   * The claim silences everything under the overlay floor; the composer's own
+   * keys sit at or above it and survive, which is right for ⇧⌘⌫ — the second
+   * press that means it — and wrong for the rest. A question about whether this
+   * draft should exist that ⌘⏎ can send the draft out from under is not a
+   * question. So they wait for one of the two answers.
+   */
   useKeyBindings([
     {
       keys: COMPOSER_KEYS.send,
@@ -284,7 +395,7 @@ export function Composer({
       description: "Send",
       allowInInput: true,
       priority: 100,
-      when: () => active,
+      when: () => active && !confirmingDiscard,
       handler: () => send(),
     },
     {
@@ -293,7 +404,7 @@ export function Composer({
       description: "Schedule send",
       allowInInput: true,
       priority: 100,
-      when: () => active,
+      when: () => active && !confirmingDiscard,
       handler: () => setScheduling((open) => !open),
     },
     {
@@ -302,7 +413,7 @@ export function Composer({
       description: "Attach files",
       allowInInput: true,
       priority: 100,
-      when: () => active && !busy,
+      when: () => active && !busy && !confirmingDiscard,
       handler: () => onAttach(),
     },
     {
@@ -324,6 +435,25 @@ export function Composer({
       priority: 110,
       when: () => active && onPopOut !== undefined,
       handler: () => popOut(),
+    },
+    /*
+     * Escape answers the question before it answers anything else.
+     *
+     * Above the composer's own Escape, which closes the panel: while the
+     * question is up, the thing on screen that Escape is aimed at is the
+     * question. It cancels — a key that could confirm a discard by being
+     * pressed at the wrong moment is not a key, it is a trap — and hands the
+     * caret back. `allowInInput` because the answer must arrive whether the
+     * writer left the caret in the message or is on the button itself.
+     */
+    {
+      keys: COMPOSER_KEYS.close,
+      group: "Composer",
+      description: "Keep the draft",
+      allowInInput: true,
+      priority: OVERLAY_KEY_FLOOR + 30,
+      when: () => active && confirmingDiscard,
+      handler: () => keep(),
     },
     {
       keys: COMPOSER_KEYS.close,
@@ -551,72 +681,121 @@ export function Composer({
           It keeps its size while the message gives up as much as the panel
           asks for — see COMPOSER_FIXED_ROW. Named in the DOM because "is the
           footer still inside the panel" is a question worth being able to ask.
+
+          It has a second state, and it is the same row rather than a row of
+          its own: the question `discard` raises. Same box, same measure, same
+          height — so answering it costs no layout and the writer's eye does
+          not have to go anywhere. See `confirmingDiscard`.
+
+          The tint is the half a swap of words cannot do. Both states are a
+          line of micro type along the same edge, and read at a glance — which
+          is the only way this row is ever read — one line of small grey text
+          looks like the other. The band changes colour under the whole row, so
+          the eye that was on `discard` when it was clicked has an answer at the
+          point it was looking. It carries no padding of its own: the row may
+          not change height, or the message above it moves while being written.
         */}
         <div
           data-mach-composer-footer=""
           className={cn(
             COMPOSER_FIXED_ROW,
-            "mt-2 flex items-center gap-3 text-micro text-faint-foreground",
+            "mt-2 flex items-center gap-3 text-micro",
+            confirmingDiscard
+              ? "-mx-5 bg-danger/10 px-5 text-muted-foreground"
+              : "text-faint-foreground",
           )}
         >
-          <span className="inline-flex items-center gap-1">
-            <Kbd keys={COMPOSER_KEYS.send} /> send
-          </span>
-          <span className="inline-flex items-center gap-1">
-            <Kbd keys={COMPOSER_KEYS.schedule} /> later
-          </span>
-          {/* Not `onClick={onAttach}`: that hands the click event to `inline`. */}
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => onAttach()}
-            className="inline-flex items-center gap-1 hover:text-foreground"
-          >
-            <Paperclip className="size-3" /> attach
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onDiscard}
-            className="inline-flex items-center gap-1 hover:text-danger"
-          >
-            discard
-          </button>
-          {onPopOut && (
-            <button
-              type="button"
-              onClick={popOut}
-              className="inline-flex items-center gap-1 hover:text-foreground"
-            >
-              <Kbd keys={COMPOSER_KEYS.popOut} /> {poppedOut ? "put back" : "pop out"}
-            </button>
+          {confirmingDiscard ? (
+            <>
+              <span className="min-w-0 flex-1 truncate text-foreground">
+                Discard this draft?
+              </span>
+              {/*
+                Not where the pointer is. It has just clicked `discard`, a
+                third of the way along this row, and a destructive button under
+                a pointer that is already moving is a draft lost to a double
+                click. The answers sit at the far end of the same row, which is
+                also where the bar this replaced put them.
+              */}
+              <button
+                type="button"
+                onClick={onDiscard}
+                className="inline-flex shrink-0 items-center gap-1 text-danger hover:brightness-110"
+              >
+                <Kbd keys={COMPOSER_KEYS.discard} /> Discard
+              </button>
+              <button
+                ref={keepButton}
+                type="button"
+                onClick={keep}
+                className="inline-flex shrink-0 items-center gap-1 hover:text-foreground"
+              >
+                <Kbd keys={COMPOSER_KEYS.close} /> Keep
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="inline-flex items-center gap-1">
+                <Kbd keys={COMPOSER_KEYS.send} /> send
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <Kbd keys={COMPOSER_KEYS.schedule} /> later
+              </span>
+              {/* Not `onClick={onAttach}`: that hands the click event to `inline`. */}
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => onAttach()}
+                className="inline-flex items-center gap-1 hover:text-foreground"
+              >
+                <Paperclip className="size-3" /> attach
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={onDiscard}
+                className="inline-flex items-center gap-1 hover:text-danger"
+              >
+                discard
+              </button>
+              {onPopOut && (
+                <button
+                  type="button"
+                  onClick={popOut}
+                  className="inline-flex items-center gap-1 hover:text-foreground"
+                >
+                  <Kbd keys={COMPOSER_KEYS.popOut} /> {poppedOut ? "put back" : "pop out"}
+                </button>
+              )}
+              <span className="inline-flex items-center gap-1">
+                <Kbd keys={COMPOSER_KEYS.close} /> close
+              </span>
+              {/*
+                This used to read "draft saved as you type" whenever nothing was
+                happening — the software applauding itself for doing the one
+                thing a draft is for. A draft that saves itself should just save
+                itself. What is left is the state you cannot see and might act
+                on: a send already in flight, which is why the fields have gone
+                dead.
+              */}
+              {/*
+                A draft is written here and pushed to Gmail in the background,
+                so it is on his phone as well. When that push fails it is on
+                this Mac and nowhere else — which he would otherwise have no way
+                of knowing, and would find out by opening Gmail somewhere else
+                and seeing nothing. Google's own words on hover, because "why"
+                is a second question and only the first one is worth a line.
+              */}
+              {isLocalOnly(draft) && (
+                <span className="truncate text-danger" title={draft.remote?.error ?? undefined}>
+                  Not in Gmail
+                </span>
+              )}
+              {/* Not a legend: it says a suggestion is waiting, which is news. */}
+              <GhostHint shown={subjectGhost.suggestion !== ""} />
+              <span className="ml-auto truncate">{busy ? "Sending" : null}</span>
+            </>
           )}
-          <span className="inline-flex items-center gap-1">
-            <Kbd keys={COMPOSER_KEYS.close} /> close
-          </span>
-          {/*
-            This used to read "draft saved as you type" whenever nothing was
-            happening — the software applauding itself for doing the one thing
-            a draft is for. A draft that saves itself should just save itself.
-            What is left is the state you cannot see and might act on: a send
-            already in flight, which is why the fields have gone dead.
-          */}
-          {/*
-            A draft is written here and pushed to Gmail in the background, so
-            it is on his phone as well. When that push fails it is on this Mac
-            and nowhere else — which he would otherwise have no way of knowing,
-            and would find out by opening Gmail somewhere else and seeing
-            nothing. Google's own words on hover, because "why" is a second
-            question and only the first one is worth a line.
-          */}
-          {isLocalOnly(draft) && (
-            <span className="truncate text-danger" title={draft.remote?.error ?? undefined}>
-              Not in Gmail
-            </span>
-          )}
-          {/* Not a legend: it says a suggestion is waiting, which is news. */}
-          <GhostHint shown={subjectGhost.suggestion !== ""} />
-          <span className="ml-auto truncate">{busy ? "Sending" : null}</span>
         </div>
       </div>
     </div>

@@ -72,7 +72,18 @@ export function focusAndAnnounce(
 }
 
 export interface RichTextEditorHandle {
-  focus(): void;
+  /**
+   * Put the caret back in the message.
+   *
+   * `at` is an offset from `caret()`, and giving it is the difference between
+   * "the message has focus again" and "the caret is where I left it". WebKit
+   * does not restore a contenteditable's selection when focus comes back to it,
+   * so a bare `focus()` lands at character zero — which, to somebody who was
+   * mid-sentence, means the next thing they type appears at the top of the
+   * draft. Reached for whenever focus was taken away and is being handed back;
+   * see `confirmingDiscard` in `Composer`.
+   */
+  focus(at?: number | null): void;
   /** The current HTML, read straight out of the editor rather than from state. */
   html(): string;
   /**
@@ -292,14 +303,22 @@ export function RichTextEditor({
    * the active element and it does not already believe so, which makes this
    * safe to call from anywhere, as often as you like.
    */
-  const takeFocus = useCallback(() => {
+  const takeFocus = useCallback((at?: number | null) => {
     focusAndAnnounce(editor.current, root.current);
+    const node = root.current;
+    const instance = editor.current;
+    if (!node || !instance || at == null) return;
+    // The same two calls `initialCaret` makes after a document is loaded. A
+    // range that no longer addresses anything comes back null, and the caret
+    // stays wherever focus put it rather than throwing.
+    const range = caretRangeIn(node, at);
+    if (range) instance.setSelection(range);
   }, []);
 
   useImperativeHandle(
     handle,
     () => ({
-      focus: () => takeFocus(),
+      focus: (at?: number | null) => takeFocus(at),
       html: () => editor.current?.getHTML() ?? "",
       insert: (html: string) => {
         const instance = editor.current;
