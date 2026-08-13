@@ -3,16 +3,17 @@ import {
   containWideContent,
   externalUrl,
   frameDocument,
-  nextFrameHeight,
+  nextFrameSize,
   openExternal,
   readFrameTokens,
   reportLinkFailure,
+  resetFrameSize,
   revealBlockedImages,
   FRAME_SANDBOX,
   frameKeepsKey,
   FRAME_TOKENS,
+  INITIAL_FRAME_SIZE,
   MAX_FRAME_HEIGHT,
-  MIN_FRAME_HEIGHT,
   SCROLL_ATTR,
   type BodyFormat,
   type FrameTokens,
@@ -53,21 +54,18 @@ export interface MessageFrameProps {
  */
 export function MessageFrame({ html, allowRemoteImages, format, title }: MessageFrameProps) {
   const frameRef = useRef<HTMLIFrameElement>(null);
-  const [height, setHeight] = useState(MIN_FRAME_HEIGHT);
+  // The height, the tallest height applied to the document currently in the
+  // frame, and the width it was laid out at — one value, because the decision
+  // needs all three and the updater that makes it has to be pure. Keeping the
+  // peak in a ref and raising it from inside the updater is what clipped the
+  // last line of a message; [`nextFrameSize`] has the measurement.
+  const [size, setSize] = useState(INITIAL_FRAME_SIZE);
   const tokens = useThemeTokens();
 
   const srcDoc = useMemo(
     () => frameDocument({ html, allowRemoteImages, format, tokens }),
     [html, allowRemoteImages, format, tokens],
   );
-
-  // The tallest height applied to the document currently in the frame, and the
-  // width it was laid out at. `nextFrameHeight` refuses anything shorter than
-  // the peak, which is what makes the measure→resize→measure cycle terminate;
-  // a change of width is the one thing that may take it back down, and it can
-  // only come from the reader. Both are reset when the document is replaced.
-  const peak = useRef(MIN_FRAME_HEIGHT);
-  const laidOutAt = useRef(0);
 
   const measure = useCallback(() => {
     const frame = frameRef.current;
@@ -76,12 +74,13 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
 
     // The frame element's own width, which is 100% of the reading pane and so
     // never a function of the height we set. When it changes, the frame is in a
-    // new layout and the heights measured in the old one say nothing about it.
+    // new layout and the heights measured in the old one say nothing about it —
+    // `nextFrameSize` resets the peak on exactly that.
+    //
+    // It is not a rare event: a message tall enough to make the reading pane
+    // scroll takes a scrollbar's width off the frame partway through settling,
+    // and the body rewraps a line or two taller in the narrower box.
     const width = frame.clientWidth;
-    if (width !== laidOutAt.current) {
-      laidOutAt.current = width;
-      peak.current = MIN_FRAME_HEIGHT;
-    }
 
     /*
      * Three readings, because each one misses something the others catch.
@@ -103,11 +102,7 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
       Math.ceil(body?.getBoundingClientRect().height ?? 0),
       Math.ceil(root?.getBoundingClientRect().height ?? 0),
     );
-    setHeight((current) => {
-      const next = nextFrameHeight(current, measured, peak.current);
-      if (next !== current) peak.current = Math.max(peak.current, next);
-      return next;
-    });
+    setSize((current) => nextFrameSize(current, measured, width));
   }, []);
 
   /*
@@ -163,8 +158,7 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
     if (!doc) return;
 
     // A new document is new content, so the old heights say nothing about it.
-    peak.current = MIN_FRAME_HEIGHT;
-    laidOutAt.current = 0;
+    setSize(resetFrameSize);
 
     // Belt and braces: the authoritative reveal is the re-render with
     // `allowRemoteImages: true`, which also widens the frame CSP. This catches
@@ -247,7 +241,7 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
       referrerPolicy="no-referrer"
       onLoad={onLoad}
       className="block w-full border-0 bg-transparent"
-      style={{ height }}
+      style={{ height: size.height }}
     />
   );
 }
