@@ -1,11 +1,11 @@
-import { Calendar, Mail, PenLine, Video } from "lucide-react";
+import { Calendar, Mail, MapPin, PenLine, Video } from "lucide-react";
 import {
   artifactAction,
   eventWhen,
   guestLine,
   type Artifact,
 } from "@/lib/agent";
-import { joinUrl } from "@/lib/calendar-links";
+import { joinUrl, mapsUrl } from "@/lib/calendar-links";
 import { listTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
@@ -49,6 +49,9 @@ export function ArtifactCard({
   onOpenExternal?: (url: string) => void;
 }) {
   const join = artifact.kind === "event" ? joinUrl(artifact.conferenceUrl) : null;
+  // Same bargain as Join: its own control rather than a link inside the body,
+  // because nested interactive elements are invalid and unreachable.
+  const map = artifact.kind === "event" ? mapsUrl(artifact.location) : null;
 
   return (
     <div
@@ -88,6 +91,20 @@ export function ArtifactCard({
         >
           <Video size={11} strokeWidth={1.75} />
           Join
+        </button>
+      )}
+      {map && (
+        <button
+          type="button"
+          onClick={() => onOpenExternal?.(map)}
+          aria-label={`Map the address for ${artifact.label}`}
+          className={cn(
+            "flex shrink-0 items-center gap-1 border-l border-border px-2 text-micro text-accent",
+            "hover:bg-row-hover focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent",
+          )}
+        >
+          <MapPin size={11} strokeWidth={1.75} />
+          Map
         </button>
       )}
     </div>
