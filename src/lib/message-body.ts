@@ -652,6 +652,96 @@ export function nextFrameHeight(current: number, measured: number, peak: number)
   return next > peak ? next : current;
 }
 
+/**
+ * Everything the rule above needs, as one value.
+ *
+ * # Why the peak cannot live in a ref
+ *
+ * It did, and it cost the last line of a message.
+ *
+ * `MessageFrame` used to hold the height in state and the peak and the width in
+ * refs, and raise the peak *inside* the `setHeight` updater. That updater is
+ * therefore not a function of its argument: it reads a ref it also writes. React
+ * is allowed to call an updater more than once for a single update, and in
+ * `StrictMode` — which `main.tsx` mounts the app in — it always calls it twice.
+ * The second call sees the peak the first one just raised, so `next > peak` is
+ * now false, and it returns the height it was given instead of the one it just
+ * computed. React commits the last answer.
+ *
+ * Measured in the app, on a GitHub notification. The reading pane grows its own
+ * scrollbar once the message is tall enough, which narrows the frame from 579 to
+ * 569 and rewraps the body two lines taller:
+ *
+ *     w=569 m=2596 cur=2550 peak=2596 -> 2596     the growth, seen
+ *     w=569 m=2596 cur=2550 peak=2596 -> 2550     the same update, again
+ *
+ * The frame stayed at 2550 against 2596 of content, and the last line was cut
+ * through the middle. Nothing further re-measured, because nothing further
+ * changed: the frame had stopped growing, so the observer had stopped firing.
+ *
+ * So the peak stops being a side effect and becomes part of the value. This
+ * function is pure and idempotent — calling it twice on the same state with the
+ * same measurement gives the same answer as calling it once — which is exactly
+ * the property React asks an updater for and the one the ref could not have.
+ */
+export interface FrameSize {
+  /** The height applied to the frame. */
+  height: number;
+  /** The tallest height applied since the frame was last laid out at [`width`]. */
+  peak: number;
+  /** The frame's own width when that peak was set. 0 before the first measure. */
+  width: number;
+}
+
+export const INITIAL_FRAME_SIZE: FrameSize = {
+  height: MIN_FRAME_HEIGHT,
+  peak: MIN_FRAME_HEIGHT,
+  width: 0,
+};
+
+/**
+ * The size to apply next, given a fresh measurement and the width it was taken
+ * at.
+ *
+ * A width the peak was not established at is a new layout, and the heights
+ * measured in the old one say nothing about it — that is the one thing that lets
+ * a frame shrink, and it can only come from the reader dragging the splitter or
+ * resizing the window. See [`nextFrameHeight`] for why growth is otherwise the
+ * only direction.
+ *
+ * The peak records what was *applied*. A measurement refused as sub-pixel churn
+ * leaves it alone, so the first measurement after a width change cannot lock a
+ * frame at a height it never actually took.
+ *
+ * Returns `current` unchanged — by identity — when nothing moved, so a settled
+ * frame stops re-rendering.
+ */
+export function nextFrameSize(current: FrameSize, measured: number, width: number): FrameSize {
+  const peak = width === current.width ? current.peak : MIN_FRAME_HEIGHT;
+  const height = nextFrameHeight(current.height, measured, peak);
+  const next: FrameSize = {
+    height,
+    peak: height === current.height ? peak : Math.max(peak, height),
+    width,
+  };
+  return next.height === current.height && next.peak === current.peak && next.width === current.width
+    ? current
+    : next;
+}
+
+/**
+ * A new document in the frame. Its height is unknown until it is measured, and
+ * nothing measured against the document being replaced applies to it.
+ *
+ * The height already applied is kept rather than dropped to the floor: it is
+ * wrong, but it is wrong by less than 28px would be, and it is replaced on the
+ * first measurement of the new document either way.
+ */
+export function resetFrameSize(current: FrameSize): FrameSize {
+  if (current.width === 0 && current.peak === MIN_FRAME_HEIGHT) return current;
+  return { height: current.height, peak: MIN_FRAME_HEIGHT, width: 0 };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Width                                                                       */
 /* -------------------------------------------------------------------------- */

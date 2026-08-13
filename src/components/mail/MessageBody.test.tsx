@@ -23,16 +23,20 @@ import {
   localTextRender,
   mapRenderedMessage,
   nextFrameHeight,
+  nextFrameSize,
   reportLinkFailure,
+  resetFrameSize,
   revealBlockedImages,
   shouldAutoExpandQuote,
   subscribeLinkFailures,
   FRAME_HEIGHT_EPSILON,
   FRAME_SANDBOX,
+  INITIAL_FRAME_SIZE,
   LINK_FAILED_EVENT,
   MAX_FRAME_HEIGHT,
   MIN_FRAME_HEIGHT,
   type BlockedImage,
+  type FrameSize,
   type FrameTokens,
   type RenderedMessage,
   type WideCandidate,
@@ -466,24 +470,30 @@ describe("the wire payload", () => {
 // ---------------------------------------------------------------------------
 
 describe("the frame height rule", () => {
+  /** One width, held constant — what a settling document produces. */
+  const WIDTH = 600;
+
   /**
    * Run a measurement sequence the way `MessageFrame` does, at one width.
    *
-   * `MessageFrame` keeps the peak in a ref and resets it when the frame's own
-   * width changes; a sequence with no width change is exactly what a settling
-   * document produces.
+   * Every measurement goes through the `setSize` updater **twice** from the
+   * same base state, because that is what React does: `main.tsx` mounts the app
+   * in `StrictMode`, which double-invokes every state updater, and the value it
+   * commits is the last one returned. A rule that reads a peak it also writes
+   * gives two different answers to those two calls — see [`nextFrameSize`].
    */
   function settle(measurements: number[], start = MIN_FRAME_HEIGHT) {
-    let peak = MIN_FRAME_HEIGHT;
-    let height = start;
+    let size: FrameSize = { height: start, peak: MIN_FRAME_HEIGHT, width: WIDTH };
     const history: number[] = [];
     for (const measured of measurements) {
-      const next = nextFrameHeight(height, measured, peak);
-      if (next !== height) peak = Math.max(peak, next);
-      height = next;
-      history.push(height);
+      const once = nextFrameSize(size, measured, WIDTH);
+      const twice = nextFrameSize(size, measured, WIDTH);
+      // The whole point: the second call must not see anything the first did.
+      expect(twice).toEqual(once);
+      size = twice;
+      history.push(size.height);
     }
-    return { height, history };
+    return { height: size.height, history };
   }
 
   it("settles the two-value oscillation that caused the flicker", () => {
@@ -572,6 +582,103 @@ describe("the frame height rule", () => {
       height = nextFrameHeight(height, measured, MIN_FRAME_HEIGHT);
       expect(height).toBe(measured);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the last line of a GitHub notification
+//
+// The frame settled one or two lines shorter than its content and the final
+// line was cut through the middle. The arithmetic was right; the update was
+// applied twice. React calls a state updater more than once for one update —
+// always twice under `StrictMode`, which is how `main.tsx` mounts the app — and
+// the old updater raised the peak as a side effect, so the second call saw a
+// peak it had just raised, decided its own growth was not growth, and returned
+// the height it started with. React commits the last answer.
+//
+// These are that update, in the numbers WKWebView reported.
+// ---------------------------------------------------------------------------
+
+describe("a measurement React applies twice", () => {
+  /** The frame as it stood after first paint, before the pane grew a scrollbar. */
+  const settled: FrameSize = { height: 2550, peak: 2550, width: 579 };
+
+  it("keeps the growth the reading pane's own scrollbar caused", () => {
+    // The message is tall enough that the pane scrolls, which takes 10px off
+    // the frame and rewraps the body two lines taller. Nothing re-measures
+    // afterwards, because nothing changes afterwards: this one update is the
+    // only chance to be right.
+    const once = nextFrameSize(settled, 2596, 569);
+    expect(once.height).toBe(2596);
+
+    // Called again with the state it was called with the first time.
+    expect(nextFrameSize(settled, 2596, 569)).toEqual(once);
+
+    // And again with what the first call returned, which is what the next
+    // observer callback hands it.
+    expect(nextFrameSize(once, 2596, 569)).toBe(once);
+  });
+
+  it("gives the same answer however many times it is called", () => {
+    // Growth, a refused shrink, a width change, and sub-pixel churn — the four
+    // outcomes, each one asked for ten times over.
+    const cases: Array<[FrameSize, number, number]> = [
+      [settled, 2596, 569],
+      [settled, 1200, 579],
+      [settled, 1200, 700],
+      [settled, 2551, 579],
+      [{ height: 900, peak: 900, width: 400 }, 4000, 400],
+      [INITIAL_FRAME_SIZE, 2596, 569],
+    ];
+    for (const [state, measured, width] of cases) {
+      const first = nextFrameSize(state, measured, width);
+      for (let i = 0; i < 10; i++) {
+        expect(nextFrameSize(state, measured, width)).toEqual(first);
+      }
+      // Idempotent on its own output too, so a re-measure that found nothing
+      // new re-renders nothing.
+      expect(nextFrameSize(first, measured, width)).toBe(first);
+    }
+  });
+
+  it("still refuses to shrink at a width it has already been measured at", () => {
+    // The oscillation this rule exists for: a frame a pixel short grows a
+    // scrollbar, the scrollbar rewraps the body taller, and the height that
+    // fixes it is the height that caused it. Growth is still the only
+    // direction at a fixed width.
+    const grown = nextFrameSize(settled, 2596, 569);
+    expect(nextFrameSize(grown, 2550, 569).height).toBe(2596);
+    expect(nextFrameSize(grown, 4, 569).height).toBe(2596);
+  });
+
+  it("takes a new width as a new layout, and only then comes back down", () => {
+    // The reader drags the splitter. The peak from the old width is not
+    // evidence about the new one.
+    const wider = nextFrameSize(settled, 1800, 900);
+    expect(wider).toEqual({ height: 1800, peak: 1800, width: 900 });
+    // Twice, again: this is the path that resets the peak, so it is the path
+    // most easily broken by an updater that remembers anything.
+    expect(nextFrameSize(settled, 1800, 900)).toEqual(wider);
+  });
+
+  it("does not lock a frame at a height it never applied", () => {
+    // A first measurement at a new width that lands inside the epsilon is not
+    // an applied height, so it must not become the peak — otherwise the frame
+    // could never come down at the width the reader just dragged it to.
+    const nudged = nextFrameSize(settled, 2550, 700);
+    expect(nudged.height).toBe(2550);
+    expect(nextFrameSize(nudged, 1400, 700).height).toBe(1400);
+  });
+
+  it("forgets everything when the document is replaced", () => {
+    // A new message is new content. The height already applied is kept until
+    // the new document is measured — it is wrong, but by less than 28px would
+    // be — and the peak that would refuse a shorter message is dropped.
+    const fresh = resetFrameSize({ height: 2596, peak: 2596, width: 569 });
+    expect(fresh).toEqual({ height: 2596, peak: MIN_FRAME_HEIGHT, width: 0 });
+    expect(resetFrameSize(fresh)).toBe(fresh);
+    // A one-line reply in the frame a newsletter just left.
+    expect(nextFrameSize(fresh, 120, 569).height).toBe(120);
   });
 });
 
