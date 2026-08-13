@@ -333,6 +333,11 @@ export function buildItems(
 
   separate();
   push("Actions", "Archive", "Archive");
+  // Above Report spam, because it is the gentler of the two answers to the same
+  // complaint. It is offered on every row: the binding decides what it can
+  // honestly do when there is no offer, and `find` is what keeps the item from
+  // appearing at all if the key is ever taken away.
+  push("Actions", "Unsubscribe", "Unsubscribe");
   push("Actions", "Report spam", "Report spam", "danger");
   push("Actions", "Trash", "Trash", "danger");
 

@@ -362,6 +362,10 @@ function attachDigest(): void {
   if (!messages || !first) return;
   messages.length = 1;
   first.bodyText = DIGEST_BODY;
+  // Machine-generated mail from a sender the store believes in, which is
+  // exactly the case `unsub::rule` says yes to — so the reading pane's
+  // unsubscribe button has somewhere to appear in `bun run dev`.
+  first.unsubscribe = { offer: "unsubscribe", method: "oneClick" };
   const thread = built.threads.find((t) => t.id === DIGEST_THREAD_ID);
   if (thread) thread.messageCount = 1;
 }

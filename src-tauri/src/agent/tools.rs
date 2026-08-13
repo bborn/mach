@@ -112,11 +112,20 @@ impl Tool {
 /// RSVP argument. So the agent may propose it and the owner presses the button.
 /// Everything else in the catalogue is a label move nobody else can see.
 ///
+/// `unsubscribe` is the strongest case in the list. It is not undoable at all,
+/// the request reaches a stranger's server rather than Google's, and what it
+/// tells them is that this address is live and read. `crate::unsub::rule` is
+/// re-run in the command layer whoever asks, so an agent cannot talk the app
+/// into unsubscribing from something it would refuse a keystroke — but "the
+/// rule would have allowed it" is a different claim from "he wanted it", and
+/// this is the one command where getting that wrong cannot be taken back.
+///
 /// Names rather than a property on [`CommandSpec`] because "does this reach
 /// someone else" is a judgement about consequences, and the catalogue is owned
 /// by the command layer, not by this module.
 pub const APPROVAL_COMMANDS: &[&str] = &[
     "reportSpam",
+    "unsubscribe",
     "rsvp",
     "createEvent",
     "updateEvent",
@@ -255,6 +264,7 @@ fn property_for(param: &ParamSpec) -> Value {
             "minItems": 1,
         }),
         ParamType::EventId => json!({ "type": "integer" }),
+        ParamType::MessageId => json!({ "type": "integer" }),
         ParamType::Bool => json!({ "type": "boolean" }),
         ParamType::Timestamp => json!({ "type": "integer" }),
         ParamType::LabelId => json!({ "type": "string" }),

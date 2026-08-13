@@ -59,6 +59,7 @@ const SAMPLES: Record<CommandKind, Command> = {
   untrash: { kind: "untrash", threadIds: [1] },
   snooze: { kind: "snooze", threadIds: [1], until: 1 },
   unsnooze: { kind: "unsnooze", threadIds: [1] },
+  unsubscribe: { kind: "unsubscribe", messageId: 1 },
   rsvp: { kind: "rsvp", eventId: 1, response: "accepted" },
   createEvent: {
     kind: "createEvent",
@@ -90,6 +91,12 @@ const NOT_PROJECTED: Partial<Record<CommandKind, string>> = {
     "`run` draws the block from the draft the command already carries — see " +
     "`placeholderEvent` and `settledPendingEvents` — which is the same claim " +
     "made the only way a create can make it.",
+  unsubscribe:
+    "Unsubscribe changes no local row, because it is an outbound request to " +
+    "the sender rather than a change to the mailbox, so there is nothing to " +
+    "project and nothing to roll back. What the gesture does put on screen is " +
+    "the archive it fires alongside — see `unsubscribe` in `useMach` — and " +
+    "that command is projected in the ordinary way.",
 };
 
 /**

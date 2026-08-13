@@ -1368,6 +1368,12 @@ fn the_wire_sample_is_what_the_frontend_will_receive() {
         is_unread: true,
         is_draft: true,
         mach_draft_id: Some("draft-18f0c0ffee".into()),
+        // The `unsubscribe` half of the wire, with the shape that carries a
+        // payload. `reportSpam` is the other variant and is the one with no
+        // extra field to forget, so this is the sample worth pinning.
+        unsubscribe: Some(mach_lib::unsub::Offer::Unsubscribe {
+            method: "oneClick".into(),
+        }),
         // Filled in rather than `None`, and filled in with the *matched* shape:
         // the fields that only exist once the uid has found an event are the
         // ones a mapper is most likely to forget, and a `None` here would let

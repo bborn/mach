@@ -125,6 +125,7 @@ export function MailMode() {
         star: () => actions.starSelected(),
         trash: () => actions.trashSelected(),
         reportSpam: () => actions.reportSpamSelected(),
+        unsubscribe: () => actions.unsubscribe(),
         favorite: () => actions.toggleFavoriteFocused(),
         undo: () => actions.undo(),
       },

@@ -30,11 +30,13 @@ import {
   describeWakeFailure,
   failedIds,
   getDataSource,
-  isMailCommand,
+  isCalendarCommand,
+  FAILURE_LABELS,
   type Command,
   type CommandResult,
   type MailCommand,
 } from "@/lib/data";
+import { unsubscribeAction } from "@/components/mail/unsubscribe-offer";
 import {
   applyEventGuesses,
   applyGuess,
@@ -50,6 +52,7 @@ import {
   settledEventGuesses,
   settledGuesses,
   settledPendingEvents,
+  INBOX,
   READ_GUESS,
   type EventGuesses,
   type Guesses,
@@ -146,7 +149,31 @@ export interface StatusMessage {
    * carry, and the thing worth offering after it is ⇧⌘Z.
    */
   offer?: "undo" | "redo";
+  /**
+   * A button beside this message that is neither ⌘Z nor ⇧⌘Z.
+   *
+   * `offer` above names a *traversal*, and everything about how it renders —
+   * its word, its sentence, its binding — is read back off the undo stack,
+   * which is what keeps it from ever promising a step the stack no longer has.
+   * That is the whole of what it can express, and one message needs more: an
+   * unsubscribe the sender refused has one thing left to try, and it is not on
+   * any stack. So the message carries the button itself.
+   *
+   * Rare, and it should stay rare. A status with a button of its own is a small
+   * dialog in the corner of the window, and the reason there is one here is
+   * that the alternative was a failure with nothing to do about it.
+   */
+  action?: StatusAction;
   tone: "info" | "error";
+}
+
+/** The button a {@link StatusMessage} carries, when it carries one. */
+export interface StatusAction {
+  /** The word on it — "Open page". */
+  word: string;
+  /** The whole sentence, for the accessible name and the tooltip. */
+  title: string;
+  run: () => void;
 }
 
 /**
@@ -187,6 +214,19 @@ export const TOAST_MAX_MS = 6_000;
 export function statusLifetime(status: StatusMessage, undoWindow: number): number {
   const base = Math.min(undoWindow, TOAST_MAX_MS);
   return status.tone === "error" ? base * ERROR_HOLD : base;
+}
+
+/**
+ * "Could not unsubscribe from Whiny Nil — Google refused".
+ *
+ * `describeResult` is the wrong sentence for this one: it counts ids, and an
+ * unsubscribe addresses no row, so it would report "0 failed". What matters is
+ * which list is still sending and why the request did not land.
+ */
+export function unsubscribeRefusal(result: CommandResult, sender: string): string {
+  const failure = result.failed[0];
+  const reason = failure?.message || FAILURE_LABELS[failure?.kind ?? "unexpected"];
+  return `Could not unsubscribe from ${sender} — ${reason}`;
 }
 
 interface UiState {
@@ -706,6 +746,33 @@ export interface MachActions {
    * is exact and it goes on the stack ⌘Z reads.
    */
   reportSpamSelected: () => void;
+  /**
+   * ⌘⇧U — ask the sender of the open conversation to stop.
+   *
+   * It takes no argument, and that is the design rather than a convenience.
+   * Which message of a conversation carries the usable `List-Unsubscribe` is a
+   * real question with a real answer — see `unsubscribeAction` in
+   * `components/mail/unsubscribe-offer.ts` — and if the reading pane's button,
+   * the key and the ⌘K entry each answered it for themselves, three surfaces
+   * would eventually disagree about which sender they were writing to.
+   *
+   * Three outcomes, and the offer Rust computed decides which:
+   *
+   *  * `reportSpam` — the header is there and nothing vouches for the sender,
+   *    so the honest gesture is Gmail's spam report. Nothing is unsubscribed
+   *    from; an unsubscribe would confirm to a stranger that the address is
+   *    read.
+   *  * `unsubscribe` by `link` — a page only a person can complete, opened in
+   *    the browser from Rust. No command is dispatched.
+   *  * `unsubscribe` by `oneClick` or `mail` — the conversation is archived
+   *    (which is the half ⌘Z can take back) and the request goes out behind it.
+   *
+   * The request itself is not awaited. It has no inverse and it is somebody
+   * else's server, so making the keyboard wait for it would be paying a
+   * stranger's latency for an action whose whole point is to stop thinking
+   * about them.
+   */
+  unsubscribe: () => void;
   starSelected: () => void;
   /**
    * Snooze to a named instant.
@@ -1520,6 +1587,17 @@ export function MachProvider({ children }: { children: ReactNode }) {
         quiet?: boolean;
         reselectFailed?: boolean;
         label?: string;
+        /**
+         * What the ⌘Z entry should say, when `label` would overstate it.
+         *
+         * The caller's half of {@link CommandResult.undoLabel}, and it exists
+         * for one gesture: unsubscribing archives the conversation and then
+         * asks the sender to stop, and the toast has to name the second thing
+         * while ⌘Z can only take back the first. Without this the undo entry
+         * inherits `label` and offers to undo an unsubscribe, which is a
+         * promise nothing in the app can keep.
+         */
+        undoLabel?: string;
         projected?: boolean;
         /**
          * Told about a command that did not entirely succeed.
@@ -1583,7 +1661,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
         // nothing else refetches that window. Without this, `z` on a deleted
         // event puts it back on Google and in SQLite and leaves the grid empty —
         // undo that reports success and visibly does nothing.
-        if (!isMailCommand(command)) setEventsKey((k) => k + 1);
+        if (isCalendarCommand(command)) setEventsKey((k) => k + 1);
         /*
          * The exact inverse of what was drawn above, and it is the whole of it:
          * the write did not happen, so the block goes back to where it was and
@@ -1660,7 +1738,8 @@ export function MachProvider({ children }: { children: ReactNode }) {
          * conversations. See `CommandResult.undoLabel`.
          */
         const undoLabel =
-          options.label && result.ok ? options.label : result.undoLabel ?? message;
+          (result.ok ? options.undoLabel : undefined) ??
+          (options.label && result.ok ? options.label : result.undoLabel ?? message);
         if (!options.quiet || !result.ok) {
           dispatchUi({
             type: "status",
@@ -1868,7 +1947,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
      * flag did: archiving from a label the conversation still carries does not
      * take the row anywhere, and the cursor should not jump as though it had.
      */
-    const bulk = (command: MailCommand, label?: string) => {
+    const bulk = (command: MailCommand, label?: string, undoLabel?: string) => {
       const ids = command.threadIds;
       if (ids.length === 0) return;
       const leaving = leavingIds(command, visibleThreads, ui.labelId);
@@ -1879,7 +1958,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "selection", selection: clearSelection(ui.selection) });
       // Synchronous up to its first `await`, so the rows are gone in the same
       // React batch as the cursor move above rather than a frame after it.
-      void run(command, { reselectFailed: true, label });
+      void run(command, { reselectFailed: true, label, undoLabel });
     };
 
     const pin = (favorite: Favorite) => {
@@ -2006,6 +2085,127 @@ export function MachProvider({ children }: { children: ReactNode }) {
       trashSelected: () => bulk({ kind: "trash", threadIds: commandTargetIds }),
       reportSpamSelected: () =>
         bulk({ kind: "reportSpam", threadIds: commandTargetIds }),
+      unsubscribe: () => {
+        const thread = visibleDetail?.thread;
+        const target = visibleDetail ? unsubscribeAction(visibleDetail.messages) : null;
+        /*
+         * Quietly, and with one line rather than none.
+         *
+         * Almost every conversation in a mailbox has no `List-Unsubscribe`, so
+         * the key and the ⌘K entry will be pressed against one sooner or later.
+         * An error would be wrong — nothing failed — and silence reads as a
+         * dropped keystroke, which is the thing that makes people press a key
+         * twice.
+         */
+        if (!thread || !target) {
+          dispatch({
+            type: "status",
+            status: { message: "No unsubscribe offered here", tone: "info" },
+          });
+          return;
+        }
+
+        // It looks like spam rather than like a newsletter, so this is the
+        // whole gesture: report it, and never confirm the address to whoever
+        // sent it. `reportSpam` has an exact inverse, so ⌘Z covers all of it.
+        if (target.offer.offer === "reportSpam") {
+          bulk({ kind: "reportSpam", threadIds: [thread.id] });
+          return;
+        }
+
+        const openPage = () => {
+          void getDataSource()
+            .openUnsubscribePage(target.messageId)
+            .catch((caught) =>
+              dispatch({
+                type: "status",
+                status: { message: toMailboxError(caught).message, tone: "error" },
+              }),
+            );
+        };
+
+        /**
+         * The failure, said out loud, with the one thing left to try beside it.
+         *
+         * A refused unsubscribe is the case worth being careful about: the
+         * conversation is already archived, the request went nowhere, and the
+         * sender goes on sending. The page is not a consolation prize — for a
+         * `mailto:` list Google would not send to, it is usually the route that
+         * works.
+         */
+        const refused = (message: string) =>
+          dispatch({
+            type: "status",
+            status: {
+              message,
+              tone: "error",
+              action: {
+                word: "Open page",
+                title: `Open ${target.sender}'s unsubscribe page`,
+                run: openPage,
+              },
+            },
+          });
+
+        // A link is a page with a form on it. Rust will not act on one and
+        // neither will this: the URL never reaches the webview, so the id goes
+        // out and the browser is what opens.
+        if (target.offer.method === "link") {
+          openPage();
+          return;
+        }
+
+        /*
+         * The acknowledgement, and it is the archive.
+         *
+         * The row leaves the list in the frame the keystroke produced, because
+         * `run` projects before its first `await` — so the conversation is gone
+         * long before the sender has answered. `undoLabel` is what keeps the
+         * ⌘Z entry honest: the toast says the unsubscribe is on its way, and
+         * the button beside it offers back the one thing that can be given
+         * back.
+         */
+        const inInbox = thread.labelIds.includes(INBOX);
+        if (inInbox) {
+          bulk(
+            { kind: "archive", threadIds: [thread.id] },
+            `Unsubscribing from ${target.sender}…`,
+            "Archived 1 conversation",
+          );
+        } else {
+          dispatch({
+            type: "status",
+            status: { message: `Unsubscribing from ${target.sender}…`, tone: "info" },
+          });
+        }
+
+        /*
+         * Fired, not awaited — and executed here rather than through `run`.
+         *
+         * There is nothing for `run` to do with it: no guess to project, no
+         * inverse to record, and its own failure line has to carry a button
+         * that the generic path has no way to attach. `projection-coverage`
+         * allows this file to execute for exactly that reason, and the
+         * exemption is written down in `NOT_PROJECTED`.
+         */
+        void getDataSource()
+          .execute({ kind: "unsubscribe", messageId: target.messageId })
+          .then((result) => {
+            if (result.ok) {
+              dispatch({
+                type: "status",
+                status: { message: `Unsubscribed from ${target.sender}`, tone: "info" },
+              });
+              return;
+            }
+            refused(unsubscribeRefusal(result, target.sender));
+          })
+          .catch((caught) =>
+            refused(
+              `Could not unsubscribe from ${target.sender} — ${toMailboxError(caught).message}`,
+            ),
+          );
+      },
       snoozeSelected: (until) =>
         bulk(
           { kind: "snooze", threadIds: commandTargetIds, until },
@@ -2183,6 +2383,9 @@ export function MachProvider({ children }: { children: ReactNode }) {
     ui.focus,
     selectedIndex,
     visibleThreads,
+    // `unsubscribe` resolves which message carries the offer out of the open
+    // conversation, so the action has to be rebuilt when that conversation is.
+    visibleDetail,
     listIds,
     commandTargetIds,
     viewFavorite,

@@ -117,6 +117,17 @@ pub fn prepare_message(account_id: i64, msg: &g::Message) -> PreparedMessage {
             internal_date: msg.internal_date_ms().unwrap_or(0),
             is_unread: label_ids.iter().any(|l| l == "UNREAD"),
             is_draft: label_ids.iter().any(|l| l == "DRAFT"),
+            // The list headers, kept verbatim. They are the whole input to
+            // `unsub::rule`, which decides — when a conversation is opened, from
+            // rows, with no request — whether Mach may offer to unsubscribe.
+            // Empty is filtered to `None` so a sender who wrote the header and
+            // left it blank reads the same as one who never wrote it.
+            list_unsubscribe: msg.header("List-Unsubscribe").filter(|s| !s.trim().is_empty()),
+            list_unsubscribe_post: msg
+                .header("List-Unsubscribe-Post")
+                .filter(|s| !s.trim().is_empty()),
+            list_id: msg.header("List-Id").filter(|s| !s.trim().is_empty()),
+            precedence: msg.header("Precedence").filter(|s| !s.trim().is_empty()),
         },
         attachments,
         label_ids,

@@ -305,6 +305,11 @@ impl Outbox {
             internal_date: now_ms,
             is_unread: false,
             is_draft: false,
+            // Mail Mach sent carries no list headers.
+            list_unsubscribe: None,
+            list_unsubscribe_post: None,
+            list_id: None,
+            precedence: None,
         };
 
         self.db.write(|conn| {

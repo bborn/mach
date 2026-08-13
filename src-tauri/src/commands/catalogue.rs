@@ -24,6 +24,9 @@ pub enum ParamType {
     ThreadIds,
     /// A local event row id.
     EventId,
+    /// A local message row id. Distinct from a thread id: the two are separate
+    /// tables with overlapping ranges, so a command that takes one must say so.
+    MessageId,
     Bool,
     /// Unix milliseconds.
     Timestamp,
@@ -331,6 +334,19 @@ pub(crate) const CATALOGUE: &[CommandSpec] = &[
             NOTIFY,
         ],
         undoable: true,
+        batch: false,
+    },
+    CommandSpec {
+        kind: "unsubscribe",
+        summary: "Leave the mailing list a message came from. Cannot be undone, and is refused \
+                  for anything that looks like spam rather than a newsletter.",
+        params: &[ParamSpec {
+            name: "messageId",
+            ty: ParamType::MessageId,
+            required: true,
+            description: "The message carrying the List-Unsubscribe header.",
+        }],
+        undoable: false,
         batch: false,
     },
 ];

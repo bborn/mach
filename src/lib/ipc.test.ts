@@ -629,6 +629,66 @@ describe("requests", () => {
     expect(detail?.messages[1]?.isDraft).toBe(true);
   });
 
+  /*
+   * The wire is the sender's word for the header and Rust's word for what may
+   * be done about it, and only the second is trustworthy. An `offer` this build
+   * does not recognise reaches `ReadingPane` as a button with no label and
+   * `useMach` as a branch that falls through to nothing — a control on screen
+   * that does not work. Dropping it means the button is simply not offered.
+   */
+  it("drops an unsubscribe offer it does not recognise", () => {
+    expect(
+      mapMessage({
+        id: 900,
+        threadId: 41,
+        accountId: 2,
+        unsubscribe: { offer: "openTheirPreferencesCentre" },
+      } as never).unsubscribe,
+    ).toBeUndefined();
+
+    // Absent is the ordinary case: almost no message carries one at all.
+    expect(mapMessage({ id: 900, threadId: 41, accountId: 2 } as never).unsubscribe).toBeUndefined();
+    expect(
+      mapMessage({ id: 900, threadId: 41, accountId: 2, unsubscribe: null } as never).unsubscribe,
+    ).toBeUndefined();
+  });
+
+  it("carries an offer it does recognise, both faces of it", () => {
+    expect(
+      mapMessage({
+        id: 900,
+        threadId: 41,
+        accountId: 2,
+        unsubscribe: { offer: "unsubscribe", method: "oneClick" },
+      } as never).unsubscribe,
+    ).toEqual({ offer: "unsubscribe", method: "oneClick" });
+
+    expect(
+      mapMessage({
+        id: 901,
+        threadId: 41,
+        accountId: 2,
+        unsubscribe: { offer: "reportSpam", reason: "notBulkMail" },
+      } as never).unsubscribe,
+    ).toEqual({ offer: "reportSpam", reason: "notBulkMail" });
+  });
+
+  /*
+   * A `method` from a newer backend is not a reason to withhold the offer: the
+   * offer is still true, and `link` is the reading of it that acts on nobody's
+   * behalf — it opens a page and lets a person finish the job.
+   */
+  it("reads an unknown method as a link rather than as no offer at all", () => {
+    expect(
+      mapMessage({
+        id: 900,
+        threadId: 41,
+        accountId: 2,
+        unsubscribe: { offer: "unsubscribe", method: "smokeSignal" },
+      } as never).unsubscribe,
+    ).toEqual({ offer: "unsubscribe", method: "link" });
+  });
+
   it("keeps the snippet beside the body, because they disagree when it matters", async () => {
     // The fifth field this mapper has eaten, and the reason it is now its own
     // property rather than a fallback folded into `bodyText`: some mailers put

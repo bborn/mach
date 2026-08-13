@@ -135,7 +135,8 @@ export const READ_GUESS: ThreadGuess = { add: [], remove: [UNREAD], unread: fals
  * the row is loaded.
  *
  * Returns `null` for a calendar command, which has no effect on any list of
- * conversations, and for an empty target set.
+ * conversations, for `unsubscribe`, which changes no local row at all, and for
+ * an empty target set.
  */
 export function project(
   command: Command,
@@ -654,10 +655,15 @@ function patchFields(patch: EventPatch): EventFields | null {
   return Object.keys(fields).length > 0 ? fields : null;
 }
 
-/** The ids a calendar command's guess is about. Empty for a mail command. */
+/**
+ * The ids a calendar command's guess is about. Empty for everything else.
+ *
+ * Read off the field rather than off the `kind`: `createEvent` has no id yet,
+ * and neither a mail command nor `unsubscribe` names an event at all, so the
+ * one question worth asking is whether the command carries one.
+ */
 export function guessedEventIds(command: Command): EventId[] {
-  if (isMailCommand(command) || command.kind === "createEvent") return [];
-  return [command.eventId];
+  return "eventId" in command ? [command.eventId] : [];
 }
 
 /*

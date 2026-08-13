@@ -102,6 +102,25 @@ describe("inverses", () => {
     expect(inverseOf({ kind: "rsvp", eventId: 1, response: "declined" })).toBeUndefined();
   });
 
+  /*
+   * The one command in the vocabulary that nothing anywhere can reverse. The
+   * others above are missing an inverse because the state that would build one
+   * lives in the command layer; this one has no inverse to build. `undefined`
+   * is this function's spelling of "there is none" — `CommandResult.undo` is
+   * optional rather than nullable, so a `null` here could not be carried.
+   */
+  it("claims no inverse for unsubscribe, which has left the machine", () => {
+    expect(inverseOf({ kind: "unsubscribe", messageId: 512 })).toBeUndefined();
+    expect(inverseOf({ kind: "unsubscribe", messageId: 512 }) ?? null).toBeNull();
+  });
+
+  it("addresses no local row with an unsubscribe", () => {
+    // Its `messageId` says which header to use, not which row to change, so
+    // nothing in `applied`, `failed` or the projection is keyed by it.
+    expect(targetIds({ kind: "unsubscribe", messageId: 512 })).toEqual([]);
+    expect(isMailCommand({ kind: "unsubscribe", messageId: 512 })).toBe(false);
+  });
+
   it("carries an exact restore set when the command layer supplies one", () => {
     const undo: Command = {
       kind: "unarchive",

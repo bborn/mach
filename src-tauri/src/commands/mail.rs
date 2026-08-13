@@ -521,13 +521,14 @@ async fn build_plans(
             // function — `CommandDispatcher::execute` routes it away first —
             // but the match has to be total, and saying so is cheaper than a
             // wildcard that would swallow a future mail command.
-            Command::Rsvp { .. }
+            Command::Unsubscribe { .. }
+            | Command::Rsvp { .. }
             | Command::CreateEvent { .. }
             | Command::UpdateEvent { .. }
             | Command::DeleteEvent { .. }
             | Command::MoveEvent { .. } => {
                 return Err(CommandError::Invalid {
-                    message: format!("{} is not a mail command", command.kind()),
+                    message: format!("{} is not a label change", command.kind()),
                 })
             }
         };
@@ -715,7 +716,10 @@ fn inverse(command: &Command, changed: &[&ThreadPlan]) -> Option<Command> {
                 until: wakes[0],
             }
         }
-        Command::Rsvp { .. }
+        // Unsubscribe has no inverse and never reaches here; the others are
+        // the calendar half, which builds its own.
+        Command::Unsubscribe { .. }
+        | Command::Rsvp { .. }
         | Command::CreateEvent { .. }
         | Command::UpdateEvent { .. }
         | Command::DeleteEvent { .. }
@@ -757,6 +761,9 @@ fn describe(command: &Command, n: usize) -> String {
         Command::Snooze { .. } => format!("Snoozed {subject}"),
         Command::Unsnooze { .. } => format!("Un-snoozed {subject}"),
         Command::Rsvp { .. } => "RSVP sent".to_string(),
+        // Not reachable: `commands::unsubscribe` writes its own message, and
+        // this one counts conversations, which an unsubscribe does not touch.
+        Command::Unsubscribe { .. } => "Unsubscribed".to_string(),
         // Not reachable: `commands::calendar` writes its own messages.
         Command::CreateEvent { .. }
         | Command::UpdateEvent { .. }

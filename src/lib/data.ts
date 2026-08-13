@@ -27,6 +27,7 @@ import type {
   Label,
   LabelId,
   MailFilter,
+  MessageId,
   Participant,
   Rsvp,
   SyncStatus,
@@ -161,6 +162,19 @@ export type Command =
   | { kind: "untrash"; threadIds: ThreadId[]; restore?: ThreadLabelState[] }
   | { kind: "snooze"; threadIds: ThreadId[]; until: number }
   | { kind: "unsnooze"; threadIds: ThreadId[] }
+  /**
+   * Ask the sender to stop, using the `List-Unsubscribe` header on one message.
+   *
+   * The only command in the vocabulary that names a message rather than a set
+   * of conversations, and the only one with no inverse: it is an outbound
+   * request to somebody else's server — an RFC 8058 POST, or a `mailto:`
+   * unsubscribe — and nothing here can un-send it. It changes no local row
+   * either, which is why `lib/projection.ts` has nothing to say about it.
+   *
+   * Rust refuses to act for `method: "link"`, and so does the UI: a link is a
+   * page a person has to complete. `openUnsubscribePage` is that route.
+   */
+  | { kind: "unsubscribe"; messageId: MessageId }
   | {
       kind: "rsvp";
       eventId: EventId;
@@ -200,24 +214,40 @@ export type CalendarCommandKind = (typeof CALENDAR_COMMAND_KINDS)[number];
 
 export type CalendarCommand = Extract<Command, { kind: CalendarCommandKind }>;
 
-/** The commands that take a list of threads — i.e. everything but the calendar. */
-export type MailCommand = Exclude<Command, { kind: CalendarCommandKind }>;
+/**
+ * The commands that take a list of conversations.
+ *
+ * Read off the field rather than off the `kind`, which it did not used to be:
+ * "everything that is not a calendar command" was the same set for as long as
+ * every non-calendar command carried `threadIds`, and `unsubscribe` is the
+ * first that does not. Extracting on the field means a command that names
+ * something else is excluded by construction rather than by a list somebody has
+ * to remember to add to.
+ */
+export type MailCommand = Extract<Command, { threadIds: ThreadId[] }>;
 
 const CALENDAR_KINDS = new Set<string>(CALENDAR_COMMAND_KINDS);
 
 export function isMailCommand(command: Command): command is MailCommand {
-  return !CALENDAR_KINDS.has(command.kind);
+  return "threadIds" in command;
+}
+
+export function isCalendarCommand(command: Command): command is CalendarCommand {
+  return CALENDAR_KINDS.has(command.kind);
 }
 
 /**
- * The ids a command addresses, whichever half of the vocabulary it is from.
+ * The ids a command addresses, whichever part of the vocabulary it is from.
  *
- * A create has none: the row it makes does not exist until it has run, and
- * `CommandResult.applied` is where the new id comes back.
+ * Two commands have none. A create's row does not exist until it has run, and
+ * `CommandResult.applied` is where the new id comes back. `unsubscribe`
+ * addresses no local row at all — its `messageId` says which header to use, not
+ * which row to change — so an empty list is the honest answer rather than a
+ * shortcoming of this function.
  */
 export function targetIds(command: Command): number[] {
   if (isMailCommand(command)) return command.threadIds;
-  return command.kind === "createEvent" ? [] : [command.eventId];
+  return "eventId" in command ? [command.eventId] : [];
 }
 
 /** Why a remote call failed, in the categories a caller can act on. */
@@ -336,6 +366,16 @@ export function inverseOf(command: Command): Command | undefined {
       return { ...command, starred: !command.starred };
     case "label":
       return { ...command, add: !command.add };
+    /*
+     * There is no inverse, and there is no state anywhere that would supply
+     * one. The other cases below need something only the command layer holds;
+     * this one needs something nobody holds. An unsubscribe is a request that
+     * left the machine — the sender's list has already been written to, and
+     * "subscribe me again" is not a thing `List-Unsubscribe` can express. The
+     * gesture in `useMach` archives the conversation *as well*, and that half
+     * is what ⌘Z takes back.
+     */
+    case "unsubscribe":
     // These need state only the command layer holds: the prior labels, the
     // prior RSVP, the row id a create is about to mint, the calendar an event
     // came from. Nothing local can honestly claim an inverse.
@@ -498,6 +538,21 @@ export interface MachDataSource {
   deleteFilter(accountId: AccountId, filterId: string): Promise<void>;
   /** Hand the URL to the system browser; Google's consent screen is not ours. */
   openExternal(url: string): Promise<void>;
+
+  /**
+   * Open the unsubscribe page this message's header points at.
+   *
+   * The URL is never sent to the webview, which is the point of a second door
+   * beside `openExternal`: a `List-Unsubscribe` URL comes from the sender, and
+   * handing an arbitrary one to the page would make the mailbox a place a
+   * stranger can put a link. Rust validates it — https, and the one the header
+   * actually named — and opens it itself.
+   *
+   * Two callers: the `link` method, which no command can act on, and the
+   * failure of an `oneClick` or `mail` unsubscribe, where the page is what is
+   * left to try.
+   */
+  openUnsubscribePage(messageId: MessageId): Promise<void>;
 
   /** Push, never poll. All three return an unsubscribe. */
   onSyncStatus(handler: (status: SyncStatus) => void): Promise<Unsubscribe>;
@@ -682,6 +737,10 @@ export const fixtureSource: MachDataSource = {
         );
       case "unsnooze":
         return fixtureResult(command, "Woken");
+      // No `undo`, no `applied`: nothing local changed and nothing can be taken
+      // back. `fixtureResult` would attach an inverse it does not have.
+      case "unsubscribe":
+        return { ok: true, message: "Unsubscribed", applied: [], failed: [] };
       case "rsvp":
         return fixtureResult(command, "RSVP sent");
       // The calendar write path is real only against the command layer: these
@@ -775,6 +834,10 @@ export const fixtureSource: MachDataSource = {
   async openExternal(url) {
     if (typeof window !== "undefined") window.open(url, "_blank", "noopener");
   },
+  // The URL lives in the store beside the message, and the fixture browser has
+  // neither. Resolving is what a fixture can honestly do here: the gesture
+  // completes, and nothing claims a page was opened.
+  async openUnsubscribePage() {},
 
   async onSyncStatus() {
     return () => {};

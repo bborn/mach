@@ -55,6 +55,8 @@ pub mod staleness;
 /// Replies the agent writes before he arrives at the conversation.
 pub mod suggest;
 pub mod sync;
+/// Leaving a mailing list without leaving the app.
+pub mod unsub;
 
 use std::sync::Arc;
 
@@ -213,6 +215,7 @@ pub fn run() {
             ipc::commands::list_contacts,
             ipc::commands::list_threads,
             ipc::commands::get_thread,
+            ipc::commands::open_unsubscribe_page,
             ipc::commands::search_threads,
             ipc::commands::list_calendars,
             ipc::commands::list_events,

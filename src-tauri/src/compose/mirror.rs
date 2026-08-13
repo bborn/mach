@@ -255,6 +255,11 @@ pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
                 internal_date: now_ms,
                 is_unread: false,
                 is_draft: true,
+                // A draft Mach wrote is not a newsletter.
+                list_unsubscribe: None,
+                list_unsubscribe_post: None,
+                list_id: None,
+                precedence: None,
             },
         )?;
 

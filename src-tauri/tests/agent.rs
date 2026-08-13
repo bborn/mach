@@ -627,6 +627,16 @@ fn only_what_touches_another_human_needs_approval() {
 }
 
 #[test]
+fn the_agent_may_never_unsubscribe_on_its_own() {
+    // The one command with no inverse anywhere. It leaves the machine for a
+    // stranger's server and tells them the address is live, and no later
+    // message takes that back — so the owner presses the button, whatever the
+    // rule in `unsub::rule` would have said about the message.
+    assert_eq!(tools::policy_for("unsubscribe"), ToolPolicy::Approve);
+    assert!(tools::APPROVAL_COMMANDS.contains(&"unsubscribe"));
+}
+
+#[test]
 fn a_tool_call_becomes_the_typed_command() {
     assert_eq!(
         tools::command_from_call("archive", &json!({ "threadIds": [7, 9] })).unwrap(),

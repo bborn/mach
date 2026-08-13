@@ -71,9 +71,32 @@ pub fn list_threads(db: &Db, query: &ThreadQuery) -> Result<ThreadPage, IpcError
 }
 
 /// A thread and its whole conversation.
+///
+/// This is also where a message learns whether it may be unsubscribed from.
+/// It happens here rather than in `queries::thread_with_messages` because it is
+/// the only read path with a reader's eyes behind it — the same reason
+/// `invitation` is filled in on this path and nowhere else — and because it
+/// costs two sender lookups per message that carries a `List-Unsubscribe`,
+/// which the thread list would pay a hundred times a scroll for nothing.
+///
+/// Both halves ride one `db.read`, so opening a conversation is still one
+/// transaction and the offer cannot disagree with the messages it is about.
 pub fn get_thread(db: &Db, thread_id: i64) -> Result<ThreadDetail, IpcError> {
-    db.read(|conn| queries::thread_with_messages(conn, thread_id))?
-        .ok_or_else(|| IpcError::not_found("thread", thread_id))
+    let detail = db.read(|conn| {
+        let Some(mut detail) = queries::thread_with_messages(conn, thread_id)? else {
+            return Ok(None);
+        };
+        for (message_id, verdict) in crate::unsub::store::offers_for_thread(conn, thread_id)? {
+            let Some(offer) = crate::unsub::Offer::from_verdict(&verdict) else {
+                continue;
+            };
+            if let Some(message) = detail.messages.iter_mut().find(|m| m.id == message_id) {
+                message.unsubscribe = Some(offer);
+            }
+        }
+        Ok(Some(detail))
+    })?;
+    detail.ok_or_else(|| IpcError::not_found("thread", thread_id))
 }
 
 /// Local full-text search, already collapsed to threads and ranked.

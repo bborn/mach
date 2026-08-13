@@ -44,6 +44,7 @@ import type {
   ThreadPage,
   ThreadQuery,
   TimeRange,
+  UnsubscribeOffer,
 } from "@/types";
 import { normalizeEmail, type Contact } from "./contacts";
 import {
@@ -188,6 +189,15 @@ interface WireMessage {
   attachments?: Nullable<WireAttachment[]>;
   /** `db::models::MessageInvitation` — absent on every message that is not one. */
   invitation?: Nullable<WireInvitation>;
+  /** `unsub::rule`'s answer — absent on almost every message. */
+  unsubscribe?: Nullable<WireUnsubscribe>;
+}
+
+/** `UnsubscribeOffer` as serde writes it: `offer` is the tag, fields inline. */
+interface WireUnsubscribe {
+  offer?: Nullable<string>;
+  method?: Nullable<string>;
+  reason?: Nullable<string>;
 }
 
 interface WireInvitation {
@@ -583,7 +593,49 @@ export function mapMessage(wire: WireMessage): Message {
     machDraftId: optional(wire.machDraftId),
     attachments: (wire.attachments ?? []).map(mapAttachment),
     invitation: wire.invitation ? mapInvitation(wire.invitation) : undefined,
+    unsubscribe: mapUnsubscribe(wire.unsubscribe),
   };
+}
+
+/** The two `offer` values that mean anything here. */
+const UNSUBSCRIBE_METHODS = new Set(["oneClick", "mail", "link"]);
+const REPORT_SPAM_REASONS = new Set(["notBulkMail", "unknownSender"]);
+
+/**
+ * An offer this app knows how to make, or nothing.
+ *
+ * The permissive reading is wrong here, unlike `accessRole` above. An `offer`
+ * string nobody recognises would reach `ReadingPane` as a button with no label
+ * and `useMach` as a branch that falls through to doing nothing — a control
+ * that is on screen and inert. Dropping it means the button is simply not
+ * offered, which is what "this build cannot honestly say" looks like.
+ *
+ * `method` and `reason` are defaulted rather than dropped, because the offer is
+ * still true without them: an unsubscribe whose method is a word from a newer
+ * backend is at worst treated as a link, which is the one method that opens a
+ * page instead of acting.
+ */
+function mapUnsubscribe(wire: Nullable<WireUnsubscribe>): UnsubscribeOffer | undefined {
+  if (!wire) return undefined;
+  if (wire.offer === "unsubscribe") {
+    const method = text(wire.method);
+    return {
+      offer: "unsubscribe",
+      method: (UNSUBSCRIBE_METHODS.has(method)
+        ? method
+        : "link") as Extract<UnsubscribeOffer, { offer: "unsubscribe" }>["method"],
+    };
+  }
+  if (wire.offer === "reportSpam") {
+    const reason = text(wire.reason);
+    return {
+      offer: "reportSpam",
+      reason: (REPORT_SPAM_REASONS.has(reason)
+        ? reason
+        : "unknownSender") as Extract<UnsubscribeOffer, { offer: "reportSpam" }>["reason"],
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -986,6 +1038,14 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
       } catch (error) {
         throw toMachError(error);
       }
+    },
+
+    // Deliberately not `openExternal`: the id goes out and no URL comes back.
+    // Rust reads the header off the row, checks it is the https link it said it
+    // was, and opens it — so a sender cannot get an arbitrary URL through the
+    // webview by writing one into a header.
+    async openUnsubscribePage(messageId) {
+      await call<void>("open_unsubscribe_page", { messageId });
     },
 
     async onSyncStatus(handler) {

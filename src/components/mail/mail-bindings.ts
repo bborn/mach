@@ -43,6 +43,8 @@ export interface MailActionHandlers {
   trash: () => void;
   /** `!` — report the selection as spam. */
   reportSpam: () => void;
+  /** ⌘⇧U — ask the sender of the open conversation to stop. */
+  unsubscribe: () => void;
   favorite: () => void;
   undo: () => void;
 }
@@ -165,6 +167,30 @@ export function mailActionBindings(
       description: "Report spam",
       when: active,
       handler: on.reportSpam,
+    },
+    {
+      /*
+       * ⌘⇧U, and every part of that is a decision.
+       *
+       * Gmail has no unsubscribe shortcut at all, so the standing rule — match
+       * Gmail where Gmail has a key — has nothing to say and this is not a
+       * divergence from anything. What Gmail *does* have on the letter is ⇧U
+       * for mark-as-unread, so a bare `u` or ⇧U here would take a key a Gmail
+       * hand already presses for something else and spend it on an action that
+       * cannot be taken back.
+       *
+       * Which is the other half. This is the one action in the app with no
+       * inverse: `archive`, `trash`, `reportSpam`, `snooze`, every calendar
+       * write and even a sent message can be undone, and an unsubscribe has
+       * left the machine. A gesture nothing can reverse should not sit under a
+       * single unmodified letter, where a mistyped `j` reaches it. Two
+       * modifiers is the cost of the mistake being unrecoverable.
+       */
+      keys: "mod+shift+u",
+      group: "Actions",
+      description: "Unsubscribe",
+      when: active,
+      handler: on.unsubscribe,
     },
     {
       /*
