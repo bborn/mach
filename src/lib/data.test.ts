@@ -10,6 +10,7 @@ import {
   type Command,
   type CommandResult,
 } from "./data";
+import * as fixtures from "./fixtures";
 
 describe("the command vocabulary", () => {
   it("covers everything in the Rust catalogue", () => {
@@ -226,6 +227,37 @@ describe("the fixture source", () => {
     expect(page.threads.length).toBeGreaterThan(0);
     expect(page.threads.every((t) => t.accountId === 4)).toBe(true);
     expect(page.threads.every((t) => t.labelIds.includes("L_FAMILY"))).toBe(true);
+  });
+
+  it("answers Archive as the absence of a mailbox rather than a label", async () => {
+    const page = await fixtureSource.listThreads({ labelId: "ARCHIVE", limit: 1000 });
+    expect(page.threads.length).toBeGreaterThan(0);
+    for (const thread of page.threads) {
+      expect(thread.labelIds).not.toContain("INBOX");
+      expect(thread.labelIds).not.toContain("SENT");
+      expect(thread.labelIds).not.toContain("DRAFT");
+      expect(thread.labelIds).not.toContain("SPAM");
+      expect(thread.labelIds).not.toContain("TRASH");
+    }
+    const inbox = await fixtureSource.listThreads({ labelId: "INBOX", limit: 1000 });
+    const both = inbox.threads.filter((t) => page.threads.some((a) => a.id === t.id));
+    expect(both, "an inbox conversation is not in the archive").toHaveLength(0);
+  });
+
+  it("keeps a snoozed conversation in Snoozed and out of Archive", async () => {
+    const snoozed = await fixtureSource.listThreads({ labelId: "SNOOZED", limit: 1000 });
+    expect(snoozed.threads.map((t) => t.id).sort()).toEqual([...fixtures.SNOOZED_THREAD_IDS].sort());
+
+    const archive = await fixtureSource.listThreads({ labelId: "ARCHIVE", limit: 1000 });
+    for (const id of fixtures.SNOOZED_THREAD_IDS) {
+      expect(archive.threads.some((t) => t.id === id)).toBe(false);
+    }
+  });
+
+  it("narrows Archive to one account, as the rail does to every other mailbox", async () => {
+    const page = await fixtureSource.listThreads({ accountId: 1, labelId: "ARCHIVE", limit: 1000 });
+    expect(page.threads.length).toBeGreaterThan(0);
+    expect(page.threads.every((t) => t.accountId === 1)).toBe(true);
   });
 
   it("returns numeric row ids, like SQLite", async () => {

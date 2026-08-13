@@ -615,9 +615,33 @@ function page(rows: Thread[], query: ThreadQuery): ThreadPage {
 
 function matchesQuery(thread: Thread, query: ThreadQuery): boolean {
   if (query.accountId != null && thread.accountId !== query.accountId) return false;
-  if (query.labelId && !thread.labelIds.includes(query.labelId)) return false;
+  if (query.labelId && !inMailbox(thread, query.labelId)) return false;
   if (query.unreadOnly && !thread.unread) return false;
   return true;
+}
+
+/**
+ * Carrying any of these means the conversation is filed somewhere of its own,
+ * and so is not in the archive. The same list as `FILED_ELSEWHERE` in
+ * `db::queries` — the two are separate implementations of one definition, and a
+ * fixture app that disagreed about what Archive means would be worse than no
+ * fixture app.
+ */
+const FILED_ELSEWHERE: readonly LabelId[] = ["INBOX", "SENT", "DRAFT", "SPAM", "TRASH"];
+
+/**
+ * Whether a thread is in one mailbox. Archive and Snoozed are questions rather
+ * than labels; see `withVirtualMailboxes`.
+ */
+function inMailbox(thread: Thread, labelId: LabelId): boolean {
+  if (labelId === "ARCHIVE") {
+    return (
+      !thread.labelIds.some((id) => FILED_ELSEWHERE.includes(id)) &&
+      !fixtures.SNOOZED_THREAD_IDS.includes(thread.id)
+    );
+  }
+  if (labelId === "SNOOZED") return fixtures.SNOOZED_THREAD_IDS.includes(thread.id);
+  return thread.labelIds.includes(labelId);
 }
 
 function pluralize(n: number, word: string): string {
@@ -784,6 +808,7 @@ export const fixtureSource: MachDataSource = {
       configurationError: null,
       needsReauthorization: [],
       missingScope: [],
+      storeEmpty: fixtures.threads.length === 0,
     };
   },
   async syncNow(accountId?: AccountId): Promise<ForcedSync> {

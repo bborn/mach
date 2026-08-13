@@ -486,6 +486,13 @@ export interface SyncStatus {
    * the account consents again.
    */
   missingScope: string[];
+  /**
+   * No conversation has ever landed in the store.
+   *
+   * What tells an empty mailbox apart from a store that has not been filled
+   * yet. Only the second one is a reason to show the first-sync panel.
+   */
+  storeEmpty: boolean;
 }
 
 /** What one account did during a pass somebody asked for. */

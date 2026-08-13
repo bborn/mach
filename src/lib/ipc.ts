@@ -319,6 +319,7 @@ interface WireSyncStatus {
   configurationError?: Nullable<string>;
   needsReauthorization?: Nullable<string[]>;
   missingScope?: Nullable<string[]>;
+  storeEmpty?: Nullable<boolean>;
 }
 
 /** `sync_now`, straight off the wire. */
@@ -816,6 +817,10 @@ export function mapSyncStatus(wire: Nullable<WireSyncStatus>): SyncStatus {
     configurationError: optional(wire?.configurationError) ?? null,
     needsReauthorization: wire?.needsReauthorization ?? [],
     missingScope: wire?.missingScope ?? [],
+    // Absent means "an older backend that cannot tell us", and the safe reading
+    // is that the store has something in it: an empty mailbox then says it is
+    // empty, rather than promising mail that is never coming.
+    storeEmpty: wire?.storeEmpty === true,
   };
 }
 

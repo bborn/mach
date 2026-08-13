@@ -40,6 +40,7 @@
 //! "no credentials for …" against that account rather than retrying forever.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::auth::flow::{self, AuthorizedAccount, PendingAuthorization};
@@ -206,6 +207,9 @@ pub struct AppState {
     /// Authorization handshakes waiting for their loopback callback, keyed by
     /// the opaque id handed to the frontend.
     pending: Mutex<HashMap<String, Handshake>>,
+    /// Latched once the store has been seen holding a thread. See
+    /// [`AppState::store_empty`].
+    store_filled: AtomicBool,
 }
 
 /// A sign-in in flight, plus the address it was started for.
@@ -263,7 +267,36 @@ impl AppState {
             configuration_error: self.config.configuration_error.clone(),
             needs_reauthorization: self.needs_reauthorization(),
             missing_scope,
+            store_empty: self.store_empty(),
         }
+    }
+
+    /// Whether the store holds no conversations at all.
+    ///
+    /// The question the empty list needs answered, and the one it was guessing
+    /// at. "No rows here, and a sync is running" was being read as "the first
+    /// pass has not filled the store yet" — so an empty Archive in a store of
+    /// 67,000 messages offered the first-sync panel, complete with a progress
+    /// bar for work that had finished months ago.
+    ///
+    /// Latched, because it is only ever interesting while the answer is yes: a
+    /// store that has held a thread has been filled, and nothing empties it
+    /// short of removing every account, which rebuilds this state anyway. So it
+    /// costs one first-row read per emit until the first conversation lands and
+    /// nothing after that — which matters, because the sync loop emits this
+    /// payload on every change to its watch channel.
+    fn store_empty(&self) -> bool {
+        if self.store_filled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let filled = self
+            .db
+            .read(queries::any_threads)
+            .unwrap_or(false);
+        if filled {
+            self.store_filled.store(true, Ordering::Relaxed);
+        }
+        !filled
     }
 
     /// Every address that needs a person to sign in again, from all three
@@ -457,6 +490,7 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
         tokens,
         needs_reauthorization: Mutex::new(needs_reauthorization),
         pending: Mutex::new(HashMap::new()),
+        store_filled: AtomicBool::new(false),
     })
 }
 

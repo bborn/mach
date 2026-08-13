@@ -28,6 +28,44 @@ export const RAIL_ORDER: readonly LabelId[] = [
 ];
 
 /**
+ * The two mailboxes Gmail has no label for, and which the store answers itself.
+ *
+ * Both were in `RAIL_ORDER` from the start and in no rail on any real mailbox,
+ * because `railMailboxes` shows the labels the store actually has and neither
+ * of these is one. `g a` and `g b` still offered them, so the keyboard reached
+ * a place the rail could not name and the list came back empty — which is the
+ * bug as it was reported.
+ *
+ * Archived means the *absence* of `INBOX`; snoozed is a local wake row plus a
+ * per-account user label. `db::queries::mailbox_clause` is where each becomes a
+ * query. Synthesizing them as labels here is what keeps the rail, ⌘K, the
+ * favorites and the list header reading from one list rather than from two that
+ * can disagree.
+ *
+ * `accountId: null` because neither belongs to an account — the archive spans
+ * every mailbox, and narrowing it to one is the account rail's job, exactly as
+ * it is for Sent.
+ */
+export const VIRTUAL_MAILBOXES: readonly Label[] = [
+  { id: "SNOOZED", accountId: null, name: "Snoozed", kind: "system" },
+  { id: "ARCHIVE", accountId: null, name: "Archive", kind: "system" },
+];
+
+/**
+ * The store's labels plus the mailboxes it answers without one.
+ *
+ * Applied once, where the label list arrives, so that everything downstream
+ * sees the same set. An empty list stays empty: before the first sync there is
+ * no mailbox to have an archive of, and a rail carrying nothing but "Archive"
+ * would be worse than a rail carrying nothing.
+ */
+export function withVirtualMailboxes(labels: readonly Label[]): Label[] {
+  if (labels.length === 0) return [...labels];
+  const present = new Set(labels.map((label) => label.id));
+  return [...labels, ...VIRTUAL_MAILBOXES.filter((mailbox) => !present.has(mailbox.id))];
+}
+
+/**
  * Gmail's system label ids are their names too, and they shout. These are the
  * ones worth a hand-written translation; anything else falls back to
  * `humanize`.

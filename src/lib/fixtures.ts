@@ -42,11 +42,13 @@ function accountFor(key: string): Account {
 }
 
 export const labels: Label[] = [
+  // No ARCHIVE and no SNOOZED. Gmail has neither label and so neither does
+  // this: both are questions about the store, and `withVirtualMailboxes` adds
+  // them to whatever label list arrives. Listing them here would have the
+  // fixture app agree with a shape the real one cannot have.
   { id: "INBOX", accountId: null, name: "Inbox", kind: "system" },
   { id: "STARRED", accountId: null, name: "Starred", kind: "system" },
-  { id: "SNOOZED", accountId: null, name: "Snoozed", kind: "system" },
   { id: "SENT", accountId: null, name: "Sent", kind: "system" },
-  { id: "ARCHIVE", accountId: null, name: "Archive", kind: "system" },
   { id: "L_INVESTORS", accountId: null, name: "Investors", kind: "user" },
   { id: "L_CUSTOMERS", accountId: null, name: "Customers", kind: "user" },
   { id: "L_RECEIPTS", accountId: null, name: "Receipts", kind: "user" },
@@ -139,17 +141,17 @@ const THREAD_SEEDS: ThreadSeed[] = [
   ["a1", "dana@northwind.example", "QA pass on the reporting rewrite", "Nine issues, three are blockers. The date picker resets to today when you change accounts, and CSV export drops", 7.4, false, true, ["INBOX"]],
   ["a2", "sam@stripe.com", "Your Stripe account: radar rule triggered 42 times", "A rule you created on Sep 4 blocked 42 payments in the last 24 hours, totalling $6,140. Review whether this is", 8.8, false, false, ["INBOX"]],
   ["a4", "deb@feldmanlegal.example", "Trust documents — signature needed", "Attached the restated version with the changes we discussed. Sign pages 14 and 22 only; the rest is exhibits", 11.0, true, true, ["INBOX", "L_FAMILY"]],
-  ["a1", "aurora@linear.app", "Re: Bulk API rate limits", "We can raise you to 5k/hour on the current plan. Beyond that it's a conversation about the enterprise tier, but", 13.2, false, false, ["INBOX"]],
+  ["a1", "aurora@linear.app", "Re: Bulk API rate limits", "We can raise you to 5k/hour on the current plan. Beyond that it's a conversation about the enterprise tier, but", 13.2, false, false, []],
   ["a5", "receipts@anthropic.com", "Your Anthropic receipt — $1,284.30", "Invoice INV-2026-08-0442 for API usage between Jul 1 and Jul 31. Paid automatically with the card ending 4417", 14.5, false, true, ["INBOX", "L_RECEIPTS"]],
   ["a3", "tomas@talleres.example", "Fotos del showroom de Polanco", "Mandé al fotógrafo el jueves. Las de la cocina salieron mejor que las del vestidor, creo que por la luz de la", 16.0, false, true, ["INBOX"]],
   ["a2", "cassidy@paperbark.example", "Intro: Paperbark x Lumen", "Marcus suggested we talk. We're doing about 40k orders a month and our current offer engine is a pile of Shopify", 19.0, true, false, ["INBOX", "L_CUSTOMERS"]],
-  ["a1", "billing-noreply@google.com", "Your Google Cloud invoice is available", "Account 0142-9987-3311. Amount due: $412.66. This invoice will be charged automatically on Aug 15", 22.0, false, false, ["INBOX", "L_RECEIPTS"]],
+  ["a1", "billing-noreply@google.com", "Your Google Cloud invoice is available", "Account 0142-9987-3311. Amount due: $412.66. This invoice will be charged automatically on Aug 15", 22.0, false, false, ["L_RECEIPTS"]],
   ["a1", "tawny@northloop.example", "Thursday 2pm still works?", "I'll bring Priyanka from the platform team. She has questions about the creator payout flow that I couldn't", 26.0, false, false, ["INBOX", "L_INVESTORS"]],
-  ["a2", "marcus@lumen.example", "Postmortem: the 6% checkout drop", "Root cause was the address autocomplete change — it silently failed for anyone with a non-US billing country", 28.0, false, true, ["INBOX"]],
+  ["a2", "marcus@lumen.example", "Postmortem: the 6% checkout drop", "Root cause was the address autocomplete change — it silently failed for anyone with a non-US billing country", 28.0, false, true, []],
   ["a1", "priya@northwind.example", "Hiring: two staff engineer candidates", "Both are strong. Candidate A is better on distributed systems, candidate B has actually shipped a sync engine", 31.0, false, false, ["INBOX"]],
   ["a4", "deb@feldmanlegal.example", "Re: Trust documents — signature needed", "No rush on the exhibits, but the signature pages should be back before the 20th or we redo the notary", 34.0, false, false, ["INBOX", "L_FAMILY"]],
   ["a5", "ilya@meridian.example", "dbt model naming — settling this", "Proposal: stg_ for sources, int_ for intermediate, fct_/dim_ for marts. No exceptions, including the legacy", 37.0, false, false, ["INBOX"]],
-  ["a1", "hana@shopify.com", "Approved — listing goes live Monday", "Consent copy looks right now. Marketing will feature you in the app store roundup the week after, assuming the", 40.0, false, false, ["INBOX"]],
+  ["a1", "hana@shopify.com", "Approved — listing goes live Monday", "Consent copy looks right now. Marketing will feature you in the app store roundup the week after, assuming the", 40.0, false, false, []],
   ["a3", "rosa@talleres.example", "Nómina de agosto", "Adjunto el cálculo. Subieron las horas extra por el pedido de Santa Fe, revisa la línea de Tomás antes de que", 44.0, false, true, ["INBOX"]],
   ["a2", "sam@stripe.com", "Payout summary — $84,201.55", "Your payout of $84,201.55 is on its way and should arrive by Aug 8. This covers 1,842 charges", 48.0, false, false, ["INBOX", "L_RECEIPTS"]],
   ["a1", "dana@northwind.example", "Re: QA pass on the reporting rewrite", "Retested. Date picker is fixed, CSV export still drops the last row when the range ends on a Sunday", 52.0, false, false, ["INBOX"]],
@@ -168,12 +170,12 @@ const THREAD_SEEDS: ThreadSeed[] = [
   ["a1", "hana@shopify.com", "Feedback from the app review team", "Minor: your empty states assume the merchant has data. Reviewers install into a blank dev store, so screenshot", 154.0, false, false, ["INBOX"]],
   ["a4", "riley@example.com", "school picture day form", "its due friday. mom said to send it to you. also i need $22 for the package with the wallet size ones", 168.0, false, true, ["INBOX", "L_FAMILY"]],
   ["a2", "sam@stripe.com", "Dispute opened on charge ch_3PqL", "A cardholder disputed a $340.00 charge as 'product not received'. Respond with evidence by Aug 19", 182.0, false, false, ["INBOX"]],
-  ["a1", "dana@northwind.example", "Regression suite is green again", "The three flaky tests were all the same root cause — a fixture that assumed the local timezone was UTC", 200.0, false, false, ["INBOX"]],
+  ["a1", "dana@northwind.example", "Regression suite is green again", "The three flaky tests were all the same root cause — a fixture that assumed the local timezone was UTC", 200.0, false, false, []],
   ["a5", "aurora@linear.app", "Re: Meridian Data workspace", "Bumped you to 40 seats at the current rate through renewal. New seats after that price at the standard tier", 220.0, false, false, ["INBOX"]],
   ["a1", "cassidy@paperbark.example", "Notes from the Paperbark call", "Three asks: bulk offer import, a sandbox, and SSO. The first two are cheap, SSO is the real conversation", 244.0, false, true, ["INBOX", "L_CUSTOMERS"]],
   ["a2", "marcus@lumen.example", "Renewal terms — Paperbark", "They want annual with quarterly outs, which is not a thing. Countering with annual, 30-day termination for", 268.0, false, false, ["INBOX", "L_CUSTOMERS"]],
   ["a1", "tawny@northloop.example", "Term sheet — redline attached", "Two changes from what we discussed: the option pool is pre-money and the board seat converts at Series B", 292.0, false, true, ["INBOX", "L_INVESTORS"]],
-  ["a4", "deb@feldmanlegal.example", "Re: Property tax assessment appeal", "Filed. Hearing is scheduled for Oct 14 at 9am, and you do not need to attend unless they contest the comps", 316.0, false, false, ["INBOX", "L_FAMILY"]],
+  ["a4", "deb@feldmanlegal.example", "Re: Property tax assessment appeal", "Filed. Hearing is scheduled for Oct 14 at 9am, and you do not need to attend unless they contest the comps", 316.0, false, false, ["L_FAMILY"]],
   ["a5", "books@whinynil.example", "Bookkeeping digest — Monday 10 August", "Three things need you; the rest is filed. Invoice #51 is drafted and waiting for you to send — OfferLab, 64.0", 9.5, true, false, ["INBOX", "L_RECEIPTS"]],
 ];
 
@@ -282,6 +284,16 @@ const built = build();
  *
  * `src/lib/compose.ts` seeds the matching editable copy, so the draft opens.
  */
+/**
+ * Two conversations are snoozed.
+ *
+ * The store keeps this in `snoozed_threads` rather than in a label, because
+ * Gmail's API has no snooze and the per-account `Mach/Snoozed` label carries no
+ * wake time. There is nothing on a `Thread` to hang it off, so the fixture says
+ * it the same way the store does: a set of ids beside the rows.
+ */
+export const SNOOZED_THREAD_IDS: readonly number[] = [5, 9];
+
 export const DRAFT_THREAD_ID = 2;
 export const DRAFT_MESSAGE_ID = 290;
 export const DRAFT_ID = "draft-fixture-2";

@@ -99,7 +99,7 @@ import {
   toggleAll,
   type Selection,
 } from "@/lib/selection";
-import { mailboxName } from "@/lib/mailboxes";
+import { mailboxName, withVirtualMailboxes } from "@/lib/mailboxes";
 import type { Contact } from "@/lib/contacts";
 import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
@@ -1060,7 +1060,10 @@ export function MachProvider({ children }: { children: ReactNode }) {
         ]);
         if (!live) return;
         setAccounts(a);
-        setLabels(l);
+        // The one seam where the label list is built, so the rail, ⌘K, the
+        // favorites and the list header cannot disagree about which mailboxes
+        // exist. See `withVirtualMailboxes`.
+        setLabels(withVirtualMailboxes(l));
         setCalendars(c);
         setSync(s);
         setBootError(null);

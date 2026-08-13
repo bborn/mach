@@ -1,6 +1,7 @@
 import { useMach } from "@/hooks/useMach";
 import { Button } from "@/components/ui/button";
 import { SyncBar } from "@/components/chrome/SyncIndicator";
+import { mailboxName } from "@/lib/mailboxes";
 
 /**
  * What the list says when it has no rows.
@@ -18,10 +19,20 @@ import { SyncBar } from "@/components/chrome/SyncIndicator";
  * reading for. What survives is the state's name, the one thing they could not
  * work out for themselves (that the first sync is minutes, not seconds), and
  * the button. The reasoning lives here instead.
+ *
+ * Which of the four applies is `mailbox-state.ts`'s decision, and one of its
+ * rules is worth repeating here because this is where the damage showed: the
+ * first-sync panel belongs to a store with nothing in it, not to any empty list
+ * that happens to coincide with a running pass. An empty Archive over 67,000
+ * messages was offering a progress bar for a backfill that finished months ago.
  */
 export function MailboxNotice() {
   const { state, actions, labels, ui, progress } = useMach();
-  const mailbox = labels.find((l) => l.id === ui.labelId)?.name ?? ui.labelId;
+  // `mailboxName`, not the stored `name`: Gmail's own name for its system
+  // labels is the id, so reading the row directly put "Nothing in TRASH." on
+  // screen. The rail and the list header have always gone through here.
+  const label = labels.find((l) => l.id === ui.labelId);
+  const mailbox = label ? mailboxName(label) : ui.labelId;
 
   switch (state.kind) {
     case "loading":

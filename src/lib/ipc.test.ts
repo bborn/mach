@@ -987,6 +987,9 @@ describe("events", () => {
         configurationError: null,
         needsReauthorization: [],
         missingScope: [],
+        // Absent on the wire reads as "the store has something in it", so an
+        // empty mailbox says it is empty rather than promising mail.
+        storeEmpty: false,
       },
     ]);
   });

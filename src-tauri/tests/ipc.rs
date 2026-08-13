@@ -426,6 +426,33 @@ fn listing_threads_narrows_to_one_account_and_one_label() {
     assert!(missing.items.is_empty());
 }
 
+/// The path the rail and `g a` actually take. `ARCHIVE` travels as a `labelId`,
+/// which is why it used to come back empty — nothing carries that label, and
+/// nothing ever will.
+#[test]
+fn listing_the_archive_answers_over_the_same_ipc_shape_as_a_label() {
+    let db = TempDb::new("archive-ipc");
+    let a = account(&db, "a@example.com", 0);
+    // `thread` puts its rows in the inbox; this one is taken back out.
+    let filed = thread(&db, a, "t1", "Filed away", 200);
+    thread(&db, a, "t2", "Still in the inbox", 300);
+    db.write(|conn| q::set_thread_labels(conn, filed, &["Label_7".to_string()]))
+        .expect("archive it");
+
+    let page = reads::list_threads(
+        &db,
+        &ThreadQuery {
+            label_id: Some("ARCHIVE".into()),
+            ..Default::default()
+        },
+    )
+    .expect("list threads");
+    assert_eq!(
+        page.items.iter().map(|t| t.subject.as_str()).collect::<Vec<_>>(),
+        vec!["Filed away"]
+    );
+}
+
 #[test]
 fn searching_returns_fts_matches_ranked_and_hydrated() {
     let db = TempDb::new("search");
@@ -942,6 +969,7 @@ fn camel_case_sync_status() {
         "configurationError",
         "needsReauthorization",
         "missingScope",
+        "storeEmpty",
     ] {
         assert!(payload.get(key).is_some(), "sync status is missing {key}");
     }

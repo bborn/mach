@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Label } from "@/types";
-import { mailboxName, mailboxTargets, railMailboxes } from "./mailboxes";
+import {
+  mailboxName,
+  mailboxTargets,
+  railMailboxes,
+  withVirtualMailboxes,
+} from "./mailboxes";
 
 function system(id: string, name = id): Label {
   return { id, accountId: null, name, kind: "system" };
@@ -59,6 +64,55 @@ describe("railMailboxes", () => {
 
   it("shows nothing rather than guessing when no labels have loaded", () => {
     expect(railMailboxes([])).toEqual([]);
+  });
+});
+
+describe("withVirtualMailboxes", () => {
+  /* What `list_labels` actually returns for a real Gmail account: no ARCHIVE
+     and no SNOOZED, because Gmail has neither. */
+  const stored = [
+    system("INBOX"),
+    system("STARRED"),
+    system("SENT"),
+    system("DRAFT"),
+    system("SPAM"),
+    system("TRASH"),
+    user("Label_112", "Mach/Snoozed", 1),
+  ];
+
+  it("adds the mailboxes Gmail has no label for", () => {
+    const ids = withVirtualMailboxes(stored).map((l) => l.id);
+    expect(ids).toContain("ARCHIVE");
+    expect(ids).toContain("SNOOZED");
+  });
+
+  it("puts them in the rail, where the keyboard already went", () => {
+    expect(railMailboxes(withVirtualMailboxes(stored)).map((l) => l.name)).toEqual([
+      "Inbox",
+      "Starred",
+      "Snoozed",
+      "Drafts",
+      "Sent",
+      "Archive",
+      "Spam",
+      "Trash",
+    ]);
+  });
+
+  it("offers them to ⌘K too, so the two ways in agree", () => {
+    const names = mailboxTargets(withVirtualMailboxes(stored), () => undefined).map((t) => t.name);
+    expect(names).toContain("Archive");
+    expect(names).toContain("Snoozed");
+  });
+
+  it("adds nothing before the first label list arrives", () => {
+    // A rail whose only row is "Archive" is worse than a rail with no rows.
+    expect(withVirtualMailboxes([])).toEqual([]);
+  });
+
+  it("does not duplicate a mailbox the store somehow already has", () => {
+    const ids = withVirtualMailboxes([system("INBOX"), system("ARCHIVE")]).map((l) => l.id);
+    expect(ids.filter((id) => id === "ARCHIVE")).toHaveLength(1);
   });
 });
 
