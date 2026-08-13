@@ -22,6 +22,12 @@ import {
   loadBackendStatus,
   type AgentBackendStatus,
 } from "@/lib/agent";
+import {
+  EMPTY_STATS,
+  WORTH_IT_RATE,
+  loadSuggestionStats,
+  type SuggestionStats,
+} from "@/lib/suggestions";
 import { errorMessage } from "@/lib/ipc";
 import { openExternal } from "@/lib/message-body";
 import { Button } from "@/components/ui/button";
@@ -1144,7 +1150,82 @@ function AgentSettings({
           <FieldDescription>Contract: docs/agent-backends.md</FieldDescription>
         </Field>
       )}
+
+      <Field orientation="row">
+        <FieldLabel htmlFor={ids.replySuggestions}>Replies</FieldLabel>
+        {/*
+          Off means nothing generates — no model call, no row, no cost — which
+          is the only version of this switch worth having. The rule behind it is
+          deliberately not written on screen: any human message addressed to
+          him, minus list mail, no-reply senders and the categories Gmail has
+          already filed as bulk. See `suggest::rule`.
+        */}
+        <Toggle
+          id={ids.replySuggestions}
+          label="Write replies for new mail"
+          checked={prefs.replySuggestions}
+          onChange={(on) => set("replySuggestions", on)}
+        />
+      </Field>
+
+      {prefs.replySuggestions && (
+        <>
+          <Field orientation="row">
+            <FieldLabel htmlFor={ids.replySuggestionModel}>Reply model</FieldLabel>
+            <Input
+              id={ids.replySuggestionModel}
+              spellCheck={false}
+              placeholder="claude-sonnet-5"
+              value={prefs.replySuggestionModel}
+              onChange={(event) => set("replySuggestionModel", event.target.value)}
+            />
+          </Field>
+          <SuggestionHitRate />
+        </>
+      )}
     </>
+  );
+}
+
+/**
+ * How many of the written replies he actually sends.
+ *
+ * The one number that decides whether this feature is worth its cost, and the
+ * only place it exists. It is here rather than nowhere because the alternative
+ * is trusting an impression — and the impression of a feature that writes for
+ * you is always better than the measurement.
+ *
+ * Absent until something has been suggested: a rate with no denominator is a
+ * shape on screen that says nothing.
+ */
+function SuggestionHitRate() {
+  const [stats, setStats] = useState<SuggestionStats>(EMPTY_STATS);
+
+  useEffect(() => {
+    let live = true;
+    void loadSuggestionStats().then((next) => {
+      if (live) setStats(next);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  if (stats.asWrittenRate === null) return null;
+  const percent = Math.round(stats.asWrittenRate * 100);
+  const thin = stats.asWrittenRate < WORTH_IT_RATE;
+
+  return (
+    <Field orientation="row">
+      <FieldLabel>Sent as written</FieldLabel>
+      <div className={cn("text-list tabular-nums", thin ? "text-danger" : "text-foreground")}>
+        {percent}%
+      </div>
+      <FieldDescription>
+        {stats.sentAsWritten} of {stats.suggested} written · {stats.picked} opened ·{" "}
+        {stats.sentEdited} rewritten · {stats.dismissed} declined
+      </FieldDescription>
+    </Field>
   );
 }
 
@@ -1166,5 +1247,7 @@ function useIds() {
     agentBackend: `${prefix}-agent-backend`,
     agentModel: `${prefix}-agent-model`,
     agentCommand: `${prefix}-agent-command`,
+    replySuggestions: `${prefix}-reply-suggestions`,
+    replySuggestionModel: `${prefix}-reply-suggestion-model`,
   };
 }

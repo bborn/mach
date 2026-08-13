@@ -15,6 +15,18 @@ import { Kbd } from "@/components/ui/kbd";
 import { Overlay } from "@/components/ui/dialog";
 import { RESIZE_STEP, Resizer } from "@/components/ui/split";
 import { Composer, type ComposerPresentation } from "./Composer";
+import { StanceRow } from "./StanceRow";
+import {
+  caretAfter,
+  loadSuggestion,
+  MAX_KEYED_STANCES,
+  recordOutcome,
+  sendOutcome,
+  stanceHtml,
+  SUGGESTION_KEYS,
+  type ReplySuggestion,
+  type Stance,
+} from "@/lib/suggestions";
 import type { RichTextEditorHandle } from "./RichTextEditor";
 import {
   DEFAULT_COMPOSER_HEIGHT,
@@ -203,6 +215,15 @@ export function ComposerDock() {
    * draft B would be worse than not restoring one at all.
    */
   const caret = useRef<{ id: string; offset: number } | null>(null);
+  /**
+   * Which stance a draft came from, until it is sent or thrown away.
+   *
+   * Kept here rather than on the `Draft` so that a stance cannot travel to Rust:
+   * a suggestion is not part of a draft, and the moment one becomes a real
+   * message it is a message like any other. This map exists only to answer "did
+   * he send roughly what was written", and it is dropped on send.
+   */
+  const fromStance = useRef(new Map<string, { index: number; stance: Stance }>());
 
   const draft = useMemo(
     () => drafts.find((entry) => entry.id === activeId) ?? null,
@@ -392,6 +413,62 @@ export function ComposerDock() {
   );
 
   /**
+   * A stance, opened as an ordinary reply with its text already in it.
+   *
+   * From this instant it is a draft on the ordinary path — same autosave, same
+   * mirror, same `⌘⏎`, same ten seconds, same undo. Nothing downstream knows a
+   * model wrote the first version, which is the point: the only thing that makes
+   * this different from `r` is that the composer opens with words in it.
+   *
+   * **This is where a suggestion becomes a Gmail draft, and it is the only
+   * place.** `prepareDraft` is the same local call `r` makes; the row on Gmail
+   * appears when autosave writes one, exactly as it does for anything typed by
+   * hand. Until this function runs the stance is a row in SQLite and Google has
+   * never heard of it.
+   *
+   * A half-written draft still wins, the way it does for every other route in —
+   * `open` refuses to throw away text that already exists, and picking a stance
+   * must not be the one gesture that does.
+   */
+  const pickStance = useCallback(
+    (index: number, stance: Stance) => {
+      if (threadId === null) return;
+      recordOutcome("picked", {
+        stanceIndex: index,
+        stanceLabel: stance.label,
+        threadId,
+      });
+      void (async () => {
+        const existing = await loadDraftForThread(threadId).catch(() => null);
+        if (existing && hasWrittenBody(existing)) {
+          openDraft(signed(existing));
+          return;
+        }
+        const prepared = await prepareDraft(threadId, "reply", replyTarget()).catch(
+          (error: unknown) => {
+            actions.setStatus(errorMessage(error), "error");
+            return null;
+          },
+        );
+        if (!prepared) return;
+        // The signature goes on after the stance, through the same
+        // `signed` every other composer route uses — so a stance is signed
+        // exactly once and in the same place as a reply typed by hand.
+        const withStance = signed({
+          ...prepared,
+          body: stanceHtml(stance),
+          bodyFormat: "html",
+        });
+        // Cursor at the end of what was written, not after the signature.
+        caret.current = { id: withStance.id, offset: caretAfter(stance) };
+        fromStance.current.set(withStance.id, { index, stance });
+        openDraft(withStance);
+      })();
+    },
+    [threadId, actions, signed, openDraft],
+  );
+
+  /**
    * `c` — a message to somebody, from nothing.
    *
    * It opens over the reading pane like every other composer here, whether or
@@ -417,6 +494,40 @@ export function ComposerDock() {
     },
     [ui.accountId, accounts, actions, prefs, signed, openDraft],
   );
+
+  /* ----------------------------------------------------------- suggestions */
+
+  /**
+   * The stances the agent wrote for this conversation, if it wrote any and they
+   * still answer its newest message.
+   *
+   * One local read per conversation opened, keyed on the thread *and* on how
+   * many messages it has — so a reply landing while the thread is open takes the
+   * row away rather than leaving three answers to a question that has moved on.
+   * Rust decides staleness; this only has to ask again.
+   */
+  const [suggestion, setSuggestion] = useState<ReplySuggestion | null>(null);
+  const messageCount = detail?.messages.length ?? 0;
+  useEffect(() => {
+    if (threadId === null) {
+      setSuggestion(null);
+      return;
+    }
+    let live = true;
+    void loadSuggestion(threadId)
+      .then((found) => {
+        // Only if it is still the conversation that was asked about: switching
+        // threads while the read is in flight must not put one thread's stances
+        // under another's message.
+        if (live) setSuggestion(found?.threadId === threadId ? found : null);
+      })
+      .catch(() => {
+        if (live) setSuggestion(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, [threadId, messageCount]);
 
   /**
    * Resume a specific draft — the other end of the agent's "Open draft".
@@ -822,6 +933,26 @@ export function ComposerDock() {
     else bodyEditor.current?.focus();
   }, [visible]);
 
+  /**
+   * An unsent draft mirrored into this conversation.
+   *
+   * Read off the messages rather than asked of the store, so the strip and the
+   * row the reader is looking at cannot disagree. Declared here rather than
+   * beside the render because the stance keys are gated on it: a conversation he
+   * has already started answering has no use for three fresh opinions.
+   */
+  const threadDraft = detail?.messages.some((message) => message.isDraft) ?? false;
+
+  /*
+   * When the stance row is on screen, and therefore when its keys answer.
+   *
+   * The same four conditions the render below uses, named once so the buttons
+   * and the digits cannot come apart.
+   */
+  const stanceKeys = suggestion?.stances.slice(0, MAX_KEYED_STANCES) ?? [];
+  const stanceRowLive =
+    active && visible === null && stanceKeys.length > 0 && !threadDraft;
+
   useKeyBindings([
     /*
      * The keyboard's own route to the handle on the top edge.
@@ -955,6 +1086,43 @@ export function ComposerDock() {
     },
   ]);
 
+  /*
+   * `1` `2` `3` — the stances, and `0` for the empty composer.
+   *
+   * Registered from the data the row renders, so a key and a button cannot
+   * disagree about which stance is which. Live only when the row itself is:
+   * mail mode, no composer on screen for this conversation, no draft in it, and
+   * stances to press. Nothing is `allowInInput`, so a digit typed into the
+   * search field or into a half-written reply is a character.
+   *
+   * The keys are bare digits because the digit is already on the button — the
+   * gesture needs no learning, which is what a row that comes and goes needs.
+   * See `SUGGESTION_KEYS` for why they cannot collide with the calendar's views
+   * or the snooze picker's, and `suggestion-keys.test.ts` for what keeps that
+   * true.
+   */
+  useKeyBindings([
+    ...stanceKeys.map((stance, index) => ({
+      keys: SUGGESTION_KEYS.stance(index),
+      group: "Write",
+      description: `Reply: ${stance.label}`,
+      priority: 5,
+      when: () => stanceRowLive,
+      handler: () => pickStance(index, stance),
+    })),
+    {
+      keys: SUGGESTION_KEYS.mine,
+      group: "Write",
+      description: "Reply, writing it myself",
+      priority: 5,
+      when: () => stanceRowLive,
+      handler: () => {
+        recordOutcome("dismissed", { threadId: threadId ?? undefined });
+        open("reply", replyTarget());
+      },
+    },
+  ]);
+
   // ⌥1…⌥9 — the tab strip's keys. Registered from data so the strip and the
   // keys cannot disagree about which composer is which.
   useKeyBindings(
@@ -982,6 +1150,28 @@ export function ComposerDock() {
         return;
       }
       const id = draft.id;
+      /*
+       * Did the stance survive?
+       *
+       * Recorded here, at `⌘⏎`, rather than when the message actually leaves:
+       * the ten-second window can end with the process gone, and a hit rate that
+       * only counts the sends somebody stayed to watch is a hit rate that
+       * flatters itself. Undo does not take it back — see `recall`, which counts
+       * nothing, because a recalled message is a message he decided about and
+       * the deciding is what this measures.
+       */
+      const origin = fromStance.current.get(id);
+      if (origin) {
+        fromStance.current.delete(id);
+        recordOutcome(sendOutcome(origin.stance.body, bodyAsHtml(draft)), {
+          stanceIndex: origin.index,
+          stanceLabel: origin.stance.label,
+          threadId: draft.threadId ?? undefined,
+        });
+        // The conversation has been answered; there is nothing left to suggest
+        // about it. Rust drops the row on the same call.
+        setSuggestion(null);
+      }
       // Cancelled *and* forgotten. `close` flushes whatever the debounce is
       // holding, so leaving the entry in the map means one more `saveDraft`
       // after the message has been queued — a draft of a reply that has just
@@ -1168,10 +1358,6 @@ export function ComposerDock() {
 
   const hasThread = threadId !== null && detail !== null;
   const holding = pending !== null && pending.state === "holding";
-  // An unsent draft mirrored into this conversation. Read off the messages
-  // rather than asked of the store, so the strip and the row the reader is
-  // looking at cannot disagree.
-  const threadDraft = detail?.messages.some((message) => message.isDraft) ?? false;
 
   /**
    * Discard the conversation's draft without opening it.
@@ -1287,7 +1473,33 @@ export function ComposerDock() {
      * one action in this strip that does not answer the conversation above
      * it — `c` still opens it from anywhere, but a chip among reply/forward
      * controls implied it belonged to this thread, and it does not.
+     *
+     * And when the agent has written replies for this conversation, the stances
+     * stand in for the strip rather than sitting above it — two rows of controls
+     * for one act is the fault this file has already been through once. They do
+     * not take anything away with them: reply, reply-all and forward follow the
+     * stances on the same row, in the same faint register they have here, since
+     * a conversation the model had an opinion about is not one you never want
+     * to forward.
      */
+    if (stanceRowLive) {
+      return (
+        <>
+          {strip}
+          <StanceRow
+            stances={stanceKeys}
+            onPick={pickStance}
+            onWriteMyself={() => {
+              recordOutcome("dismissed", { threadId: threadId ?? undefined });
+              open("reply", replyTarget());
+            }}
+            onReplyAll={() => open("replyAll", replyTarget())}
+            onForward={() => open("forward", replyTarget())}
+          />
+        </>
+      );
+    }
+
     return (
       <>
         {strip}

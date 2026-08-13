@@ -82,7 +82,78 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 16,
         sql: M16_MESSAGE_INVITATION,
     },
+    Migration {
+        version: 17,
+        sql: M17_REPLY_SUGGESTIONS,
+    },
 ];
+
+/// Migration 17 — the stances the agent has written for a conversation, and
+/// what happened to them.
+///
+/// # Why a suggestion is not a draft
+///
+/// Both tables are local and neither is ever pushed anywhere. A stance is text
+/// on this disk until the owner picks one; only then does the ordinary composer
+/// path run, and only then does Gmail hear about it. That rule is the reason for
+/// the whole feature: a Gmail draft is visible on a phone and can be sent from
+/// one by accident, and an agent that writes drafts unattended would put words
+/// the owner has never read one thumb away from leaving.
+///
+/// # `reply_suggestions`
+///
+/// Keyed by thread, because there is at most one set of stances per
+/// conversation — a second set would mean choosing which to show, and the answer
+/// would always be "the newer one", which is what replacing the row already
+/// does.
+///
+/// `message_id` is the newest message in the thread when the stances were
+/// written, and it is how staleness is decided: a conversation that has gained a
+/// message since — from the correspondent, or from the owner replying by any
+/// other means — no longer has the same question in it, so the answers are
+/// dropped rather than shown. That check is a comparison against the thread's
+/// own newest message, so it costs one indexed read and cannot go wrong by
+/// forgetting to run a sweep.
+///
+/// `stances` is a JSON array of `{label, body}`. JSON rather than a child table
+/// because nothing queries *across* stances: they are read as a unit, written as
+/// a unit, and thrown away as a unit — which is the same reasoning that keeps
+/// `participants` a JSON column on `threads`.
+///
+/// # `reply_suggestion_outcomes`
+///
+/// The hit rate, locally. If "sent roughly as written" runs under about four in
+/// ten the feature is costing more attention than it saves, and the owner has to
+/// be able to see that rather than guess at it.
+///
+/// Deliberately not keyed to `threads` by foreign key. A conversation that is
+/// deleted takes its suggestion row with it, and should: that row is state. It
+/// must not take the *history* with it, or the counters would quietly improve
+/// every time an old thread was cleaned up.
+const M17_REPLY_SUGGESTIONS: &str = r#"
+CREATE TABLE reply_suggestions (
+    thread_id        INTEGER NOT NULL PRIMARY KEY REFERENCES threads(id)   ON DELETE CASCADE,
+    account_id       INTEGER NOT NULL             REFERENCES accounts(id)  ON DELETE CASCADE,
+    -- The newest message in the thread when these were written.
+    message_id       INTEGER NOT NULL             REFERENCES messages(id)  ON DELETE CASCADE,
+    gmail_message_id TEXT    NOT NULL DEFAULT '',
+    -- JSON array of { "label": TEXT, "body": TEXT }
+    stances          TEXT    NOT NULL DEFAULT '[]',
+    model            TEXT    NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE reply_suggestion_outcomes (
+    id           INTEGER PRIMARY KEY,
+    -- 'suggested' | 'picked' | 'sentAsWritten' | 'sentEdited' | 'dismissed'
+    kind         TEXT    NOT NULL,
+    stance_index INTEGER,
+    stance_label TEXT    NOT NULL DEFAULT '',
+    at_ms        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_reply_suggestion_outcomes_kind ON reply_suggestion_outcomes (kind, at_ms);
+"#;
 
 /// Migration 16 — which meeting a message is an invitation to.
 ///
