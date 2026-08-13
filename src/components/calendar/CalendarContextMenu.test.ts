@@ -38,10 +38,10 @@ function event(over: Partial<CalendarEvent> = {}): CalendarEvent {
 /** The bindings `CalendarMode` registers, as the registry has them. */
 function registry(over: Partial<Record<string, boolean>> = {}): KeyBinding[] {
   const all: KeyBinding[] = [
-    { keys: "e", group: "Event", description: "Open the event", handler: () => {} },
-    { keys: "backspace", group: "Event", description: "Delete the event", handler: () => {} },
-    { keys: "mod+c", group: "Event", description: "Copy the event", handler: () => {} },
-    { keys: "shift+d", group: "Event", description: "Duplicate the event", handler: () => {} },
+    { keys: "e", group: "Event", description: "Open", handler: () => {} },
+    { keys: "backspace", group: "Event", description: "Delete", handler: () => {} },
+    { keys: "mod+c", group: "Event", description: "Copy", handler: () => {} },
+    { keys: "shift+d", group: "Event", description: "Duplicate", handler: () => {} },
     { keys: "o", group: "Event", description: "Open in Google Calendar", handler: () => {} },
     { keys: "shift+c", group: "Event", description: "Create — full editor", handler: () => {} },
   ];
@@ -140,7 +140,7 @@ describe("buildEventItems", () => {
   });
 
   it("omits an item whose binding is not live rather than offering a dead one", () => {
-    const items = buildEventItems(registry({ "Delete the event": false }), event(), writable());
+    const items = buildEventItems(registry({ Delete: false }), event(), writable());
 
     expect(labels(items)).not.toContain("Delete");
     expect(labels(items)).toContain("Open");
@@ -148,7 +148,7 @@ describe("buildEventItems", () => {
 
   it("prints the binding's own keys, so the menu cannot drift from the keymap", () => {
     const moved: KeyBinding[] = [
-      { keys: "mod+shift+o", group: "Event", description: "Open the event", handler: () => {} },
+      { keys: "mod+shift+o", group: "Event", description: "Open", handler: () => {} },
     ];
     const items = buildEventItems(moved, event(), writable());
 
@@ -185,7 +185,7 @@ describe("buildEventItems", () => {
       buildEventItems(registry(), event({ rsvp: "tentative" }), writable()),
       buildEventItems(registry(), event(), writable({ canEdit: false, canCreate: false })),
       buildEventItems(
-        registry({ "Open the event": false, "Copy the event": false }),
+        registry({ Open: false, Copy: false }),
         event(),
         writable(),
       ),

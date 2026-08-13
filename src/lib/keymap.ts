@@ -76,6 +76,21 @@ export interface KeyBinding {
   description?: string;
   /** Grouping label for the help sheet: "Mail", "Calendar", "Global". */
   group?: string;
+  /**
+   * Other keys that belong on the same row of the help sheet, drawn as further
+   * chips after this one's.
+   *
+   * Purely how the sheet reads — it changes nothing about dispatch, and each
+   * key named here is still its own binding, registered next to this one with
+   * no `description` of its own so it does not also print a row.
+   *
+   * It exists because a description that names a key is a row that should have
+   * been several. "Next event ↓ ↑, nearest event on another day ← →" was one
+   * row, one chip and four keys, and no reader could tell which arrow did what.
+   * The chips are the column the eye is already running down, so the keys go
+   * there and the description goes back to being a label.
+   */
+  alsoKeys?: readonly string[];
   /** Gate on mode, focus, dialog state. Absent means always live. */
   when?: () => boolean;
   /** Bindings are dead while typing unless this is set. */

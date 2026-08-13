@@ -102,7 +102,10 @@ export function useKeyBindings(bindings: KeyBinding[]): void {
   latest.current = bindings;
 
   const signature = bindings
-    .map((b) => `${b.keys}/${b.priority ?? 0}/${b.allowInInput ? 1 : 0}/${b.group ?? ""}/${b.description ?? ""}`)
+    .map(
+      (b) =>
+        `${b.keys}/${b.priority ?? 0}/${b.allowInInput ? 1 : 0}/${b.group ?? ""}/${b.description ?? ""}/${b.alsoKeys?.join(" ") ?? ""}`,
+    )
     .join("|");
 
   useEffect(() => {
@@ -111,6 +114,7 @@ export function useKeyBindings(bindings: KeyBinding[]): void {
         keys: binding.keys,
         description: binding.description,
         group: binding.group,
+        alsoKeys: binding.alsoKeys,
         priority: binding.priority,
         allowInInput: binding.allowInInput,
         preventDefault: binding.preventDefault,

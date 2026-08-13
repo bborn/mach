@@ -31,6 +31,14 @@ import { formatBinding, type KeyBinding } from "@/lib/keymap";
  *     wide (`?` … `G then I`), so a chip-then-text row leaves the descriptions
  *     on a ragged edge that the eye cannot run down. The chips are right-set in
  *     a column of their own and every description starts at the same x.
+ *   * **Every key the row talks about is a chip in that column.** A row may
+ *     carry more than one — `↓ ⇥` for two spellings of the same step, `⇧↑ ⇧↓`
+ *     for a pair that is one idea and two directions — and the description
+ *     stays a label either way. See `KeyBinding.alsoKeys`. The rule this
+ *     enforces is that a description never names a key: the sheet used to
+ *     print "Next event ↓ ↑, nearest event on another day ← →" against a
+ *     single `↓`, and a reader could not tell what any of the four keys did
+ *     without reading a sentence to the end.
  *   * **Columns balance by content, not by group.** Two columns of sections,
  *     laid out with CSS multi-column so the browser splits them by height:
  *     Global's five rows no longer sit beside Mail's twenty.
@@ -38,8 +46,9 @@ import { formatBinding, type KeyBinding } from "@/lib/keymap";
  *     under itself. Truncation on a reference card hides the one word you
  *     opened it for.
  *   * **Filtering matches what is drawn, not what is registered.** The field
- *     tests each row's description and its formatted key label — "G then I",
- *     not "g i" — because that is what is on screen to search for.
+ *     tests each row's description, its formatted key label — "G then I", not
+ *     "g i" — and the group's heading, because those three are what is on
+ *     screen to search for.
  *   * **Escape always closes, even with text in the field.** `App.tsx` binds
  *     it unconditionally to `setShortcuts(null)`. Finding the row is the
  *     terminal action here, not the filter text — a first Escape that only
@@ -66,17 +75,23 @@ const GROUP_ORDER = [
   "Sidebar",
   "Calendar",
   "Event",
-  "Calendars",
+  "Visibility",
 ];
 
 export interface SheetRow {
-  keys: string;
+  /**
+   * Every chip on the row, left to right — usually one, and more when the
+   * binding named others through `alsoKeys`.
+   */
+  keys: string[];
   description: string;
   /**
    * What `Kbd` actually draws — "G then I", "⌘⌥→" — as opposed to `keys`,
    * which is the registry's internal token ("g i", "mod+alt+right"). The
    * filter matches against this, not against `keys`: matching the token
-   * would mean a search that finds things the row never displayed.
+   * would mean a search that finds things the row never displayed. Every chip
+   * on the row is in it, so a search for "↑" finds the row that draws one
+   * whichever of its keys carried the description.
    */
   keyLabel: string;
 }
@@ -97,11 +112,12 @@ export function buildGroups(bindings: readonly KeyBinding[]): SheetGroup[] {
     if (!binding.description) continue;
     const group = binding.group ?? "Other";
     const list = byGroup.get(group) ?? [];
-    if (!list.some((item) => item.keys === binding.keys)) {
+    const keys = [binding.keys, ...(binding.alsoKeys ?? [])];
+    if (!list.some((item) => item.keys[0] === binding.keys)) {
       list.push({
-        keys: binding.keys,
+        keys,
         description: binding.description,
-        keyLabel: formatBinding(binding.keys),
+        keyLabel: keys.map((key) => formatBinding(key)).join(" "),
       });
     }
     byGroup.set(group, list);
@@ -115,10 +131,16 @@ export function buildGroups(bindings: readonly KeyBinding[]): SheetGroup[] {
 }
 
 /**
- * Rows whose description or displayed key contains `query`. A group left
- * with nothing is dropped rather than printed with an empty body — an
- * uppercase heading over nothing is exactly the noise the filter exists to
- * cut.
+ * Rows whose description or displayed key contains `query`, plus every row of
+ * a group whose *heading* does. A group left with nothing is dropped rather
+ * than printed with an empty body — an uppercase heading over nothing is
+ * exactly the noise the filter exists to cut.
+ *
+ * The heading counts because it is on screen and because the rows under it
+ * stopped repeating it. "Delete the event" and "Copy the event" said "event"
+ * four times under a heading that already said EVENT; they say "Delete" and
+ * "Copy" now, and without this a search for "event" would answer with nothing
+ * from the group named after it.
  */
 export function filterGroups(groups: readonly SheetGroup[], query: string): SheetGroup[] {
   const q = query.trim().toLowerCase();
@@ -126,6 +148,10 @@ export function filterGroups(groups: readonly SheetGroup[], query: string): Shee
 
   const result: SheetGroup[] = [];
   for (const [group, rows] of groups) {
+    if (group.toLowerCase().includes(q)) {
+      result.push([group, rows]);
+      continue;
+    }
     const matched = rows.filter(
       (row) =>
         row.description.toLowerCase().includes(q) || row.keyLabel.toLowerCase().includes(q),
@@ -197,15 +223,18 @@ export function ShortcutSheet({
                 </h3>
                 <ul className="flex flex-col gap-1">
                   {list.map((row) => (
-                    <li key={row.keys} className="flex items-baseline gap-2.5">
+                    <li key={row.keys.join(" ")} className="flex items-baseline gap-2.5">
                       {/*
-                        Fixed width, right-set. The chip hugs the gutter and every
-                        description below it starts on the same line, which is the
+                        Fixed width, right-set. The chips hug the gutter and every
+                        description below them starts on the same line, which is the
                         whole reason the column exists. `G then I` is the widest
-                        thing `formatBinding` produces and it fits.
+                        single chip `formatBinding` produces and it fits; so does the
+                        widest pair the sheet draws, `⌥⇧↑ ⌥⇧↓`.
                       */}
-                      <span className="flex w-[4.75rem] shrink-0 justify-end">
-                        <Kbd keys={row.keys} />
+                      <span className="flex w-[4.75rem] shrink-0 justify-end gap-1">
+                        {row.keys.map((key) => (
+                          <Kbd key={key} keys={key} />
+                        ))}
                       </span>
                       <span className="min-w-0 flex-1 text-micro leading-[1.45] text-muted-foreground">
                         {row.description}
