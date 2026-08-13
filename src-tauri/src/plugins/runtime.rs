@@ -80,6 +80,36 @@ pub struct ConformanceReport {
     pub error: Option<String>,
 }
 
+impl ConformanceReport {
+    /// Does the evidence in this report actually support a pass?
+    ///
+    /// `ok` arrives as a boolean the frontend computed. That is fine as far as
+    /// it goes — the frontend is not the adversary here, a plugin is, and a
+    /// plugin has no way to reach IPC — but it means the gate that decides
+    /// whether untrusted code runs is a claim rather than a derivation, and the
+    /// rest of the report is the evidence for it sitting right there unread.
+    ///
+    /// So this re-derives the verdict from the rows, in Rust, using the same
+    /// three rules the probe describes:
+    ///
+    /// 1. **No attempt succeeded.** An `allowed` row is an escape that worked.
+    /// 2. **Something was attempted.** An empty run proves nothing, and "no
+    ///    rows" is what a probe that crashed early looks like.
+    /// 3. **The control succeeded.** Every check is a negative, so an unplugged
+    ///    network passes all of them. Without the positive control a verified
+    ///    sandbox and a dead network are the same report.
+    ///
+    /// Rule 3 is the one worth having on this side. A report can arrive with
+    /// `ok: true` and `control: { succeeded: false }` — the frontend would have
+    /// caught that, but the field that decides is the one Rust reads.
+    pub fn evidence_supports_a_pass(&self) -> bool {
+        let nothing_escaped = self.rows.iter().all(|row| !row.allowed);
+        let something_was_tried = !self.rows.is_empty();
+        let control_held = self.control.as_ref().is_some_and(|c| c.succeeded);
+        nothing_escaped && something_was_tried && control_held && self.failures.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConformanceControl {

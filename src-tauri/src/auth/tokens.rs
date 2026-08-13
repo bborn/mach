@@ -335,9 +335,26 @@ impl TokenStore for KeychainTokenStore {
 
 /// Process-lifetime store. Used by tests, and usable for a headless run where
 /// prompting for keychain access would hang.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryTokenStore {
     inner: Mutex<HashMap<String, String>>,
+}
+
+/// Test-only in practice, and redacted anyway. The rule this module states —
+/// every type holding secret material writes its own `Debug` — does not get an
+/// exemption for the store that holds refresh tokens as plain `String`s. A
+/// derived `Debug` here prints the whole map.
+impl fmt::Debug for MemoryTokenStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let accounts = self
+            .inner
+            .lock()
+            .map(|held| held.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        f.debug_struct("MemoryTokenStore")
+            .field("accounts", &accounts)
+            .finish()
+    }
 }
 
 impl TokenStore for MemoryTokenStore {

@@ -566,7 +566,7 @@ impl fmt::Debug for LoopbackServer {
 // ---------------------------------------------------------------------------
 
 /// A response from the token endpoint, reduced to what this module needs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
@@ -575,6 +575,21 @@ pub struct HttpResponse {
 impl HttpResponse {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+}
+
+/// Hand-written, like every other `Debug` in `auth`, and for a sharper reason
+/// than most: on the path that succeeds, `body` **is** the refresh token. A
+/// derived `Debug` here would put one `{:?}` between a stack trace and a
+/// permanent credential in a log. Only failure bodies are safe to show, and
+/// distinguishing them at format time is exactly the kind of thing that is
+/// right until somebody moves a line, so neither is shown.
+impl fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("body", &format_args!("<{} bytes, redacted>", self.body.len()))
+            .finish()
     }
 }
 

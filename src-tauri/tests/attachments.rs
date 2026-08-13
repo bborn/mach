@@ -24,7 +24,7 @@ use mach_lib::google::{
 };
 use mach_lib::ipc::attachments::store::names::{
     disambiguate, extension_of, is_dangerous, is_safe_component, is_valid_content_id,
-    raster_extension, raster_mime, safe_filename, sniff_raster_image,
+    raster_extension, raster_mime, safe_filename, sniff_executable, sniff_raster_image,
     truncate_preserving_extension, FALLBACK_NAME, MAX_FILENAME_BYTES,
 };
 use mach_lib::ipc::attachments::store::{
@@ -550,6 +550,136 @@ fn things_that_execute_on_a_double_click_are_still_refused() {
             "{mime:?} describes a program and must not be openable"
         );
     }
+}
+
+/// The macOS formats where "open" hands the system something it acts on with
+/// the user's authority, even though nothing about them is an ELF header.
+///
+/// `.mobileconfig` is the one that matters most. Double-clicking one opens
+/// System Settings at the profile installer, and an installed profile can add a
+/// root certificate, point every connection at a proxy, or enrol the machine in
+/// somebody else's MDM. It arrives as a small XML file with a friendly name, it
+/// is the standard macOS phishing payload, and a mail client that opens it for
+/// you is doing the attacker's hardest step.
+#[test]
+fn macos_formats_that_configure_or_mount_the_machine_are_refused() {
+    for name in [
+        // Configuration profiles: root CAs, proxies, MDM enrolment.
+        "wifi-setup.mobileconfig",
+        // Signed archives macOS expands and runs — how Xcode ships.
+        "tool.xip",
+        // Mountable images, siblings of the .dmg and .iso already refused.
+        "backup.sparseimage",
+        "backup.sparsebundle",
+        "disc.cdr",
+        "installer.smi",
+        // Executable bundles, siblings of .bundle and .app.
+        "helper.appex",
+        "helper.xpc",
+        "Thing.framework",
+        // Terminal settings files carry a command string.
+        "session.term",
+        // Apple Shortcuts.
+        "handy.shortcut",
+        // Java Web Start.
+        "launch.jnlp",
+    ] {
+        assert!(
+            is_dangerous(name, "application/octet-stream"),
+            "{name:?} hands the system something it acts on and must not be openable"
+        );
+    }
+}
+
+/// Extensions that are the same interpreter as one already on the list, spelled
+/// differently. Leaving these off means the list refuses `x.js` and opens
+/// `x.mjs`, which is not a decision, it is an oversight.
+#[test]
+fn script_extensions_are_refused_in_every_spelling_of_the_same_interpreter() {
+    for name in [
+        "loader.mjs",
+        "loader.cjs",
+        "silent.pyw",
+        "bundle.pyz",
+        "script.tcl",
+        "payload.vbscript",
+        "run.settingcontent-ms",
+        "app.appx",
+        "app.msix",
+        "app.appxbundle",
+        "repair.diagcab",
+    ] {
+        assert!(
+            is_dangerous(name, "application/octet-stream"),
+            "{name:?} runs code and must not be openable"
+        );
+    }
+}
+
+/// The bytes get a vote, not just the name.
+///
+/// A sender who names the part `invoice` with no extension and declares it
+/// `application/pdf` gets past both halves of [`is_dangerous`], because both
+/// halves read what the sender wrote. This is the one check that reads what the
+/// sender *sent*.
+#[test]
+fn a_program_is_recognised_from_its_bytes_whatever_it_is_called() {
+    // Mach-O, both widths, both endiannesses, and the universal wrapper.
+    assert!(sniff_executable(&[0xFE, 0xED, 0xFA, 0xCF, 0x0C]).is_some());
+    assert!(sniff_executable(&[0xCF, 0xFA, 0xED, 0xFE, 0x0C]).is_some());
+    assert!(sniff_executable(&[0xFE, 0xED, 0xFA, 0xCE, 0x0C]).is_some());
+    assert!(sniff_executable(&[0xCE, 0xFA, 0xED, 0xFE, 0x0C]).is_some());
+    assert!(sniff_executable(&[0xCA, 0xFE, 0xBA, 0xBE, 0x00]).is_some());
+    assert!(sniff_executable(&[0xBE, 0xBA, 0xFE, 0xCA, 0x00]).is_some());
+    // ELF and PE, because a saved attachment gets forwarded.
+    assert!(sniff_executable(b"\x7fELF\x02\x01").is_some());
+    assert!(sniff_executable(b"MZ\x90\x00").is_some());
+
+    // Documents are not programs, and this must never be the thing that stops
+    // the owner opening his own mail.
+    for benign in [
+        &b"%PDF-1.7 ..."[..],
+        &b"\x89PNG\r\n\x1a\n"[..],
+        &b"PK\x03\x04"[..],       // any zip: docx, xlsx, key, jar-shaped-but-named-.zip
+        &b"<!doctype html>"[..],
+        &b"Dear Bruno,"[..],
+        &b"{\"a\":1}"[..],
+        &b""[..],
+        &b"M"[..],
+    ] {
+        assert_eq!(
+            sniff_executable(benign),
+            None,
+            "a document was called a program: {:?}",
+            String::from_utf8_lossy(&benign[..benign.len().min(12)])
+        );
+    }
+}
+
+/// Polyglots, stated honestly.
+///
+/// A file can be a valid zip *and* a valid Mach-O at once — the zip directory
+/// lives at the end, so the front of the file is free. The sniff reads the
+/// front, so it catches that one. It does **not** catch the reverse (a real zip
+/// with a program appended), and it cannot: that file *is* a zip, and opening
+/// it unarchives rather than executes. The extension is what LaunchServices
+/// dispatches on and is checked first; the sniff is the second opinion for the
+/// case where the sender declined to give an extension at all.
+#[test]
+fn the_sniff_reads_the_front_of_the_file_which_is_what_the_loader_reads() {
+    let mut macho_then_zip = vec![0xFE, 0xED, 0xFA, 0xCF];
+    macho_then_zip.extend_from_slice(&[0u8; 64]);
+    macho_then_zip.extend_from_slice(b"PK\x05\x06");
+    assert!(
+        sniff_executable(&macho_then_zip).is_some(),
+        "a Mach-O with a zip trailer is still a Mach-O to the loader"
+    );
+
+    // And the honest limit, asserted so nobody reads more into the defence than
+    // it gives: a zip with a program inside is an ordinary zip.
+    let mut zip_then_macho = b"PK\x03\x04".to_vec();
+    zip_then_macho.extend_from_slice(&[0xFE, 0xED, 0xFA, 0xCF]);
+    assert_eq!(sniff_executable(&zip_then_macho), None);
 }
 
 #[test]
