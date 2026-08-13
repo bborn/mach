@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { CalendarEvent } from "@/types";
-import { conferenceLink, dialUrl, entryLabel, googleCalendarUrl, joinUrl } from "./calendar-links";
+import {
+  conferenceLink,
+  dialUrl,
+  entryLabel,
+  googleCalendarUrl,
+  joinUrl,
+  looksLikeAddress,
+  mapsUrl,
+} from "./calendar-links";
 
 const base: CalendarEvent = {
   id: 1,
@@ -183,6 +191,127 @@ describe("dialUrl", () => {
     expect(dialUrl("tel:+1-513-555-0199 <script>")).toBeNull();
     expect(dialUrl("telnet:host")).toBeNull();
     expect(dialUrl("tel:")).toBeNull();
+  });
+});
+
+/**
+ * The locations here are the shapes that actually turn up on his calendar:
+ * a venue with a street address after it, a room, a Meet link, and nothing.
+ */
+describe("looksLikeAddress", () => {
+  it("says yes to a street address, with or without the venue in front of it", () => {
+    expect(
+      looksLikeAddress(
+        "Twin Ignition Startup Garage, 1317 Marshall St NE, Minneapolis, MN 55413, USA",
+      ),
+    ).toBe(true);
+    expect(looksLikeAddress("1317 Marshall St NE, Minneapolis, MN 55413, USA")).toBe(true);
+    expect(looksLikeAddress("10 Downing Street, London SW1A 2AA")).toBe(true);
+    expect(looksLikeAddress("Bahnhofstrasse 10, 8001 Zürich")).toBe(true);
+  });
+
+  it("says no to a room, which is the case a map would be wrong about", () => {
+    // The number is there and means nothing. Offering directions to this is
+    // the specific failure the predicate leans away from.
+    expect(looksLikeAddress("Room 2")).toBe(false);
+    expect(looksLikeAddress("Conference Room 2, Building A")).toBe(false);
+    expect(looksLikeAddress("Bruno's desk")).toBe(false);
+  });
+
+  it("says no to the rest of what a week actually holds", () => {
+    // Every other location in the fixture week, which is a fair sample of what
+    // a `location` carries: a floor, a building, a provider's name, a school.
+    for (const location of [
+      "Northloop, 3rd floor",
+      "Westview HS",
+      "All hands",
+      "Zoom",
+      "Google Meet",
+      "Clinic",
+    ]) {
+      expect(looksLikeAddress(location), location).toBe(false);
+    }
+  });
+
+  it("says no to a call, which already has a Join button", () => {
+    expect(looksLikeAddress("https://meet.google.com/abc-defg-hij")).toBe(false);
+    expect(looksLikeAddress("meet.google.com/abc-defg-hij")).toBe(false);
+    expect(looksLikeAddress("https://acme.zoom.us/j/98765432")).toBe(false);
+  });
+
+  it("says no to nothing at all", () => {
+    expect(looksLikeAddress("")).toBe(false);
+    expect(looksLikeAddress("   ")).toBe(false);
+    expect(looksLikeAddress(null)).toBe(false);
+    expect(looksLikeAddress(undefined)).toBe(false);
+  });
+
+  it("refuses every scheme a hostile invitation could carry", () => {
+    for (const hostile of [
+      "javascript:alert(1)",
+      "JavaScript:alert(1)",
+      "data:text/html,<script>alert(1)</script>",
+      "file:///etc/passwd",
+      "zoommtg://zoom.us/join?confno=1",
+      "vbscript:msgbox(1)",
+    ]) {
+      expect(looksLikeAddress(hostile)).toBe(false);
+    }
+  });
+
+  it("refuses a paragraph, which is parking instructions rather than a place", () => {
+    expect(looksLikeAddress(`1317 Marshall St NE ${"and then a long note ".repeat(30)}`)).toBe(
+      false,
+    );
+  });
+});
+
+describe("mapsUrl", () => {
+  it("is null wherever the location is not a place", () => {
+    expect(mapsUrl("Room 2")).toBeNull();
+    expect(mapsUrl("https://meet.google.com/abc-defg-hij")).toBeNull();
+    expect(mapsUrl("")).toBeNull();
+    expect(mapsUrl(undefined)).toBeNull();
+  });
+
+  it("carries the address as an encoded query, not as a path", () => {
+    // Spaces, commas, an ampersand and a non-ASCII letter — everything that
+    // would break a URL if it were pasted in raw.
+    const url = mapsUrl("Café & Bar, 1 Rue de l'Église, 75001 Paris");
+    expect(url).toBe(
+      "https://www.google.com/maps/search/?api=1&query=" +
+        "Caf%C3%A9%20%26%20Bar%2C%201%20Rue%20de%20l'%C3%89glise%2C%2075001%20Paris",
+    );
+    // The `&` inside the address is `%26`, so it cannot start a parameter of
+    // its own, and `query` is still the last one Maps will read.
+    expect(new URL(url!).searchParams.get("query")).toBe(
+      "Café & Bar, 1 Rue de l'Église, 75001 Paris",
+    );
+  });
+
+  it("cannot be talked into a scheme, a host, or a path by its input", () => {
+    // Address-shaped, so the predicate lets it through — and the URL that comes
+    // out is still an https Google Maps search with the payload inert inside a
+    // query parameter. This is the second lock: the first is that a bare
+    // `javascript:` location never reaches here at all.
+    expect(mapsUrl("javascript:alert(1)")).toBeNull();
+
+    for (const payload of [
+      "123 Main Street, javascript:alert(1)",
+      "123 Main Street#@evil.example",
+      "123 Main Street?q=x&z=y",
+      "123 Main Street /../../evil",
+    ]) {
+      const url = mapsUrl(payload);
+      expect(url).not.toBeNull();
+      const parsed = new URL(url!);
+      expect(parsed.protocol).toBe("https:");
+      expect(parsed.hostname).toBe("www.google.com");
+      expect(parsed.pathname).toBe("/maps/search/");
+      expect(parsed.hash).toBe("");
+      expect(parsed.searchParams.get("query")).toBe(payload);
+      expect(url).not.toContain("javascript:");
+    }
   });
 });
 

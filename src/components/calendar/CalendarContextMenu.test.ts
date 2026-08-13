@@ -43,6 +43,7 @@ function registry(over: Partial<Record<string, boolean>> = {}): KeyBinding[] {
     { keys: "mod+c", group: "Event", description: "Copy the event", handler: () => {} },
     { keys: "shift+d", group: "Event", description: "Duplicate the event", handler: () => {} },
     { keys: "o", group: "Event", description: "Open in Google Calendar", handler: () => {} },
+    { keys: "shift+m", group: "Event", description: "Map the address", handler: () => {} },
     { keys: "shift+c", group: "Event", description: "Create — full editor", handler: () => {} },
   ];
   return all.filter((b) => over[b.description!] !== false);
@@ -55,6 +56,7 @@ function verbs(): CalendarVerbs {
     duplicate: vi.fn(),
     copy: vi.fn(),
     openInGoogle: vi.fn(),
+    openMap: vi.fn(),
     rsvp: vi.fn(),
     createAt: vi.fn(),
   };
@@ -169,6 +171,30 @@ describe("buildEventItems", () => {
     expect(on.open).toHaveBeenCalledWith(target);
     expect(on.duplicate).toHaveBeenCalledWith(target);
     expect(on.openInGoogle).toHaveBeenCalledWith(target);
+  });
+
+  it("offers a map only where there is an address to map", () => {
+    const withAddress = event({
+      location: "Twin Ignition Startup Garage, 1317 Marshall St NE, Minneapolis, MN 55413, USA",
+    });
+    expect(labels(buildEventItems(registry(), withAddress, writable()))).toContain("Map");
+
+    // A room, a call, and nothing at all — three locations a map cannot take.
+    for (const location of [undefined, "Room 2", "https://meet.google.com/abc-defg-hij"]) {
+      expect(labels(buildEventItems(registry(), event({ location }), writable()))).not.toContain(
+        "Map",
+      );
+    }
+  });
+
+  it("hands the map the event the menu is about, through the verb", () => {
+    const on = verbs();
+    const target = event({ id: 9, location: "1317 Marshall St NE, Minneapolis, MN 55413" });
+    const items = buildEventItems(registry(), target, writable({ verbs: on }));
+
+    byLabel(items, "Map")?.run();
+    expect(on.openMap).toHaveBeenCalledWith(target);
+    expect(byLabel(items, "Map")?.shortcut).toBe("shift+m");
   });
 
   it("hands the RSVP the response its label names", () => {
