@@ -30,6 +30,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { Account, Calendar } from "@/types";
+import type { Solo } from "@/lib/calendar-solo";
 import { parseSession, type CalendarVisibility } from "@/lib/prefs";
 import {
   CalendarSidebar,
@@ -58,7 +59,12 @@ const SECOND: Account = {
   kind: "workspace",
 };
 
-function render(calendars: Calendar[], accounts: Account[] = [ACCOUNT], hidden: string[] = []) {
+function render(
+  calendars: Calendar[],
+  accounts: Account[] = [ACCOUNT],
+  hidden: string[] = [],
+  solo: Solo | null = null,
+) {
   return renderToStaticMarkup(
     <CalendarSidebar
       accounts={accounts}
@@ -66,7 +72,7 @@ function render(calendars: Calendar[], accounts: Account[] = [ACCOUNT], hidden: 
       hidden={hidden}
       colorFor={() => "#16a765"}
       dark={false}
-      soloAccount={null}
+      solo={solo}
       onToggle={() => {}}
       onSolo={() => {}}
       settings={{ mergeDuplicates: false, showDeclined: false, showWeekends: true }}
@@ -139,6 +145,23 @@ describe("the calendar rail", () => {
     // the button stays in the tab order and in the accessibility tree.
     expect(html).toContain("opacity-0");
     expect(html).toContain("focus-visible:opacity-100");
+  });
+
+  it("offers solo as a third real button, naming the key that does it", () => {
+    // ⌥-click is the accelerator; this is the half that can be found. Google
+    // shows "Display this only" on hover and nothing at all otherwise, which is
+    // the same bargain — except that a button is also a tab stop.
+    const html = render([calendar({ name: "Training" })]);
+    expect(html).toContain('aria-label="Show only Training"');
+    expect(html).toContain("Show only this calendar (⌥1)");
+  });
+
+  it("lights the soloed row's chip and offers the way back on it", () => {
+    const html = render([calendar()], [ACCOUNT], [], { kind: "calendar", id: "c1" });
+    expect(html).toContain('aria-label="Show every calendar"');
+    // Lit, not faded: while one calendar is soloed the return may not be
+    // waiting behind a hover.
+    expect(html).toMatch(/aria-label="Show every calendar"[^>]*bg-accent/);
   });
 
   it("puts the full name in the tooltip, because the row truncates", () => {
@@ -261,7 +284,9 @@ describe("one calendar, one row", () => {
       ],
       [ACCOUNT, SECOND],
     );
-    expect(html.match(/aria-pressed/g)).toHaveLength(2);
+    // Two rows, both on. `aria-pressed="true"` rather than `aria-pressed`,
+    // because the solo chips beside them carry one too — and theirs is false.
+    expect(html.match(/aria-pressed="true"/g)).toHaveLength(2);
     expect(html).toContain("title=\"Family\nbruno@example.com");
     expect(html).toContain("title=\"Family\nbruno@work.example");
   });
