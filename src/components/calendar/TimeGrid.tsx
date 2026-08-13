@@ -209,34 +209,98 @@ export function TimeGrid({
   // relative to a seven o'clock day.
   const scrollFloor = Math.max(workingHours.start - 0.5, 0);
 
-  // Open on now, a quarter of the way down — not on a fixed 07:00, which is
-  // right at nine in the morning and useless after lunch.
-  useLayoutEffect(() => {
-    const node = scroller.current;
-    if (!node) return;
-    node.scrollTop = nowScrollTop(
-      Date.now(),
-      startOfDay(Date.now()).getTime(),
-      node.clientHeight,
-      scrollFloor,
-    );
-    // Mount only: instant, so there is no visible lurch on open.
-  }, []);
+  /**
+   * The last scroll position this component asked for.
+   *
+   * How a scroll of ours is told apart from a scroll of the user's, which is
+   * the difference between a position we may replace and one we may not.
+   */
+  const asked = useRef<number | null>(null);
+  /** The user has put the grid somewhere. It is theirs now. */
+  const moved = useRef(false);
 
-  // `t` re-anchors, and animates so the keypress visibly registered.
-  useEffect(() => {
-    const node = scroller.current;
-    if (!node || todayNonce === 0) return;
-    node.scrollTo({
-      top: nowScrollTop(
+  /**
+   * Put now a quarter of the way down, if the grid is in a state to be asked.
+   *
+   * Returns whether it actually happened. **`scrollTop` is a request, not an
+   * assignment**: an element with no layout — no height, nothing to overflow —
+   * takes the write, keeps zero, and reports zero afterwards. Zero is midnight,
+   * and midnight is a screen and a half of empty night with the day's events
+   * pushed below the fold. So the caller is told, and tries again later.
+   */
+  const anchor = useCallback(
+    (behavior: ScrollBehavior): boolean => {
+      const node = scroller.current;
+      if (!node) return false;
+      // Not "is it visible": the calendar is mounted behind the mail pane for
+      // the life of the window and is anchored perfectly well from there. It is
+      // "is there anything to scroll", which is the precondition the write has.
+      if (node.clientHeight <= 0 || node.scrollHeight <= node.clientHeight) return false;
+      const top = nowScrollTop(
         Date.now(),
         startOfDay(Date.now()).getTime(),
         node.clientHeight,
         scrollFloor,
-      ),
-      behavior: "smooth",
+      );
+      asked.current = top;
+      if (behavior === "smooth") node.scrollTo({ top, behavior });
+      else node.scrollTop = top;
+      return true;
+    },
+    [scrollFloor],
+  );
+
+  /*
+   * Where the grid opens.
+   *
+   * This used to be a `[]` effect — one write, at mount, believed. Three
+   * things are wrong with that, and the first one shipped:
+   *
+   *   - **A mount is not a layout.** The calendar mounts with the window,
+   *     whichever mode is on screen, and a window that has not been laid out
+   *     yet gives the scroller `clientHeight: 0` and `scrollHeight: 0`. The
+   *     write is dropped, the grid stays at midnight, and nothing ever asks
+   *     again. So the anchor waits for the first layout the grid is given.
+   *   - **The floor is a guess until the store answers.** `workingHours`
+   *     arrives asynchronously, so the first render's floor is the default and
+   *     may be an hour and a half off. A floor that changes re-anchors.
+   *   - **A grid the user has scrolled is not ours to move.** Once they have
+   *     put it somewhere, a preference landing late leaves it alone.
+   *
+   * Day and week share this component and this scroller, so switching between
+   * them keeps the position, which is what Google Calendar does. Month is a
+   * different component: coming back from it is a mount, and mounts anchor.
+   */
+  useLayoutEffect(() => {
+    if (moved.current) return;
+    if (anchor("auto")) return;
+    const node = scroller.current;
+    if (!node) return;
+    // No layout yet. `ResizeObserver` fires as soon as the box is real —
+    // including the fire it makes on observe, which covers the case where the
+    // layout arrived between the effect and here.
+    const observer = new ResizeObserver(() => {
+      if (moved.current || anchor("auto")) observer.disconnect();
     });
-  }, [todayNonce, scrollFloor]);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [anchor]);
+
+  /*
+   * `t` re-anchors, and animates so the keypress visibly registered.
+   *
+   * An explicit ask, so it overrides a scroll the user made — and having
+   * answered it the grid is where they asked, not where anything guessed, so a
+   * later change of floor leaves it alone. Keyed on the nonce itself rather
+   * than on the effect running: `anchor` changes identity with the working day,
+   * and that must not replay the last keypress.
+   */
+  const answered = useRef(0);
+  useEffect(() => {
+    if (todayNonce === 0 || todayNonce === answered.current) return;
+    answered.current = todayNonce;
+    if (anchor("smooth")) moved.current = true;
+  }, [todayNonce, anchor]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 60_000);
@@ -477,6 +541,15 @@ export function TimeGrid({
       ref={scroller}
       className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
       style={{ overscrollBehavior: "contain", scrollbarGutter: "stable" }}
+      // Whose scroll position is this? Ours until something moves it that is
+      // not us — a wheel, a drag of the bar, an arrow key stepping onto a block
+      // off screen. After that the grid stays where it was put, and a
+      // preference arriving late does not yank it back.
+      onScroll={(event) => {
+        const top = event.currentTarget.scrollTop;
+        if (asked.current !== null && Math.abs(top - asked.current) < 1) return;
+        moved.current = true;
+      }}
       // A click is how a block opens, and a drag ends in one. Swallowing it in
       // the capture phase is the only place that can tell the two apart.
       onClickCapture={(event) => {

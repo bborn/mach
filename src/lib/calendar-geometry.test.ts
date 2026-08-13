@@ -8,6 +8,7 @@ import {
   blockHeight,
   blockPlan,
   blockTier,
+  clamp,
   clusterPlan,
   nowScrollTop,
   offsetForTime,
@@ -74,6 +75,55 @@ describe("nowScrollTop", () => {
 
   it("survives a viewport taller than the grid", () => {
     expect(nowScrollTop(DAY_START + 12 * HOUR, DAY_START, 2000)).toBe(6.5 * HOUR_HEIGHT);
+  });
+
+  /*
+   * The three states the grid was in when it opened on 1 AM.
+   *
+   * None of them is an arithmetic bug — the function answers sensibly to all
+   * three. The defect was in believing the *write* that carried the answer, and
+   * the assertions below are the reason to say that out loud: at 20:02 this
+   * function cannot return anything near midnight, so a grid showing midnight
+   * was never given the number this computed.
+   */
+  it("takes the floor from the working day rather than a fixed 06:30", () => {
+    // Nine to five, half an hour of air above it. A day that starts at ten
+    // should not open on half past six.
+    const eightAm = DAY_START + 8 * HOUR;
+    expect(nowScrollTop(eightAm, DAY_START, viewport, 8.5)).toBe(8.5 * HOUR_HEIGHT);
+    expect(nowScrollTop(eightAm, DAY_START, viewport, 0)).toBe(8 * HOUR_HEIGHT - 125);
+  });
+
+  it("prefers the floor when the day's bottom would put it above it", () => {
+    // The evening case, with the default nine o'clock working day: 20:02 is
+    // 961px down, the viewport can only be scrolled to 377, and the floor is
+    // 408. `clamp` prefers its minimum when the range inverts, so the grid
+    // opens on the working day and runs to midnight — never above 08:30.
+    const evening = DAY_START + 20 * HOUR + 2 * MINUTE;
+    expect(clamp(961, 408, 377)).toBe(408);
+    expect(nowScrollTop(evening, DAY_START, 775, 8.5)).toBe(8.5 * HOUR_HEIGHT);
+  });
+
+  it("answers plausibly for a viewport of zero, which is the trap", () => {
+    // A grid that has not been laid out reports `clientHeight: 0`, and this
+    // function has no way to know that: a quarter of nothing is nothing, so it
+    // returns now's own offset and looks entirely reasonable doing it. The
+    // caller cannot tell a good answer from a useless one here, which is why
+    // `TimeGrid` checks that the *element* can be scrolled before it writes,
+    // and asks again when it can.
+    const evening = DAY_START + 20 * HOUR + 2 * MINUTE;
+    expect(nowScrollTop(evening, DAY_START, 0, 8.5)).toBeCloseTo(20.0333 * HOUR_HEIGHT, 1);
+    expect(nowScrollTop(evening, DAY_START, 0, 8.5)).toBeGreaterThan(0);
+  });
+});
+
+describe("clamp", () => {
+  it("prefers the minimum when the range inverts", () => {
+    // Relied on twice: by the cascade, where every step is the floor and the
+    // top block takes what is left, and by `nowScrollTop`, where a working day
+    // that starts after the last scrollable pixel still wins.
+    expect(clamp(50, 10, 0)).toBe(10);
+    expect(clamp(-50, 10, 0)).toBe(10);
   });
 });
 
