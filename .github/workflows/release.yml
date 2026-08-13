@@ -1,0 +1,211 @@
+# The release path. It runs when a `v*` tag is pushed, and the release it makes
+# is a draft — nothing is public until somebody presses publish.
+#
+# `workflow_dispatch` runs the same build and makes no release, which is how you
+# find out the workflow works without publishing anything. The bundle comes back
+# as a workflow artifact either way.
+#
+# ---------------------------------------------------------------------------
+# SIGNING
+# ---------------------------------------------------------------------------
+#
+# A `.dmg` downloaded from a GitHub release carries `com.apple.quarantine`, and
+# Gatekeeper refuses an app inside one that is neither signed with a Developer
+# ID nor notarized. Notarizing needs the $99/year Apple Developer Program, so
+# the default here produces an ad-hoc signed bundle — see the ad-hoc comment in
+# the signing step, which is the difference between a refusal the user can
+# clear and one they cannot — and RELEASING.md carries the command they need.
+#
+# The signed path is wired and dormant. Add the secrets and this same workflow
+# signs and notarizes instead; add none and it behaves exactly as it does now.
+#
+# It goes through $GITHUB_ENV rather than a job-level `env:` block. An undefined
+# secret evaluates to the empty string, GitHub defines the variable anyway, and
+# the Tauri bundler reads these with `var_os`, for which `Some("")` is present.
+# `APPLE_CERTIFICATE=""` would reach `Keychain::with_certificate` with nothing in
+# it and fail the build rather than skip signing. A variable never written to
+# $GITHUB_ENV is absent.
+#
+# Nothing here is related to `scripts/sign`, which is a self-signed certificate
+# whose only job is to stop the login Keychain re-prompting on every rebuild.
+# It cannot be used for distribution and must not be.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Uploading assets to a release is a write to the repository.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macOS bundle
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Universal, so one download works on both architectures — which is what
+      # the README promises. Building on an Apple silicon runner, the x86_64
+      # half needs its target installed explicitly.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # `tauri build` runs `bun run build`, which typechecks. This is the half
+      # that would otherwise not run before a release. `cargo test` is not here:
+      # CI ran it on the commit being tagged, and running it again would compile
+      # the dependency tree a second time under a different profile.
+      - name: Test
+        run: bunx vitest run
+
+      # Three files carry a version and only tauri.conf.json reaches the bundle,
+      # so the other two can drift for months without anything failing. A tag
+      # that disagrees with them produces a release whose name is a lie. Reading
+      # them is instant; finding out afterwards is not.
+      - name: The tag and the versions agree
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          conf="$(bun -e 'console.log(require("./src-tauri/tauri.conf.json").version)')"
+          pkg="$(bun -e 'console.log(require("./package.json").version)')"
+          cargo="$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -1)"
+          echo "tag $tag · tauri.conf.json $conf · package.json $pkg · Cargo.toml $cargo"
+          if [ "$tag" != "$conf" ] || [ "$tag" != "$pkg" ] || [ "$tag" != "$cargo" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match tauri.conf.json ($conf), package.json ($pkg) and Cargo.toml ($cargo). Run scripts/version." >&2
+            exit 1
+          fi
+
+      - name: Signing credentials, if there are any
+        id: signing
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          # Heredoc form, because a base64 certificate is thousands of
+          # characters over many lines and KEY=value is one line.
+          put() {
+            printf '%s<<__MACH_ENV__\n%s\n__MACH_ENV__\n' "$1" "$2" >> "$GITHUB_ENV"
+          }
+
+          signing=no
+          if [ -n "$CERTIFICATE" ] && [ -n "$CERTIFICATE_PASSWORD" ]; then
+            put APPLE_CERTIFICATE "$CERTIFICATE"
+            put APPLE_CERTIFICATE_PASSWORD "$CERTIFICATE_PASSWORD"
+            signing=yes
+            echo "Signing with the Developer ID certificate in APPLE_CERTIFICATE."
+            # No APPLE_SIGNING_IDENTITY: the bundler infers it from the
+            # certificate, and setting both makes it compare the two and fail
+            # the build when they differ by so much as a suffix.
+          else
+            # Ad-hoc, and this is the difference between an app the user can
+            # open and one they cannot. An unsigned arm64 binary is killed by
+            # the kernel before Gatekeeper is consulted, and the dialog is
+            # "Mach is damaged and can't be opened", which has no Open Anyway
+            # button — a dead end, not a speed bump. Ad-hoc signing gets the
+            # "Apple could not verify" dialog instead, which System Settings
+            # can clear. Tauri's own distribution docs say to do this.
+            #
+            # It lives here rather than in tauri.conf.json so that a local
+            # `tauri build` is unaffected, and so the Developer ID path above
+            # cannot collide with an identity of "-".
+            put APPLE_SIGNING_IDENTITY "-"
+            echo "No APPLE_CERTIFICATE. Ad-hoc signing instead, so macOS says it cannot verify Mach rather than that Mach is damaged."
+          fi
+
+          # Notarization submits a signed bundle to Apple. Asking for it without
+          # a certificate cannot succeed, so it is gated on signing rather than
+          # attempted and failed.
+          notarizing=no
+          if [ "$signing" = yes ] \
+            && [ -n "$NOTARY_APPLE_ID" ] \
+            && [ -n "$NOTARY_PASSWORD" ] \
+            && [ -n "$NOTARY_TEAM_ID" ]; then
+            put APPLE_ID "$NOTARY_APPLE_ID"
+            put APPLE_PASSWORD "$NOTARY_PASSWORD"
+            put APPLE_TEAM_ID "$NOTARY_TEAM_ID"
+            notarizing=yes
+            echo "Notarizing as $NOTARY_TEAM_ID."
+          else
+            echo "Not notarizing."
+          fi
+
+          echo "signing=$signing" >> "$GITHUB_OUTPUT"
+          echo "notarizing=$notarizing" >> "$GITHUB_OUTPUT"
+
+      # The install note has to match what the build actually is, so it is
+      # written here from the outcome above rather than kept in the workflow as
+      # a constant that would go stale the day the secrets are added.
+      - name: Release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          {
+            echo "body<<__MACH_NOTES__"
+            if [ "${{ steps.signing.outputs.notarizing }}" = yes ]; then
+              echo "Signed with a Developer ID and notarized by Apple. Drag it to Applications and open it."
+            else
+              echo "This build is ad-hoc signed and not notarized, so macOS will refuse it the"
+              echo "first time and say it cannot verify Mach is free of malware."
+              echo
+              echo "**Drag Mach to Applications first.** A copy taken out of the .dmg gets its own"
+              echo "quarantine flag, and an app opened from Downloads runs from a randomised"
+              echo "read-only path where none of this sticks. Then either:"
+              echo
+              echo '    xattr -dr com.apple.quarantine /Applications/Mach.app'
+              echo
+              echo "or double-click it, let macOS refuse, and go to **System Settings → Privacy &"
+              echo "Security → Open Anyway**. That button only appears after the refused attempt"
+              echo "and lasts about an hour. Control-click → Open has not worked since macOS 15."
+            fi
+            echo
+            echo "You bring your own Google OAuth client; Mach ships no credentials."
+            echo "[The setup skill](https://github.com/bborn/mach/blob/main/skills/mach-setup/SKILL.md) walks a coding agent through the Google Cloud half of it."
+            echo
+            echo "Changes: [CHANGELOG.md](https://github.com/bborn/mach/blob/main/CHANGELOG.md)."
+            echo "__MACH_NOTES__"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target universal-apple-darwin
+          # Empty on a manual run, which is what makes it build without
+          # releasing.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: Mach ${{ github.ref_name }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: true
+          # Mach has no updater, so there is no latest.json and no signature to
+          # go with it.
+          uploadUpdaterJson: false
+          uploadWorkflowArtifacts: true
+          # Asset uploads are the flaky part; the build behind them is twenty
+          # minutes that should not be thrown away for one bad connection.
+          retryAttempts: 3

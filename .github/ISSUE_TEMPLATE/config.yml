@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/bborn/mach/security/advisories/new
+    about: Report it privately instead. See SECURITY.md.
+  - name: Setting up the Google OAuth client
+    url: https://github.com/bborn/mach/blob/main/skills/mach-setup/SKILL.md
+    about: The click-by-click checklist for the Google Cloud half of the install.

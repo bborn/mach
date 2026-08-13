@@ -1,0 +1,40 @@
+# Three ecosystems — cargo, bun, github-actions — monthly and grouped.
+#
+# Weekly across three ecosystems is a pull request every day or two on a project
+# with one maintainer, and the ones that get ignored are the ones that matter.
+# Monthly and grouped is one batch to read.
+#
+# Security updates ignore the schedule and the group, and arrive on their own.
+# Major versions are left out of the groups, so a breaking bump arrives as its
+# own pull request rather than hidden inside a batch of patches.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # `bun`, not `npm`. The lockfile here is bun.lock, and the npm ecosystem
+  # would edit package.json and leave the lockfile it cannot read behind.
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      bun:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
