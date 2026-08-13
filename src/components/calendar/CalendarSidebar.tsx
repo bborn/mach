@@ -536,10 +536,24 @@ export function calendarRows(
   const unlisted = rows.filter((row) => row.state === "unlisted");
   const listed = rows.filter((row) => row.state !== "unlisted");
 
-  const groups = accounts.map((account) => ({
-    account,
-    rows: listed.filter((row) => row.calendar.accountId === account.id),
-  }));
+  /*
+   * An account with nothing under it is not a heading, it is a stub.
+   *
+   * The heading exists to say whose the calendars below it are, and it carries
+   * a fold triangle and a "solo" button — so an account whose only calendar was
+   * unlisted kept a row that named nothing, folded nothing, and offered to solo
+   * a set with no members. The calendar is still one press away under "Hidden
+   * from list", and restoring it brings the heading back with it.
+   *
+   * Empty because Google returned no calendars for the account at all is the
+   * same picture and gets the same answer.
+   */
+  const groups = accounts
+    .map((account) => ({
+      account,
+      rows: listed.filter((row) => row.calendar.accountId === account.id),
+    }))
+    .filter((group) => group.rows.length > 0);
   // Calendars whose account is gone should still be reachable.
   const orphans = listed.filter((row) => !accounts.some((a) => a.id === row.calendar.accountId));
   if (orphans.length > 0) {

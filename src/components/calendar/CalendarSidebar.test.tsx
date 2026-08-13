@@ -240,10 +240,14 @@ describe("one calendar, one row", () => {
       ],
       {},
     );
-    expect(groups[0].rows).toHaveLength(0);
-    expect(groups[1].rows).toHaveLength(1);
-    expect(groups[1].rows[0].calendar.accessRole).toBe("owner");
-    expect(groups[1].rows[0].accountIds).toEqual([2, 1]);
+    // By account rather than by position: the reader account contributes no row
+    // of its own, so it has no heading at all now, and an index would be naming
+    // whichever group happened to survive.
+    const under = (id: number) => groups.find((g) => g.account.id === id);
+    expect(under(1)).toBeUndefined();
+    expect(under(2)?.rows).toHaveLength(1);
+    expect(under(2)?.rows[0].calendar.accessRole).toBe("owner");
+    expect(under(2)?.rows[0].accountIds).toEqual([2, 1]);
   });
 
   it("keeps two different calendars that share a name apart", () => {
@@ -287,6 +291,43 @@ describe("one calendar, one row", () => {
       calendarRows([ACCOUNT, SECOND], [holidays(1, false), holidays(2, false)], {})
         .groups.flatMap((g) => g.rows)[0].state,
     ).toBe("hidden");
+  });
+});
+
+describe("an account with nothing left under it", () => {
+  it("drops the heading when its only calendar was unlisted", () => {
+    // He removed the one calendar on his disenoclosets account and the account
+    // stayed in the rail: a heading naming nothing, a fold triangle folding
+    // nothing, and a solo button offering to solo an empty set.
+    const { groups, unlisted } = calendarRows(
+      [ACCOUNT, SECOND],
+      [calendar(), calendar({ id: "c2", accountId: 2, name: "Work" })],
+      { c2: "unlisted" },
+    );
+    expect(groups.map((g) => g.account.id)).toEqual([1]);
+    expect(unlisted).toHaveLength(1);
+  });
+
+  it("keeps the heading when the calendar is merely switched off", () => {
+    // Off is a toggle he wants to toggle back, so the row stays visible and so
+    // does the account above it. Only "unlisted" takes a calendar out of the
+    // rail, and that is what the disclosure at the foot is for.
+    const { groups } = calendarRows(
+      [ACCOUNT, SECOND],
+      [calendar(), calendar({ id: "c2", accountId: 2, name: "Work" })],
+      { c2: "hidden" },
+    );
+    expect(groups.map((g) => g.account.id)).toEqual([1, 2]);
+  });
+
+  it("drops the heading for an account Google returned no calendars for", () => {
+    const { groups } = calendarRows([ACCOUNT, SECOND], [calendar()], {});
+    expect(groups.map((g) => g.account.id)).toEqual([1]);
+  });
+
+  it("brings the heading back when the calendar is restored", () => {
+    const both = [calendar(), calendar({ id: "c2", accountId: 2, name: "Work" })];
+    expect(calendarRows([ACCOUNT, SECOND], both, { c2: "shown" }).groups).toHaveLength(2);
   });
 });
 
