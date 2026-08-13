@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# scripts/version — set the version in the three files that carry one.
+#
+# `tauri.conf.json` names what the bundle calls itself, `package.json` is what
+# anybody reading the repo looks at first, and `Cargo.toml` is what `cargo`
+# reports. Tauri reads its own file and ignores the other two, so nothing fails
+# when they disagree — the disagreement just sits there until a release is built
+# from it. `.github/workflows/release.yml` refuses a tag that does not match, and
+# this is how you make it match.
+#
+#     scripts/version            # print what they say now
+#     scripts/version 0.2.0      # set all three
+#
+# It does not tag, commit, or push. Bruno decides when a version exists.
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+PKG="$REPO/package.json"
+CONF="$REPO/src-tauri/tauri.conf.json"
+CARGO="$REPO/src-tauri/Cargo.toml"
+
+read_pkg()   { sed -n 's/^  "version": "\(.*\)",$/\1/p' "$PKG" | head -1; }
+read_conf()  { sed -n 's/^  "version": "\(.*\)",$/\1/p' "$CONF" | head -1; }
+read_cargo() { sed -n 's/^version = "\(.*\)"$/\1/p' "$CARGO" | head -1; }
+
+if [ $# -eq 0 ]; then
+  printf 'package.json          %s\n' "$(read_pkg)"
+  printf 'tauri.conf.json       %s\n' "$(read_conf)"
+  printf 'src-tauri/Cargo.toml  %s\n' "$(read_cargo)"
+  exit 0
+fi
+
+VERSION="$1"
+
+# Semver, because the tag guard in CI compares strings and a `v` or a stray
+# space here becomes a confusing failure there instead of an obvious one now.
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+  echo "version: \"$VERSION\" is not a semver version (0.2.0, 1.0.0-rc.1)" >&2
+  exit 2
+fi
+
+# Anchored to the top-level key in each file. `"version"` appears in
+# package.json's dependency tree too, and only the top-level one is at this
+# indentation with a trailing comma.
+sed -i '' "s/^  \"version\": \".*\",$/  \"version\": \"$VERSION\",/" "$PKG"
+sed -i '' "s/^  \"version\": \".*\",$/  \"version\": \"$VERSION\",/" "$CONF"
+# Only the first `version = ` line, which is the package's own; the dependency
+# table below it is full of them.
+sed -i '' "1,/^version = /s/^version = \".*\"$/version = \"$VERSION\"/" "$CARGO"
+
+for f in "$PKG" "$CONF" "$CARGO"; do
+  echo "version: $(basename "$f") → $VERSION"
+done
+
+cat <<NEXT
+
+Next, when you mean it:
+
+    git commit -am "chore: $VERSION"
+    git tag v$VERSION
+    git push origin main --tags
+
+The tag is what runs .github/workflows/release.yml. It leaves a draft release.
+NEXT

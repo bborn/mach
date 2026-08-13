@@ -1,0 +1,45 @@
+name: Bug
+description: Something in Mach does not do what it says it does.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, and what Mach did instead of what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce it
+      description: >
+        If you can get it to happen again, say how. If you can't, say that —
+        an intermittent bug is still worth filing.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit
+      description: "`git rev-parse --short HEAD` in your checkout."
+      placeholder: 1624c30
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "15.2, Apple silicon"
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: >
+        Please don't paste real email addresses, message contents or tokens.
+        Redact them, or use fixture data — `?fixtures` on the dev URL fills the
+        app with invented mail.

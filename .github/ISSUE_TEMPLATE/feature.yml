@@ -1,0 +1,27 @@
+name: Feature
+description: Something Mach should do and does not.
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Read the "What this is, and is not" section of the README first. IMAP,
+        SMTP, other providers, Windows, Linux, mobile, web, teams and sharing
+        are out of scope, and an issue asking for one of them will be closed.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What you want it to do
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: What you're doing today instead
+      description: >
+        The workaround you have now. It's usually the most useful thing in the
+        issue.
+    validations:
+      required: false
