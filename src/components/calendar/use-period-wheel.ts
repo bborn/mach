@@ -1,5 +1,6 @@
 import { useEffect, useRef, type RefObject } from "react";
 import { IDLE_GESTURE, feedWheel, type WheelGesture } from "@/lib/calendar-gesture";
+import { readFingers } from "@/lib/scroll-phase";
 
 /**
  * The DOM half of trackpad navigation. The gesture arithmetic lives in
@@ -10,6 +11,21 @@ import { IDLE_GESTURE, feedWheel, type WheelGesture } from "@/lib/calendar-gestu
  * handlers passively at the root, so `preventDefault` from one is a silent
  * no-op, and a horizontal swipe that reaches the webview unclaimed is a
  * back-navigation out of the app.
+ *
+ * # Where the native phase enters, and where it does not
+ *
+ * `readFingers()` reports what the trackpad is doing — see `scroll-phase.ts`.
+ * It is read here, per event, and passed down with the deltas.
+ *
+ * It is read *here* rather than in Rust because the monitor that produces it
+ * sees the whole application's scrolling: the mail list, the reading pane, the
+ * hour grid, a preferences sheet. It knows fingers are down; it has no idea
+ * what they are over. Every question about eligibility — is the calendar on
+ * screen, is the pointer over the grid, is a drag in flight, does something
+ * under the pointer have its own scrolling left to do — is answered below,
+ * from the DOM event, exactly as it was before. A period still moves only when
+ * a `wheel` event lands on the calendar grid. The phase changes what a stream
+ * of those events *means*, and nothing about which streams reach it.
  */
 
 /**
@@ -84,6 +100,7 @@ export function usePeriodWheel({ ref, vertical, enabled, onStep }: PeriodWheelOp
           deltaMode: event.deltaMode,
           timeStamp: event.timeStamp,
           ctrlKey: event.ctrlKey,
+          phase: readFingers(),
         },
         { vertical: pagesVertically },
       );

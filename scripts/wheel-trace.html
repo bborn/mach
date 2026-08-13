@@ -2,20 +2,36 @@
 <!--
   Record what the trackpad actually sends.
 
-  `src/lib/calendar-gesture.ts` is calibrated against streams that were written
-  by hand from a description of how macOS momentum behaves. This page replaces
-  the description with a measurement. Open it in Safari — the same engine the
-  app's window runs, on the same trackpad — swipe across the grey box, and copy
-  the result into `src/lib/calendar-gesture.test.ts`.
+  `src/lib/calendar-gesture.ts` decides whether a swipe moves a period from two
+  things: the deltas WebKit reports, and whether the fingers are still on the
+  glass. This page records both, in the form `replay()` in
+  `calendar-gesture.test.ts` takes.
+
+  There are two ways to run it, and they capture different things.
+
+  ## In the app — the only place the phase exists
+
+      MACH_QA_INSTANCE=agent scripts/qa up
+      # note the port it prints, then relaunch pointed at this page:
+      MACH_QA_INSTANCE=agent MACH_DEV_URL=http://localhost:<port>/scripts/wheel-trace.html \
+        scripts/qa restart
+
+  macOS puts the scroll phase on the NSEvent and WebKit forwards none of it, so
+  Rust reads it off the event and emits it — see `src-tauri/src/scroll.rs`. That
+  only happens inside a Tauri window, so only here does the `down` column mean
+  anything. It is also the only place the *whole* path is under test: the native
+  monitor, the emit, and the wheel stream arriving on its own schedule.
+
+  ## In Safari — the shape of the hand, and nothing about phase
 
       open -a Safari scripts/wheel-trace.html
 
   Safari and not Chrome, because the numbers a wheel event carries are the
   engine's translation of an NSEvent and the two engines translate differently.
-  It is still not the app: a page with nothing to render never blocks its main
-  thread, so nothing here is ever coalesced, and the fat merged events a real
-  re-render produces will not appear. What it does capture is the shape of the
-  hand and of the momentum tail, which is what the constants are about.
+  There is no Rust here, so every event records `down: null` and the trace says
+  only what the deltas did. It is still not the app: a page with nothing to
+  render never blocks its main thread, so nothing here is ever coalesced, and
+  the fat merged events a real re-render produces will not appear.
 -->
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -53,10 +69,37 @@
 </style>
 
 <h1>Wheel trace</h1>
-<p>Swipe across the box. A gesture ends after 400ms of quiet.</p>
+<p>Swipe across the box. A trace ends after 400ms of quiet.</p>
 <div id="pad">swipe here</div>
+<p id="phase">native phase: not connected — this is a browser, so every event will say <code>down: null</code></p>
 <p><button id="clear">Clear</button><span id="summary"></span></p>
 <pre id="out"></pre>
+
+<!--
+  Loads only when the app's dev server is serving this page, which is the only
+  place there is a phase to read. Under file:// in Safari a module script with a
+  bare specifier does not resolve at all, the import throws, and the recorder
+  below simply never sees a phase — which is the correct answer there.
+-->
+<script type="module">
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    const seen = [];
+    const line = document.getElementById("phase");
+    line.textContent = "native phase: connected, nothing scrolled yet";
+    await listen("scroll-phase", (event) => {
+      window.__machPhase = event.payload;
+      // Every transition, in order, live. A swipe that reads
+      // `down #1 · up #1` put one hand on the glass and coasted; one that
+      // reads `down #1 · up #1 · down #2` is two hands, which is the thing
+      // no amount of staring at deltas could ever establish.
+      seen.push(`${event.payload.phase.replace("fingers-", "")} #${event.payload.gesture}`);
+      line.textContent = `native phase: ${seen.slice(-12).join(" · ")}`;
+    });
+  } catch {
+    /* Not in the app. The notice above already says so. */
+  }
+</script>
 
 <script>
   const pad = document.getElementById("pad");
@@ -70,12 +113,18 @@
     "wheel",
     (event) => {
       event.preventDefault();
+      // Read at handling time, exactly as `use-period-wheel.ts` reads it, so
+      // the lag between the two pipes shows up in the trace instead of being
+      // smoothed away by recording it somewhere else.
+      const phase = window.__machPhase ?? null;
       samples.push({
         dx: event.deltaX,
         dy: event.deltaY,
         mode: event.deltaMode,
         t: event.timeStamp,
         ctrl: event.ctrlKey,
+        down: phase === null ? null : phase.phase === "fingers-down",
+        gesture: phase === null ? null : phase.gesture,
       });
       clearTimeout(timer);
       timer = setTimeout(report, 400);
@@ -96,17 +145,29 @@
     const gaps = samples.slice(1).map((s, i) => s.t - samples[i].t);
 
     // The form `replay()` in calendar-gesture.test.ts takes: travel along the
-    // dominant axis, and milliseconds since the previous event.
+    // dominant axis, milliseconds since the previous event, and whether the
+    // fingers were down.
     const total = samples.reduce(
       (acc, s) => ({ x: acc.x + Math.abs(s.dx), y: acc.y + Math.abs(s.dy) }),
       { x: 0, y: 0 },
     );
     const axis = total.x >= total.y ? "dx" : "dy";
-    const pairs = samples.map((s, i) => {
+    const triples = samples.map((s, i) => {
       const gap = i === 0 ? 0 : Math.round((s.t - samples[i - 1].t) * 10) / 10;
       const magnitude = Math.round(Math.abs(s[axis]) * 10) / 10;
-      return `  [${magnitude}, ${gap}],`;
+      return `  [${magnitude}, ${gap}, ${s.down}],`;
     });
+
+    // The question this page exists to answer, stated outright rather than left
+    // to be counted off a hundred and fifty rows: how many separate hands the
+    // OS saw, and how much of the stream was the coast afterwards.
+    const gestures = [...new Set(samples.map((s) => s.gesture).filter((g) => g !== null))];
+    const fingers = samples.filter((s) => s.down === true).length;
+    const phaseLine =
+      gestures.length === 0
+        ? "no native phase — browser"
+        : `${gestures.length} gesture(s) ${gestures.join(", ")} · ` +
+          `${fingers} events with fingers down · ${samples.length - fingers} coasting`;
 
     summary.textContent =
       `${samples.length} events · ${Math.round(last - first)}ms · ` +
@@ -115,9 +176,10 @@
 
     out.textContent =
       `// ${summary.textContent}\n` +
+      `// ${phaseLine}\n` +
       `// deltaMode ${samples[0].mode}, ctrlKey ${samples[0].ctrl}\n` +
-      `[\n${pairs.join("\n")}\n]\n\n` +
-      `// raw, in case the pairs threw away something that mattered\n` +
+      `[\n${triples.join("\n")}\n]\n\n` +
+      `// raw, in case the triples threw away something that mattered\n` +
       JSON.stringify(samples, null, 1);
   }
 

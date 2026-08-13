@@ -73,3 +73,11 @@ libc = "0.2.189"
 # copy of the crate and one `NSUserNotificationCenter` delegate.
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6.13"
+# Reading the scroll phase off the NSEvent, which is the one fact about a
+# trackpad swipe that no web engine forwards — see `scroll`. All three of these
+# are already in the tree underneath tao and wry, at these exact versions, so
+# naming them here adds no crate to the build: it turns on the `NSEvent` module
+# of a crate that was being compiled anyway.
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSEvent"] }
+block2 = "0.6.2"

@@ -48,6 +48,9 @@ pub mod plugins;
 #[cfg(debug_assertions)]
 pub mod qa;
 pub mod render;
+/// Whether the fingers are still on the trackpad — the one thing WebKit
+/// declines to forward, read off the `NSEvent` instead of guessed at.
+pub mod scroll;
 pub mod shell;
 /// The clock that brings a snoozed conversation back.
 pub mod snooze;
@@ -97,6 +100,12 @@ pub fn run() {
         .setup(|app| {
             // Before anything is shown: a QA instance must never take focus.
             shell::apply_qa_policy(app)?;
+
+            // One block in the application's own event stream, reading the
+            // scroll phase off each NSEvent and handing the event straight
+            // back. It steers nothing and swallows nothing — see `scroll`.
+            // Here on the main thread, which is where AppKit dispatches.
+            scroll::install(app.handle());
 
             // MACH_DATA_DIR gives an agent (or a second window) its own store,
             // so QA cannot mutate the mailbox someone is actually reading.

@@ -2,61 +2,63 @@
  * Turning wheel events into "move one period".
  *
  * A two-finger swipe on a trackpad is not one event. macOS emits a stream at
- * roughly 60Hz while the fingers move, and then — this is the part that breaks
- * naive implementations — it keeps emitting for another half second after the
- * fingers have left the glass, with the deltas decaying towards zero. A rule
- * like "deltaX over 40 means next week" turns one flick into fifteen weeks,
- * because the tail is forty more events that each clear 40.
+ * roughly 60Hz while the fingers move, and then keeps emitting for another
+ * second or so after the fingers have left, with the deltas decaying towards
+ * zero. A rule like "deltaX over 40 means next week" turns one flick into
+ * fifteen weeks, because the tail is forty more events that each clear 40.
  *
- * The DOM gives us nothing to lean on here. Safari and Chrome both withhold the
- * NSEvent momentum phase, so there is no flag that says "the fingers are gone".
- * Everything below is inference from the shape of the stream.
+ * # What used to be here, and why it is gone
  *
- * Three rules do the work:
+ * Three fixes tried to tell the finger half from the tail by the *shape* of the
+ * DOM stream — how fast it was going, whether it had wound down and climbed
+ * again, whether there was a hole in it. All three failed, and a captured trace
+ * says why: a real finger's magnitudes read `41, 10, 24, 5, 31, 5, 25, 3, 20`,
+ * a factor of ten between neighbouring events, because a hand is not a smooth
+ * ramp and WebKit's sampling is not even. Every "wound down then rose again"
+ * rule fires repeatedly while the hand is still on the glass. The last of them
+ * papered over that by refusing to fire twice until the stream went quiet, and
+ * a tail runs about 1.2 seconds — so a second swipe did nothing until well
+ * after you had made it.
  *
- *  1. **A gesture is a stream, not an event.** Events less than `IDLE_MS` apart
- *     belong to the same gesture. A period moves at most once per gesture, so
- *     however long the tail runs, it moves one period.
+ * macOS knows the answer exactly. Every scroll `NSEvent` carries `phase` and
+ * `momentumPhase`; WebKit reads both and forwards neither. So Rust reads them
+ * off the event and publishes the one bit that matters — see
+ * `src-tauri/src/scroll.rs` and `scroll-phase.ts` — and this file stops
+ * guessing:
  *
- *  2. **A gesture commits to an axis.** Once the accumulated travel is
- *     unambiguous, the gesture is horizontal or vertical for the rest of its
- *     life. This is what stops the sideways drift that rides along with every
- *     real trackpad scroll from paging the view: by the time the drift adds up
- *     to anything, the gesture has been vertical for a hundred events. macOS
- *     locks axes for the same reason.
+ *  1. **Travel counts only while the fingers are down.** Everything after the
+ *     lift is discarded outright, however large it is and however long it runs.
  *
- *  3. **One movement rises once, then only decays.** After a step fires, the
- *     gesture watches speed — pixels per millisecond, not pixels per event —
- *     and remembers the fastest it has been and the slowest it has been since.
- *     A second gesture is the speed winding down from that peak and then
- *     climbing back out of the trough, which is what fingers landing on the
- *     glass looks like: macOS cancels the momentum, the stream restarts from
- *     small deltas and grows. Four quick flicks page four weeks that way, while
- *     a single flick's forty-event tail pages one.
+ *  2. **A period moves once per gesture,** as soon as the travel along the
+ *     committed axis is unambiguous — which is two or three events in, not at
+ *     the end. Nothing later in the same gesture can fire again.
  *
- *     Each half of that replaces something that was wrong.
+ *  3. **Fingers landing start a new gesture,** by the counter Rust increments,
+ *     not by a clock. A second swipe a frame after the first is a second
+ *     gesture; a tail an hour long is not.
  *
- *     *Why speed.* Per-event magnitude is a property of the sampling rather
- *     than of the hand, and the sampling moves. WebKit coalesces wheel events
- *     when the main thread is busy — and the main thread is busy immediately
- *     after a step fires, because the calendar is re-rendering a whole period —
- *     so the tail arrives as fewer, fatter events. Six frames of a decaying
- *     tail merged into one event is a sixfold jump in magnitude and no change
- *     at all in speed. The same goes for a 120Hz display, which halves every
- *     delta and doubles every count.
+ * Rule 2's axis lock survives from before and does real work: it is what stops
+ * the sideways drift that rides along with every real vertical scroll from
+ * paging the view. Once the accumulated travel is unambiguous the gesture is
+ * horizontal or vertical for the rest of its life. macOS locks axes for the
+ * same reason.
  *
- *     *Why only after the peak.* The trigger fires as soon as 42px have gone by,
- *     which on a fast flick is two or three events in — while the finger is
- *     still accelerating. The rest of that ramp is a rise, and a rise is
- *     exactly the signal that used to mean "a second swipe". One flick, two
- *     weeks. So a rise counts for nothing until the speed has first fallen
- *     away from its peak: a new peak drags the trough up with it, and while
- *     the hand is still speeding up the two are equal and no re-arm is
- *     possible.
+ * # When there is no phase
+ *
+ * A mouse wheel has none — it is a different instrument, with no horizontal
+ * axis, no momentum and a coarse discrete step, and it goes down its own path
+ * below (`notch`) exactly as it always has.
+ *
+ * A trackpad with no phase means there is no Rust: a browser, the fixture
+ * harness, this file's own tests. Then the fallback is the plain one — a
+ * gesture is a stream of events less than `IDLE_MS` apart, and it moves one
+ * period however long it runs. It cannot tell a tail from a second swipe
+ * without waiting for silence, which is the whole limitation the native signal
+ * exists to remove, and no path in the shipping app takes it.
  *
  * Everything here is pure — samples in, a step out — which is the only way to
- * test the momentum handling, since the thing being tested is a sequence of
- * fifty events with particular magnitudes and timings.
+ * test this at all, since the thing being tested is a sequence of a hundred and
+ * fifty events with particular magnitudes, timings and phases.
  */
 
 /**
@@ -65,6 +67,17 @@
  * discrete step; a trackpad has all three and a fine one.
  */
 export type WheelDevice = "trackpad" | "wheel";
+
+/**
+ * The native reading of the trackpad at the moment the event was handled.
+ * `null` when nothing is publishing one — see the header.
+ */
+export interface FingerPhase {
+  /** Fingers on the glass. False during the coast after a lift. */
+  down: boolean;
+  /** Increments when a hand lands. The only marker of a gesture boundary. */
+  gesture: number;
+}
 
 /** The parts of a `WheelEvent` the gesture logic reads. */
 export interface WheelSample {
@@ -79,6 +92,8 @@ export interface WheelSample {
    * set and no key held. It is a zoom, and it must not move the calendar.
    */
   ctrlKey?: boolean;
+  /** From `readFingers()`, sampled by the caller at handling time. */
+  phase?: FingerPhase | null;
 }
 
 /** How many periods to move: forward, back, or stay. */
@@ -97,25 +112,23 @@ export interface GestureAxes {
 export interface WheelGesture {
   /** `timeStamp` of the last sample, for the idle gap that ends a gesture. */
   readonly last: number;
-  /** Travel accumulated since the gesture began, or since it last re-armed. */
+  /** Travel accumulated since the gesture began. */
   readonly x: number;
   readonly y: number;
   /** The axis this gesture belongs to; null until the travel says which. */
   readonly axis: "x" | "y" | null;
-  /** True once a step has fired. Everything after is momentum until re-arm. */
+  /** True once a step has fired. Nothing in this gesture can fire again. */
   readonly fired: boolean;
-  /** Fastest this gesture has moved, in px/ms. Only meaningful once fired. */
-  readonly peak: number;
-  /**
-   * Slowest it has moved since that peak, in px/ms — the trough a second
-   * gesture has to climb out of. A new peak resets it to the peak's own speed,
-   * so a hand that is still accelerating has no trough to climb out of at all.
-   */
-  readonly floor: number;
   /** Decided from the first sample of the gesture and held for its duration. */
   readonly device: WheelDevice | null;
   /** When a step last fired, which rate-limits the wheel across gestures. */
   readonly emitted: number;
+  /**
+   * The native gesture number this belongs to, or null when the gesture was
+   * begun without a phase to hand. A sample whose number differs from this one
+   * is a new hand on the glass.
+   */
+  readonly gesture: number | null;
 }
 
 export interface WheelOutcome {
@@ -125,6 +138,8 @@ export interface WheelOutcome {
    * The gesture has taken this event over and the caller should
    * `preventDefault`. A horizontal swipe that reaches the webview unclaimed
    * becomes a back-navigation, which is a far worse outcome than a lost week.
+   * A momentum tail is claimed too: the fingers are gone but the events are
+   * still arriving, and an unclaimed one navigates just as well.
    */
   readonly claimed: boolean;
 }
@@ -136,40 +151,22 @@ export const IDLE_GESTURE: WheelGesture = {
   y: 0,
   axis: null,
   fired: false,
-  peak: 0,
-  floor: Number.POSITIVE_INFINITY,
   device: null,
   emitted: Number.NEGATIVE_INFINITY,
+  gesture: null,
 };
 
 /**
- * A quiet gap this long ends a gesture. It has to sit above the ~16ms spacing
- * of a live stream and below the pause between two deliberate flicks, and
- * anything in the 100–150ms band does that.
+ * A quiet gap this long ends a gesture.
+ *
+ * With a phase to read this is a backstop and no more: the gesture counter ends
+ * gestures, and a stream that stops mid-swipe and resumes a second later is two
+ * gestures by the counter before this timer has an opinion. It matters in the
+ * no-phase fallback, where it is the *only* boundary, and there it has to sit
+ * above the ~16ms spacing of a live stream and below the pause between two
+ * deliberate flicks. Anything in the 100–150ms band does that.
  */
 const IDLE_MS = 130;
-
-/**
- * How much quiet a gesture that has already moved a period needs before it
- * counts as over.
- *
- * A momentum tail is a second of events, and anything that blocks the main
- * thread mid-tail — a slow commit, a garbage collection — puts a hole in the
- * stream that `IDLE_MS` reads as the end of one gesture and the start of
- * another. What comes out the far side of such a hole is one fat coalesced
- * event carrying every frame the stall swallowed, which clears `TRIGGER_PX`
- * without trying: the original bug wearing a disguise. A headless run with a
- * stalling renderer stopped for 350ms at a stretch and turned one flick into
- * four that way.
- *
- * This is a gap between two events, not a clock on the gesture: however long a
- * tail runs, it moves one period, because nothing about the length of the
- * stream ends it. Only silence does. The number is set above any stall that is
- * not already a bug of its own, and making it longer costs nothing, because
- * rapid flicking never relied on this timer — two flicks in quick succession
- * are separated by the re-arm rule, not by silence.
- */
-const TAIL_MS = 800;
 
 /** Nominal sizes for the two non-pixel delta modes. */
 const LINE_PX = 16;
@@ -187,31 +184,6 @@ const AXIS_RATIO = 1.4;
 
 /** Travel along the committed axis that counts as a swipe. */
 const TRIGGER_PX = 42;
-
-/**
- * A re-arm has to clear all three of these.
- *
- * `REARM_SETTLE` is the one that separates a second swipe from the back half of
- * the first: the speed has to have dropped a fifth below its peak before a rise
- * means anything. A hand that is still accelerating never satisfies it, because
- * a new peak resets the trough to itself.
- *
- * `REARM_FACTOR` then asks the rise to double the trough, which a tail decaying
- * a few percent a frame cannot do, and `REARM_SPEED` puts an absolute floor
- * under it so that the last dying pixels of a tail, where the trough is near
- * zero and doubling it means nothing, cannot re-arm on noise. 0.2px/ms is about
- * 3px in a 60Hz frame.
- */
-const REARM_SETTLE = 0.8;
-const REARM_FACTOR = 2;
-const REARM_SPEED = 0.2;
-
-/**
- * A gap this long is a hole in the stream rather than the next frame. Two and a
- * half frames at 60Hz, five at 120Hz — above any real spacing and below the
- * pause between two flicks.
- */
-const STALL_MS = 40;
 
 /**
  * First-sample magnitude that marks a mouse wheel. A trackpad ramps up from
@@ -238,6 +210,11 @@ const WHEEL_COOLDOWN_MS = 60;
  * `deltaMode` settles it outright when it is lines or pages — no trackpad
  * reports those. Otherwise the tell is a first event that is large, vertical,
  * whole-numbered and perfectly straight, which is a notch and not a finger.
+ *
+ * The native phase is not consulted here on purpose. It says whether fingers
+ * are down, which is a fact about the *last* scroll event the application saw
+ * anywhere — the mail list, a preferences sheet — and not about this one. The
+ * delta shape is about this one.
  */
 export function classifyDevice(sample: WheelSample): WheelDevice {
   if (sample.deltaMode !== 0) return "wheel";
@@ -287,31 +264,33 @@ export function feedWheel(
   }
 
   const gap = now - gesture.last;
-  const over = gap > (gesture.fired ? TAIL_MS : IDLE_MS);
+  const phase = sample.phase ?? null;
+  const stale = gap > IDLE_MS;
 
-  // A hole longer than the idle gap is a real seam in the stream, and the long
-  // window a fired gesture gets is there to survive a stall, not to hold on to
-  // the trackpad after the hand has moved to a mouse. If what comes out the far
-  // side of the seam is shaped like a notch, take it as one.
-  const swapped =
-    !over &&
-    gap > IDLE_MS &&
-    gesture.device === "trackpad" &&
-    classifyDevice(sample) === "wheel";
+  // Any real gap re-decides the instrument. A hand that leaves the trackpad for
+  // a mouse leaves one, and the two are read from the shape of the delta rather
+  // than from the phase — see `classifyDevice`.
+  const device = stale ? classifyDevice(sample) : (gesture.device ?? classifyDevice(sample));
 
-  // `emitted` survives the gesture boundary on purpose: it is what stops a
-  // wheel spun fast enough to break into separate gestures from running away.
+  // What ends a gesture. With a phase to read it is the counter, handled in
+  // `swipe`, and the timer has to stay out of it: a stall in the middle of one
+  // hand's movement is not a second swipe, and clearing `fired` on it would let
+  // one hand move two periods. Without a phase, silence is the only boundary
+  // there is.
+  //
+  // `emitted` survives the boundary on purpose: it is what stops a wheel spun
+  // fast enough to break into separate gestures from running away.
   const base: WheelGesture =
-    over || swapped
-      ? { ...IDLE_GESTURE, emitted: gesture.emitted, device: classifyDevice(sample) }
-      : gesture;
+    stale && (phase === null || device === "wheel")
+      ? { ...IDLE_GESTURE, emitted: gesture.emitted, device }
+      : { ...gesture, device };
 
   const dx = pixels(sample.deltaX, sample.deltaMode);
   const dy = pixels(sample.deltaY, sample.deltaMode);
 
-  return base.device === "wheel"
+  return device === "wheel"
     ? notch(base, { now, dy, gap }, axes)
-    : swipe(base, { now, dx, dy, gap: now - base.last }, axes);
+    : swipe(base, { now, dx, dy, phase }, axes);
 }
 
 function notch(
@@ -337,55 +316,49 @@ function notch(
 
 function swipe(
   base: WheelGesture,
-  { now, dx, dy, gap }: { now: number; dx: number; dy: number; gap: number },
+  {
+    now,
+    dx,
+    dy,
+    phase,
+  }: { now: number; dx: number; dy: number; phase: FingerPhase | null },
   axes: GestureAxes,
 ): WheelOutcome {
   let start = base;
-  // Pixels per millisecond. A gesture's first event has nothing to measure
-  // from, so its gap is infinite and its speed comes out zero — the honest
-  // answer, and the conservative one: a gesture with no measured peak can
-  // never re-arm, and picks one up from its second event.
-  const speed = Math.hypot(dx, dy) / Math.max(gap, 1);
 
-  if (start.fired) {
-    // An event that arrives after a hole in the stream is not evidence about
-    // anything. Whether the hole swallowed the frames it covers or merged them
-    // into this one event decides whether its magnitude and its speed mean what
-    // they usually mean, and there is no way to tell from here which happened.
-    // So it moves neither the peak nor the trough, and it moves no period. The
-    // next few evenly-spaced events say what is going on.
-    if (gap > STALL_MS) {
-      return { gesture: { ...start, last: now }, step: 0, claimed: claims(start.axis, axes) };
+  if (phase !== null) {
+    // Fingers landed since the last event this gesture saw, so whatever it was
+    // doing is over — mid-tail, mid-swipe, it does not matter. Start again from
+    // this event's travel. This is the case every inference-based fix got
+    // wrong, and it is now a number comparison.
+    if (phase.gesture !== start.gesture) {
+      start = {
+        ...IDLE_GESTURE,
+        device: start.device,
+        emitted: start.emitted,
+        gesture: phase.gesture,
+      };
     }
 
-    const settled = start.peak > 0 && start.floor <= start.peak * REARM_SETTLE;
-    const rising = speed > Math.max(REARM_SPEED, start.floor * REARM_FACTOR);
-
-    if (!settled || !rising) {
-      // Still one movement. A faster event moves the peak and takes the trough
-      // with it, so the rest of a ramp can never look like a second swipe; a
-      // slower one deepens the trough the next swipe will have to climb out of.
-      const tracked =
-        speed > start.peak
-          ? { ...start, peak: speed, floor: speed }
-          : { ...start, floor: Math.min(start.floor, speed) };
+    // The coast. However far it travels and however long it runs, it is not the
+    // hand and it moves nothing. Still claimed, because these events would
+    // navigate the webview back just as well as the hand's would.
+    if (!phase.down) {
       return {
-        gesture: { ...tracked, last: now },
+        gesture: { ...start, last: now },
         step: 0,
         claimed: claims(start.axis, axes),
       };
     }
-    // Wound down and now climbing again, which one movement does not do. The
-    // fingers are back on the glass, so this is a second gesture wearing the
-    // first one's clothes: start it over from this event's travel.
-    start = {
-      ...start,
-      x: 0,
-      y: 0,
-      axis: null,
-      fired: false,
-      peak: 0,
-      floor: Number.POSITIVE_INFINITY,
+  }
+
+  // One period per gesture. With a phase that means per hand-on-the-glass; the
+  // fallback below means per stream-with-no-gap-in-it.
+  if (start.fired) {
+    return {
+      gesture: { ...start, last: now },
+      step: 0,
+      claimed: claims(start.axis, axes),
     };
   }
 
@@ -411,7 +384,7 @@ function swipe(
   }
 
   return {
-    gesture: { ...gesture, fired: true, peak: speed, floor: speed, emitted: now },
+    gesture: { ...gesture, fired: true, emitted: now },
     step: travel > 0 ? 1 : -1,
     claimed,
   };
