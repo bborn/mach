@@ -25,6 +25,55 @@ export const MIN_BLOCK_HEIGHT = 11;
 /** 1px of air between vertically adjacent blocks, so they read as two cards. */
 export const BLOCK_GAP = 1;
 
+/**
+ * The shortest a block's *pointer target* is allowed to be.
+ *
+ * The rule above is about honesty of scale, and it stays. But the drawing and
+ * the hit area are two different questions, and only the first one owes the
+ * grid its geometry. A 30-minute meeting is 23px of colour and a 15-minute one
+ * is 11px, and at 11px the thing you are aiming at is thinner than the pointer's
+ * own hotspot. Missing it does not do nothing, either — the press lands on empty
+ * grid, which is drag-to-create, so a 2px miss answers "open my standup" with a
+ * new untitled event and a text field.
+ *
+ * So a short block carries a transparent skirt above and below its painted body,
+ * bringing the target to 32px: about a 40-minute event, which is the smallest
+ * block nobody complains about. Nothing moves and nothing is drawn — the block
+ * keeps its true top, its true bottom and its true height.
+ *
+ * The skirt is only ever allowed to claim grid that is otherwise empty. Every
+ * painted block sits at `Z_EVENT` or above and every skirt at `Z_EVENT_HIT`
+ * below it, so a skirt reaching down into its neighbour passes *under* that
+ * neighbour's body: the 09:00 block can never take a click meant for the 09:30
+ * one. Where two skirts overlap each other — a gap shorter than the two of them
+ * — the later block's wins, being painted after it.
+ */
+export const MIN_HIT_HEIGHT = 32;
+
+/**
+ * And the furthest it may reach to get there.
+ *
+ * Without a ceiling the rule bites back: an 11px sliver would claim 11px above
+ * and below itself, and the strip of grid just under a quarter-hour meeting is
+ * where you press to drag-create the thing that follows it. Answering that with
+ * the meeting's own modal is the same defect as the one being fixed, pointing
+ * the other way.
+ *
+ * Eight is what a 15-minute block can take before that trade turns: 27px of
+ * target, two and a half times what it had, and ten minutes of grid rather than
+ * fifteen. A 30-minute block wants five and never meets this at all.
+ *
+ * So the promise the grid makes is bounded: nothing answers the pointer more
+ * than 8px from where it is drawn.
+ */
+export const MAX_HIT_OVERHANG = 8;
+
+/** How far a block's hit area overhangs its painted body, top and bottom. */
+export function hitSkirt(height: number): number {
+  const wanted = Math.ceil((MIN_HIT_HEIGHT - height) / 2);
+  return clamp(wanted, 0, MAX_HIT_OVERHANG);
+}
+
 /** Time gutter: 56px wide, label right-aligned with an 8px inset. */
 export const TIME_GUTTER = 56;
 export const TIME_GUTTER_INSET = 8;
@@ -144,6 +193,15 @@ export function clusterPlan(columns: number, clusterWidth: number): ClusterPlan 
  * Below the hover layer, though — an expanded block is deliberately covering
  * its cluster and should keep doing so.
  */
+/**
+ * A block's hit skirt, under every painted block including its own.
+ *
+ * It has to be above 0 rather than absent: the working-hours wash is an
+ * unpositioned sibling, and a `z-index: auto` positioned element would still
+ * paint over it, but a stated layer keeps the two orderings from depending on
+ * which one happens to render first.
+ */
+export const Z_EVENT_HIT = 1;
 export const Z_EVENT = 5;
 export const Z_EVENT_SELECTED = 8;
 export const Z_EVENT_HOVER = 10;

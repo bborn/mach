@@ -151,6 +151,36 @@ The current `MIN_BLOCK_HEIGHT = 17` is a workaround for not doing this. **Lower 
 taller than its true duration, which is a lie about the geometry — at 17px a 15-minute
 event looks the same size as a 21-minute one.
 
+### Short-event pointer targets
+
+Added after the report "the half hour event blocks are too tiny — they need a min height
+that's reasonable to click on."
+
+The height stays. The *target* does not have to match it: a block shorter than
+`MIN_HIT_HEIGHT` (32px) carries a transparent hit area above and below its painted body,
+centred on it, reaching at most `MAX_HIT_OVERHANG` (8px) either way. A 30-minute block
+goes from 23px to 33px, a 15-minute one from 11px to 27px. Nothing is drawn and nothing
+moves.
+
+The ceiling is there because the strip of grid just under a short meeting is where you
+press to drag-create the thing after it. Nothing answers the pointer more than 8px from
+where it is drawn.
+
+Two rules keep it from taking clicks that belong elsewhere:
+
+- **Every hit area sits below every painted block** (`Z_EVENT_HIT` under `Z_EVENT`), so a
+  hit area reaching into the next block passes underneath it. A 09:00 block cannot take a
+  press on the 09:30 one.
+- **It grows vertically only.** Left and width come from the block, so side-by-side
+  columns keep their boundary.
+
+What it costs: the few pixels of grid above and below a short block no longer start a
+drag-to-create. The 13px right-hand gutter below is still clear on every column.
+
+The same 32px is why the resize handles' floor is `24 - BLOCK_GAP` and not 24. A
+30-minute block renders at 23px, so a raw 24 excluded the most common meeting length
+there is from mouse resize entirely.
+
 ---
 
 ## 2. Overlapping events
