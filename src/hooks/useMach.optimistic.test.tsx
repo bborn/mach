@@ -102,6 +102,8 @@ function stubSource(initial: Thread[] = [thread(1), thread(TARGET), thread(3)]) 
   let listeners: (() => void)[] = [];
   let pending: ((rows: Thread[]) => Thread[]) | null = null;
   let refusal: CommandResult | null = null;
+  /** A command round trip that has not come back yet. See `hold`. */
+  let held: Promise<void> | null = null;
   const commands: Command[] = [];
 
   const source: MachDataSource = {
@@ -128,6 +130,7 @@ function stubSource(initial: Thread[] = [thread(1), thread(TARGET), thread(3)]) 
     },
     async execute(command): Promise<CommandResult> {
       commands.push(command);
+      if (held) await held;
       if (refusal) return refusal;
       if (pending) {
         rows = pending(rows);
@@ -158,6 +161,23 @@ function stubSource(initial: Thread[] = [thread(1), thread(TARGET), thread(3)]) 
     /** What the command's own write does to the store. */
     willBecome(f: (rows: Thread[]) => Thread[]) {
       pending = f;
+    },
+    /**
+     * Keep every command in flight until the returned function is called.
+     *
+     * Gmail's `batchModify` takes a few hundred milliseconds and sometimes
+     * seconds, and the undo entry does not exist until it has answered — so
+     * this is the window ⌘Z used to fall into and vanish.
+     */
+    hold() {
+      let release = () => {};
+      held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return () => {
+        held = null;
+        release();
+      };
     },
     /** Make the next command come back refused, with everything rolled back. */
     refuse(message: string) {
@@ -625,6 +645,134 @@ describe("⌘Z is on screen in the frame the keystroke produced", () => {
     expect(latest(frames).present).toBe(false);
     expect(latest(frames).status).toBe("Redid done");
     await flush();
+  });
+
+  /*
+   * The reported lag, and the one an end-state test cannot see.
+   *
+   * A guess is a delta and needs a row to land on. Once `list_threads` has been
+   * refetched the archived conversation is not in the list any more, so the
+   * `{ add: ["INBOX"] }` a ⌘Z makes had nothing to apply itself to and the row
+   * came back only when the next refetch carried it — 966ms against a 300ms
+   * command, measured in the real window, where the same keystroke pressed
+   * before the refetch took 10ms.
+   */
+  it("brings back a row the list has already dropped, in the keystroke's own frame", async () => {
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    s.willBecome((rows) => rows.filter((r) => r.id !== TARGET));
+    act(() => probe().archiveSelected());
+    await flush();
+    // The refetch the archive triggers: the row is gone from `list_threads`
+    // now, not merely hidden by a guess.
+    await refetch(s);
+    expect(latest(frames).present).toBe(false);
+
+    frames.length = 0;
+    act(() => void probe().undo());
+    expect(latest(frames).present).toBe(true);
+    // In its place, not appended: the list is one order and this is part of it.
+    expect(latest(frames).rows).toEqual([1, TARGET, 3]);
+    await flush();
+  });
+
+});
+
+/**
+ * The window between a keystroke and the entry it makes.
+ *
+ * An undo entry is built from the command layer's answer — `result.undo` is the
+ * exact inverse, and nothing here guesses at one — so the stack is still empty
+ * for the length of the round trip. ⌘Z in that window popped nothing and
+ * returned: the keymap reported it handled, and nothing happened, was drawn or
+ * was said.
+ */
+describe("⌘Z pressed before the action it takes back has answered", () => {
+  it("is honoured rather than lost", async () => {
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    const release = s.hold();
+    s.willBecome((rows) => rows.filter((r) => r.id !== TARGET));
+    act(() => probe().archiveSelected());
+    await flush();
+    expect(latest(frames).present).toBe(false);
+    // Nothing to take back yet — this is the state ⌘Z used to fall into.
+    expect(latest(frames).undo).toBeNull();
+
+    act(() => void probe().undo());
+    await act(async () => {
+      release();
+      await flush();
+    });
+    await flush();
+
+    expect(latest(frames).present).toBe(true);
+    expect(s.commands.map((c) => c.kind)).toEqual(["archive", "unarchive"]);
+  });
+
+  it("takes one entry per keystroke when two arrive in the window", async () => {
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    act(() => probe().archiveSelected());
+    await flush();
+
+    const release = s.hold();
+    act(() => probe().starSelected());
+    await flush();
+
+    // Both land while the star is still going out. The first takes the star
+    // back, the second the archive — never the same entry twice.
+    act(() => {
+      void probe().undo();
+      void probe().undo();
+    });
+    await act(async () => {
+      release();
+      await flush();
+    });
+    await flush();
+
+    expect(s.commands.map((c) => c.kind)).toEqual(["archive", "star", "star", "unarchive"]);
+    expect(latest(frames).present).toBe(true);
+    expect(latest(frames).undo).toBeNull();
+  });
+
+  /*
+   * The list on screen was fetched before either command, so it agrees with the
+   * undo's `{ add: ["INBOX"] }` for the wrong reason — it has simply not heard
+   * about the archive yet. Retiring the guess on that let the archive's own
+   * refetch, landing a moment later, take the row back off screen. Measured in
+   * the real window: back at 3168ms, retired at 3270ms, gone again at 3820ms.
+   */
+  it("does not let a list older than the undo retire its guess", async () => {
+    const s = stubSource();
+    const frames: Frame[] = [];
+    await mount(s.source, frames);
+
+    const release = s.hold();
+    s.willBecome((rows) => rows.filter((r) => r.id !== TARGET));
+    act(() => probe().archiveSelected());
+    await flush();
+
+    act(() => void probe().undo());
+    await act(async () => {
+      release();
+      await flush();
+    });
+    await flush();
+    expect(latest(frames).present).toBe(true);
+
+    frames.length = 0;
+    // The archive's refetch, coalesced behind both commands and carrying a
+    // store the undo has not reached yet.
+    await refetch(s);
+    expect(frames.every((f) => f.present)).toBe(true);
   });
 });
 

@@ -38,6 +38,7 @@ import {
 import {
   applyEventGuesses,
   applyGuess,
+  byRecency,
   guessedEventIds,
   leavesMailbox,
   leavingIds,
@@ -45,6 +46,7 @@ import {
   placeholderEvent,
   project,
   projectEvent,
+  returningRows,
   settledEventGuesses,
   settledGuesses,
   settledPendingEvents,
@@ -60,6 +62,7 @@ import {
   runRedo,
   runUndo,
   type UndoHost,
+  type UndoOutcome,
   type UndoState,
 } from "@/lib/undo-stack";
 import {
@@ -256,6 +259,40 @@ interface UiState {
    */
   guesses: Guesses;
   /**
+   * The rows a command has spoken for, kept after the list drops them.
+   *
+   * A guess is a delta and needs something to land on. Everything the list
+   * shows comes out of `list_threads`, so the instant a refetch stops carrying
+   * an archived conversation there is no row for `{ add: [INBOX] }` to be
+   * applied to — and a ⌘Z arriving after that repainted nothing and left the
+   * user watching most of a second go by while the write and the next refetch
+   * happened. Measured in the real window at 10ms to the row when the undo came
+   * straight after the archive and 966ms when it came after the refetch,
+   * against a 300ms command.
+   *
+   * So the list keeps its own copy of every row a command names, and
+   * `returningRows` draws from it when a guess puts a conversation back into the
+   * mailbox on screen. It is a memory of rows already shown rather than a second
+   * store: the loaded list always wins where the two overlap, and a copy is only
+   * ever on screen for the span between the keystroke and the refetch that makes
+   * it real.
+   *
+   * Bounded, and in insertion order, which is why it is a `Map` — an object with
+   * numeric keys iterates smallest-first and could not be trimmed oldest-first
+   * at all.
+   */
+  remembered: Map<ThreadId, Thread>;
+  /**
+   * The list each guess was made against, as a version count.
+   *
+   * A guess retires when the loaded list agrees with it, and the list is always
+   * a copy fetched at some point in the past — so a copy taken *before* the
+   * command ran is not evidence about it. It agrees, when it agrees, because it
+   * has not heard yet. See {@link settledGuesses}, which is where the rule is
+   * written down and what the number is for.
+   */
+  guessedAt: Record<ThreadId, number>;
+  /**
    * The same thing for events, and it exists for the same reason.
    *
    * The calendar had none of this: `rsvp`, `createEvent`, `updateEvent`,
@@ -300,10 +337,33 @@ type UiAction =
   | { type: "listWidth"; width: number }
   | { type: "toggleCalendar"; calendarId: CalendarId }
   | { type: "theme"; theme: Theme }
-  /** Show what a command did, before the list has been refetched. */
-  | { type: "project"; guesses: Guesses }
-  /** Drop guesses — the list agrees now, or the write was refused. */
-  | { type: "forget"; threadIds: ThreadId[] }
+  /**
+   * Show what a command did, before the list has been refetched.
+   *
+   * `rows` are the loaded rows the guess names, which the reducer keeps so a
+   * later guess about the same conversation has something to land on once the
+   * list has dropped it. See `UiState.remembered`. `listVersion` is the list it
+   * was made against — see `UiState.guessedAt`.
+   */
+  | {
+      type: "project";
+      guesses: Guesses;
+      rows?: readonly Thread[];
+      listVersion?: number;
+    }
+  /**
+   * Drop guesses — the list agrees now, or the write was refused.
+   *
+   * `settled` is the guess each id was judged on, and an id is dropped only if
+   * that is still the guess standing for it. Without it, an id is enough to
+   * delete a guess made *after* the judgement: the settle effect runs from a
+   * committed render, React flushes it at the head of the next one, and a ⌘Z
+   * pressed in that gap had its own guess deleted by the archive's settling.
+   * Measured in the real window — the undo's `{ add: ["INBOX"] }` never reached
+   * a paint. Omitted by the failure path and by a traversal retracting the
+   * previous guess, both of which mean "whatever is there, drop it".
+   */
+  | { type: "forget"; threadIds: ThreadId[]; settled?: Guesses }
   /** Show what a calendar command did, before the event window was refetched. */
   | { type: "projectEvents"; guesses: EventGuesses }
   /** Draw a block for a create that has not come back yet. */
@@ -339,10 +399,74 @@ export const initialUi: UiState = {
   hiddenCalendars: [],
   theme: "system",
   guesses: {},
+  remembered: new Map(),
+  guessedAt: {},
   eventGuesses: {},
   pendingEvents: [],
   status: null,
 };
+
+/**
+ * How many dropped rows are kept for a guess to land on.
+ *
+ * The undo stack is fifty deep and one entry can be a bulk archive, so this is
+ * not "fifty rows". It is a few screens' worth of conversations, which is what
+ * a triage session actually produces, and a thread row is a subject, a snippet
+ * and a handful of participants — not the messages, which the reading pane
+ * fetches by id.
+ */
+const REMEMBERED = 500;
+
+/**
+ * Adds rows to the memory, newest last, and drops the oldest over the bound.
+ *
+ * A row already remembered is moved to the end rather than left where it was: a
+ * conversation acted on twice is the one most likely to be acted on again, and
+ * the newer copy is the more accurate one.
+ */
+function remember(
+  previous: Map<ThreadId, Thread>,
+  rows: readonly Thread[] | undefined,
+): Map<ThreadId, Thread> {
+  if (!rows || rows.length === 0) return previous;
+  const next = new Map(previous);
+  for (const row of rows) {
+    next.delete(row.id);
+    next.set(row.id, row);
+  }
+  if (next.size > REMEMBERED) {
+    let overflow = next.size - REMEMBERED;
+    for (const id of next.keys()) {
+      if (overflow-- <= 0) break;
+      next.delete(id);
+    }
+  }
+  return next;
+}
+
+/** The loaded rows a set of guesses is about, for the reducer to remember. */
+function namedRows(guesses: Guesses, rows: readonly Thread[]): Thread[] {
+  return rows.filter((row) => guesses[row.id] !== undefined);
+}
+
+/**
+ * Puts a promise in `pending` and hands back the function that settles it.
+ *
+ * A `Promise.withResolvers` this project's target does not have yet. Callers
+ * use it to say "something is outstanding" without holding the resolver and the
+ * set membership apart, which is the pair that goes wrong.
+ */
+function awaitable(pending: Set<Promise<void>>): () => void {
+  let settle = () => {};
+  const promise = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  pending.add(promise);
+  return () => {
+    pending.delete(promise);
+    settle();
+  };
+}
 
 export function uiReducer(state: UiState, action: UiAction): UiState {
   switch (action.type) {
@@ -427,13 +551,31 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
     // statements about the same thread, and the second is the current one —
     // starring and then archiving must not leave the star's delta behind to be
     // re-applied to a row that has since been refetched.
-    case "project":
-      return { ...state, guesses: { ...state.guesses, ...action.guesses } };
+    case "project": {
+      const guessedAt = { ...state.guessedAt };
+      for (const id of Object.keys(action.guesses)) {
+        guessedAt[Number(id)] = action.listVersion ?? -1;
+      }
+      return {
+        ...state,
+        guesses: { ...state.guesses, ...action.guesses },
+        guessedAt,
+        remembered: remember(state.remembered, action.rows),
+      };
+    }
     case "forget": {
-      if (!action.threadIds.some((id) => id in state.guesses)) return state;
+      const settled = action.settled;
+      const going = action.threadIds.filter(
+        (id) => id in state.guesses && (!settled || state.guesses[id] === settled[id]),
+      );
+      if (going.length === 0) return state;
       const next = { ...state.guesses };
-      for (const id of action.threadIds) delete next[id];
-      return { ...state, guesses: next };
+      const guessedAt = { ...state.guessedAt };
+      for (const id of going) {
+        delete next[id];
+        delete guessedAt[id];
+      }
+      return { ...state, guesses: next, guessedAt };
     }
     // Same rule as `project` above: a later claim about one event replaces the
     // earlier one outright. Dragging a block and then answering "Going" are two
@@ -737,6 +879,23 @@ export function MachProvider({ children }: { children: ReactNode }) {
     undoRef.current = next;
     setUndoState(next);
   }, []);
+
+  /**
+   * The actions whose undo entry has not been recorded yet.
+   *
+   * An entry is made from the command layer's answer — `result.undo` is the
+   * exact inverse, and nothing here guesses at one — so it does not exist until
+   * the round trip is over. For that whole span ⌘Z popped an empty stack and
+   * returned: `handled: true` from the keymap, and nothing on screen, nothing
+   * said. Reproduced against a 5s command layer in the real window — archive,
+   * ⌘Z 300ms later, and the marks show `undo:start` followed by nothing at all.
+   *
+   * A traversal therefore waits for these before it reads the stack. It is not
+   * a lock: the set is empty in the ordinary case and {@link traverse} keeps the
+   * synchronous path for that, because `runUndo` putting the whole undo on
+   * screen in the tick the keystroke produced is the thing being protected.
+   */
+  const unrecorded = useRef(new Set<Promise<void>>());
 
   /**
    * The dispatch everything outside `run` uses — and the seam where an action
@@ -1069,6 +1228,23 @@ export function MachProvider({ children }: { children: ReactNode }) {
   const allThreads = stream.threads;
 
   /*
+   * How many times `list_threads` has actually changed the list.
+   *
+   * What a guess is stamped with, so that a list fetched *before* the command
+   * cannot be what retires its guess — see `UiState.guessedAt`. Counted rather
+   * than timed because `reconcile` already answers "did anything move" exactly:
+   * it returns the previous array when the refetch carried no change, so
+   * identity is the whole test and a sync pass that changed nothing does not
+   * make a guess decidable.
+   */
+  const listVersion = useRef(0);
+  const lastList = useRef(allThreads);
+  if (lastList.current !== allThreads) {
+    lastList.current = allThreads;
+    listVersion.current += 1;
+  }
+
+  /*
    * Retire a guess when the list catches up with it.
    *
    * The other half of never dropping one on a clock. A guess has to stop being
@@ -1080,9 +1256,19 @@ export function MachProvider({ children }: { children: ReactNode }) {
    * claims; this only reports the answer to the reducer.
    */
   useEffect(() => {
-    const settled = settledGuesses(allThreads, ui.guesses, ui.labelId);
-    if (settled.length > 0) dispatchUi({ type: "forget", threadIds: settled });
-  }, [allThreads, ui.guesses, ui.labelId]);
+    const settled = settledGuesses(
+      allThreads,
+      ui.guesses,
+      ui.labelId,
+      ui.guessedAt,
+      listVersion.current,
+    );
+    // `settled: ui.guesses` — the ids alone would let this delete a guess made
+    // between the judgement and the dispatch. See the `forget` action.
+    if (settled.length > 0) {
+      dispatchUi({ type: "forget", threadIds: settled, settled: ui.guesses });
+    }
+  }, [allThreads, ui.guesses, ui.labelId, ui.guessedAt]);
 
   /*
    * The list, with every outstanding guess projected onto it.
@@ -1097,6 +1283,13 @@ export function MachProvider({ children }: { children: ReactNode }) {
    * A row with no guess is passed through untouched, identity included. Rows
    * are only rebuilt where a guess actually changes something, so a refetch
    * that returns the same data re-renders nothing.
+   *
+   * The third thing is the mirror of the second, and it is what an undo needs.
+   * A guess that puts `INBOX` back on a conversation the list has already
+   * dropped has no row here to be applied to, so `returningRows` draws it from
+   * `remembered` — the list's own copy of the rows it has shown. Merged and
+   * sorted only when there is something to merge, which is only ever the span
+   * between a ⌘Z and the refetch that makes it true.
    */
   const visibleThreads = useMemo(() => {
     const guesses = ui.guesses;
@@ -1112,8 +1305,16 @@ export function MachProvider({ children }: { children: ReactNode }) {
       if (leavesMailbox(guess, ui.labelId)) continue;
       rows.push(applyGuess(thread, guess));
     }
-    return rows;
-  }, [allThreads, ui.guesses, ui.labelId]);
+    const returning = returningRows(
+      ui.guesses,
+      ui.remembered,
+      ui.labelId,
+      allThreads,
+      ui.accountId,
+    );
+    if (returning.length === 0) return rows;
+    return [...rows, ...returning].sort(byRecency);
+  }, [allThreads, ui.guesses, ui.labelId, ui.remembered, ui.accountId]);
 
   /*
    * Retire an event guess when the store catches up with it.
@@ -1339,7 +1540,14 @@ export function MachProvider({ children }: { children: ReactNode }) {
        * vocabulary — the conversation the command names, or the event.
        */
       const guesses = project(command, threadsRef.current);
-      if (guesses && !options.projected) dispatchUi({ type: "project", guesses });
+      if (guesses && !options.projected) {
+        dispatchUi({
+          type: "project",
+          guesses,
+          rows: namedRows(guesses, threadsRef.current),
+          listVersion: listVersion.current,
+        });
+      }
       const eventGuesses = projectEvent(command);
       if (eventGuesses && !options.projected) {
         dispatchUi({ type: "projectEvents", guesses: eventGuesses });
@@ -1361,6 +1569,14 @@ export function MachProvider({ children }: { children: ReactNode }) {
         ...guessedEventIds(command),
         ...(placeholder === null ? [] : [placeholder]),
       ];
+      /*
+       * Say that an entry is on its way, so a ⌘Z arriving now can wait for it.
+       *
+       * Only for a command that will record one — a traversal's own steps run
+       * `quiet` and record nothing, and making ⌘Z wait for those would turn a
+       * held key into one entry per round trip.
+       */
+      const recorded = options.quiet ? null : awaitable(unrecorded.current);
       try {
         const result = await getDataSource().execute(command);
         // A calendar command's whole effect is rows in the event window, and
@@ -1477,6 +1693,8 @@ export function MachProvider({ children }: { children: ReactNode }) {
         dispatchUi({ type: "status", status: { message, tone: "error" } });
         options.onRefused?.({ message, command });
         return null;
+      } finally {
+        recorded?.();
       }
     },
     [commitUndo],
@@ -1515,7 +1733,14 @@ export function MachProvider({ children }: { children: ReactNode }) {
         anyEvent = true;
       }
     }
-    if (any) dispatchUi({ type: "project", guesses: merged });
+    if (any) {
+      dispatchUi({
+        type: "project",
+        guesses: merged,
+        rows: namedRows(merged, threadsRef.current),
+        listVersion: listVersion.current,
+      });
+    }
     if (anyEvent) dispatchUi({ type: "projectEvents", guesses: mergedEvents });
   }, []);
 
@@ -1554,6 +1779,37 @@ export function MachProvider({ children }: { children: ReactNode }) {
         dispatchUi({ type: "status", status: { message, tone: "info", offer } }),
     }),
     [commitUndo, projectCommands, run],
+  );
+
+  /**
+   * Run a traversal, once every action that owes the stack an entry has made it.
+   *
+   * The synchronous path is the one that matters and is kept exactly: with
+   * nothing outstanding, `runUndo` is called from the keystroke's own tick, so
+   * its pop and its `showSteps` land in the frame that keystroke produced. The
+   * await is only for the case that used to lose the keystroke outright —
+   * pressing ⌘Z while the archive it is taking back is still in flight, where
+   * the stack is empty and a traversal has nothing to read.
+   *
+   * Waiting rather than recording an entry up front is what keeps the stack
+   * from guessing: the inverse belongs to the command layer, and an entry made
+   * before the answer would be a claim about a write that may yet be refused.
+   * What it costs is that the ⌘Z still cannot finish before the command it
+   * follows does.
+   */
+  const traverse = useCallback(
+    (run: (host: UndoHost) => Promise<UndoOutcome>) => {
+      const waiting = [...unrecorded.current];
+      if (waiting.length === 0) {
+        void run(undoHost);
+        return;
+      }
+      void (async () => {
+        await Promise.allSettled(waiting);
+        await run(undoHost);
+      })();
+    },
+    [undoHost],
   );
 
   // Opening an unread conversation marks it read — once, and quietly.
@@ -1806,8 +2062,8 @@ export function MachProvider({ children }: { children: ReactNode }) {
           );
         }
       },
-      undo: () => void runUndo(undoHost),
-      redo: () => void runRedo(undoHost),
+      undo: () => traverse(runUndo),
+      redo: () => traverse(runRedo),
 
       pushUndoGroup: (label, inverses) => {
         if (inverses.length === 0) return;
@@ -1934,6 +2190,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
     isFavorite,
     run,
     undoHost,
+    traverse,
   ]);
 
   const uiWithOverlays = useMemo(() => ({ ...ui, overlays }), [ui, overlays]);
