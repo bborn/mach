@@ -475,6 +475,23 @@ export function CalendarMode() {
   );
 
   /**
+   * The event a keyboard nudge would move, or null when nothing is focused.
+   *
+   * The *drawn* event, not the stored one. They differ for exactly as long as
+   * an optimistic move is in flight, and nudging from the stored copy made the
+   * second of two quick presses a no-op: it recomputed "fifteen minutes after
+   * 1pm" from a row that still said 1pm, and arrived back at the time the first
+   * press had already moved it to.
+   *
+   * Read by ⇧← and ⇧→ as well, which decline the key when it is null so the
+   * period steps instead. See the bindings.
+   */
+  const nudgeTarget = useMemo(
+    () => visibleEvents.find((e) => e.id === ui.eventId) ?? selectedEvent,
+    [visibleEvents, ui.eventId, selectedEvent],
+  );
+
+  /**
    * Nudge the focused event from the keyboard.
    *
    * All-day events move in UTC days because that is how the store pins them;
@@ -488,12 +505,7 @@ export function CalendarMode() {
         | { kind: "move"; axis: "day"; days: number }
         | { kind: "resize"; edge: "start" | "end"; steps: number },
     ) => {
-      // The *drawn* event, not the stored one. They differ for exactly as long
-      // as an optimistic move is in flight, and nudging from the stored copy
-      // made the second of two quick presses a no-op: it recomputed "fifteen
-      // minutes after 1pm" from a row that still said 1pm, and arrived back at
-      // the time the first press had already moved it to.
-      const event = visibleEvents.find((e) => e.id === ui.eventId) ?? selectedEvent;
+      const event = nudgeTarget;
       if (!event) {
         actions.setStatus("Pick an event first", "info");
         return;
@@ -513,7 +525,7 @@ export function CalendarMode() {
       );
       applyMove(event.id, outcome, false);
     },
-    [selectedEvent, visibleEvents, ui.eventId, applyMove, actions],
+    [nudgeTarget, applyMove, actions],
   );
 
   /* ---------------------------------------------------------------------- */
@@ -976,6 +988,32 @@ export function CalendarMode() {
         handler: () => actions.shiftPeriod(-1),
       },
       { keys: "p", when: () => active, handler: () => actions.shiftPeriod(-1) },
+
+      /*
+       * ⇧← and ⇧→ page the range as well — the gesture a hand reaches for once
+       * the bare arrows belong to the events.
+       *
+       * The same chord already moves a *selected* event by a day, and that
+       * still wins: those two bindings sit at priority 10 and decline the key
+       * when nothing is selected, at which point the dispatcher tries the next
+       * candidate and lands here. Declaring the difference as a priority rather
+       * than leaving it to registration order is what keeps `conflicts()` quiet
+       * — a tie is an accident, and this is not one.
+       */
+      {
+        keys: "shift+left",
+        group: "Calendar",
+        description: "Previous period",
+        when: () => active,
+        handler: () => actions.shiftPeriod(-1),
+      },
+      {
+        keys: "shift+right",
+        group: "Calendar",
+        description: "Next period",
+        when: () => active,
+        handler: () => actions.shiftPeriod(1),
+      },
       {
         keys: "t",
         group: "Calendar",
@@ -1104,6 +1142,13 @@ export function CalendarMode() {
         when: () => active,
         handler: () => nudgeSelected({ kind: "move", axis: "time", steps: -1 }),
       },
+      /*
+       * The two day nudges share their chord with "page the range", above, and
+       * they answer first — but only while there is something to move. With
+       * nothing selected they decline the key rather than saying "Pick an event
+       * first", and it pages instead. The other nudges have no competitor and
+       * still say it.
+       */
       {
         keys: "shift+down",
         when: () => active,
@@ -1112,15 +1157,18 @@ export function CalendarMode() {
       {
         keys: "shift+left",
         alsoKeys: ["shift+right"],
+        priority: 10,
         group: "Event",
         description: "Move by a day",
         when: () => active,
-        handler: () => nudgeSelected({ kind: "move", axis: "day", days: -1 }),
+        handler: () =>
+          nudgeTarget ? nudgeSelected({ kind: "move", axis: "day", days: -1 }) : false,
       },
       {
         keys: "shift+right",
+        priority: 10,
         when: () => active,
-        handler: () => nudgeSelected({ kind: "move", axis: "day", days: 1 }),
+        handler: () => (nudgeTarget ? nudgeSelected({ kind: "move", axis: "day", days: 1 }) : false),
       },
       {
         keys: "alt+up",
@@ -1272,6 +1320,7 @@ export function CalendarMode() {
       goToday,
       modalOpen,
       nudgeSelected,
+      nudgeTarget,
       openCreate,
       openEvent,
       openInGoogle,

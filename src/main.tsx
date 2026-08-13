@@ -42,6 +42,24 @@ if ((globalThis as Record<string, unknown>).__MACH_PLUGIN_PROBE__) {
 
   setDataSource(isTauri() && !fixturesRequested ? createTauriSource() : fixtureSource);
 
+  /*
+   * Whether the fingers are on the trackpad, which no web engine will tell us
+   * and Rust reads off the NSEvent — see `scroll-phase.ts`.
+   *
+   * Started here and never stopped: it is one listener for the life of the
+   * window, feeding a module-level value that a `wheel` handler reads
+   * synchronously. Hanging it off a component would tie a fact about the
+   * hardware to a mount, and the one place that reads it is a listener written
+   * specifically to survive re-renders mid-swipe.
+   *
+   * Unlike the data source this is *not* gated on `?fixtures`. Fixtures are
+   * invented mail; the trackpad is still a trackpad, and the screenshot window
+   * should swipe like the real one.
+   */
+  if (isTauri()) {
+    void import("@/lib/scroll-phase").then((phase) => phase.connectScrollPhase());
+  }
+
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
       <App />
