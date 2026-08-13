@@ -619,6 +619,13 @@ export function ComposerDock() {
    * A draft with nothing in it skips the question entirely, because there is
    * nothing to lose and being asked would be the software admiring its own
    * caution.
+   *
+   * **Where the question appears is the composer's business, not this one's.**
+   * It used to be a bar this rendered above the composer, which put the answer
+   * to a click on the footer some 460px above the pointer that made it — and
+   * for a popped-out draft, behind the overlay entirely. All this holds now is
+   * *which* draft is being asked about; the composer turns its footer into the
+   * question, beside the control that raised it. See `confirmingDiscard`.
    */
   const discard = useCallback(
     (id: string) => {
@@ -1588,34 +1595,12 @@ export function ComposerDock() {
       onSend={send}
       onClose={dismiss}
       onDiscard={() => discard(visible.id)}
+      confirmingDiscard={confirming === visible.id}
+      onKeepDraft={() => setConfirming(null)}
       onAttach={(inline) => attach(visible.id, inline)}
       onRemoveAttachment={(attachmentId) => unattach(visible.id, attachmentId)}
       onSetInline={(attachmentId, inline) => setInline(visible.id, attachmentId, inline)}
     />
-  );
-
-  const question = confirming === visible.id && (
-    <div className="shrink-0 border-t border-danger/40 bg-surface">
-      <div className="mx-auto flex max-w-[72ch] items-center gap-3 px-5 py-2 text-list text-muted-foreground">
-        <span className="min-w-0 flex-1 truncate">
-          Throw this draft away? It is not kept anywhere else.
-        </span>
-        <button
-          type="button"
-          onClick={() => discard(visible.id)}
-          className="shrink-0 text-list text-danger hover:brightness-110"
-        >
-          Discard
-        </button>
-        <button
-          type="button"
-          onClick={() => setConfirming(null)}
-          className="shrink-0 text-list hover:text-foreground"
-        >
-          Keep
-        </button>
-      </div>
-    </div>
   );
 
   /*
@@ -1643,7 +1628,6 @@ export function ComposerDock() {
     return (
       <>
         {strip}
-        {question}
         <Overlay
           open
           onClose={isNew ? dismiss : () => popOut(visible.id, null)}
@@ -1684,7 +1668,6 @@ export function ComposerDock() {
         className="-my-1 w-full"
       />
       {strip}
-      {question}
       {editor("dock")}
     </>
   );
