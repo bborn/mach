@@ -248,8 +248,7 @@ impl EventPatch {
 /// Every action Mach can take.
 ///
 /// Shapes match the TypeScript `Command` union in `src/lib/data.ts`: same
-/// `kind` strings, same field names. `trash`, `untrash` and `unsnooze` are the
-/// three that the TypeScript side has yet to gain.
+/// `kind` strings, same field names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Command {

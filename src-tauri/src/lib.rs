@@ -79,7 +79,6 @@ pub fn run() {
         // (`on_navigation`) is below the web engine, which is the only layer a
         // sandboxed message frame cannot silence — see `ipc::render::link_guard`.
         .plugin(ipc::render::link_guard())
-        .plugin(tauri_plugin_shell::init())
         // The save panel for attachments. Registered here rather than lazily on
         // first use; nothing `dialog:` is granted to JavaScript, so the only
         // reachable operation is "save *this* attachment" via Rust.
