@@ -72,7 +72,7 @@
  * {@link settledPendingEvents} retires once the real row shows up.
  */
 
-import type { CalendarEvent, EventId, LabelId, Thread, ThreadId } from "@/types";
+import type { AccountId, CalendarEvent, EventId, LabelId, Thread, ThreadId } from "@/types";
 import {
   isMailCommand,
   type Command,
@@ -87,6 +87,17 @@ export const STARRED = "STARRED";
 export const SPAM = "SPAM";
 export const TRASH = "TRASH";
 export const DRAFT = "DRAFT";
+
+/**
+ * The labels that decide which mailbox a conversation is in.
+ *
+ * A restore state names a whole label set, and turning one into a delta needs
+ * to say what came *off* as well as what went on. Without the row there is no
+ * way to enumerate the labels it might be carrying, and no need to: only these
+ * three move a conversation between mailboxes, so only these three have to be
+ * named for the answer to be right about membership.
+ */
+const MEMBERSHIP: LabelId[] = [INBOX, TRASH, SPAM];
 
 /**
  * One conversation's worth of "this has happened, the store just does not say
@@ -207,27 +218,65 @@ function guessFor(
      *
      * `restore` carries the labels the thread actually had before the action
      * being taken back — that is what makes undo exact rather than a guess at
-     * `INBOX`. Turning it into a delta needs the row's current labels, so a
-     * thread that is not loaded falls back to the same thing the backend falls
-     * back to when it has no restore state: put `INBOX` on, take `TRASH` (or
-     * `SPAM`) off.
+     * `INBOX`. With no restore at all the fallback is what the backend falls
+     * back to: put `INBOX` on, take `TRASH` (or `SPAM`) off.
      */
     case "unarchive":
     case "notSpam":
     case "untrash": {
-      const fallback: ThreadGuess =
-        command.kind === "untrash"
+      const state = command.restore?.find((s) => s.threadId === id);
+      if (!state) {
+        return command.kind === "untrash"
           ? { add: [INBOX], remove: [TRASH] }
           : command.kind === "notSpam"
             ? { add: [INBOX], remove: [SPAM] }
             : { add: [INBOX], remove: [] };
-      const state = command.restore?.find((s) => s.threadId === id);
-      if (!state) return fallback;
+      }
+      /*
+       * The label set as the command layer will write it, verbatim.
+       *
+       * A restore state names the read flag twice — as `isUnread`, and as
+       * `UNREAD` inside `labelIds` — and the two come from different columns
+       * (`threads.is_unread` and `thread_labels`). Reconciling them here looks
+       * tempting and is wrong: `commands::mail` applies both verbatim through
+       * `set_thread_state`, so a restore that disagreed with itself produces a
+       * refetched row that disagrees with itself in exactly the same way, and a
+       * guess that had "corrected" one of them would be the thing that never
+       * agreed.
+       */
+      const target = state.labelIds;
+
       const row = rows.find((r) => r.id === id);
-      if (!row) return { ...fallback, unread: state.isUnread };
+      if (row) {
+        return {
+          add: target.filter((l) => !row.labelIds.includes(l)),
+          remove: row.labelIds.filter((l) => !target.includes(l)),
+          unread: state.isUnread,
+        };
+      }
+      /*
+       * No row to diff against, which is the case a ⇧⌘Z is usually in: the
+       * action being re-applied took the conversation out of this mailbox, so
+       * the list dropped it a refetch ago.
+       *
+       * This used to fall through to the same `add: [INBOX]` as a command with
+       * no restore state at all, and that is a claim about the row rather than
+       * a gap in one. A redo whose restore set does *not* contain `INBOX` had
+       * the projection saying the conversation was coming back to the inbox
+       * while the command it described took it out — measured in the real
+       * window as `{"add":["INBOX"]}` for a ⇧⌘Z that re-archived. The guess
+       * then agreed with nothing and was never retired.
+       *
+       * The whole target set is here, so state it: everything it names goes
+       * on, and the three labels that decide which mailbox a row is in come off
+       * when it does not name them. Adding a label the row already carries is a
+       * no-op in {@link applyGuess}, so the over-broad `add` costs nothing, and
+       * naming the missing memberships is what lets {@link leavesMailbox} and
+       * {@link settledGuesses} answer at all.
+       */
       return {
-        add: state.labelIds.filter((l) => !row.labelIds.includes(l)),
-        remove: row.labelIds.filter((l) => !state.labelIds.includes(l)),
+        add: target,
+        remove: MEMBERSHIP.filter((l) => !target.includes(l)),
         unread: state.isUnread,
       };
     }
@@ -296,6 +345,84 @@ export function leavesMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
 }
 
 /**
+ * Whether the guess is what puts the row *back* into the mailbox on screen.
+ *
+ * The mirror of {@link leavesMailbox}, and it exists because the two questions
+ * were never symmetric in effect. A guess that takes `INBOX` off a loaded row
+ * hides it, and needs nothing but the row. A guess that puts `INBOX` back on a
+ * row the list has already dropped has nothing to hide or show: the row is not
+ * in the list any more, so the guess lands on nothing and the conversation
+ * returns only when `list_threads` next answers. That is the whole of why a
+ * ⌘Z felt instant when it came straight after the archive and took most of a
+ * second when it came after the refetch — 966ms to the row against a 300ms
+ * command, measured in the real window.
+ *
+ * Deliberately "does the guess *add* this label", for the same reason
+ * {@link leavesMailbox} asks about `remove`: it is the claim the command made,
+ * rather than a property of the label set it leaves behind.
+ */
+export function entersMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
+  return guess.add.includes(labelId);
+}
+
+/**
+ * The rows a guess says belong in this mailbox again, drawn from memory.
+ *
+ * `remembered` is the list's own copy of rows it has since dropped — see
+ * `useMach`, which keeps one for every conversation a command speaks for. A row
+ * is redrawn only when four things hold: the loaded list does not already carry
+ * it, a guess adds the mailbox's label back, the row is still remembered, and
+ * it belongs to the account being shown. Anything else and there is nothing
+ * honest to draw.
+ *
+ * That last one is not hypothetical. A guess outlives a switch of account, and
+ * the memory does too, so without it an archive taken back in one mailbox would
+ * draw its row into the next mailbox the user opened. `accountId` is `null` for
+ * the all-accounts list, which is every row.
+ *
+ * The result is *not* sorted here; the caller merges it into the list it
+ * already has and sorts once. Returns an empty array in the ordinary case,
+ * which is every case where nothing has been taken back.
+ */
+export function returningRows(
+  guesses: Guesses,
+  remembered: ReadonlyMap<ThreadId, Thread>,
+  labelId: LabelId,
+  present: readonly Pick<Thread, "id">[],
+  accountId: AccountId | null,
+): Thread[] {
+  const ids = Object.keys(guesses);
+  if (ids.length === 0 || remembered.size === 0) return [];
+  const loaded = new Set(present.map((row) => row.id));
+  const out: Thread[] = [];
+  for (const key of ids) {
+    const id = Number(key);
+    if (loaded.has(id)) continue;
+    const guess = guesses[id]!;
+    if (!entersMailbox(guess, labelId)) continue;
+    const row = remembered.get(id);
+    if (!row) continue;
+    if (accountId !== null && row.accountId !== accountId) continue;
+    out.push(applyGuess(row, guess));
+  }
+  return out;
+}
+
+/**
+ * `list_threads`' own order: newest first, ties broken by id.
+ *
+ * The same comparator the fixture source sorts with — see `byRecency` in
+ * `data.ts`, which cannot be shared without `data` and this module importing
+ * each other.
+ */
+export function byRecency(
+  a: Pick<Thread, "id" | "timestamp">,
+  b: Pick<Thread, "id" | "timestamp">,
+): number {
+  return b.timestamp - a.timestamp || b.id - a.id;
+}
+
+/**
  * Which of a command's targets will leave the mailbox on screen.
  *
  * The cursor's question, and the only thing a caller still has to ask before
@@ -360,11 +487,29 @@ export function suppressedIds(guesses: Guesses, labelId: LabelId): Set<ThreadId>
  *    was emptied by `g i`) keeps its guess, because dropping it would put a
  *    star back out for the length of a round trip over a change that did
  *    happen.
+ *
+ * Both shapes have the same precondition, and leaving it out is what the
+ * reported lag's second half was. **The list has to have been fetched since the
+ * guess was made.** The one on screen is always a copy from some point in the
+ * past, and a copy taken before the command ran cannot be evidence about it —
+ * it agrees, when it agrees, because it has not heard yet. A ⌘Z pressed while
+ * the archive it takes back was still going out made `{ add: ["INBOX"] }`
+ * against a list that still had the row in the inbox, which agreed instantly;
+ * the guess was retired ~160ms later and the row it had just put back vanished
+ * again when the archive's own refetch landed. Measured in the real window
+ * against a 3s command layer: back at 3168ms, retired at 3270ms, gone at
+ * 3820ms.
+ *
+ * `listVersion` counts the times `list_threads` has actually changed the list,
+ * and `guessedAt` is the count each guess was made at. Equal means nothing has
+ * arrived since, so there is nothing to decide on yet.
  */
 export function settledGuesses(
   rows: readonly Pick<Thread, "id" | "labelIds" | "unread">[],
   guesses: Guesses,
   labelId: LabelId,
+  guessedAt: Readonly<Record<ThreadId, number>> = {},
+  listVersion = -1,
 ): ThreadId[] {
   const ids = Object.keys(guesses);
   // Cheap when nothing is pending, which is almost always.
@@ -374,6 +519,7 @@ export function settledGuesses(
   const settled: ThreadId[] = [];
   for (const key of ids) {
     const id = Number(key);
+    if (guessedAt[id] === listVersion) continue;
     const guess = guesses[id]!;
     const row = byId.get(id);
     if (row) {

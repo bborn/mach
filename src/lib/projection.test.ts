@@ -4,6 +4,7 @@ import {
   applyEventGuess,
   applyEventGuesses,
   applyGuess,
+  entersMailbox,
   isPendingEvent,
   leavesMailbox,
   leavingIds,
@@ -11,6 +12,7 @@ import {
   placeholderEvent,
   project,
   projectEvent,
+  returningRows,
   settledEventGuesses,
   settledGuesses,
   settledPendingEvents,
@@ -165,10 +167,64 @@ describe("what a command is known to do", () => {
     ).toEqual({ 1: { add: ["INBOX", "Family"], remove: [], unread: true } });
   });
 
-  it("falls back the way the backend does when the row is not loaded", () => {
+  it("falls back the way the backend does when there is no restore state", () => {
     expect(
       project({ kind: "untrash", threadIds: [1], restore: undefined }, []),
     ).toEqual({ 1: { add: ["INBOX"], remove: ["TRASH"] } });
+  });
+
+  /*
+   * The redo of an archive: `commands::mail` inverts an unarchive to an
+   * unarchive carrying the prior label set, and that set does *not* contain
+   * INBOX. The row is off the list by then — the archive took it off a refetch
+   * ago — and the guess used to fall through to the same `add: ["INBOX"]` as a
+   * command with no restore state at all, which is the opposite of what the
+   * command does. It agreed with nothing and was never retired.
+   */
+  it("states the restored set when the row is not loaded, rather than guessing INBOX", () => {
+    expect(
+      project(
+        {
+          kind: "unarchive",
+          threadIds: [1],
+          restore: [{ threadId: 1, labelIds: ["Receipts"], isUnread: false }],
+        },
+        [],
+      ),
+    ).toEqual({ 1: { add: ["Receipts"], remove: ["INBOX", "TRASH", "SPAM"], unread: false } });
+  });
+
+  it("says a restore-to-inbox enters the inbox, loaded row or not", () => {
+    const guess = project(
+      {
+        kind: "unarchive",
+        threadIds: [1],
+        restore: [{ threadId: 1, labelIds: ["INBOX", "Receipts"], isUnread: true }],
+      },
+      [],
+    )![1]!;
+    expect(entersMailbox(guess, "INBOX")).toBe(true);
+    expect(leavesMailbox(guess, "INBOX")).toBe(false);
+    expect(guess.remove).toEqual(["TRASH", "SPAM"]);
+  });
+
+  /*
+   * `is_unread` and the `UNREAD` label come from different columns, and
+   * `set_thread_state` writes both verbatim. A guess that "corrected" one of
+   * them against the other would be the thing that never agreed with the row
+   * the restore produced, so neither is derived from the other here.
+   */
+  it("carries the restore state's read flag and label set as they came", () => {
+    expect(
+      project(
+        {
+          kind: "unarchive",
+          threadIds: [1],
+          restore: [{ threadId: 1, labelIds: ["INBOX", "UNREAD"], isUnread: false }],
+        },
+        [],
+      ),
+    ).toEqual({ 1: { add: ["INBOX", "UNREAD"], remove: ["TRASH", "SPAM"], unread: false } });
   });
 
   it("has nothing to say about a calendar command", () => {
@@ -295,6 +351,77 @@ describe("retiring a guess", () => {
 
   it("says nothing when nothing is pending", () => {
     expect(settledGuesses([row(1)], {}, "INBOX")).toEqual([]);
+  });
+
+  /*
+   * A ⌘Z dispatched while the archive it takes back was still going out made
+   * `{ add: ["INBOX"] }` against a list that still had the row in the inbox.
+   * That list agreed instantly and for the wrong reason — it had not heard
+   * about either command — so the guess was retired and the row it had just put
+   * back vanished when the archive's own refetch landed.
+   */
+  it("does not retire a guess against the list it was made against", () => {
+    const back: ThreadGuess = { add: ["INBOX"], remove: [] };
+    const stale = [row(1, { labelIds: ["INBOX"] })];
+    expect(settledGuesses(stale, { 1: back }, "INBOX", { 1: 4 }, 4)).toEqual([]);
+    expect(settledGuesses(stale, { 1: back }, "INBOX", { 1: 4 }, 5)).toEqual([1]);
+  });
+
+  it("decides a guess with no stamp, which is every guess made outside a command", () => {
+    const guess: ThreadGuess = { add: ["STARRED"], remove: [] };
+    const rows = [row(1, { labelIds: ["INBOX", "STARRED"] })];
+    expect(settledGuesses(rows, { 1: guess }, "INBOX", {}, 3)).toEqual([1]);
+  });
+});
+
+/*
+ * The undo half of the projection, and the one the reported lag lived in.
+ *
+ * A guess is a delta and needs a row to land on. `list_threads` stops carrying
+ * an archived conversation the moment it is refetched, so a ⌘Z arriving after
+ * that had nothing to apply itself to and repainted nothing: 966ms to the row
+ * against a 300ms command, measured in the real window, against 13ms for the
+ * same keystroke pressed before the refetch.
+ */
+describe("rows a guess brings back", () => {
+  const back: ThreadGuess = { add: ["INBOX"], remove: [] };
+
+  it("draws a remembered row the list has dropped", () => {
+    const gone = row(7, { labelIds: ["Receipts"] });
+    const drawn = returningRows({ 7: back }, new Map([[7, gone]]), "INBOX", [], null);
+    expect(drawn.map((t) => t.id)).toEqual([7]);
+    expect(drawn[0]!.labelIds).toContain("INBOX");
+  });
+
+  it("leaves the loaded list to speak for a row it still carries", () => {
+    const loaded = row(7, { labelIds: ["INBOX"] });
+    expect(returningRows({ 7: back }, new Map([[7, loaded]]), "INBOX", [loaded], null)).toEqual([]);
+  });
+
+  it("draws nothing for a guess that does not name this mailbox", () => {
+    const gone = row(7, { labelIds: ["Receipts"] });
+    expect(returningRows({ 7: back }, new Map([[7, gone]]), "Receipts", [], null)).toEqual([]);
+  });
+
+  it("draws nothing for an archive, which is the direction that needs no help", () => {
+    const gone = row(7);
+    const leaving: ThreadGuess = { add: [], remove: ["INBOX"] };
+    expect(returningRows({ 7: leaving }, new Map([[7, gone]]), "INBOX", [], null)).toEqual([]);
+  });
+
+  // A guess outlives a switch of account, and so does the memory. Without this
+  // an archive taken back in one mailbox would draw its row into the next one.
+  it("keeps a remembered row out of another account's list", () => {
+    const gone = row(7, { accountId: 2, labelIds: ["Receipts"] });
+    const remembered = new Map([[7, gone]]);
+    expect(returningRows({ 7: back }, remembered, "INBOX", [], 1)).toEqual([]);
+    expect(returningRows({ 7: back }, remembered, "INBOX", [], 2).map((t) => t.id)).toEqual([7]);
+    expect(returningRows({ 7: back }, remembered, "INBOX", [], null).map((t) => t.id)).toEqual([7]);
+  });
+
+  it("says nothing when there is nothing pending or nothing remembered", () => {
+    expect(returningRows({}, new Map([[7, row(7)]]), "INBOX", [], null)).toEqual([]);
+    expect(returningRows({ 7: back }, new Map(), "INBOX", [], null)).toEqual([]);
   });
 });
 

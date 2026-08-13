@@ -48,11 +48,92 @@ describe("holding a guess", () => {
     expect(Object.keys(one.guesses)).toEqual(["2"]);
   });
 
+  /*
+   * The settle effect judges the guesses of a committed render and dispatches
+   * from a passive effect, which React flushes at the head of the *next* one. A
+   * ⌘Z pressed in that gap made its own guess and then watched the archive's
+   * settling delete it by id — no paint, no row, nothing said. So a settlement
+   * names the guess it judged, and drops it only if it is still the one there.
+   */
+  it("does not drop a guess made after the settlement was judged", () => {
+    const archived = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 1: { add: [], remove: ["INBOX"] } },
+    });
+    const judged = archived.guesses;
+    const undone = uiReducer(archived, {
+      type: "project",
+      guesses: { 1: { add: ["INBOX"], remove: [] } },
+    });
+    const after = uiReducer(undone, { type: "forget", threadIds: [1], settled: judged });
+    expect(after.guesses[1]).toEqual({ add: ["INBOX"], remove: [] });
+    expect(after).toBe(undone);
+  });
+
+  it("still drops the guess a settlement actually judged", () => {
+    const archived = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 1: { add: [], remove: ["INBOX"] } },
+    });
+    const after = uiReducer(archived, {
+      type: "forget",
+      threadIds: [1],
+      settled: archived.guesses,
+    });
+    expect(after.guesses).toEqual({});
+  });
+
+  it("drops whatever is there when no guess is named — a refusal, or a traversal", () => {
+    const archived = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 1: { add: [], remove: ["INBOX"] } },
+    });
+    expect(uiReducer(archived, { type: "forget", threadIds: [1] }).guesses).toEqual({});
+  });
+
   it("returns the same state when there is nothing to forget", () => {
     // The retirement effect runs on every list change; a new object every time
     // would re-render the whole app on every sync pass for nothing.
     const state = uiReducer(initialUi, { type: "forget", threadIds: [9] });
     expect(state).toBe(initialUi);
+  });
+
+  it("keeps a copy of every row a command names, so a later guess can land", () => {
+    const gone = {
+      id: 1,
+      accountId: 1,
+      subject: "s",
+      snippet: "",
+      participants: [],
+      timestamp: 1,
+      unread: false,
+      starred: false,
+      hasAttachment: false,
+      messageCount: 1,
+      labelIds: ["INBOX"],
+    };
+    const state = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 1: { add: [], remove: ["INBOX"] } },
+      rows: [gone],
+    });
+    expect(state.remembered.get(1)).toBe(gone);
+  });
+
+  /*
+   * A guess retires when the list agrees with it, and the list is always a copy
+   * fetched in the past — so the one it was made against is not evidence about
+   * it. The stamp is what `settledGuesses` compares.
+   */
+  it("stamps a guess with the list it was made against, and drops the stamp with it", () => {
+    const state = uiReducer(initialUi, {
+      type: "project",
+      guesses: { 1: { add: [], remove: ["INBOX"] } },
+      listVersion: 7,
+    });
+    expect(state.guessedAt).toEqual({ 1: 7 });
+    const after = uiReducer(state, { type: "forget", threadIds: [1] });
+    expect(after.guessedAt).toEqual({});
   });
 
   it("guesses that an opened conversation has been read", () => {
