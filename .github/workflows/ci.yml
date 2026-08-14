@@ -47,6 +47,57 @@ jobs:
       - name: Test
         run: bunx vitest run
 
+      # `vitest` and `tsc` between them never load vite.config.ts: vitest has
+      # its own config, and tsconfig.json includes only src/ and plugins/. So a
+      # @vitejs/plugin-react bump that made `vite dev` refuse to start at all
+      # ("./internal is not exported by the resolved vite" — plugin-react 6
+      # wants vite ^8, this repo is on ^7) merged green, and was reverted in
+      # 8cefbe7. The config's plugin imports are resolved before the server
+      # binds anything, so starting it and asking for the page once is enough
+      # to catch that whole class.
+      #
+      # Bounded three ways, because a CI job that hangs is worse than the bug
+      # it was added to catch: the step has a timeout, the poll gives up after
+      # 60 tries, and the loop exits the moment vite's own process dies rather
+      # than waiting out the clock.
+      - name: Dev server boots
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+
+          bunx vite --port 5173 --strictPort >vite.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+          # `localhost`, not `127.0.0.1`: vite binds the name, and on a host
+          # that resolves it to ::1 first it listens on v6 alone. curl tries
+          # both families; an IP literal only tries the one.
+          served=0
+          for _ in $(seq 1 60); do
+            if curl -fsS -o page.html http://localhost:5173/; then
+              served=1
+              break
+            fi
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+
+          if [ "$served" -ne 1 ]; then
+            echo "::error::the dev server never served a page"
+            cat vite.log
+            exit 1
+          fi
+
+          # A 200 with no entry script would mean vite is answering but has not
+          # transformed anything.
+          grep -q '/src/main.tsx' page.html || {
+            echo "::error::page served without the app entry point"
+            cat page.html
+            exit 1
+          }
+
+          echo "dev server served the page"
+
   rust:
     name: rust
     runs-on: macos-latest

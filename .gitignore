@@ -42,6 +42,11 @@ client_secret*.json
 # Per-machine agent settings
 .claude/settings.local.json
 
+# One git worktree per agent task, nested inside the repo. Untracked here
+# anyway — but Tailwind's source scanner and every other tool that walks the
+# tree reads .gitignore, and without this they scan thirty-odd copies of src/.
+.claude/worktrees/
+
 # Scratch directory for assets/logo/build.py.
 target-icons/
 

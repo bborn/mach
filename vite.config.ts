@@ -109,7 +109,21 @@ export default defineConfig(async () => ({
       : undefined,
     watch: {
       // 3. tell vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      //
+      // ...and `.claude/`, which is where the agent harness puts a git worktree
+      // per task — thirty-odd full checkouts of this repo, nested inside it.
+      // Each one has a `tsconfig.json`, and vite answers a changed tsconfig
+      // anywhere under the root by clearing its cache and forcing a full
+      // reload. Deleting a merged worktree therefore reloaded the running app
+      // against a tree that had just stopped existing, and it came back blank.
+      ignored: ["**/src-tauri/**", "**/.claude/**"],
     },
+  },
+
+  // The dependency scanner crawls every `**/*.html` under the root looking for
+  // entry points, which finds each worktree's `index.html` and follows it into
+  // that branch's `src/`. This project has one entry point.
+  optimizeDeps: {
+    entries: ["index.html"],
   },
 }));

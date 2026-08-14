@@ -11,9 +11,12 @@ export default defineConfig({
     exclude: [
       "**/node_modules/**",
       "**/dist/**",
-      // TaskYou checks each task out into a worktree *inside* the repo, so a
+      // Each agent task is checked out into a worktree *inside* the repo, so a
       // default glob walks into another agent's half-finished branch and
       // reports its failures as ours. Scope to src/ and skip these explicitly.
+      // `.claude/worktrees/` is where the harness puts them now;
+      // `.task-worktrees/` was the old path.
+      "**/.claude/**",
       "**/.task-worktrees/**",
       "**/.qa/**",
     ],

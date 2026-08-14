@@ -32,6 +32,82 @@ echo "==> Setting up Mach worktree${WORKTREE_TASK_ID:+ for task $WORKTREE_TASK_I
 echo "    worktree: $WORKTREE_DIR"
 echo "    parent:   $PARENT_DIR"
 
+# --- Base commit -------------------------------------------------------------
+# The harness branches a new worktree from `origin/main`; the branch reflog
+# says so in as many words ("Created from origin/main"). That is a
+# remote-tracking ref, and on this machine it does not track anything:
+#
+#   * Nothing here runs `git fetch origin`. Every entry in `origin/main`'s
+#     reflog is "update by push", so the ref only moves when something is
+#     pushed *from* this machine.
+#   * Commits that land on GitHub come back down with
+#     `git pull https://github.com/bborn/mach.git main` — a pull by URL. Git
+#     treats a URL as an anonymous remote: it fast-forwards the checked-out
+#     branch and writes FETCH_HEAD, and having no refspec for
+#     refs/remotes/origin/*, it leaves `origin/main` exactly where it was.
+#
+# On 2026-08-13 those two together left `origin/main` 44 commits behind `main`.
+# Four agents in a row were branched onto a base that predated the files they
+# had been asked to edit, and nothing on screen said so — they found out by
+# reporting that files on main did not exist, and the work was thrown away.
+#
+# So the contract is: a worktree starts from the tip of main as this machine
+# will actually merge it — whichever of `main` and a freshly fetched
+# `origin/main` is ahead, preferring `main` when the two have diverged, because
+# unpushed merges land there first and that is what this branch gets merged
+# into. The base is printed, here and again at the end, so that a wrong one
+# shows up in the first minute rather than after the work is done.
+BASE_SUMMARY=""
+if [ "$PARENT_DIR" = "$WORKTREE_DIR" ]; then
+  BASE_SUMMARY="base:     $(git rev-parse --short HEAD) — main checkout, left alone"
+  echo "    ${BASE_SUMMARY}"
+else
+  # Explicit refspec rather than `git fetch origin main`: this must update the
+  # remote-tracking ref, which is the whole point, and not rely on git's
+  # opportunistic update of it.
+  if ! git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" 2>/dev/null; then
+    echo "!!! Could not fetch origin — the base below may be out of date."
+  fi
+
+  # Whichever of the two is a descendant of the other. A ref that is missing,
+  # or behind, or diverged never wins.
+  BASE_REF=""
+  BASE_SHA=""
+  for ref in refs/heads/main refs/remotes/origin/main; do
+    sha="$(git rev-parse --verify --quiet "$ref" || true)"
+    [ -n "$sha" ] || continue
+    if [ -z "$BASE_SHA" ] || git merge-base --is-ancestor "$BASE_SHA" "$sha"; then
+      BASE_SHA="$sha"
+      BASE_REF="$ref"
+    fi
+  done
+
+  if [ -z "$BASE_SHA" ]; then
+    echo "!!! Found neither main nor origin/main. Leaving this worktree where it is."
+    BASE_SUMMARY="base:     $(git rev-parse --short HEAD) — UNVERIFIED, no main branch to compare against"
+  else
+    HEAD_SHA="$(git rev-parse HEAD)"
+    BEHIND="$(git rev-list --count "HEAD..$BASE_SHA")"
+    echo "    base:     $(git rev-parse --short "$BASE_SHA") ($BASE_REF) $(git log -1 --format=%s "$BASE_SHA")"
+
+    if [ "$HEAD_SHA" = "$BASE_SHA" ]; then
+      BASE_SUMMARY="base:     $(git rev-parse --short "$BASE_SHA") ($BASE_REF) — already current"
+    elif [ -n "$(git status --porcelain)" ]; then
+      echo "!!! This worktree is $BEHIND commits behind that base and has uncommitted"
+      echo "    changes, so it is being left alone. Rebase it yourself before you trust"
+      echo "    anything you build here."
+      BASE_SUMMARY="base:     $(git rev-parse --short HEAD) — STALE, $BEHIND commits behind $BASE_REF"
+    elif git merge --ff-only --quiet "$BASE_SHA" 2>/dev/null; then
+      echo "==> Moved this worktree forward $BEHIND commits (was $(git rev-parse --short "$HEAD_SHA"))"
+      BASE_SUMMARY="base:     $(git rev-parse --short "$BASE_SHA") ($BASE_REF) — fast-forwarded $BEHIND commits"
+    else
+      echo "!!! This worktree has commits of its own and cannot fast-forward onto that"
+      echo "    base. Leaving it alone — rebase onto $BASE_REF before you trust it."
+      BASE_SUMMARY="base:     $(git rev-parse --short HEAD) — DIVERGED from $BASE_REF"
+    fi
+  fi
+fi
+
 # --- Google OAuth credentials ------------------------------------------------
 # Without these the app boots but reports "not configured", so anything
 # touching auth, sync or the API clients is untestable.
@@ -85,9 +161,11 @@ echo "==> Warming the Rust build"
   echo "!!! cargo check failed — see above before starting work."
 }
 
-cat <<'EOF'
+echo
+echo "==> Ready."
+echo "    $BASE_SUMMARY"
 
-==> Ready.
+cat <<'EOF'
 
     Tests:      cd src-tauri && cargo test     ·     bunx vitest run
     Build:      bun run build
