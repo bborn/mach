@@ -34,6 +34,14 @@ tauri-build = { version = "2", features = [] }
 # alpha channel and nothing else. Already in the lock as a transitive
 # dependency, so this costs no download.
 png = "0.18"
+# `tests/browser.rs` drives Tauri's own IPC gate — `Webview::on_message`, the
+# function that decides whether an invoke from a given window and origin is
+# allowed to reach a handler — against a mock runtime. It is the only way to
+# assert the *negative* (the page window cannot call a command) rather than
+# asserting that a configuration file currently says the right thing.
+# `test = []` in tauri's manifest: it turns on `tauri::test` and pulls in
+# nothing else.
+tauri = { version = "2", features = ["test"] }
 
 [dependencies]
 tauri = { version = "2", features = [] }

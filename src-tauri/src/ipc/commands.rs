@@ -63,11 +63,43 @@ pub fn get_thread(state: State<'_, AppState>, thread_id: i64) -> Result<ThreadDe
     reads::get_thread(&state.db, thread_id)
 }
 
-/// Open a message's unsubscribe page in the default browser.
+/// The unsubscribe URL for a message, looked up again from the store.
+///
+/// Split out of the command below for the reason every other handler in this
+/// file is a wrapper: a `#[tauri::command]` can only be driven by standing up
+/// an application, so the decision — which verdicts have a page, and which do
+/// not — lives here where `tests/unsub.rs` can reach it.
+///
+/// Every kind with a URL is returned, not only `Link`. A sender who supports
+/// one-click also has a page behind the same URL, and this is the fallback
+/// offered when the POST fails; refusing it there because the header said
+/// one-click would leave him with nowhere to go.
+pub fn unsubscribe_page_url(
+    db: &crate::db::Db,
+    message_id: i64,
+) -> Result<String, IpcError> {
+    use crate::unsub::{store, Target, Verdict};
+
+    let candidate = db
+        .read(move |conn| store::candidate(conn, message_id))?
+        .ok_or_else(|| IpcError::not_found("message", message_id))?;
+
+    match crate::unsub::verdict(&candidate) {
+        Verdict::Unsubscribe(Target::Link { url } | Target::OneClick { url }) => Ok(url),
+        Verdict::Unsubscribe(Target::Mail { .. }) => Err(IpcError::Internal(
+            "that unsubscribe is an email address, not a page".into(),
+        )),
+        _ => Err(IpcError::Internal(
+            "that message has no unsubscribe page to open".into(),
+        )),
+    }
+}
+
+/// Open a message's unsubscribe page.
 ///
 /// The one case Mach will not automate — an `https` `List-Unsubscribe` with no
 /// RFC 8058 one-click support, which may be a form, a login wall or a plain
-/// confirmation. Rather than guessing, it hands the page to the browser.
+/// confirmation. Rather than guessing, it shows him the page.
 ///
 /// # Why the URL is looked up here instead of being passed in
 ///
@@ -76,45 +108,34 @@ pub fn get_thread(state: State<'_, AppState>, thread_id: i64) -> Result<ThreadDe
 /// reach, and no way for a caller to name a destination of its own. This
 /// re-reads the header from the store and re-runs both the rule and the scheme
 /// and host validation before anything opens — the parameter is a message id,
-/// which is not something an attacker can turn into a URL.
+/// which is not something an attacker can turn into a URL. It still is not: the
+/// in-app window is built from Rust with the URL Rust resolved, and the string
+/// never crosses into the app's webview in either direction.
 ///
-/// It goes to the *system* browser through the opener plugin, never to the
-/// webview: a different process, a different origin, and no access to his mail.
+/// # Two destinations, and the second one is not a lesser version
+///
+/// `system: false` — the default — puts the page in [`crate::browser`], a
+/// window inside Mach with no capability grant, no shared cookie jar, and the
+/// host in its title bar. `system: true` hands it to the default browser
+/// through the opener plugin, which is a different process with his real
+/// session in it. The page that wants him signed in needs the second, and the
+/// command palette is where he asks for it.
 #[tauri::command]
 pub fn open_unsubscribe_page(
     app: AppHandle,
     state: State<'_, AppState>,
     message_id: i64,
+    system: Option<bool>,
 ) -> Result<(), IpcError> {
-    use crate::unsub::{store, Target, Verdict};
+    let url = unsubscribe_page_url(&state.db, message_id)?;
 
-    let candidate = state
-        .db
-        .read(move |conn| store::candidate(conn, message_id))?
-        .ok_or_else(|| IpcError::not_found("message", message_id))?;
+    if system.unwrap_or(false) {
+        tauri_plugin_opener::open_url(&url, None::<&str>)
+            .map_err(|e| IpcError::Internal(format!("the page could not be opened: {e}")))?;
+        return Ok(());
+    }
 
-    let url = match crate::unsub::verdict(&candidate) {
-        // Every kind is opened, not only `Link`. A sender who supports
-        // one-click also has a page behind the same URL, and this command is
-        // the fallback offered when the POST fails — refusing it there because
-        // the header said one-click would leave him with nowhere to go.
-        Verdict::Unsubscribe(Target::Link { url } | Target::OneClick { url }) => url,
-        Verdict::Unsubscribe(Target::Mail { .. }) => {
-            return Err(IpcError::Internal(
-                "that unsubscribe is an email address, not a page".into(),
-            ))
-        }
-        _ => {
-            return Err(IpcError::Internal(
-                "that message has no unsubscribe page to open".into(),
-            ))
-        }
-    };
-
-    tauri_plugin_opener::open_url(&url, None::<&str>)
-        .map_err(|e| IpcError::Internal(format!("the page could not be opened: {e}")))?;
-    let _ = &app;
-    Ok(())
+    crate::browser::open(&app, &url, None).map_err(IpcError::Internal)
 }
 
 /// Search.

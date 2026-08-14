@@ -273,9 +273,26 @@ struct LinkFailure {
 ///
 /// Registered as a plugin rather than on a window builder because the window
 /// comes from `tauri.conf.json`; a plugin's hook reaches it either way.
+///
+/// # It reaches one window too many
+///
+/// A plugin hook is consulted for *every* webview, and `crate::browser` opens
+/// one whose whole job is to be somewhere else on the internet. Without the
+/// skip below, the first `https` navigation in that window would be classified
+/// as "a link in a message", cancelled, and pushed out to the system browser —
+/// so the in-app page would open a system browser tab and show nothing, which
+/// is precisely the bug this hook exists to prevent, inverted.
+///
+/// The skip is by label and it is not a hole: that window has its own
+/// `on_navigation` from its own builder, and both hooks are consulted, so
+/// nothing it navigates to is unchecked. See `browser::may_navigate`, which is
+/// a narrower allowlist than this one.
 pub fn link_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::new("mach-links")
         .on_navigation(|webview, url| {
+            if webview.window().label() == crate::browser::WINDOW_LABEL {
+                return true;
+            }
             if !is_external_link(url) {
                 return true;
             }

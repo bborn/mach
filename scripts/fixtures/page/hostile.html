@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Manage your subscription</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 13px/1.5 -apple-system, system-ui, sans-serif; margin: 0; padding: 24px 28px; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  p.lede { margin: 0 0 20px; color: #666; }
+  form { border: 1px solid #d8d8d8; border-radius: 6px; padding: 14px 16px; margin-bottom: 22px; }
+  label { display: block; margin: 6px 0; }
+  button { font: inherit; padding: 5px 12px; margin-top: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { width: 15rem; font-weight: 600; }
+  td.v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .no  { color: #0a7d34; font-weight: 600; }
+  .yes { color: #b00020; font-weight: 600; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #888; margin: 22px 0 6px; }
+</style>
+</head>
+<body>
+
+<!--
+  The fixture the in-app page window is looked at with.
+
+  It plays two parts at once. The top is what a real form-only unsubscribe
+  looks like, so a screenshot shows the thing being built. Everything under it
+  is the probe: it tries, from the page's own script, each escape the window is
+  supposed to refuse, and prints what actually happened.
+
+  It runs on loopback and reaches nothing. `qa browser` will not accept any
+  other kind of address, and no request here leaves the machine.
+-->
+
+<h1>Manage your subscription</h1>
+<p class="lede">books@whinynil.example</p>
+
+<form onsubmit="event.preventDefault(); document.getElementById('done').textContent = 'Submitted (fixture — nothing was sent).';">
+  <label><input type="checkbox" checked> Weekly digest</label>
+  <label><input type="checkbox" checked> Product announcements</label>
+  <label><input type="checkbox"> Everything else</label>
+  <button type="submit">Update preferences</button>
+  <span id="done"></span>
+</form>
+
+<h2>What this page can reach</h2>
+<table><tbody id="probe"></tbody></table>
+
+<h2>Blocked out of band</h2>
+<p style="font-size:12px;color:#666;margin:0">
+  <a href="https://example.com/second" target="_blank">target=_blank</a> ·
+  <a href="#" onclick="window.open('https://example.com/popup','_blank');return false">window.open</a> ·
+  <a href="/download.bin" download="payload.bin">download</a> ·
+  <a href="http://localhost:1420/">the app's dev server</a> ·
+  <a href="tauri://localhost/index.html">tauri://localhost</a> ·
+  <a href="file:///etc/passwd">file:///etc/passwd</a>
+</p>
+
+<script>
+(() => {
+  // Declared first: `paint` is called from probes that run before the bottom of
+  // this function is reached, and a `const` read from inside its own temporal
+  // dead zone throws — which silently blanks the whole table.
+  const rows = [];
+  const painted = new Map();
+  const probeEl = document.getElementById('probe');
+  function paint(name, bad, detail) {
+    painted.set(name, [bad, detail]);
+    render();
+  }
+  function render() {
+    const extra = [...painted.entries()].map(([name, [bad, detail]]) =>
+      '<tr><th>' + name + '</th><td class="' + (bad ? 'yes' : 'no') + '">' +
+      (bad ? 'REACHED' : 'refused') + '</td><td class="v">' + detail + '</td></tr>');
+    probeEl.innerHTML = rows.join('') + extra.join('');
+  }
+
+  const row = (name, bad, detail) =>
+    rows.push(
+      '<tr><th>' + name + '</th><td class="' + (bad ? 'yes' : 'no') + '">' +
+      (bad ? 'REACHED' : 'refused') + '</td><td class="v">' + detail + '</td></tr>'
+    );
+
+  // 1. Is Tauri's bridge in this page at all?
+  const internals = window.__TAURI_INTERNALS__;
+  row('window.__TAURI_INTERNALS__', !!internals,
+      internals ? Object.keys(internals).sort().join(', ') : 'absent');
+
+  // 2. The one that matters: can it call a command?
+  //    `list_accounts` returns every Google account in the mailbox.
+  if (internals && typeof internals.invoke === 'function') {
+    const name = 'invoke("list_accounts")';
+    paint(name, false, 'in flight…');
+    let settled = false;
+    const done = (bad, detail) => { if (!settled) { settled = true; paint(name, bad, detail); } };
+    // A rejected invoke does not always come back: `on_message` returns without
+    // responding when the key is wrong, and the fetch transport then has
+    // nothing to resolve. Both shapes are refusals; only one of them answers.
+    setTimeout(() => done(false, 'no answer in 3s — the request was dropped'), 3000);
+    internals.invoke('list_accounts')
+      .then(v => done(true, JSON.stringify(v).slice(0, 120)))
+      .catch(e => done(false, String(e).slice(0, 160)));
+  } else {
+    row('invoke("list_accounts")', false, 'no invoke function');
+  }
+
+  // 3. …and the raw transport underneath it, in case `invoke` is only a wrapper.
+  if (internals && typeof internals.postMessage === 'function') {
+    try {
+      internals.postMessage({
+        cmd: 'list_accounts', callback: 1, error: 2, payload: {}, options: {},
+      });
+      row('postMessage(list_accounts)', false, 'sent; no callback ever fires — see below');
+    } catch (e) {
+      row('postMessage(list_accounts)', false, String(e).slice(0, 120));
+    }
+  }
+
+  // 4. Storage: is anything here shared with the app or with a previous visit?
+  try {
+    const seen = localStorage.getItem('mach-fixture-visits');
+    localStorage.setItem('mach-fixture-visits', String(Number(seen || 0) + 1));
+    row('localStorage', false,
+        'own store; visits recorded before this one: ' + (seen === null ? 'none' : seen));
+  } catch (e) {
+    row('localStorage', false, String(e).slice(0, 120));
+  }
+  row('document.cookie', document.cookie.length > 0,
+      document.cookie.length ? document.cookie : '(empty)');
+
+  // 5. Can it *read* the app's own origin? A fetch is not a navigation, so the
+  //    guard in `browser::may_navigate` never sees one — CORS is the only
+  //    thing between this page and Tauri's own protocol handlers, and CORS is
+  //    decided by Tauri rather than by Mach. Report the body, not the status:
+  //    a readable status with an unreadable body is not a leak.
+  // With a deadline, because one of these never settles at all: an invoke with
+  // a forged key is dropped in `Webview::on_message` before anything responds,
+  // so the request hangs rather than failing. A probe with no timeout would
+  // simply have no row, which reads as "not attempted".
+  const probeBody = (name, url, init) => {
+    paint(name, false, 'in flight…');
+    let settled = false;
+    const done = (bad, detail) => { if (!settled) { settled = true; paint(name, bad, detail); } };
+    setTimeout(() => done(false, 'no response in 2.5s — the request was dropped'), 2500);
+    fetch(url, init)
+      .then(r => r.text().then(
+        t => done(t.length > 0, 'status ' + r.status + ' · ' + t.length +
+                  ' bytes readable · ' + JSON.stringify(t.slice(0, 60))),
+        e => done(false, 'status ' + r.status + ' · body unreadable: ' + e)))
+      .catch(e => done(false, String(e).slice(0, 140)));
+  };
+
+  // Read the row this prints against the build you are running.
+  //
+  // A release build embeds the frontend, so `get_asset` succeeds, so
+  // `browser.rs`'s `on_web_resource_request` hook runs and empties the
+  // response: this says "refused · TypeError: Load failed".
+  //
+  // A debug build embeds nothing (tauri-codegen uses an empty asset set when
+  // `dev` and a `devUrl` are both configured), so every path misses and Tauri
+  // answers from an error arm that never consults the hook — a 500 whose body
+  // is the constant `asset not found: <path>`. That reads REACHED here and it
+  // is the residue written up in `browser.rs`; the 27 bytes are the sentence,
+  // not the bundle. To see the release behaviour without a release build,
+  // remove `devUrl` from `tauri.conf.json` and rebuild.
+  probeBody('fetch(tauri://localhost/index.html)', 'tauri://localhost/index.html');
+
+  // The IPC endpoint itself, called directly rather than through the injected
+  // bridge. `Origin` is a forbidden header name, so the engine stamps this
+  // page's real origin on it and Rust reads *that* — there is nothing here to
+  // forge. The invoke key is a guess, and it is the second lock.
+  probeBody('fetch(ipc://localhost/list_accounts)', 'ipc://localhost/list_accounts', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Tauri-Callback': '1',
+      'Tauri-Error': '2',
+      'Tauri-Invoke-Key': 'guessed',
+    },
+    body: '{}',
+  });
+
+  // The Vite dev server. Its port is per-instance (see `scripts/qa`), and it
+  // does not exist in a shipped build at all — `?dev=PORT` names it so this
+  // probe can be pointed at whichever instance is running.
+  const devPort = new URLSearchParams(location.search).get('dev');
+  if (devPort) {
+    probeBody('fetch(dev server :' + devPort + ')', 'http://localhost:' + devPort + '/');
+  }
+
+  // 6. Other windows.
+  row('window.opener', !!window.opener, window.opener ? 'present' : 'null');
+
+  render();
+
+  // The window title is drawn by AppKit from the URL, not from here. Changing
+  // it is the check that `on_document_title_changed` was left unset.
+  setTimeout(() => { document.title = 'accounts.google.com'; }, 400);
+
+  // `?escape=<name>` makes the page try to leave, on its own, with no click.
+  //
+  // One at a time, because two of them succeed at *navigating* (which is the
+  // designed answer to `window.open` — the same window goes there, and the
+  // title bar follows) and would then take the rest of this script with them.
+  //
+  // Every host below is `.invalid`, which RFC 2606 reserves and no resolver
+  // will answer: the point is what Mach decides about the address, and nothing
+  // here should reach the network to find out.
+  const escape = new URLSearchParams(location.search).get('escape');
+  const attempt = {
+    // Allowed, as a navigation of this window rather than a second one. The
+    // title bar should change to `popup.invalid`.
+    popup: () => window.open('https://popup.invalid/second', '_blank'),
+    // Refused: only https.
+    plaintext: () => { location.href = 'http://plaintext.invalid/'; },
+    // Refused: the app's own dev server.
+    app: () => { location.href = 'http://localhost:1420/'; },
+    // Refused: the app's own protocol.
+    tauri: () => { location.href = 'tauri://localhost/index.html'; },
+    // Refused: nothing here writes a file.
+    download: () => {
+      const a = document.createElement('a');
+      a.href = '/download.bin';
+      a.download = 'payload.bin';
+      document.body.append(a);
+      a.click();
+    },
+  }[escape];
+  if (attempt) setTimeout(attempt, 1500);
+})();
+</script>
+</body>
+</html>

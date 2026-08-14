@@ -77,6 +77,7 @@ function message(unsubscribe?: UnsubscribeOffer): Message {
 function stubSource(options: { offer?: UnsubscribeOffer; refuse?: boolean; rows?: Thread[] } = {}) {
   const commands: Command[] = [];
   const opened: number[] = [];
+  const destinations: ("app" | "browser")[] = [];
   const rows = options.rows ?? [thread()];
 
   const source: MachDataSource = {
@@ -127,8 +128,13 @@ function stubSource(options: { offer?: UnsubscribeOffer; refuse?: boolean; rows?
         failed: [],
       };
     },
-    async openUnsubscribePage(messageId) {
+    async openUnsubscribePage(messageId, system) {
       opened.push(messageId);
+      // Which window the page lands in is a security decision — in-app means a
+      // webview with no capabilities and no session, the system browser means
+      // the one holding every cookie he has — so the flag is recorded and
+      // asserted rather than ignored.
+      destinations.push(system === true ? "browser" : "app");
     },
     async onThreadsChanged() {
       return () => {};
@@ -138,7 +144,7 @@ function stubSource(options: { offer?: UnsubscribeOffer; refuse?: boolean; rows?
     },
   };
 
-  return { source, commands, opened };
+  return { source, commands, opened, destinations };
 }
 
 function probe(): MachActions {
@@ -252,6 +258,47 @@ describe("unsubscribe", () => {
 
     expect(stub.commands).toEqual([]);
     expect(stub.opened).toEqual([MESSAGE_ID]);
+    // In Mach's own page window, not the system browser: no session, no
+    // capabilities, and the host in the title bar.
+    expect(stub.destinations).toEqual(["app"]);
+  });
+
+  /*
+   * The way out of the sandbox, for the page that will not work inside it.
+   *
+   * The in-app window has an empty cookie jar by construction, so a sender who
+   * puts the unsubscribe behind a login is unreachable there. This is the one
+   * route to the browser that has his sessions, and it has to resolve the same
+   * message the keystroke would.
+   */
+  it("hands the same page to the system browser when asked", async () => {
+    const stub = stubSource({ offer: { offer: "unsubscribe", method: "link" } });
+    await open(stub);
+
+    await act(async () => probe().unsubscribePageInBrowser());
+    await flush();
+
+    expect(stub.commands).toEqual([]);
+    expect(stub.opened).toEqual([MESSAGE_ID]);
+    expect(stub.destinations).toEqual(["browser"]);
+  });
+
+  /*
+   * `reportSpam` is a verdict that nothing vouches for this sender, and every
+   * request to their server — including a plain page load — confirms the
+   * address is read. There is no page to open here, and the entry must not
+   * quietly find one.
+   */
+  it("opens nothing in the browser for a sender it would report instead", async () => {
+    const stub = stubSource({ offer: { offer: "reportSpam", reason: "unknownSender" } });
+    await open(stub);
+
+    await act(async () => probe().unsubscribePageInBrowser());
+    await flush();
+
+    expect(stub.opened).toEqual([]);
+    expect(stub.commands).toEqual([]);
+    expect(status()?.message).toBe("No unsubscribe page here");
   });
 
   it("archives the conversation and asks the sender to stop", async () => {

@@ -1,0 +1,145 @@
+# Mach's own commands, named so that the ACL is consulted for every one of them.
+#
+# # What this file is for, and it is not the main window
+#
+# Nothing here widens anything. `capabilities/default.json` already scopes the
+# frontend's access to the window labelled `main`, and this permission is
+# granted to that capability and to no other — so the set of commands the
+# mailbox can call is exactly what it was before this file existed.
+#
+# What it changes is the *other* window. `crate::browser` opens one — label
+# `mach-page` — that renders a page whoever sent the mail chose, with their
+# script running in it. Before this file, Tauri's invoke gate read:
+#
+#     if (plugin_command.is_some() || has_app_acl_manifest || !is_local)
+#         && invoke.acl.is_none() { reject }
+#
+# — `tauri::webview::Webview::on_message`, tauri 2.11.5. With no app ACL
+# manifest anywhere in the project, `has_app_acl_manifest` was `false`, and a
+# request from a **local** origin therefore skipped the ACL lookup entirely and
+# ran the handler. The empty capability grant refused that window only at a
+# *remote* origin. The one thing holding the line at a local origin was
+# `browser::may_navigate` refusing to go to a local origin in the first place.
+#
+# `tauri-build` turns any file under `permissions/` into the app manifest under
+# the key `__app-acl__`, which is what `has_app_acl_manifest` is asking about.
+# With this file present the ACL is consulted for **every** invoke regardless of
+# origin, the lookup is keyed on the window label, no capability names
+# `mach-page`, and the call resolves to nothing. Two independent refusals where
+# there was one. `tests/browser.rs` drives both through the real gate.
+#
+# # Why the list is written out
+#
+# `commands.allow` cannot be a glob, and that is the right shape for this: a
+# command added to `generate_handler!` without a line here does not silently
+# lose a privilege — it stops working in the mailbox, immediately and visibly.
+# `tests/capabilities.rs::every_command_the_app_registers_is_named_here` makes
+# that a test failure rather than a bug report, by comparing this list against
+# the handler list in `lib.rs` in both directions.
+
+"$schema" = "../gen/schemas/desktop-schema.json"
+
+[[permission]]
+identifier = "mailbox"
+description = """Every command the mailbox frontend invokes. Granted to the \
+`main` window by capabilities/default.json and to nothing else — a window \
+without that capability resolves each of these to nothing."""
+commands.allow = [
+  # Reads: accounts, labels, contacts, the list, one conversation.
+  "list_accounts",
+  "list_labels",
+  "list_contacts",
+  "list_threads",
+  "get_thread",
+  "search_threads",
+  # Calendar.
+  "list_calendars",
+  "list_events",
+  # Writes, and the catalogue the palette is built from.
+  "execute_command",
+  "command_catalogue",
+  # Filters.
+  "list_filters",
+  "create_filter",
+  "delete_filter",
+  # Sync, and the account lifecycle.
+  "sync_status",
+  "sync_now",
+  "begin_add_account",
+  "complete_add_account",
+  "remove_account",
+  # Preferences.
+  "get_preferences",
+  "set_preference",
+  # Notifications.
+  "notification_state",
+  "notification_request_permission",
+  "notification_pending_open",
+  # ⌘K → Send feedback.
+  "submit_feedback",
+  "capture_window",
+  # Handoff, and its terminal sessions.
+  "handoff_targets",
+  "handoff_save_targets",
+  "handoff_pick_directory",
+  "handoff_terminals",
+  "handoff_preview",
+  "handoff_run",
+  "handoff_session_open",
+  "handoff_sessions",
+  "handoff_session_write",
+  "handoff_session_resize",
+  "handoff_session_close",
+  # Message bodies, the link guard's escape hatch, and the evicted-body reload.
+  "render_message_body",
+  "open_external",
+  "restore_message_body",
+  # The unsubscribe page — the command that opens `crate::browser`'s window.
+  # Callable from the mailbox, which is the only place it is asked for; the
+  # window it opens cannot call it back.
+  "open_unsubscribe_page",
+  # Attachments.
+  "attachment_open",
+  "attachment_save",
+  "attachment_inline_image",
+  # Compose.
+  "send_message",
+  # The agent panel.
+  "agent_start",
+  "agent_sessions",
+  "agent_send",
+  "copy_context_text",
+  "agent_backend_status",
+  "agent_status",
+  "agent_complete",
+  # Reply suggestions.
+  "reply_suggestions",
+  "reply_suggestion_record",
+  "reply_suggestion_stats",
+  # The plugin host.
+  "plugin_sandbox",
+  "plugin_conformance",
+  "plugin_list",
+  "plugin_inspect",
+  "plugin_install",
+  "plugin_remove",
+  "plugin_set_enabled",
+  "plugin_source",
+  "plugin_invoke_result",
+]
+
+# The conformance probe is a second binary — `src/bin/plugin_probe.rs` — and it
+# builds from `tauri::generate_context!()`, so it loads this same manifest and
+# the same capability file. Its window is labelled `main` for exactly that
+# reason. `probe_log` is the one command it registers that the app does not, and
+# without a line here the probe would stop being able to report anything the
+# moment an app manifest existed.
+#
+# Granting it in the app costs nothing: the mailbox binary registers no
+# `probe_log` handler, and an allowed command with no handler is still
+# "command not found".
+[[permission]]
+identifier = "plugin-probe"
+description = """`probe_log`, the console bridge the plugin conformance probe \
+binary talks back over. Not registered by the mailbox binary at all."""
+commands.allow = ["probe_log"]

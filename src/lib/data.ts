@@ -551,8 +551,15 @@ export interface MachDataSource {
    * Two callers: the `link` method, which no command can act on, and the
    * failure of an `oneClick` or `mail` unsubscribe, where the page is what is
    * left to try.
+   *
+   * `system` picks the destination. Left off, the page opens in Mach's own
+   * page window — a webview with no capability grant and no cookies shared with
+   * anything, which is where reading a form is safe. Set, it goes to the
+   * default browser instead, which is the one that has his sessions in it and
+   * is what a login-walled unsubscribe needs. Either way this side never learns
+   * the URL.
    */
-  openUnsubscribePage(messageId: MessageId): Promise<void>;
+  openUnsubscribePage(messageId: MessageId, system?: boolean): Promise<void>;
 
   /** Push, never poll. All three return an unsubscribe. */
   onSyncStatus(handler: (status: SyncStatus) => void): Promise<Unsubscribe>;

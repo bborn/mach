@@ -62,6 +62,15 @@ const COMMANDS: PaletteCommand[] = [
     keywords: "unsubscribe newsletter list mailing opt out",
   },
   {
+    // ⇧⌘U shows the page inside Mach, in a window with no session and no
+    // capabilities. This is the way to the browser that has his logins in it,
+    // and it is here rather than on a modifier because it is what he reaches
+    // for after seeing the page ask him to sign in.
+    id: "unsubscribe-in-browser",
+    title: "Unsubscribe page in browser",
+    keywords: "unsubscribe page browser safari open external sign in login",
+  },
+  {
     id: "favorite-view",
     title: "Favorite this mailbox",
     hint: "⇧F",
@@ -220,6 +229,8 @@ export function CommandPalette() {
         // says so quietly when there is nothing to unsubscribe from.
         case "unsubscribe":
           return actions.unsubscribe();
+        case "unsubscribe-in-browser":
+          return actions.unsubscribePageInBrowser();
         case "snooze":
           // Hands over to the picker rather than committing a time of its own.
           // The reducer's `snooze` case shuts this palette on the way out, so

@@ -22,6 +22,8 @@
 
 use std::path::PathBuf;
 
+use tauri::utils::acl::APP_ACL_KEY;
+
 fn src_tauri() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -59,6 +61,16 @@ fn csp() -> String {
 ///
 /// Every entry has to be something the frontend actually calls:
 ///
+/// * `mailbox` — Mach's own commands, defined in `permissions/mach.toml`. No
+///   prefix, so it resolves against the app's own ACL manifest rather than a
+///   plugin's. It grants nothing that was not already reachable: before that
+///   file existed the app had no ACL manifest at all, which meant Tauri skipped
+///   the ACL for every local-origin invoke and ran the handler. Naming the
+///   commands is what makes the ACL authoritative — see the file's own header,
+///   and `tests/browser.rs::the_page_window_is_refused_on_both_grounds`.
+/// * `plugin-probe` — `probe_log`, for the separate `plugin_probe` binary,
+///   which builds from the same `generate_context!` and therefore the same two
+///   directories. The mailbox binary registers no such handler.
 /// * `core:default` — window/webview/app introspection, `path`, `event`. All
 ///   read-only; it contains no way to create a window, navigate one, or touch
 ///   a file.
@@ -76,11 +88,130 @@ fn the_window_is_granted_exactly_these_and_nothing_else() {
         vec![
             "core:default",
             "core:event:default",
+            "mailbox",
             "opener:allow-default-urls",
             "opener:allow-open-url",
+            "plugin-probe",
         ],
         "the capability file changed — every entry needs a reason in this test"
     );
+}
+
+/// The app ACL manifest exists, which is the thing `has_app_acl` is asking
+/// about.
+///
+/// One boolean, deep inside `tauri::webview::Webview::on_message`, decides
+/// whether an invoke from a *local* origin is checked against the ACL at all:
+///
+/// ```text
+/// if (plugin_command.is_some() || has_app_acl_manifest || !is_local)
+///     && invoke.acl.is_none() { reject }
+/// ```
+///
+/// `has_app_acl_manifest` is `acl.contains_key("__app-acl__")`, and that key
+/// appears only when `tauri-build` finds permission files under
+/// `src-tauri/permissions/`. Delete that directory and every window in Mach —
+/// including `browser::WINDOW_LABEL` — gets its app commands run unchecked at a
+/// local origin again.
+///
+/// Deleting it outright does not compile: `capabilities/default.json` names
+/// `mailbox`, and `tauri_build`'s `validate_capabilities` fails the build for a
+/// permission that resolves to nothing. This test is for the way round that
+/// *does* compile — the capability entry and the directory going together, in
+/// one tidy-looking commit — which would leave the app working, every other
+/// test passing, and the gate open.
+#[test]
+fn the_app_defines_an_acl_manifest_so_the_acl_is_never_skipped() {
+    let manifests = json("gen/schemas/acl-manifests.json");
+    let app = manifests.get(APP_ACL_KEY).unwrap_or_else(|| {
+        panic!(
+            "no {APP_ACL_KEY} in the generated manifests. src-tauri/permissions/ \
+             is what produces it, and without it Tauri consults no ACL for a \
+             local-origin invoke in any window."
+        )
+    });
+    assert!(
+        !app["permissions"]
+            .as_object()
+            .expect("the app manifest lists permissions")
+            .is_empty(),
+        "an app manifest with no permissions grants nothing to the mailbox either"
+    );
+}
+
+/// The permission list and the handler list, compared both ways.
+///
+/// With an app ACL manifest in place these two have to agree exactly, and
+/// nothing else in the build makes them. The two failures are different and
+/// both are silent:
+///
+///  * a command in `generate_handler!` that no permission names is **refused at
+///    runtime** — the mailbox calls it, Tauri answers "not allowed by ACL", and
+///    the compiler had nothing to say about it;
+///  * a command named by a permission that no longer exists is a grant pointing
+///    at nothing, which is how a list stops describing the program.
+///
+/// `probe_log` is the one deliberate asymmetry, and it is named here rather
+/// than tolerated by a wildcard: it belongs to `src/bin/plugin_probe.rs`, a
+/// second binary that builds from the same `generate_context!` and therefore
+/// needs its command in the same manifest.
+#[test]
+fn every_command_the_app_registers_is_named_here() {
+    let manifests = json("gen/schemas/acl-manifests.json");
+    let permissions = manifests[APP_ACL_KEY]["permissions"]
+        .as_object()
+        .expect("the app manifest lists permissions")
+        .clone();
+
+    let mut granted: Vec<String> = permissions
+        .values()
+        .flat_map(|permission| {
+            permission["commands"]["allow"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|value| value.as_str().expect("a command is a string").to_string())
+        .collect();
+    granted.sort();
+
+    let mut registered = registered_commands();
+    // The probe binary's, and only it. See the doc above.
+    registered.push("probe_log".to_string());
+    registered.sort();
+
+    let missing: Vec<_> = registered.iter().filter(|c| !granted.contains(c)).collect();
+    assert!(
+        missing.is_empty(),
+        "these commands are registered but no permission names them, so the \
+         mailbox is refused when it calls them: {missing:?}. Add them to \
+         src-tauri/permissions/mach.toml."
+    );
+
+    let stale: Vec<_> = granted.iter().filter(|c| !registered.contains(c)).collect();
+    assert!(
+        stale.is_empty(),
+        "these commands are granted but nothing registers them any more: \
+         {stale:?}. Remove them from src-tauri/permissions/mach.toml."
+    );
+}
+
+/// The commands `lib.rs` hands to `generate_handler!`, read out of the source.
+///
+/// From the handler rather than from a second list, because the drift between
+/// the two is the whole failure being guarded against.
+fn registered_commands() -> Vec<String> {
+    let source = read("src/lib.rs");
+    let after = source
+        .split_once("generate_handler![")
+        .expect("lib.rs registers a handler")
+        .1;
+    let list = after.split_once("])").expect("the handler list is closed").0;
+    list.lines()
+        .map(|line| line.trim().trim_end_matches(',').trim())
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(|line| line.rsplit("::").next().unwrap().to_string())
+        .collect()
 }
 
 /// The one that would undo `attachments::names::is_dangerous` completely.
@@ -154,6 +285,110 @@ fn the_grant_is_scoped_to_the_main_window() {
         .expect("windows is listed explicitly")
         .clone();
     assert_eq!(windows, vec![serde_json::json!("main")]);
+}
+
+/// Every capability file in the directory, not just the one this test knows
+/// about.
+///
+/// Tauri loads `capabilities/*.json` as a directory. A second file added later
+/// would be picked up silently, and if it omitted `windows` — or wrote `"*"` —
+/// it would apply to the page window too. So the invariant is asserted over the
+/// whole directory rather than over one filename.
+fn capability_files() -> Vec<(String, serde_json::Value)> {
+    let dir = src_tauri().join("capabilities");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("capabilities/ exists") {
+        let path = entry.expect("a directory entry").path();
+        let is_capability = path
+            .extension()
+            .is_some_and(|e| e == "json" || e == "json5" || e == "toml");
+        if !is_capability {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(&path).expect("readable");
+        // Only JSON is parsed here; a json5 or toml capability would need a
+        // parser this crate does not have, so its presence is the failure.
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+            panic!("{name} is not JSON this test can read ({e}) — it must be, or this file stops guarding anything")
+        });
+        out.push((name, value));
+    }
+    assert!(!out.is_empty(), "no capability files found");
+    out
+}
+
+/// The page window's grant is empty, and it is empty by *absence*.
+///
+/// `browser::WINDOW_LABEL` is the window that renders a page a stranger chose,
+/// with that stranger's JavaScript running in it. Tauri resolves an invoke's
+/// permissions by window label, so the whole isolation is that no capability
+/// mentions this one. There is nothing to revoke and nothing to get wrong at
+/// runtime — the grant is the empty set because no file names it.
+///
+/// Three ways that could quietly stop being true, all asserted:
+///
+///  * a capability with no `windows` key, which applies to every window;
+///  * a glob — `"*"`, `"mach-*"`, `"?ain"` — that happens to match;
+///  * the label itself being added to a list.
+///
+/// `tests/browser.rs` asserts the consequence — an invoke from that window is
+/// refused — through Tauri's own gate.
+#[test]
+fn no_capability_reaches_the_page_window() {
+    let label = mach_lib::browser::WINDOW_LABEL;
+
+    for (name, capability) in capability_files() {
+        let windows = capability
+            .get("windows")
+            .and_then(|w| w.as_array())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} has no `windows` key, so it applies to every window \
+                     Mach will ever open — including the one that runs a sender's script"
+                )
+            });
+
+        for entry in windows {
+            let pattern = entry.as_str().expect("a window label is a string");
+            assert!(
+                !pattern.contains(['*', '?', '[']),
+                "{name} scopes a capability with the glob {pattern:?}. Globs are \
+                 matched against every window label, and {label:?} must match none — \
+                 write the labels out."
+            );
+            assert_ne!(
+                pattern, label,
+                "{name} grants permissions to the page window, which runs script \
+                 written by whoever sent the mail"
+            );
+        }
+
+        // `webviews` narrows a grant further; it can never widen one past
+        // `windows`, but a file that used it without `windows` would be the
+        // case above. Asserted so the shape stays one this test understands.
+        assert!(
+            capability.get("remote").is_none(),
+            "{name} names remote origins, which would let a page invoke commands"
+        );
+    }
+}
+
+/// The two labels Mach opens a window under, and they are different strings.
+///
+/// A copy-paste that gave the page window the label `"main"` would hand it the
+/// entire capability file, and every test above would still pass.
+#[test]
+fn the_page_window_is_not_the_main_window() {
+    assert_ne!(
+        mach_lib::browser::WINDOW_LABEL,
+        "main",
+        "the page window would inherit capabilities/default.json"
+    );
+    assert_eq!(
+        mach_lib::shell::MAIN_WINDOW, "main",
+        "capabilities/default.json names this label literally"
+    );
 }
 
 /// No `remote` key. In Tauri 2 a capability may name remote origins that are
