@@ -10,9 +10,14 @@
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     /* Mirrors the `@` alias already configured in vite.config.ts */
-    "baseUrl": ".",
     "paths": { "@/*": ["./src/*"] },
     "resolveJsonModule": true,
+    /*
+     * TypeScript 7 stopped pulling in every `@types/*` package it can see, so
+     * the ones nothing imports have to be named. `node` is the only one: the
+     * tests read fixtures off disk with `node:fs`.
+     */
+    "types": ["node"],
     /*
      * The reference plugins under `plugins/` are plain ES modules with no build
      * step — that is the authoring story — and `examples.test.ts` imports them
