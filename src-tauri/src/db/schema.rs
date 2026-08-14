@@ -94,7 +94,38 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 19,
         sql: M19_SUGGESTION_SPEND,
     },
+    Migration {
+        version: 20,
+        sql: M20_RECIPIENT_INDEX,
+    },
 ];
+
+/// Migration 20 — an index the recipient operators can stand on.
+///
+/// `to:`, `cc:` and `bcc:` compile to `EXISTS (… m.to_json LIKE '%x%')`
+/// correlated on `thread_id`. `idx_messages_thread` finds a thread's messages,
+/// but the address columns are not in it, so answering the LIKE meant a rowid
+/// lookup into `messages` — and message rows are fat, because they hold the
+/// bodies. On a query with few matches there is no LIMIT to stop early, so the
+/// planner read most of a 1.2 GB table: `to:someone-with-no-mail@example.com`
+/// measured **10–30 seconds** against the owner's 47,324-thread store.
+///
+/// Adding the three address columns to a `(thread_id, …)` index makes the
+/// subquery covering — the same trick, and for the same reason, that the
+/// full-text path already uses `INDEXED BY idx_messages_thread` for. The same
+/// worst case then measures **60 ms**.
+///
+/// Costs, measured on that store: 12 seconds to build, once, at the boot that
+/// takes this migration, and 4.3 MB on a 1.2 GB database. The columns hold
+/// addresses, not bodies, so the index stays small as the mailbox grows.
+///
+/// Not `bcc_json` alone in a second index: it is last in the key so a `bcc:`
+/// query scans the same entries, which is fine at this size, and Gmail only
+/// ever reports a Bcc header on messages the owner sent anyway.
+const M20_RECIPIENT_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_messages_thread_addresses
+    ON messages (thread_id, to_json, cc_json, bcc_json);
+"#;
 
 /// Migration 19 — what each generation cost, so the cap has something to count.
 ///
