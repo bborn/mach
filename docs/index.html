@@ -508,9 +508,9 @@
         </h1>
         <p class="lede measure">
           I got tired of waiting on Gmail, so I wrote my own. All my accounts in
-          one list, every key where Gmail put it, and an agent that can act on my
-          mail instead of just describing it. Gmail and Google Calendar only —
-          no IMAP, no other providers.
+          one list, every key where Gmail put it. There's an agent in it too,
+          and it can archive and reply rather than just tell me what's in there.
+          Gmail and Google Calendar only — no IMAP, no other providers.
         </p>
         <div class="meta">
           <span>macOS only</span>
@@ -546,9 +546,8 @@
           </picture>
         </div>
         <figcaption>
-          Five accounts in one inbox. That's the test suite's fixture data, which
-          is what the marker in the status bar is telling you — nobody in this
-          picture is real.
+          Five accounts in one inbox. That's the test suite's fixture data (the
+          marker in the status bar says so), so nobody in this picture is real.
         </figcaption>
       </figure>
 
@@ -557,9 +556,9 @@
 
         <p class="measure">
           Everything you look at comes out of a SQLite database on your own disk.
-          Opening a thread doesn't ask Google anything, so it happens the instant
-          you press the key, and it still happens on a plane. Sync runs behind
-          all of that and writes into the same database.
+          Opening a thread doesn't ask Google for anything, so there's no
+          spinner, and it works on a plane. Sync runs behind that and writes into
+          the same database.
         </p>
 
         <dl class="rows" style="margin-top: 1.75rem">
@@ -567,7 +566,8 @@
             <dt>Local data</dt>
             <dd>
               Twelve months backfilled per account, then incremental history sync
-              from a stored watermark. Nothing on screen ever waits on Google.
+              from a stored watermark. The backfill runs in the background, so
+              you can read mail while it's still filling in behind you.
             </dd>
           </div>
           <div>
@@ -576,9 +576,8 @@
               Gmail's operator syntax, parsed as you type and compiled to SQL
               against an FTS5 index. <code>from:</code>,
               <code>has:attachment</code>, <code>older_than:2m</code>, quoted
-              phrases, <code>OR</code> and <code>-</code> all work. Sixty-one
-              thousand messages, and results land before you've let go of the
-              key.
+              phrases, <code>OR</code> and <code>-</code> all work. Mine is
+              around 61,000 messages and I've never waited on it.
             </dd>
           </div>
           <div>
@@ -626,17 +625,16 @@
             </dd>
           </div>
           <div>
-            <dt>An agent with real tools</dt>
+            <dt>The agent</dt>
             <dd>
-              Every action in Mach is a typed command in Rust, and those same
-              commands are the whole of what the agent can do — it has no back
-              door the keyboard doesn't have. It runs on the Claude Code CLI if
-              you have one, so it spends the subscription you're already paying
-              for and never asks for an API key. Anything that actually leaves
-              the building stops and waits for you to say yes. Everything else
-              is undoable and shows up in the same log as the things you did
-              yourself. <kbd>⌘K</kbd> will also hand a thread off to an agent
-              running somewhere else.
+              Every action in Mach is a typed command in Rust, and the agent gets
+              that same list and nothing else. There's no second path to Google.
+              It runs on the Claude Code CLI if you have one, so it spends the
+              subscription you're already paying for and never asks for an API
+              key. Anything that actually leaves the building stops and waits for
+              you to say yes. Everything else is undoable and shows up in the
+              same log as the things you did yourself. <kbd>⌘K</kbd> will also
+              hand a thread off to an agent running somewhere else.
             </dd>
           </div>
           <div>
@@ -646,12 +644,12 @@
               offers two stances — <em>say you'll wait</em>, <em>offer a
               call</em> — with the whole reply already written behind each one.
               Press <kbd>1</kbd> and the composer opens with it in, cursor at
-              the end, an ordinary draft from there. They're written against
-              your own sent mail, so they sound like you rather than like a
-              model, and they never leave your machine until you pick one —
-              nothing lands in Gmail's drafts to be sent off your phone by
-              accident. It counts how often you send one roughly as written,
-              which is how you find out whether it's earning its keep.
+              the end, an ordinary draft from there. They're drawn from your own
+              sent mail, so they sound like you. Nothing reaches Gmail's drafts
+              until you pick one, so there's no half-written reply sitting there
+              to go out off your phone by accident. It counts how often you send
+              one roughly as written. I wanted to know whether the thing was
+              actually working.
             </dd>
           </div>
           <div>
@@ -661,14 +659,15 @@
               background. Most bulk senders support one-click now, so that's a
               single request and no page; the rest get the unsubscribe email
               sent for them. If all a sender offers is a link to a form, you get
-              a button that opens it — Mach won't click through a page it hasn't
-              read, and a request that only <em>might</em> have worked is worse
-              than one you did yourself.
+              a button that opens it. Mach won't click through a page it hasn't
+              read, and I'd rather hand you the link than send a request that
+              only <em>might</em> have worked.
               <br /><br />
-              It won't offer on anything with a link, either. Unsubscribing
-              tells the sender your address is live and read, which is right for
-              a newsletter and the worst possible move for spam — so mail that
-              looks like spam gets offered the spam report instead.
+              It doesn't offer on everything that carries an unsubscribe link,
+              either. Unsubscribing tells the sender your address is live and
+              somebody reads it. Fine for a newsletter you asked for. For spam
+              it's the most useful thing you could hand them, so mail that looks
+              like spam gets offered the spam report instead.
             </dd>
           </div>
           <div>
@@ -726,8 +725,8 @@
 
         <p class="measure">
           Ask from <kbd>⌘K</kbd> and the answer comes back in a drawer under the
-          list, with every tool it reached for and what came back, so you can
-          see what it actually did rather than take its word for it.
+          list, with every tool it called and what each one returned. I don't
+          take its word for things either.
         </p>
 
         <figure>
@@ -901,8 +900,8 @@ bun run tauri dev</code></pre>
         <p class="measure">
           This is my mail client. I built it for me and put it up here in case
           it's useful to anybody else. It isn't a product, there's no support,
-          and there are no releases. I read my mail in it every day, which is
-          the only reason any of it works.
+          and there are no releases. I read my mail in it every day; the parts I
+          don't use are probably broken.
         </p>
         <p class="measure">
           Expect rough edges. Nothing is packaged, nothing updates itself, there

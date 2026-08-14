@@ -60,8 +60,8 @@ Working, and what I read my mail in every day:
 - Unsubscribe with `⇧⌘U`: archives the conversation and unsubscribes in the
   background — one request where the sender supports one-click, the unsubscribe
   email sent for you where they don't. A sender who offers only a form gets you
-  a button that opens it, because a request that only might have worked is worse
-  than one you made yourself. It refuses to offer on mail that looks like spam,
+  a button that opens it; Mach won't click through a page it hasn't read. It
+  refuses to offer on mail that looks like spam,
   where telling the sender your address is live is the wrong move, and offers the
   spam report instead.
 - `⌥⌘C` copies what is on screen as plain text — the thread with quotes
@@ -78,8 +78,8 @@ often than I'd like. `cargo test` and `bunx vitest run` are the whole safety net
 and drops the result in `.feedback/inbox/` as a brief for a coding agent — the
 view you were in, what you annotated, the commit you were on. Point a session at
 that directory and it can pick items up as you file them; that is how most of
-this got fixed. (`MACH_FEEDBACK_SINK=taskyou` sends them to the author's own task
-runner instead, which needs a `ty` binary you probably do not have.)
+this got fixed. (`MACH_FEEDBACK_SINK=taskyou` sends them to my own task runner
+instead, which needs a `ty` binary you probably do not have.)
 
 ## You must bring your own Google OAuth app
 
@@ -176,7 +176,7 @@ Both suites run offline against fakes. Nothing in them touches Google.
 Two things shape the design.
 
 **The UI never waits on Google.** Every view renders from local SQLite. Opening
-a thread is a local read: under a millisecond, and it works offline. The network
+a thread reads that database and nothing else, so it works offline. The network
 is a background sync loop writing into that database, and the UI reacts to the
 changes.
 
@@ -187,8 +187,8 @@ Search is local. The query is parsed in TypeScript
 (`src/lib/search-query.ts`) so the box can show its interpretation as you type,
 and the AST crosses the IPC seam for Rust to compile against the FTS5 index
 (`db::queries::compile_search`). Every user value is bound rather than
-interpolated. Most queries answer in single-digit to low-tens of milliseconds
-against a 61k-message store.
+interpolated. My own store is around 61,000 messages, and I've never seen a
+query take long enough to notice.
 
 **Every action is a typed, undoable command, and the same commands are the
 agent's tool surface.** Archive, label, snooze, send, create event, RSVP, move
