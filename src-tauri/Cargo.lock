@@ -2407,7 +2407,7 @@ dependencies = [
  "mail-parser",
  "objc2",
  "objc2-app-kit",
- "png 0.17.16",
+ "png 0.18.1",
  "portable-pty",
  "reqwest",
  "rusqlite",
