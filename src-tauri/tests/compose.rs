@@ -4508,14 +4508,14 @@ fn the_repair_collapses_duplicate_mirrors_and_drops_the_ones_nothing_owns() {
     .unwrap();
     assert_eq!(draft_rows(&db, thread).len(), 3, "the store as it stands");
 
-    db.write(compose::ensure_compose_schema).unwrap();
+    db.write(compose::create_compose_schema).unwrap();
 
     let rows = draft_rows(&db, thread);
     assert_eq!(rows.len(), 1, "one draft, one row: {rows:?}");
     assert_eq!(rows[0].gmail_message_id, "gmsg-new", "the id Gmail named");
 
     // Idempotent: running it again is a no-op, not a second opinion.
-    db.write(compose::ensure_compose_schema).unwrap();
+    db.write(compose::create_compose_schema).unwrap();
     assert_eq!(draft_rows(&db, thread).len(), 1);
 }
 
@@ -4913,6 +4913,94 @@ fn a_hostile_parent_subject_flattens_rather_than_failing() {
         !header_names(&bytes).iter().any(|n| n == "bcc"),
         "{}",
         headers_of(&bytes)
+    );
+}
+
+// ===================================================== the composer's latency
+
+/// Opening a composer must not queue behind the sync engine's writer.
+///
+/// The two calls `r`, `a` and `f` await before anything is drawn are
+/// `load_draft_for_thread` — is there already a draft here? — and `prepare`.
+/// Both only read. Both used to begin with `db.write(ensure_compose_schema)`,
+/// which takes the single writer mutex, and the sync engine holds that for a
+/// whole batch of messages at a time; so pressing `a` while a backfill batch
+/// was in flight left the window with nothing on it until Google's pace
+/// allowed the batch to finish. Measured at 276ms behind a 300ms batch, and a
+/// batch is not bounded by 300ms.
+///
+/// The assertion is not a stopwatch. A background writer is held for the whole
+/// test, and the composer's reads have to *finish while it is held* — which
+/// they can only do by never asking for it.
+#[test]
+fn opening_a_composer_does_not_wait_for_the_sync_writer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (db, _account, thread, _message) = seeded();
+    // The one call per store that does have work to do. Every call after it is
+    // a read, and that is the state a running app is in.
+    draft::load_draft_for_thread(&db, thread).unwrap();
+
+    let holding = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new(AtomicBool::new(false));
+
+    let batch = std::thread::spawn({
+        let db = db.clone();
+        let holding = Arc::clone(&holding);
+        let release = Arc::clone(&release);
+        move || {
+            db.write_background(|_conn| {
+                let (lock, announced) = &*holding;
+                *lock.lock().unwrap() = true;
+                announced.notify_all();
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+    });
+
+    {
+        let (lock, announced) = &*holding;
+        let mut held = lock.lock().unwrap();
+        while !*held {
+            held = announced.wait(held).unwrap();
+        }
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let opener = std::thread::spawn({
+        let db = db.clone();
+        move || {
+            let existing = draft::load_draft_for_thread(&db, thread).unwrap();
+            let prepared =
+                draft::prepare(&db, thread, DraftKind::ReplyAll, "d-open".into()).unwrap();
+            let _ = tx.send((existing, prepared));
+        }
+    });
+
+    let opened = rx.recv_timeout(Duration::from_secs(5));
+    release.store(true, Ordering::SeqCst);
+    opener.join().unwrap();
+    batch.join().unwrap();
+
+    let (existing, prepared) = opened.expect(
+        "the composer's reads waited on the writer the sync engine was holding — \
+         something on the open path is asking for `Db::write` again",
+    );
+    assert!(existing.is_none());
+    // And it is a real reply-all, not an empty draft that happened to return.
+    assert_eq!(
+        prepared.to.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["tawny@partner.com"]
+    );
+    assert_eq!(
+        prepared.cc.iter().map(|m| m.email.as_str()).collect::<Vec<_>>(),
+        vec!["sam@partner.com", "dana@partner.com"]
     );
 }
 

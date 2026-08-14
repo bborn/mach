@@ -805,7 +805,7 @@ fn attribution_date(message: &Message) -> String {
 /// Saving always leaves the row `pending`, because it has just become newer
 /// than whatever Gmail holds.
 pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     // A draft that has been sent or thrown away stays that way. The composer's
     // last autosave can land after either, and writing this row back would put
     // a draft of an already-sent reply into the conversation and — through the
@@ -860,7 +860,7 @@ pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
 
 /// Record what Gmail said about a draft. Never touches the text.
 pub fn set_remote(db: &Db, draft_id: &str, remote: &DraftRemote) -> Result<()> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     db.write(|conn| {
         conn.execute(
             "UPDATE compose_drafts
@@ -888,7 +888,7 @@ pub fn set_remote(db: &Db, draft_id: &str, remote: &DraftRemote) -> Result<()> {
 
 /// Every draft Gmail has not been told about yet — what a push pass walks.
 pub fn drafts_needing_push(db: &Db) -> Result<Vec<Draft>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     Ok(db.read(|conn| {
         let mut stmt = conn.prepare(&format!(
             "SELECT {DRAFT_COLUMNS} FROM compose_drafts \
@@ -900,7 +900,7 @@ pub fn drafts_needing_push(db: &Db) -> Result<Vec<Draft>> {
 }
 
 pub fn load_draft(db: &Db, id: &str) -> Result<Option<Draft>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     let found = db.read(|conn| {
         Ok(conn
             .query_row(
@@ -916,7 +916,7 @@ pub fn load_draft(db: &Db, id: &str) -> Result<Option<Draft>> {
 /// The most recently touched draft for a conversation — what reopening a thread
 /// should put back in the composer.
 pub fn load_draft_for_thread(db: &Db, thread_id: i64) -> Result<Option<Draft>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     let found = db.read(|conn| {
         Ok(conn
             .query_row(
@@ -950,7 +950,7 @@ pub fn load_draft_for_thread(db: &Db, thread_id: i64) -> Result<Option<Draft>> {
 /// Mach has not learned yet, because `users.drafts.list` has not run since the
 /// draft appeared. It resolves itself within a sync pass.
 pub fn load_draft_for_message(db: &Db, message_id: i64, now_ms: i64) -> Result<Option<Draft>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     let gmail_message_id: Option<String> = db.read(|conn| {
         Ok(conn
             .query_row(
@@ -1237,7 +1237,7 @@ fn adopted_draft_id(gmail_draft_id: &str) -> String {
 /// draft row converge instead of racing; reconciliation has already decided that
 /// the remote copy is the newer one, and replaces the text with it.
 fn write_adopted(db: &Db, draft: &Draft, overwrite: bool) -> Result<()> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     let conflict = if overwrite {
         "DO UPDATE SET
              account_id       = excluded.account_id,
@@ -1322,7 +1322,7 @@ pub fn forget_drafts_missing_from(
     live: &[String],
     listed_at: i64,
 ) -> Result<Vec<String>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     let doomed: Vec<Draft> = db.read(|conn| {
         let mut stmt = conn.prepare(&format!(
             "SELECT {DRAFT_COLUMNS} FROM compose_drafts
@@ -1378,7 +1378,7 @@ fn mailboxes(people: &[Participant]) -> Vec<Mailbox> {
 /// A tombstone goes in as the row comes out — see [`retire`] — so that an
 /// autosave still in flight cannot write the draft back a moment later.
 pub fn delete_draft(db: &Db, id: &str, now_ms: i64) -> Result<()> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     retire(db, id, now_ms)?;
     super::attach::delete_for_draft(db, id)?;
     db.write(|conn| {
@@ -1421,7 +1421,7 @@ pub struct RetiredDraft {
 /// The identity is kept rather than just the id, so [`revive`] can hand it back
 /// to a recalled send.
 pub fn retire(db: &Db, id: &str, now_ms: i64) -> Result<()> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     let Some(draft) = load_draft(db, id)? else {
         // Nothing to describe. A tombstone with no identity would still be
         // worth writing, but every caller reaches here through a row it just
@@ -1490,7 +1490,7 @@ pub fn is_retired(db: &Db, id: &str) -> Result<bool> {
 /// from a reopened window, or after a relaunch, revived an identity with no
 /// words in it, and the conversation showed no draft. See [`retire`].
 pub fn revive(db: &Db, id: &str) -> Result<Option<RetiredDraft>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     let found: Option<(RetiredDraft, Option<String>)> = db.read(|conn| {
         Ok(conn
             .query_row(
@@ -1582,7 +1582,7 @@ pub fn revive(db: &Db, id: &str) -> Result<Option<RetiredDraft>> {
 /// racing a send is a matter of milliseconds, and a day is long past the point
 /// where a save with that id could be anything but a new draft.
 pub fn forget_retired_before(db: &Db, before_ms: i64) -> Result<usize> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     Ok(db.write(|conn| {
         Ok(conn.execute(
             "DELETE FROM compose_retired_drafts WHERE retired_at < ?1",
