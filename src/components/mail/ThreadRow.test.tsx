@@ -56,7 +56,6 @@ function row(over: Partial<Thread> = {}, props: Partial<Parameters<typeof Thread
       checked={false}
       selecting={false}
       onSelect={() => {}}
-      onToggle={() => {}}
       {...props}
     />,
   );

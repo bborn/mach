@@ -1742,3 +1742,235 @@ fn a_checkpoint_shrinks_the_write_ahead_log() {
         .expect("count");
     assert_eq!(n, 40 * 200);
 }
+
+// ---------------------------------------------------------------------------
+// which table a mailbox is driven from
+// ---------------------------------------------------------------------------
+
+/// The plan SQLite chose, as one line.
+///
+/// `list_threads` does not expose the SQL it built and has no reason to: the
+/// question here is what the *engine* did, which `EXPLAIN QUERY PLAN` answers
+/// and nothing else does. So the two spellings are reproduced below, and each
+/// test also calls the real `list_threads` to show the chooser only changes the
+/// plan and never the rows.
+fn plan(db: &Db, sql: &str, label: &str) -> String {
+    let conn = db.reader();
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("prepare");
+    let rows = stmt
+        .query_map([label], |row| row.get::<_, String>(3))
+        .expect("explain")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect");
+    rows.join(" | ")
+}
+
+const STREAM_HEAD: &str =
+    "SELECT t.id FROM threads t JOIN accounts a ON a.id = t.account_id WHERE 1 = 1 AND ";
+const AS_EXISTS: &str = "EXISTS (SELECT 1 FROM thread_labels tl \
+    WHERE tl.thread_id = t.id AND tl.gmail_label_id = ?1)";
+const AS_IN: &str = "t.id IN (SELECT tl.thread_id FROM thread_labels tl \
+    WHERE tl.gmail_label_id = ?1)";
+const STREAM_TAIL: &str = " ORDER BY t.last_message_at DESC, t.id DESC LIMIT 50";
+
+/// A mailbox holding a handful of threads must not cost a walk of the store.
+///
+/// This is the shape the owner's Inbox is: 49 conversations out of 47,328,
+/// because he triages. The correlated `EXISTS` spelling makes that the most
+/// expensive read in the app — SQLite tests every thread in the stream to find
+/// the few that match — and it gets worse the tidier the mailbox gets. Measured
+/// against his store: 17.3 ms, against 0.14 ms for the same rows gathered from
+/// `idx_thread_labels_label` and sorted.
+///
+/// The assertion is on the plan rather than on a duration, because a duration
+/// here would be a duration against a 200-row fixture, which is nothing either
+/// way. What regressed is which table SQLite drives from, and that is what the
+/// plan says.
+#[test]
+fn a_sparse_mailbox_is_gathered_from_the_label_not_scanned_from_the_stream() {
+    let t = TempDb::new("sparse-mailbox");
+    let a = account(&t.db, "owner@example.com", 0);
+    for i in 0..200 {
+        let id = thread(
+            &t.db,
+            a,
+            &format!("g{i}"),
+            &format!("subject {i}"),
+            1_700_000_000_000 + i,
+        );
+        let labels: Vec<String> = if i < 3 {
+            vec!["INBOX".into(), "CATEGORY_UPDATES".into()]
+        } else {
+            vec!["CATEGORY_UPDATES".into()]
+        };
+        let conn = t.db.writer();
+        q::set_thread_labels(&conn, id, &labels).expect("labels");
+    }
+
+    let sparse = plan(&t.db, &format!("{STREAM_HEAD}{AS_IN}{STREAM_TAIL}"), "INBOX");
+    assert!(
+        sparse.contains("idx_thread_labels_label"),
+        "the sparse spelling should drive from the label index: {sparse}"
+    );
+
+    let rows = t
+        .db
+        .read(|conn| {
+            q::list_threads(
+                conn,
+                &ThreadQuery {
+                    label_id: Some("INBOX".to_string()),
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("list");
+    assert_eq!(rows.len(), 3, "and return exactly the inbox");
+
+    let dense = t
+        .db
+        .read(|conn| {
+            q::list_threads(
+                conn,
+                &ThreadQuery {
+                    label_id: Some("CATEGORY_UPDATES".to_string()),
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("list");
+    assert_eq!(dense.len(), 50, "a dense mailbox still pages at fifty");
+}
+
+/// A mailbox on most of the store must keep the plan it already had.
+///
+/// The `IN (SELECT …)` spelling sorts the label's whole thread set to return
+/// fifty rows, so it is the wrong answer above a couple of thousand threads —
+/// 41 ms against 0.10 ms for `CATEGORY_UPDATES` on the owner's store. Pinning
+/// this is what stops a later "just always use the fast one" making the common
+/// mailbox four hundred times slower.
+#[test]
+fn a_dense_mailbox_still_streams_from_the_thread_index() {
+    let t = TempDb::new("dense-mailbox");
+    let a = account(&t.db, "owner@example.com", 0);
+    for i in 0..40 {
+        let id = thread(
+            &t.db,
+            a,
+            &format!("g{i}"),
+            &format!("subject {i}"),
+            1_700_000_000_000 + i,
+        );
+        let conn = t.db.writer();
+        q::set_thread_labels(&conn, id, &["CATEGORY_UPDATES".to_string()]).expect("labels");
+    }
+    let p = plan(
+        &t.db,
+        &format!("{STREAM_HEAD}{AS_EXISTS}{STREAM_TAIL}"),
+        "CATEGORY_UPDATES",
+    );
+    assert!(
+        p.contains("idx_threads_stream"),
+        "the dense spelling should stream the newest-first index: {p}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the address book, and the index it was supposed to be reading
+// ---------------------------------------------------------------------------
+
+/// The address book must not read the message bodies to find out who sent them.
+///
+/// `idx_messages_sender` was built covering and measured at 1.28 s → 0.02 s. It
+/// stopped covering when the query learned to keep the newest *name* beside each
+/// address: `from_name` is selected and was not in the key, so SQLite went back
+/// to `SCAN messages` — 211 ms, and 0.89 GB of message bodies pulled through the
+/// page cache on every launch, with nothing in the app saying so.
+///
+/// Both halves are pinned, because they fail for different reasons: the sender
+/// half when a column leaves the key, the recipient half when a function lands
+/// around the column.
+#[test]
+fn the_address_book_never_touches_the_messages_table() {
+    let t = TempDb::new("address-book-plan");
+    let a = account(&t.db, "owner@example.com", 0);
+    let th = thread(&t.db, a, "g1", "hello", 1_700_000_000_000);
+    message(&t.db, th, a, "m1", "hello", "body", 1_700_000_000_000);
+
+    let conn = t.db.reader();
+    let explain = |sql: &str| -> String {
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare");
+        stmt.query_map([], |row| row.get::<_, String>(3))
+            .expect("explain")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect")
+            .join(" | ")
+    };
+
+    let senders = explain("SELECT trim(lower(from_email)), from_name, internal_date FROM messages");
+    assert!(
+        senders.contains("COVERING INDEX idx_messages_sender"),
+        "the sender half must be answered from the index alone: {senders}"
+    );
+
+    let recipients = explain(
+        "SELECT json_extract(v.value, '$.email') FROM messages m, json_each(m.to_json) v \
+          WHERE m.is_draft = 0 AND json_valid(m.to_json) \
+            AND m.from_email COLLATE NOCASE IN (SELECT lower(email) FROM accounts)",
+    );
+    assert!(
+        recipients.contains("SEARCH m USING INDEX idx_messages_sender"),
+        "the recipient half must seek rather than scan: {recipients}"
+    );
+}
+
+/// Folding case is what the `lower()` was there for, and the collation has to go
+/// on doing it: 1,785 of the owner's 67,279 messages do not store the address
+/// lowercased, and the ones that matter here are messages he sent.
+#[test]
+fn the_address_book_still_folds_case_after_the_collation_change() {
+    let t = TempDb::new("address-book-case");
+    let a = account(&t.db, "owner@example.com", 0);
+    let th = thread(&t.db, a, "g1", "hello", 1_700_000_000_000);
+    {
+        let conn = t.db.writer();
+        q::upsert_message(
+            &conn,
+            &NewMessage {
+                thread_id: th,
+                account_id: a,
+                gmail_message_id: "sent-1".into(),
+                // Gmail hands the address back as whoever typed it typed it.
+                from: Participant {
+                    name: Some("Owner".into()),
+                    email: "Owner@Example.com".into(),
+                },
+                to: vec![Participant {
+                    name: Some("Tawny".into()),
+                    email: "tawny@example.com".into(),
+                }],
+                subject: "hello".into(),
+                internal_date: 1_700_000_000_000,
+                ..Default::default()
+            },
+        )
+        .expect("upsert");
+    }
+
+    let book = t
+        .db
+        .read(|conn| q::address_book(conn, 50))
+        .expect("address book");
+    let tawny = book
+        .iter()
+        .find(|c| c.email == "tawny@example.com")
+        .expect("the person he wrote to should be in the book");
+    assert_eq!(
+        tawny.sends, 1,
+        "a message from Owner@Example.com is still a message from this account"
+    );
+}
