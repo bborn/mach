@@ -160,7 +160,13 @@ fn opaque_bounds(path: &Path) -> (u32, u32, u32, u32, u32) {
         path.display()
     );
 
-    let mut buf = vec![0; reader.output_buffer_size()];
+    // `output_buffer_size` went from `usize` to `Option<usize>` in png 0.18: it
+    // is `None` for an image whose decoded size does not fit in a `usize`. An
+    // app icon never will, so treat it as the file being unreadable.
+    let size = reader
+        .output_buffer_size()
+        .unwrap_or_else(|| panic!("{} decodes to more than a usize of pixels", path.display()));
+    let mut buf = vec![0; size];
     let info = reader.next_frame(&mut buf).unwrap();
     let (w, h) = (info.width, info.height);
     assert_eq!(w, h, "{} is {w}x{h}; an app icon is square", path.display());
