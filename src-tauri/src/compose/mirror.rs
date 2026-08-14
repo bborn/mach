@@ -168,7 +168,7 @@ fn current_id(draft: &Draft) -> String {
 /// Idempotent: autosave calls this every few hundred milliseconds, and it must
 /// leave one row rather than a transcript of the typing.
 pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
 
     let account = db
         .read(|conn| command_queries::account_by_id(conn, draft.account_id))?
@@ -321,7 +321,7 @@ pub fn unmirror(db: &Db, draft: &Draft) -> Result<()> {
 /// shape every bug in this file's history has ended in — goes with the rest of
 /// them rather than outliving the draft it stood for.
 pub fn unmirror_ids(db: &Db, draft_id: &str, gmail_message_id: Option<&str>) -> Result<()> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     // Both ids, because a draft that has been pushed is filed under Gmail's,
     // and one that has not is filed under the placeholder — and after a failed
     // push there can be one of each.
@@ -425,7 +425,7 @@ pub fn forget_orphan_mirrors(
     live_message_ids: &[String],
     listed_at: i64,
 ) -> Result<Vec<String>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     let candidates: Vec<(String, Option<String>)> = db.read(|conn| {
         let mut stmt = conn.prepare(
             "SELECT gmail_message_id, mach_draft_id FROM messages

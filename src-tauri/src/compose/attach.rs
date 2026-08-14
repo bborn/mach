@@ -138,7 +138,7 @@ pub fn add_bytes(
     inline: bool,
     now_ms: i64,
 ) -> Result<Attachment> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
 
     let size = bytes.len() as u64;
     let filename = names::safe_filename(raw_name);
@@ -237,7 +237,7 @@ pub fn set_inline(db: &Db, attachment_id: &str, inline: bool) -> Result<Option<A
 /// recipient will see it. Metadata comes back with it so the caller does not
 /// need a second lookup to build a `data:` URL.
 pub fn bytes_of(db: &Db, attachment_id: &str) -> Result<Option<(Attachment, Vec<u8>)>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     Ok(db.read(|conn| {
         Ok(conn
             .query_row(
@@ -265,7 +265,7 @@ fn content_id_for(attachment_id: &str) -> String {
 /// What a draft is carrying, oldest first — the order they were chosen in, which
 /// is the order the composer lists them and the order they ride in the message.
 pub fn list(db: &Db, draft_id: &str) -> Result<Vec<Attachment>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     Ok(db.read(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, draft_id, filename, mime_type, size_bytes, added_at, inline, content_id
@@ -278,7 +278,7 @@ pub fn list(db: &Db, draft_id: &str) -> Result<Vec<Attachment>> {
 
 /// Metadata and bytes together — what building the message needs.
 pub fn list_with_bytes(db: &Db, draft_id: &str) -> Result<Vec<(Attachment, Vec<u8>)>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     Ok(db.read(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, draft_id, filename, mime_type, size_bytes, added_at, inline, content_id,
@@ -293,7 +293,7 @@ pub fn list_with_bytes(db: &Db, draft_id: &str) -> Result<Vec<(Attachment, Vec<u
 }
 
 pub fn total_bytes(db: &Db, draft_id: &str) -> Result<i64> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     Ok(db.read(|conn| {
         Ok(conn.query_row(
             "SELECT COALESCE(SUM(size_bytes), 0) FROM compose_attachments WHERE draft_id = ?1",
@@ -306,7 +306,7 @@ pub fn total_bytes(db: &Db, draft_id: &str) -> Result<i64> {
 /// Take one file off a draft. Returns false when it was not there — a second
 /// press of the same key, or a draft that has already been sent.
 pub fn remove(db: &Db, attachment_id: &str) -> Result<bool> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     Ok(db.write(|conn| {
         Ok(conn.execute(
             "DELETE FROM compose_attachments WHERE id = ?1",
@@ -320,7 +320,7 @@ pub fn remove(db: &Db, attachment_id: &str) -> Result<bool> {
 /// Called from the one place that forgets a draft, so a discarded or sent draft
 /// cannot leave 25 MB behind in the store with nothing pointing at it.
 pub fn delete_for_draft(db: &Db, draft_id: &str) -> Result<()> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     db.write(|conn| {
         conn.execute(
             "DELETE FROM compose_attachments WHERE draft_id = ?1",
@@ -339,7 +339,7 @@ pub fn reassign(db: &Db, from_draft_id: &str, to_draft_id: &str) -> Result<()> {
     if from_draft_id == to_draft_id {
         return Ok(());
     }
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     db.write(|conn| {
         conn.execute(
             "UPDATE compose_attachments SET draft_id = ?2 WHERE draft_id = ?1",
@@ -351,7 +351,7 @@ pub fn reassign(db: &Db, from_draft_id: &str, to_draft_id: &str) -> Result<()> {
 }
 
 pub fn get(db: &Db, attachment_id: &str) -> Result<Option<Attachment>> {
-    db.write(ensure_compose_schema)?;
+    ensure_compose_schema(db)?;
     Ok(db.read(|conn| {
         Ok(conn
             .query_row(

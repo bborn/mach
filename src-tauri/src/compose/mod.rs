@@ -54,7 +54,7 @@ pub mod remote;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::commands::CommandError;
-use crate::db::{DbError, Result as DbResult};
+use crate::db::{Db, DbError, Result as DbResult};
 use crate::google::GoogleError;
 
 pub use address::{dedupe, reply_recipients, Recipients};
@@ -258,9 +258,50 @@ const ATTACHMENT_INLINE_COLUMNS: &[(&str, &str)] = &[
 /// path's write reversible without asking the UI to remember anything.
 const RETIRED_DRAFT_COLUMNS: &[(&str, &str)] = &[("draft_json", "TEXT")];
 
-/// Idempotent. Called by every entry point into this module, so no caller has
-/// to remember it.
-pub fn ensure_compose_schema(conn: &Connection) -> DbResult<()> {
+/// Idempotent, and free once it has run. Called by every entry point into this
+/// module, so no caller has to remember it.
+///
+/// # Why this is a read first
+///
+/// Every entry point used to be `db.write(create_compose_schema)`, including
+/// the ones that only *read* — opening a composer, loading a draft. [`Db::write`]
+/// takes the single writer mutex, and the sync engine holds that for a whole
+/// batch of messages at a time, so a keystroke with nothing to write queued
+/// behind a backfill batch and the composer did not appear until Google's pace
+/// allowed it. Measured at 276ms behind a 300ms batch, and a batch can be
+/// longer than that.
+///
+/// [`ensure_one_mirror_per_draft`] creates `idx_messages_mach_draft` last, so
+/// its presence means everything above it has already run. Asking a pooled
+/// reader for it costs a lookup in `sqlite_master` and never queues behind
+/// anything, and the writer is taken only on the one call per store that has
+/// work to do.
+pub fn ensure_compose_schema(db: &Db) -> DbResult<()> {
+    if db.read(compose_schema_is_current)? {
+        return Ok(());
+    }
+    db.write(create_compose_schema)
+}
+
+/// Whether [`create_compose_schema`] has already run against this store.
+fn compose_schema_is_current(conn: &Connection) -> DbResult<bool> {
+    let indexed: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master \
+              WHERE type = 'index' AND name = 'idx_messages_mach_draft'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(indexed.is_some())
+}
+
+/// The schema itself, against a connection inside a write transaction.
+///
+/// Idempotent, and callers with a `Db` should use [`ensure_compose_schema`]
+/// rather than this: it is the one that does not take the writer for a store
+/// that is already current.
+pub fn create_compose_schema(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(COMPOSE_SCHEMA)?;
     add_missing_columns(conn, "compose_drafts", DRAFT_REMOTE_COLUMNS)?;
     add_missing_columns(conn, "compose_outbox", OUTBOX_DRAFT_COLUMNS)?;

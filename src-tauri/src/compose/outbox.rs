@@ -161,7 +161,7 @@ pub struct Outbox {
 
 impl Outbox {
     pub fn new(db: Db, clients: Arc<dyn GoogleClients>) -> Result<Self> {
-        db.write(ensure_compose_schema)?;
+        ensure_compose_schema(&db)?;
         Ok(Outbox {
             db,
             clients,
