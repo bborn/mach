@@ -1,0 +1,2 @@
+Not a payload. This file exists so the fixture page can offer a download,
+and so the refusal in browser::on_download has something to refuse.

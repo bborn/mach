@@ -6,6 +6,8 @@
     "main"
   ],
   "permissions": [
+    "mailbox",
+    "plugin-probe",
     "core:default",
     "core:event:default",
     "opener:allow-open-url",

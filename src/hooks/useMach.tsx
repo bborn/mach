@@ -763,8 +763,8 @@ export interface MachActions {
    *    so the honest gesture is Gmail's spam report. Nothing is unsubscribed
    *    from; an unsubscribe would confirm to a stranger that the address is
    *    read.
-   *  * `unsubscribe` by `link` — a page only a person can complete, opened in
-   *    the browser from Rust. No command is dispatched.
+   *  * `unsubscribe` by `link` — a page only a person can complete, opened
+   *    from Rust in Mach's own page window. No command is dispatched.
    *  * `unsubscribe` by `oneClick` or `mail` — the conversation is archived
    *    (which is the half ⌘Z can take back) and the request goes out behind it.
    *
@@ -774,6 +774,17 @@ export interface MachActions {
    * about them.
    */
   unsubscribe: () => void;
+  /**
+   * The same page, in the browser he already trusts.
+   *
+   * `unsubscribe` shows a `link` offer inside Mach, in a window that has no
+   * capability grant and an empty cookie jar — which is right for reading a
+   * form and wrong for a page that wants him signed in first. This is the way
+   * out of that, and it is a separate entry rather than a modifier because it
+   * is the answer to a question ("it wants me to log in") rather than a
+   * variation on a gesture.
+   */
+  unsubscribePageInBrowser: () => void;
   starSelected: () => void;
   /**
    * Snooze to a named instant.
@@ -2226,9 +2237,9 @@ export function MachProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        const openPage = () => {
+        const openPage = (system = false) => {
           void getDataSource()
-            .openUnsubscribePage(target.messageId)
+            .openUnsubscribePage(target.messageId, system)
             .catch((caught) =>
               dispatch({
                 type: "status",
@@ -2262,7 +2273,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
         // A link is a page with a form on it. Rust will not act on one and
         // neither will this: the URL never reaches the webview, so the id goes
-        // out and the browser is what opens.
+        // out and a window opens with the page in it.
         if (target.offer.method === "link") {
           openPage();
           return;
@@ -2317,6 +2328,33 @@ export function MachProvider({ children }: { children: ReactNode }) {
             refused(
               `Could not unsubscribe from ${target.sender} — ${toMailboxError(caught).message}`,
             ),
+          );
+      },
+      /*
+       * The same page, handed to the system browser.
+       *
+       * It resolves the target through `unsubscribeAction` exactly as
+       * `unsubscribe` does, so the two can never write to different senders,
+       * and it reports the same "nothing here" line rather than doing nothing.
+       * `reportSpam` has no page at all — there is nothing to open, and opening
+       * something would be the one thing that verdict exists to prevent.
+       */
+      unsubscribePageInBrowser: () => {
+        const target = visibleDetail ? unsubscribeAction(visibleDetail.messages) : null;
+        if (!target || target.offer.offer !== "unsubscribe") {
+          dispatch({
+            type: "status",
+            status: { message: "No unsubscribe page here", tone: "info" },
+          });
+          return;
+        }
+        void getDataSource()
+          .openUnsubscribePage(target.messageId, true)
+          .catch((caught) =>
+            dispatch({
+              type: "status",
+              status: { message: toMailboxError(caught).message, tone: "error" },
+            }),
           );
       },
       snoozeSelected: (until) =>

@@ -68,7 +68,12 @@ const SHOW_WINDOW_ID: &str = "mach://show-window";
 pub const MENU_EVENT: &str = "mach://menu";
 
 /// The label Tauri gives the window in `tauri.conf.json`.
-const MAIN_WINDOW: &str = "main";
+///
+/// Also the only label `capabilities/default.json` grants anything to, which is
+/// what makes every *other* window Mach opens — `browser::WINDOW_LABEL` is the
+/// one — unable to call a command. Public so those windows can be told apart
+/// from this one without a second copy of the string.
+pub const MAIN_WINDOW: &str = "main";
 
 /// True when this process is one of `scripts/qa`'s side instances.
 ///
@@ -298,13 +303,31 @@ pub fn on_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
 /// and never elsewhere: on Windows and Linux closing the last window is how you
 /// quit, and a hidden unquittable process there would be the bug rather than
 /// the fix.
+///
+/// **The main window only.** Hiding is for the window that holds the mailbox
+/// and must not be lost; applied to `browser::WINDOW_LABEL` it would leave a
+/// stranger's page live and running with nothing on screen pointing at it, so
+/// ⌘W there destroys as the user expects. Anything else Mach ever opens gets
+/// the same default.
 pub fn intercept_close<R: Runtime>(window: &Window<R>) -> bool {
-    if cfg!(target_os = "macos") {
-        let _ = window.hide();
-        true
-    } else {
-        false
+    if !hides_on_close(window.label()) {
+        return false;
     }
+    let _ = window.hide();
+    true
+}
+
+/// Which windows hide rather than close, by label.
+///
+/// A `Window` cannot be built without an application, so the rule lives here
+/// where a test can reach it. It is one line and it is the difference between
+/// ⌘W parking the mailbox where ⌘0 can find it, and ⌘W leaving a stranger's
+/// page running in a window nobody can see.
+#[must_use]
+pub fn hides_on_close(label: &str) -> bool {
+    // On Windows and Linux closing the last window is how you quit, and a
+    // hidden unquittable process there would be the bug rather than the fix.
+    cfg!(target_os = "macos") && label == MAIN_WINDOW
 }
 
 /// Bring the window back for a Dock click or `open -a Mach`.
@@ -346,5 +369,18 @@ mod tests {
         assert!(is_qa_instance(), "a separate store means a separate, silent instance");
 
         std::env::remove_var("MACH_DATA_DIR");
+    }
+
+    /// Hiding is for the mailbox and for nothing else.
+    ///
+    /// `crate::browser`'s window renders a page whoever sent the mail chose,
+    /// with their script running in it. Hidden, it would still be running, with
+    /// nothing on screen to close and no menu item to bring it back — ⌘0 is
+    /// wired to the main window by name.
+    #[test]
+    fn only_the_mailbox_window_hides_instead_of_closing() {
+        assert_eq!(hides_on_close(MAIN_WINDOW), cfg!(target_os = "macos"));
+        assert!(!hides_on_close(crate::browser::WINDOW_LABEL));
+        assert!(!hides_on_close("anything-added-later"));
     }
 }

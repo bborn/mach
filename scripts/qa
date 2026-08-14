@@ -16,6 +16,7 @@ set -euo pipefail
 #   qa type TEXT     put TEXT into whatever has the caret
 #   qa press KEY     an editing key into the caret: Enter, Backspace, mod+Backspace
 #   qa ui            what is on screen: mode, cursor, selection, overlay, rows
+#   qa browser URL   open the in-app page window on a LOCAL fixture (loopback only)
 #
 # ---------------------------------------------------------------------------
 # DRIVE THE REAL APP. NEVER TOUCH THE OWNER'S FOCUS.
@@ -956,6 +957,25 @@ cmd_press() {
 
 cmd_ui() { control ui; }
 
+# Open the in-app page window on a LOCAL fixture.
+#
+# `src-tauri/src/browser.rs` is the one webview in Mach that runs script
+# somebody else wrote, and looking at it is the only way to check what it shows
+# and what it refuses. It must never be pointed at a real unsubscribe URL out of
+# the owner's mail: loading one is a tracking beacon that confirms his address
+# is read, which is the whole thing the unsubscribe rule exists to avoid.
+#
+# So the verb takes loopback and nothing else — the app refuses anything that is
+# not http(s) on 127.0.0.1, localhost or ::1 — and there is a fixture beside it:
+#
+#   python3 -m http.server 8975 -d scripts/fixtures/page &
+#   MACH_QA_INSTANCE=agent scripts/qa browser http://127.0.0.1:8975/hostile.html
+#   MACH_QA_INSTANCE=agent scripts/qa shoot page
+cmd_browser() {
+  [ $# -eq 1 ] || die "usage: qa browser <http://127.0.0.1:PORT/page.html>"
+  control browser "$1"
+}
+
 cmd_logs() { tail -n "${1:-30}" "$LOG"; }
 
 # Rebuild, then restart onto what was just built.
@@ -991,6 +1011,7 @@ case "${1:-}" in
   type)  shift; cmd_type "$@" ;;
   press) shift; cmd_press "$@" ;;
   ui)    shift; cmd_ui "$@" ;;
+  browser) shift; cmd_browser "$@" ;;
   logs)  shift; cmd_logs "$@" ;;
   # Between markers rather than by line number: the help was `sed -n '4,58p'`,
   # which silently started printing the wrong paragraph the first time anything

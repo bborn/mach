@@ -154,6 +154,21 @@ pub enum Verb {
     Press,
     /// Report what the interface currently is.
     Ui,
+    /// Open `crate::browser`'s page window on a **loopback** fixture.
+    ///
+    /// The one verb Rust answers itself rather than forwarding to the window,
+    /// and the one that takes a URL. It exists because the window it opens is
+    /// the only surface in Mach that runs somebody else's JavaScript, and the
+    /// honest way to look at it is with a page an agent wrote — not with a real
+    /// unsubscribe URL out of the owner's mail, which is a live tracking beacon
+    /// aimed at his address.
+    ///
+    /// It cannot reach the internet: [`Verb::Browser`] refuses anything that is
+    /// not `http`/`https` on `127.0.0.1`, `localhost` or `::1`, so the widest
+    /// thing this port can be talked into showing is a page already on this
+    /// machine. That is on top of the four gates in the module doc — debug
+    /// build, QA instance, loopback listener, bearer token.
+    Browser,
 }
 
 impl Verb {
@@ -165,6 +180,7 @@ impl Verb {
             "type" => Some(Verb::Type),
             "press" => Some(Verb::Press),
             "ui" => Some(Verb::Ui),
+            "browser" => Some(Verb::Browser),
             _ => None,
         }
     }
@@ -177,6 +193,7 @@ impl Verb {
             Verb::Type => "type",
             Verb::Press => "press",
             Verb::Ui => "ui",
+            Verb::Browser => "browser",
         }
     }
 
@@ -210,7 +227,8 @@ pub fn parse_request(body: &str) -> Result<Request, String> {
     let name = value.get("verb").and_then(Value::as_str).unwrap_or_default();
     let verb = Verb::parse(name).ok_or_else(|| {
         format!(
-            "\"{name}\" is not a verb — this port knows key, click, rightclick, type, press and ui"
+            "\"{name}\" is not a verb — this port knows key, click, rightclick, type, press, ui \
+             and browser"
         )
     })?;
 
@@ -425,8 +443,37 @@ fn serve<R: Runtime>(
     }
 }
 
+/// The `browser` verb: a loopback URL, or a refusal.
+///
+/// Separate from [`deliver`] and from any application, so the one thing that
+/// matters about it — that it cannot be talked into opening a page on the
+/// internet — is testable without a window.
+pub fn fixture_for(argument: &str) -> Result<(url::Url, crate::browser::Fixture), String> {
+    let url = url::Url::parse(argument.trim())
+        .map_err(|_| format!("\"{argument}\" is not a URL"))?;
+    let fixture = crate::browser::Fixture::loopback(&url).ok_or_else(|| {
+        format!(
+            "{url} is not on this machine — the browser verb opens loopback fixtures only, \
+             never a real page"
+        )
+    })?;
+    Ok((url, fixture))
+}
+
 /// Hand one validated request to the window and wait for its answer.
 fn deliver<R: Runtime>(app: &AppHandle<R>, pending: &Pending, request: &Request) -> Value {
+    // Answered here rather than in the window: there is no window involved, and
+    // the frontend must never learn a URL for a page like this one.
+    if request.verb == Verb::Browser {
+        return match fixture_for(&request.argument) {
+            Ok((url, fixture)) => match crate::browser::open(app, url.as_str(), Some(fixture)) {
+                Ok(()) => json!({ "ok": true, "host": crate::browser::address_label(&url) }),
+                Err(e) => json!({ "ok": false, "error": e }),
+            },
+            Err(e) => json!({ "ok": false, "error": e }),
+        };
+    }
+
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
 
@@ -515,7 +562,7 @@ mod tests {
 
     #[test]
     fn the_vocabulary_is_a_closed_list() {
-        for word in ["key", "click", "rightclick", "type", "press", "ui"] {
+        for word in ["key", "click", "rightclick", "type", "press", "ui", "browser"] {
             assert!(Verb::parse(word).is_some(), "{word} is a verb");
         }
 
@@ -564,6 +611,38 @@ mod tests {
             Ok(Request { verb: Verb::Type, argument: " ".into() })
         );
         assert!(parse_request(r#"{"verb":"type","argument":""}"#).is_err());
+    }
+
+    /// The verb that opens a webview is the one worth being sure about: it must
+    /// not be usable to put a real site — or a `file:` URL — in front of the
+    /// owner from a socket.
+    #[test]
+    fn the_browser_verb_reaches_this_machine_and_nowhere_else() {
+        for local in [
+            "http://127.0.0.1:8975/unsubscribe.html",
+            "http://localhost:8975/",
+            "https://127.0.0.1:8443/x",
+        ] {
+            assert!(fixture_for(local).is_ok(), "{local} should be reachable");
+        }
+        for elsewhere in [
+            "https://example.com/",
+            // RFC 2606 reserved: it must not resolve, and it must not be tried.
+            "https://unsubscribe.invalid/",
+            "http://10.0.0.5:8975/",
+            "http://192.168.1.4/",
+            "file:///etc/passwd",
+            "tauri://localhost/",
+            "plugin://quick-file/guest.html",
+            // The trailing-label trick: this host is not loopback.
+            "http://127.0.0.1.evil.example/",
+            "not a url",
+        ] {
+            assert!(
+                fixture_for(elsewhere).is_err(),
+                "{elsewhere} must not be openable from the control port"
+            );
+        }
     }
 
     #[test]

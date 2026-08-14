@@ -1048,9 +1048,10 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
     // Deliberately not `openExternal`: the id goes out and no URL comes back.
     // Rust reads the header off the row, checks it is the https link it said it
     // was, and opens it — so a sender cannot get an arbitrary URL through the
-    // webview by writing one into a header.
-    async openUnsubscribePage(messageId) {
-      await call<void>("open_unsubscribe_page", { messageId });
+    // webview by writing one into a header. That holds for both destinations:
+    // the in-app page window is built in Rust from the URL Rust resolved.
+    async openUnsubscribePage(messageId, system) {
+      await call<void>("open_unsubscribe_page", { messageId, system: system ?? false });
     },
 
     async onSyncStatus(handler) {

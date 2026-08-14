@@ -29,6 +29,8 @@
 //! to set. See [`config`].
 
 pub mod auth;
+/// The one window that runs a stranger's JavaScript, and what fences it.
+pub mod browser;
 /// The system pasteboard, for ⌘⌥C.
 pub mod clipboard;
 pub mod commands;
@@ -110,6 +112,13 @@ pub fn run() {
             // back. It steers nothing and swallows nothing — see `scroll`.
             // Here on the main thread, which is where AppKit dispatches.
             scroll::install(app.handle());
+
+            // The other block in that stream, and the only one that ever
+            // swallows an event: Escape closes the page window. It has to be
+            // below the engine because the page in that window is a document a
+            // stranger wrote, and a keydown listener injected into it is one
+            // line of their script away from never running. See `browser`.
+            browser::install_escape(app.handle());
 
             // MACH_DATA_DIR gives an agent (or a second window) its own store,
             // so QA cannot mutate the mailbox someone is actually reading.
