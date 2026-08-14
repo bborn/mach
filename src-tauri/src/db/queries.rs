@@ -1652,10 +1652,11 @@ pub fn search_thread_summaries(
  *  * `from:` is prefiltered on `threads.participants`, which is the sender
  *    rollup the list already renders, so the expensive per-message check only
  *    runs on threads that could possibly match.
- *  * `to:`/`cc:`/`bcc:` have nothing indexed to stand on — an unanchored LIKE
- *    cannot use a b-tree — so they are the one operator that can still walk the
- *    message table. Combined with anything else, or with a common address, the
- *    LIMIT stops it early. See the note on `SEARCH_UNINDEXED_FIELDS`.
+ *  * `to:`/`cc:`/`bcc:` cannot seek — an unanchored LIKE has no b-tree to walk
+ *    — but they no longer have to read the fat message rows to answer:
+ *    `idx_messages_thread_addresses` carries the three address columns, so the
+ *    correlated subquery is covering. See the note on
+ *    `SEARCH_UNINDEXED_FIELDS`.
  */
 
 use serde::{Deserialize, Serialize};
@@ -1762,8 +1763,21 @@ const MAX_SEARCH_DEPTH: usize = 24;
 /// distinct senders needs at least ten messages).
 const PARTICIPANT_ROLLUP_CAP: i64 = 10;
 
-/// The operators no index can serve, named so the comment above stays honest.
+/// The operators that still scan rather than seek, named so the comment above
+/// stays honest.
+///
+/// They scan `idx_messages_thread_addresses` — see migration 20 — not the
+/// `messages` table, which is what took the worst case from tens of seconds to
+/// tens of milliseconds. An unanchored LIKE will never seek, so this list is
+/// still true; it is now a list of things that are *linear and cheap* rather
+/// than linear and ruinous.
 pub const SEARCH_UNINDEXED_FIELDS: &[SearchField] = &[SearchField::To, SearchField::Cc, SearchField::Bcc];
+
+/// The index those three stand on. Named because the compiler pins it with
+/// `INDEXED BY`: without the hint the planner is free to fall back to
+/// `idx_messages_thread` plus a rowid lookup per message, which is the plan
+/// that measured 10–30 seconds, and it would do so silently.
+const ADDRESS_INDEX: &str = "idx_messages_thread_addresses";
 
 /// Quote a user's term as a single FTS5 string literal.
 ///
@@ -1912,7 +1926,8 @@ impl Compiler {
                 };
                 let like = self.text(&like_contains(value));
                 format!(
-                    "EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = t.id \
+                    "EXISTS (SELECT 1 FROM messages m INDEXED BY {ADDRESS_INDEX} \
+                     WHERE m.thread_id = t.id \
                      AND m.{column} LIKE {like} ESCAPE '\\')"
                 )
             }

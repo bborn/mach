@@ -136,6 +136,11 @@ export const localResolver: PaletteResolver = {
       kind: "person",
       title: value.name,
       subtitle: value.email,
+      // Said out loud since there are now two things ⌘K will do with a person:
+      // this row writes to them, and `components/search/palette.ts` offers the
+      // mail already exchanged with them. Same column, same register, as the
+      // `label`/`mailbox` tags the rows above carry.
+      meta: "write",
       score,
       run: () => ctx.actions.composeTo(value.email),
     }));

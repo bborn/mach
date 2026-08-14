@@ -428,6 +428,38 @@ fn to_and_cc_address_the_right_header() {
     assert!(subjects(&t, &field(SearchField::Bcc, "dana@example.com")).is_empty());
 }
 
+/// The recipient operators must answer off `idx_messages_thread_addresses`.
+///
+/// Without it the plan is `idx_messages_thread` plus one rowid lookup per
+/// message into a table that holds the bodies, and on the owner's 47,324-thread
+/// store an address with no mail measured 10–30 *seconds* that way. The
+/// compiler pins the index with `INDEXED BY` precisely so that losing it is a
+/// hard error rather than a silent thirty seconds — this is the test that says
+/// the index the hint names is the one migration 20 creates.
+#[test]
+fn the_recipient_operators_stand_on_a_covering_index() {
+    let (t, _) = corpus();
+    let conn = t.reader();
+
+    for f in q::SEARCH_UNINDEXED_FIELDS {
+        let (predicate, args) = compile_search(&field(*f, "dana@example.com"));
+        let sql = format!("EXPLAIN QUERY PLAN SELECT t.id FROM threads t WHERE {predicate}");
+        let mut stmt = conn.prepare(&sql).expect("prepare");
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("plan")
+            .map(|r| r.expect("row"))
+            .collect();
+        let joined = plan.join("\n");
+        assert!(
+            joined.contains("COVERING INDEX idx_messages_thread_addresses"),
+            "{f:?} must be answered from the covering index, got:\n{joined}"
+        );
+    }
+}
+
 #[test]
 fn subject_looks_only_at_the_subject() {
     let (t, _) = corpus();
