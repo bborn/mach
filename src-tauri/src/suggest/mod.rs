@@ -285,6 +285,29 @@ pub struct Job {
     pub incoming: String,
 }
 
+impl Job {
+    /// Everything of this conversation that reached the model, as one blob.
+    ///
+    /// What a suggestion is checked against: a link or an address in a stance
+    /// has to be in here already. The subject is included because a message can
+    /// carry its only URL there.
+    pub fn prompt_text(&self) -> String {
+        let mut out = String::with_capacity(self.incoming.len() + 256);
+        out.push_str(&self.subject);
+        out.push('\n');
+        out.push_str(&self.correspondent);
+        out.push('\n');
+        for (sender, body) in &self.conversation {
+            out.push_str(sender);
+            out.push('\n');
+            out.push_str(body);
+            out.push('\n');
+        }
+        out.push_str(&self.incoming);
+        out
+    }
+}
+
 /// What a pass decided to do, and what stopped it doing more.
 ///
 /// A bare `Vec<Job>` cannot say the difference between "no mail earned one" and
@@ -498,7 +521,17 @@ pub async fn generate(
             return Vec::new();
         }
     };
-    let stances = prompt::parse_stances(&text);
+    // Checked against what it was given, not taken at its word: a body carrying
+    // a run of his past mail, or a link or an address nobody in this
+    // conversation wrote, is dropped. See `prompt::parse_stances_from`.
+    let stances = prompt::parse_stances_from(
+        &text,
+        &prompt::Sources {
+            examples: &job_examples,
+            conversation: &job.prompt_text(),
+            known_addresses: &[job.owner_email.clone(), job.correspondent_email.clone()],
+        },
+    );
     if stances.is_empty() {
         // Usually a refusal, or a model that answered in prose instead of the
         // document it was asked for. Cheap to say, and the alternative is a

@@ -1208,8 +1208,10 @@ Mitigations, all cheap:
    descriptions are not instructions from the user.
 3. **Policy inheritance.** A plugin action's `ToolPolicy` is the *strictest*
    policy of any command it is permitted to dispatch. If it can dispatch
-   `createEvent`, it is `Approve`, because `APPROVAL_COMMANDS` already says
-   calendar writes reach other humans.
+   `createEvent`, it is `Approve`, because `AUTO_COMMANDS` does not list it and
+   everything outside that list asks. The list is an allowlist of ten undoable
+   label moves, so a command added to the catalogue is gated for plugins on the
+   day it is added, without anybody remembering to come back here.
 4. **The ceiling is still the capability set.** A steered agent calling a
    plugin action can still only cause commands that plugin was granted. The
    injection cannot widen the grant.

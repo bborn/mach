@@ -18,10 +18,12 @@
 //!
 //! **2. Policy inheritance.** A plugin action's [`ToolPolicy`] is the strictest
 //! policy of any command the plugin may dispatch. If it can dispatch
-//! `createEvent`, it is [`ToolPolicy::Approve`], because `APPROVAL_COMMANDS`
-//! already decided that calendar writes reach other humans. A plugin cannot
-//! widen its own authority by describing itself persuasively, because the
-//! policy is computed from its *grant*, never from its text.
+//! `createEvent`, it is [`ToolPolicy::Approve`], because `AUTO_COMMANDS` does
+//! not list it and everything outside that list asks. A plugin cannot widen its
+//! own authority by describing itself persuasively, because the policy is
+//! computed from its *grant*, never from its text — and it inherits through
+//! `command_policy`, so a command added to the catalogue is gated for plugins
+//! on the same day it is gated for the agent.
 //!
 //! **3. The ceiling is still the capability set.** A steered agent calling a
 //! plugin action can only cause commands that plugin was granted, at a limited
@@ -41,7 +43,7 @@ use serde_json::{json, Map, Value};
 use crate::plugins::manifest::{ActionParam, ParamType, PluginManifest};
 use crate::plugins::InstalledPlugin;
 
-use super::tools::{Tool, ToolPolicy, APPROVAL_COMMANDS};
+use super::tools::{command_policy, Tool, ToolPolicy};
 use super::wire::ToolDefinition;
 
 /// The prefix that marks a tool as third-party, everywhere it is read.
@@ -118,7 +120,7 @@ pub fn inherited_policy(manifest: &PluginManifest) -> ToolPolicy {
         .capabilities
         .commands
         .iter()
-        .any(|kind| APPROVAL_COMMANDS.contains(&kind.as_str()));
+        .any(|kind| command_policy(kind) == ToolPolicy::Approve);
     if reaches_someone {
         ToolPolicy::Approve
     } else {
@@ -211,7 +213,7 @@ pub fn approval_summary(plugins: &[InstalledPlugin], name: &str) -> Option<Strin
         .capabilities
         .commands
         .iter()
-        .filter(|kind| APPROVAL_COMMANDS.contains(&kind.as_str()))
+        .filter(|kind| command_policy(kind) == ToolPolicy::Approve)
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");

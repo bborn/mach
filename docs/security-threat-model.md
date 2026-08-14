@@ -232,6 +232,39 @@ spam commands. These run with **no approval**:
    being in the thread. `draft_reply` into an existing thread is the safe case;
    an arbitrary new `to` is not.
 
+**Resolved.** The finding above is left as it was written; what follows is what
+the code does now, so the line numbers in it are read as history rather than as
+a description.
+
+`agent/context.rs::render_for` fences the quoted region with the `⟦…⟧` markers
+and the per-render tag out of `handoff/context.rs`, reusing that module's `scrub`
+rather than a second copy, and does it for **both** audiences — the model's block
+and the ⌘⌥C clipboard payload. The owner's own sentence now goes above the block
+rather than below it. The system prompt says mail is data, in those words.
+
+The policy list was inverted: `AUTO_COMMANDS` is an allowlist of ten undoable
+label moves, and everything else in the catalogue asks, including anything added
+to it later. `unsubscribe` arrived after this finding was written and is the case
+that proves the point — it looks exactly like a label move and is the one command
+with no inverse anywhere.
+
+`draft_reply` and `draft_message` are still `Auto`, and the reasoning at
+`tools.rs:556` still holds. What changed is the other end: `send_draft`'s approval
+sheet now names any recipient who is neither in the draft's own conversation, nor
+in what the owner typed, nor one of his own addresses — computed from the session,
+not asked of the model. A planted draft is still planted; the sentence he reads
+before it leaves says where the address came from.
+
+Two things the finding did not raise are also done: a session may move
+`WRITE_BUDGET` (25) conversations before it starts asking, charged per thread id
+so one call with two hundred of them parks on its own; and `suggest/prompt.rs`
+drops a suggested reply whose body repeats ten consecutive words of his past mail,
+or names a link or an address nobody in the conversation wrote.
+
+Still open: mail arriving through **tool results** is unfenced raw JSON. The
+system prompt names `get_thread` and `search_threads` as sources of untrusted
+text, which is the persuasive half; the structural half is not done.
+
 ---
 
 ### R3 — A link's real destination is never shown, and the thread list shows a display name as identity.

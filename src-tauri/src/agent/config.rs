@@ -23,6 +23,8 @@
 //! waiting with the drawer open. `medium` is the fastest setting that still
 //! reliably chains read → compose → schedule; `MACH_AGENT_EFFORT` moves it.
 
+use std::fmt;
+
 use super::error::AgentError;
 
 pub const ENV_API_KEY: &str = "ANTHROPIC_API_KEY";
@@ -49,7 +51,9 @@ pub const API_VERSION: &str = "2023-06-01";
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
 /// How the request authenticates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Both variants hold the secret itself. See the `Debug` below.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Credential {
     /// `x-api-key: …`
     ApiKey(String),
@@ -57,6 +61,26 @@ pub enum Credential {
     BearerToken(String),
 }
 
+/// Hand-written, the way [`crate::auth`] writes them: which *kind* of credential
+/// this is is worth printing, and the credential is not.
+///
+/// It was `#[derive(Debug)]`, which prints the key. Nothing here logs a config
+/// on purpose — but "nothing does today" is the claim a derived `Debug` quietly
+/// turns into a bet, and the losing side of it is an API key in a panic message
+/// or a test failure. The variant name is the whole diagnostic value: the
+/// question anybody debugging this asks is "is it using the key or the token",
+/// never "what is the key".
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Credential::ApiKey(_) => f.write_str("Credential::ApiKey(<redacted>)"),
+            Credential::BearerToken(_) => f.write_str("Credential::BearerToken(<redacted>)"),
+        }
+    }
+}
+
+/// Everything else about a config is inert and prints as itself; the credential
+/// goes through [`Credential`]'s own `Debug`, which is where the redaction is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     pub credential: Credential,

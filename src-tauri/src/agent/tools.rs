@@ -102,41 +102,69 @@ impl Tool {
     }
 }
 
-/// The commands whose effect leaves the mailbox even though they are undoable.
+/// The commands the agent may run without asking — and the list is this way
+/// round on purpose.
 ///
-/// An RSVP mails the organiser the moment it lands, and un-declining does not
-/// unsend that. The same is true of every calendar write that can carry guests:
-/// creating, moving, editing or cancelling an event with attendees sends them
-/// mail, and the inverse command sends them a second one.
+/// Every one of these is a label move inside his own mailbox: undoable by the
+/// command layer's own inverse, invisible to everybody else, and reversible
+/// with ⌘Z. Nothing else in the catalogue qualifies, and **anything the
+/// catalogue grows from now on is [`ToolPolicy::Approve`] until somebody puts
+/// it here on purpose.**
 ///
-/// `reportSpam` is here for the same reason wearing different clothes. It looks
-/// like a label move, and locally it is one — but a spam report is a signal to
-/// Google about a sender, it feeds a classifier, and `notSpam` puts the labels
-/// back without retracting it. The undo is exact about the mailbox and cannot
-/// be about Google's opinion of the sender, which is precisely the shape of the
-/// RSVP argument. So the agent may propose it and the owner presses the button.
-/// Everything else in the catalogue is a label move nobody else can see.
+/// It used to be the other way — a list of commands that needed approval, with
+/// `Auto` as the default. That default is the bug: a command added to
+/// [`Command::catalogue`] became a thing the agent could do unattended, on a
+/// model's say-so, without anybody making a decision about it. With the list
+/// inverted, a new command has to be argued *into* the auto set rather than
+/// silently falling into it.
 ///
-/// `unsubscribe` is the strongest case in the list. It is not undoable at all,
-/// the request reaches a stranger's server rather than Google's, and what it
-/// tells them is that this address is live and read. `crate::unsub::rule` is
-/// re-run in the command layer whoever asks, so an agent cannot talk the app
-/// into unsubscribing from something it would refuse a keystroke — but "the
-/// rule would have allowed it" is a different claim from "he wanted it", and
-/// this is the one command where getting that wrong cannot be taken back.
+/// What is deliberately not here:
+///
+/// * `unsubscribe` — the strongest case of the lot, and the one that shows why
+///   the default had to change. It is not undoable at all, the request reaches
+///   a stranger's server rather than Google's, and what it tells them is that
+///   this address is live and read. `crate::unsub::rule` is re-run in the
+///   command layer whoever asks, so an agent cannot talk the app into
+///   unsubscribing from something it would refuse a keystroke — but "the rule
+///   would have allowed it" is a different claim from "he wanted it", and this
+///   is the one command where getting that wrong cannot be taken back. It
+///   arrived in the catalogue looking exactly like a label move.
+/// * `reportSpam` — locally a label move, but a spam report is a signal to
+///   Google about a sender, it feeds a classifier, and `notSpam` puts the labels
+///   back without retracting it. The undo is exact about the mailbox and cannot
+///   be about Google's opinion of the sender.
+/// * `rsvp` — mails the organiser the moment it lands, and un-declining does not
+///   unsend that.
+/// * every calendar write that can carry guests — creating, moving, editing or
+///   cancelling an event with attendees sends them mail, and the inverse command
+///   sends them a second one.
 ///
 /// Names rather than a property on [`CommandSpec`] because "does this reach
 /// someone else" is a judgement about consequences, and the catalogue is owned
 /// by the command layer, not by this module.
-pub const APPROVAL_COMMANDS: &[&str] = &[
-    "reportSpam",
-    "unsubscribe",
-    "rsvp",
-    "createEvent",
-    "updateEvent",
-    "deleteEvent",
-    "moveEvent",
+pub const AUTO_COMMANDS: &[&str] = &[
+    "archive",
+    "unarchive",
+    "markRead",
+    "star",
+    "label",
+    "notSpam",
+    "trash",
+    "untrash",
+    "snooze",
+    "unsnooze",
 ];
+
+/// The policy for one catalogue command, by name.
+///
+/// Takes a name rather than a [`CommandSpec`] so the claim "a command nobody has
+/// judged asks first" can be made about a command that does not exist yet.
+pub fn command_policy(kind: &str) -> ToolPolicy {
+    match AUTO_COMMANDS.contains(&kind) {
+        true => ToolPolicy::Auto,
+        false => ToolPolicy::Approve,
+    }
+}
 
 /// The tool that actually puts a message in the outbox.
 pub const SEND_TOOL: &str = "send_draft";
@@ -191,8 +219,11 @@ pub fn find(name: &str) -> Option<Tool> {
     tools().into_iter().find(|t| t.definition.name == name)
 }
 
+/// The policy for a tool name. A name nobody recognises asks first — the gate
+/// refuses it anyway, but no caller of this should be told "unknown" and hear
+/// "safe".
 pub fn policy_for(name: &str) -> ToolPolicy {
-    find(name).map(|t| t.policy).unwrap_or(ToolPolicy::Auto)
+    find(name).map(|t| t.policy).unwrap_or(ToolPolicy::Approve)
 }
 
 /// The policy for a tool that may be a plugin's.
@@ -222,11 +253,7 @@ pub fn command_tools() -> Vec<Tool> {
                 description: describe(spec),
                 input_schema: schema_for(spec),
             },
-            policy: if APPROVAL_COMMANDS.contains(&spec.kind) {
-                ToolPolicy::Approve
-            } else {
-                ToolPolicy::Auto
-            },
+            policy: command_policy(spec.kind),
         })
         .collect()
 }
@@ -1819,5 +1846,65 @@ fn ipc_to_agent(error: crate::ipc::IpcError) -> AgentError {
         IpcError::Db(inner) => AgentError::Db(inner),
         IpcError::Command(inner) => AgentError::Command(inner),
         other => AgentError::Invalid(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn a_command_nobody_has_judged_asks_first() {
+        // The gap this list was inverted to close. `unsubscribe` looks like a
+        // label move, reaches a stranger's server, and is not undoable — and
+        // under the old default it would have arrived in the catalogue as an
+        // auto tool, silently, with nobody making a decision about it.
+        assert_eq!(command_policy("unsubscribe"), ToolPolicy::Approve);
+        assert_eq!(command_policy("forwardThread"), ToolPolicy::Approve);
+        assert_eq!(command_policy(""), ToolPolicy::Approve);
+        // And a tool name that is not in the surface at all.
+        assert_eq!(policy_for("exfiltrate"), ToolPolicy::Approve);
+    }
+
+    #[test]
+    fn the_auto_set_is_exactly_the_undoable_label_moves() {
+        // Pinned by name so widening it is an edit to this test as well, made
+        // by somebody who had to type out what they were adding.
+        assert_eq!(
+            AUTO_COMMANDS,
+            &[
+                "archive", "unarchive", "markRead", "star", "label", "notSpam", "trash",
+                "untrash", "snooze", "unsnooze"
+            ]
+        );
+    }
+
+    #[test]
+    fn everything_in_the_catalogue_outside_the_auto_set_asks() {
+        for spec in Command::catalogue() {
+            let expected = match AUTO_COMMANDS.contains(&spec.kind) {
+                true => ToolPolicy::Auto,
+                false => ToolPolicy::Approve,
+            };
+            assert_eq!(policy_for(spec.kind), expected, "{}", spec.kind);
+        }
+        // The ones that reach another human, by name, so a refactor that
+        // quietly dropped one from the catalogue fails here.
+        for kind in ["reportSpam", "unsubscribe", "rsvp", "createEvent", "deleteEvent"] {
+            assert_eq!(policy_for(kind), ToolPolicy::Approve, "{kind}");
+        }
+    }
+
+    #[test]
+    fn sending_and_the_standing_rules_ask_and_the_reads_do_not() {
+        assert_eq!(policy_for(SEND_TOOL), ToolPolicy::Approve);
+        assert_eq!(policy_for(CREATE_FILTER_TOOL), ToolPolicy::Approve);
+        assert_eq!(policy_for(DELETE_FILTER_TOOL), ToolPolicy::Approve);
+        for name in ["get_thread", "search_threads", "list_labels", LIST_FILTERS_TOOL] {
+            assert_eq!(policy_for(name), ToolPolicy::Auto, "{name}");
+        }
+        // Drafting is local and unsent; it is the send that asks.
+        assert_eq!(policy_for(DRAFT_TOOL), ToolPolicy::Auto);
+        assert_eq!(policy_for(NEW_DRAFT_TOOL), ToolPolicy::Auto);
     }
 }

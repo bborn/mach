@@ -33,6 +33,7 @@
 //! shows tool activity rather than reasoning.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -48,13 +49,55 @@ use super::error::AgentError;
 // ===========================================================================
 
 /// One HTTP request, already fully formed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written — see below.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ModelCall {
     pub url: String,
     /// Sorted, so a test can assert on them without caring about insertion
     /// order and a header is never silently sent twice.
     pub headers: BTreeMap<String, String>,
     pub body: String,
+}
+
+/// Header *names* in full, header values redacted — the shape [`crate::auth`]
+/// settled on, for the same reason.
+///
+/// This one had the shortest path to an actual disclosure of anything in the
+/// module. Every test double in the suite collects these into a `Vec` and
+/// asserts on them, and `assert_eq!` prints both sides with `{:?}` when it
+/// fails. So a derived `Debug` here meant a *failing test* — an ordinary
+/// afternoon, on a machine with a real key in `.env.local` — printed
+/// `x-api-key: sk-ant-…` into a terminal, a CI log, or an agent transcript.
+/// Nobody has to write a logging statement for that to happen; it is the
+/// failure path of the thing everybody writes.
+///
+/// The names stay because they are the whole diagnostic value: which headers
+/// went out, and whether the beta was among them, is what a wire bug is about.
+/// Which byte the key was is never the question.
+impl fmt::Debug for ModelCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModelCall")
+            .field("url", &self.url)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+/// `{"anthropic-version": <redacted>, "x-api-key": <redacted>}`.
+struct RedactedHeaders<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .keys()
+                    .map(|name| (name, format_args!("<redacted>"))),
+            )
+            .finish()
+    }
 }
 
 /// The chunks of one streaming response.

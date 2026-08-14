@@ -25,6 +25,22 @@
 //! `tests/agent_backends.rs` pins that: a backend handed a raw tool call still
 //! gets a parked session and an empty outbox.
 //!
+//! # One session, a bounded amount of damage
+//!
+//! Every auto command is undoable, and for a long time that was the whole
+//! answer. It is not, for two reasons that only show up in the aggregate: ⌘Z
+//! undoes *one* command, and a hundred archives is a hundred commands; and a
+//! mailbox that quietly reorganised itself while he was reading one thread is a
+//! mess whether or not each step had an inverse. A message that talks the model
+//! into "file everything from this sender, and everything that looks like an
+//! invoice, and…" costs nothing to write.
+//!
+//! So [`ToolGate`] counts conversations. [`WRITE_BUDGET`] of them may move
+//! without asking; the call that would take a session past it parks on the owner
+//! instead, naming the number. He is not refused anything — "archive these two
+//! hundred newsletters" is a real request and it costs one prompt — but nothing
+//! reaches two hundred without him seeing the figure.
+//!
 //! # One tool at a time
 //!
 //! [`ToolGate::run`] takes a lock for the whole call, including the wait for a
@@ -34,6 +50,7 @@
 //! looking at is what you are approving" true no matter how many calls a model
 //! fires in parallel.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -70,6 +87,12 @@ impl GateResult {
     }
 }
 
+/// How many conversations one session may move before it starts asking.
+///
+/// Twenty-five is "more than any sentence he would type by hand implies, and
+/// far short of a mailbox". A number is arbitrary; having one is not.
+pub const WRITE_BUDGET: usize = 25;
+
 pub struct ToolGate {
     ctx: ToolContext,
     /// Read once when the session starts. A plugin installed mid-session must
@@ -80,6 +103,42 @@ pub struct ToolGate {
     ui: Arc<SessionUi>,
     desk: Arc<ApprovalDesk>,
     turn: tokio::sync::Mutex<()>,
+    /// Conversations this session has moved. Only ever grows: once a session has
+    /// spent its budget every further write asks, which is the point.
+    spent: AtomicUsize,
+    /// Addresses he has actually seen: the ones he typed into ⌘K, and the people
+    /// already in the conversations he attached. See [`Self::unexpected`].
+    expected: Vec<String>,
+}
+
+/// What one call costs against [`WRITE_BUDGET`].
+///
+/// Reads cost nothing. A batch costs the number of conversations it names,
+/// because that is the number of things that moved — one call with two hundred
+/// ids is not one unit of surprise. Anything else that mutates costs one.
+///
+/// Free-standing and taking only the call, so the rule can be read and tested
+/// without a database behind it.
+pub fn write_cost(name: &str, policy: ToolPolicy, input: &Value) -> usize {
+    if policy == ToolPolicy::Approve {
+        // It is going to ask anyway; charging for it would make a session that
+        // asked politely twenty-five times start asking twice.
+        return 0;
+    }
+    match name {
+        "list_threads" | "search_threads" | "get_thread" | "list_events" | "list_labels"
+        | "list_accounts" | tools::LIST_CALENDARS_TOOL | tools::GET_EVENT_TOOL
+        | tools::LIST_FILTERS_TOOL => 0,
+        // A draft is local, unsent and one object. It is a write, but it is not
+        // a conversation moving.
+        tools::DRAFT_TOOL | tools::NEW_DRAFT_TOOL => 1,
+        _ => input
+            .get("threadIds")
+            .and_then(Value::as_array)
+            .map(|ids| ids.len())
+            .unwrap_or(1)
+            .max(1),
+    }
 }
 
 impl ToolGate {
@@ -97,7 +156,41 @@ impl ToolGate {
             ui,
             desk,
             turn: tokio::sync::Mutex::new(()),
+            spent: AtomicUsize::new(0),
+            expected: Vec::new(),
         }
+    }
+
+    /// The addresses this session should not be surprised by.
+    ///
+    /// A builder rather than a sixth argument to [`ToolGate::new`]: everything
+    /// that constructs a gate does so to run tools, and only the session knows
+    /// what he typed.
+    pub fn expecting(mut self, addresses: Vec<String>) -> ToolGate {
+        self.expected = addresses
+            .into_iter()
+            .map(|a| a.trim().to_lowercase())
+            .filter(|a| !a.is_empty())
+            .collect();
+        self
+    }
+
+    /// Which of these recipients he has never seen.
+    ///
+    /// The distinction that matters is not "is this address in the prompt
+    /// somewhere" — an exfiltration address usually *is*, because it was in the
+    /// body of the message that asked for it. It is: did **he** name it, or is
+    /// this person already in the conversation? An address that appears only in
+    /// the text of somebody's email is the one to say out loud.
+    ///
+    /// This is a fact computed from the session, not an opinion from the model,
+    /// and it is still only a line on a sheet he has to read.
+    fn unexpected(&self, recipients: &[String]) -> Vec<String> {
+        recipients
+            .iter()
+            .map(|r| r.trim().to_lowercase())
+            .filter(|r| !r.is_empty() && !self.expected.contains(r))
+            .collect()
     }
 
     /// The whole surface, which is the command catalogue plus the local reads
@@ -146,11 +239,22 @@ impl ToolGate {
 
         self.ui.tool_running(call_id, name, &self.running_summary(name));
 
-        if policy == ToolPolicy::Approve {
+        // What this call costs, and whether the session can still afford it.
+        // Charged before the call runs: a batch that parks and is denied has
+        // still told us how big the model's appetite was.
+        let cost = write_cost(name, policy, input);
+        let spent = self.spent.fetch_add(cost, Ordering::Relaxed) + cost;
+        let over_budget = cost > 0 && spent > WRITE_BUDGET;
+
+        if policy == ToolPolicy::Approve || over_budget {
+            let summary = match over_budget {
+                true => self.budget_summary(name, cost),
+                false => self.approval_summary(name, input).await,
+            };
             let pending = PendingApproval {
                 tool_use_id: call_id.to_string(),
                 name: name.to_string(),
-                summary: self.approval_summary(name, input).await,
+                summary,
                 input: input.clone(),
             };
             match self.desk.ask(pending).await {
@@ -194,6 +298,21 @@ impl ToolGate {
         }
     }
 
+    /// The sentence for a call that is only being asked about because of the
+    /// budget. It has to say *why* — the owner is being asked about `archive`,
+    /// which normally asks nothing, and an unexplained prompt teaches him to
+    /// click through prompts.
+    fn budget_summary(&self, name: &str, cost: usize) -> String {
+        let how_many = match cost {
+            1 => String::from("1 conversation"),
+            n => format!("{n} conversations"),
+        };
+        format!(
+            "Run {name} on {how_many}. This session has already changed {WRITE_BUDGET} \
+             without asking, so it is asking about the rest."
+        )
+    }
+
     /// What a tool call says while it is running.
     ///
     /// By name only: on the streaming backend the arguments have not finished
@@ -230,25 +349,77 @@ impl ToolGate {
             .ok()
             .flatten();
 
-        let (subject, to) = match &draft {
+        let (subject, recipients) = match &draft {
             Some(draft) => (
                 draft.subject.clone(),
                 draft
                     .to
                     .iter()
+                    .chain(draft.cc.iter())
+                    .chain(draft.bcc.iter())
                     .map(|m| m.email.clone())
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                    .collect::<Vec<_>>(),
             ),
-            None => (String::from("(draft not found)"), String::new()),
+            None => (String::from("(draft not found)"), Vec::new()),
+        };
+        let to = recipients.join(", ");
+
+        // A reply's own conversation counts as "seen" whether or not he
+        // attached it: the people on a thread the draft answers are, by
+        // definition, people in the conversation.
+        // A *reply's* thread only: a new message gets a thread row of its own,
+        // whose participants are the recipients the model just chose — asking
+        // that row whether it recognises them would be asking the model.
+        let mut recipients_to_check = recipients.clone();
+        let answers_a_conversation = draft
+            .as_ref()
+            .map(|d| !matches!(d.kind, crate::ipc::compose::engine::draft::DraftKind::New))
+            .unwrap_or(false);
+        if let Some(thread_id) = draft
+            .as_ref()
+            .filter(|_| answers_a_conversation)
+            .and_then(|d| d.thread_id)
+        {
+            if let Ok(Some(detail)) = self
+                .ctx
+                .db
+                .read(|conn| crate::db::queries::thread_with_messages(conn, thread_id))
+            {
+                let known: Vec<String> = detail
+                    .messages
+                    .iter()
+                    .filter(|m| !m.is_draft)
+                    .flat_map(|m| {
+                        std::iter::once(m.from.email.clone())
+                            .chain(m.to.iter().map(|p| p.email.clone()))
+                            .chain(m.cc.iter().map(|p| p.email.clone()))
+                    })
+                    .map(|e| e.trim().to_lowercase())
+                    .collect();
+                recipients_to_check.retain(|r| !known.contains(&r.trim().to_lowercase()));
+            }
+        }
+
+        // The line that would have caught it. A recipient he never named, who
+        // is not in the conversation either, came from somewhere — and the only
+        // other thing in the prompt is mail somebody else wrote.
+        // One sentence, not a second line: the approval bar draws its summary in
+        // a single span, so a newline here would arrive as a space.
+        let strangers = match self.unexpected(&recipients_to_check).as_slice() {
+            [] => String::new(),
+            [one] => format!(". {one} is not in this conversation and you did not name it"),
+            many => format!(
+                ". {} are not in this conversation and you did not name them",
+                many.join(", ")
+            ),
         };
 
         match input.get("sendAt").and_then(Value::as_i64) {
             Some(at) => format!(
-                "Send \u{201c}{subject}\u{201d} to {to} on {}",
+                "Send \u{201c}{subject}\u{201d} to {to} on {}{strangers}",
                 super::context::human_time(at)
             ),
-            None => format!("Send \u{201c}{subject}\u{201d} to {to} now"),
+            None => format!("Send \u{201c}{subject}\u{201d} to {to} now{strangers}"),
         }
     }
 
@@ -341,5 +512,55 @@ fn running_summary(name: &str) -> String {
         tools::CREATE_FILTER_TOOL => "Ready to make a filter…".to_string(),
         tools::DELETE_FILTER_TOOL => "Ready to delete a filter…".to_string(),
         other => format!("{other}…"),
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_read_costs_nothing_and_a_batch_costs_what_it_moves() {
+        assert_eq!(
+            write_cost("search_threads", ToolPolicy::Auto, &json!({ "query": "invoice" })),
+            0
+        );
+        assert_eq!(
+            write_cost("archive", ToolPolicy::Auto, &json!({ "threadIds": [1, 2, 3] })),
+            3
+        );
+        assert_eq!(
+            write_cost("markRead", ToolPolicy::Auto, &json!({ "threadIds": [] })),
+            1
+        );
+        assert_eq!(write_cost("unsnooze", ToolPolicy::Auto, &json!({})), 1);
+    }
+
+    #[test]
+    fn a_call_that_is_already_going_to_ask_is_not_charged_twice() {
+        // Otherwise a session that behaved perfectly — twenty-six sends, each
+        // approved — would start asking a second time for the same act.
+        assert_eq!(
+            write_cost(tools::SEND_TOOL, ToolPolicy::Approve, &json!({ "draftId": "d" })),
+            0
+        );
+        // And the same is true of everything the inverted list now gates,
+        // `unsubscribe` included: it parks on its own account, not on the
+        // budget's.
+        assert_eq!(
+            write_cost("unsubscribe", ToolPolicy::Approve, &json!({ "messageId": 1 })),
+            0
+        );
+    }
+
+    #[test]
+    fn one_call_can_exceed_the_budget_on_its_own() {
+        // "Archive everything from this sender" is one call with two hundred
+        // ids, and the point of counting conversations rather than calls is
+        // that this parks.
+        let ids: Vec<i64> = (1..=200).collect();
+        let cost = write_cost("archive", ToolPolicy::Auto, &json!({ "threadIds": ids }));
+        assert!(cost > WRITE_BUDGET, "{cost}");
     }
 }

@@ -44,7 +44,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::commands::CommandDispatcher;
-use crate::db::Db;
+use crate::db::{queries, Db};
 use crate::ipc::compose::engine::outbox::Outbox;
 
 use super::backend::{self, Availability, Backend, BackendPrefs};
@@ -850,12 +850,16 @@ impl SessionTask {
         let block = context::render(&self.db, &context)?;
 
         let desk = Arc::new(ApprovalDesk::new(Arc::clone(&self.ui)));
-        let gate = Arc::new(ToolGate::new(
-            self.tools,
-            plugins,
-            Arc::clone(&self.ui),
-            Arc::clone(&desk),
-        ));
+        let expected = expected_addresses(&self.db, &prompt, &context);
+        let gate = Arc::new(
+            ToolGate::new(
+                self.tools,
+                plugins,
+                Arc::clone(&self.ui),
+                Arc::clone(&desk),
+            )
+            .expecting(expected),
+        );
 
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
         tokio::spawn(pump(
@@ -868,7 +872,14 @@ impl SessionTask {
         let io = BrainIo {
             session_id: self.id.clone(),
             system,
-            first_message: format!("{block}{prompt}"),
+            // His sentence first, the quoted mail after it. The block used to
+            // come first, which put a stranger's prose in the position an
+            // instruction occupies — see `context`'s module doc for the payload
+            // that exploited it.
+            first_message: match block.is_empty() {
+                true => prompt.clone(),
+                false => format!("{prompt}\n\n{block}"),
+            },
             gate,
             ui: Arc::clone(&self.ui),
             messages: messages_rx,
@@ -884,6 +895,40 @@ impl SessionTask {
         desk.close();
         result
     }
+}
+
+/// The addresses this session should not be surprised by: the ones he typed,
+/// and the people already in the conversations he attached.
+///
+/// Participants and headers only — never the *body* of a message. An address
+/// somebody wrote into an email is exactly the address the send gate should say
+/// out loud, so putting bodies in here would defeat the point of computing it.
+fn expected_addresses(db: &Db, prompt: &str, context: &[ContextItem]) -> Vec<String> {
+    let mut out = context::addresses_in(prompt);
+
+    for item in context {
+        let Some(thread_id) = item.thread_id else {
+            continue;
+        };
+        let Ok(Some(detail)) = db.read(|conn| queries::thread_with_messages(conn, thread_id)) else {
+            continue;
+        };
+        out.extend(detail.thread.participants.iter().map(|p| p.email.clone()));
+        for message in &detail.messages {
+            out.push(message.from.email.clone());
+            out.extend(message.to.iter().map(|p| p.email.clone()));
+            out.extend(message.cc.iter().map(|p| p.email.clone()));
+        }
+    }
+
+    if let Ok(accounts) = db.read(queries::list_accounts) {
+        out.extend(accounts.into_iter().map(|a| a.email));
+    }
+
+    out.iter()
+        .map(|a| a.trim().to_lowercase())
+        .filter(|a| !a.is_empty())
+        .collect()
 }
 
 /// Route what the owner sends to whoever is waiting for it.

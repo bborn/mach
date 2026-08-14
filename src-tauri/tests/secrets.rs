@@ -21,9 +21,14 @@
 //! and asserts the secret is not in it. They fail if a `#[derive(Debug)]` is
 //! ever put back.
 
+use std::collections::BTreeMap;
+
 use mach_lib::auth::tokens::{MemoryTokenStore, Secret, TokenStore};
 use mach_lib::auth::{oauth, ClientConfig};
 use mach_lib::google::{HttpMethod, HttpRequest};
+use mach_lib::ipc::agent::engine::backend::Backend;
+use mach_lib::ipc::agent::engine::config::{AgentConfig, Credential};
+use mach_lib::ipc::agent::engine::wire::ModelCall;
 
 /// A value distinctive enough that a substring search for it is meaningful.
 const REFRESH: &str = "1//0gTHIS-IS-A-REFRESH-TOKEN-DO-NOT-PRINT-ME";
@@ -175,6 +180,129 @@ fn the_memory_token_store_prints_accounts_and_not_tokens() {
             .map(|s| s.expose().to_string()),
         Some(REFRESH.to_string())
     );
+}
+
+// ===========================================================================
+// The agent's own credential
+// ===========================================================================
+
+/// The Anthropic key, which reached three derives.
+///
+/// `auth`'s rule — every type holding secret material writes `Debug` by hand —
+/// stopped at the module boundary, and `agent` had grown its own credential
+/// since. The key is in `Credential`, which is in `AgentConfig`, which is in
+/// `Backend`; and it is in `ModelCall`'s headers, which is the one that would
+/// actually have printed, because every test double in the suite collects those
+/// into a `Vec` and a failing `assert_eq!` prints both sides.
+const API_KEY: &str = "sk-ant-THIS-IS-AN-API-KEY-DO-NOT-PRINT-ME";
+
+#[test]
+fn the_agent_credential_prints_its_kind_and_not_its_key() {
+    let key = Credential::ApiKey(API_KEY.to_string());
+    let printed = format!("{key:?}");
+    assert!(!printed.contains(API_KEY), "the API key was printed: {printed}");
+    assert!(printed.contains("redacted"), "{printed}");
+    // Which kind it is, is the whole question anybody debugging this asks.
+    assert!(printed.contains("ApiKey"), "{printed}");
+
+    let token = Credential::BearerToken(ACCESS.to_string());
+    let printed = format!("{token:?}");
+    assert!(!printed.contains(ACCESS), "{printed}");
+    assert!(printed.contains("BearerToken"), "{printed}");
+}
+
+#[test]
+fn an_agent_config_and_the_backend_holding_it_print_no_key() {
+    let config = AgentConfig {
+        credential: Credential::ApiKey(API_KEY.to_string()),
+        model: "claude-opus-5".into(),
+        effort: "medium".into(),
+        max_tokens: 32_000,
+        base_url: "https://api.anthropic.com".into(),
+        fallbacks: true,
+    };
+
+    let printed = format!("{config:?}");
+    assert!(!printed.contains(API_KEY), "{printed}");
+    // Everything about a config that is not the credential is inert and useful.
+    assert!(printed.contains("claude-opus-5"), "{printed}");
+    assert!(printed.contains("api.anthropic.com"), "{printed}");
+
+    let backend = Backend::AnthropicApi(Box::new(config));
+    let printed = format!("{backend:?}");
+    assert!(!printed.contains(API_KEY), "{printed}");
+    assert!(printed.contains("claude-opus-5"), "{printed}");
+}
+
+/// The other half of `Backend`: a command line the owner typed, which Mach never
+/// looks inside and therefore cannot clear.
+#[test]
+fn a_configured_command_backend_prints_its_program_and_not_its_arguments() {
+    let backend = Backend::Command {
+        program: "/usr/local/bin/my-brain".into(),
+        args: vec!["--api-key".into(), API_KEY.into()],
+    };
+    let printed = format!("{backend:?}");
+    assert!(!printed.contains(API_KEY), "{printed}");
+    assert!(printed.contains("my-brain"), "the program is the useful half: {printed}");
+    assert!(printed.contains("redacted"), "{printed}");
+}
+
+/// The one with the short path to a real disclosure: a failing `assert_eq!` on
+/// a `Vec<ModelCall>`, on a machine with a live key in `.env.local`.
+#[test]
+fn a_model_call_prints_its_header_names_and_not_their_values() {
+    let call = ModelCall {
+        url: "https://api.anthropic.com/v1/messages".into(),
+        headers: BTreeMap::from([
+            ("x-api-key".to_string(), API_KEY.to_string()),
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ]),
+        body: r#"{"model":"claude-opus-5"}"#.into(),
+    };
+
+    let printed = format!("{call:?}");
+    assert!(!printed.contains(API_KEY), "the API key was printed: {printed}");
+
+    // Which headers went out is what a wire bug is about, so the names stay.
+    assert!(printed.contains("x-api-key"), "{printed}");
+    assert!(printed.contains("anthropic-version"), "{printed}");
+    assert!(printed.contains("content-type"), "{printed}");
+    assert!(printed.contains("api.anthropic.com"), "{printed}");
+    // Every value goes, not just the credential's: a rule with an exception in
+    // it is a rule somebody has to get right twice, and the next header that
+    // carries a secret will not be called `x-api-key`.
+    assert!(!printed.contains("2023-06-01"), "{printed}");
+
+    // The body is the prompt, not a credential, and it is what a scripted
+    // transport is asserted against.
+    assert!(printed.contains("claude-opus-5"), "{printed}");
+
+    // Redaction is a formatting decision; the value is still there to send.
+    assert_eq!(call.headers.get("x-api-key").map(String::as_str), Some(API_KEY));
+}
+
+/// The tripwire under all four: a bearer token reaches the same headers when
+/// there is no key, so the redaction cannot be about the *name* `x-api-key`.
+#[test]
+fn the_oauth_flavour_of_the_agent_credential_is_redacted_the_same_way() {
+    let config = AgentConfig {
+        credential: Credential::BearerToken(ACCESS.to_string()),
+        model: "claude-opus-5".into(),
+        effort: "medium".into(),
+        max_tokens: 32_000,
+        base_url: "https://api.anthropic.com".into(),
+        fallbacks: false,
+    };
+    let call = ModelCall {
+        url: "https://api.anthropic.com/v1/messages".into(),
+        headers: mach_lib::ipc::agent::engine::wire::call_headers(&config, false),
+        body: String::new(),
+    };
+    let printed = format!("{call:?}");
+    assert!(!printed.contains(ACCESS), "{printed}");
+    assert!(printed.contains("authorization"), "{printed}");
 }
 
 // ===========================================================================

@@ -36,6 +36,7 @@
 //! the handful of places the official installers actually write to, and
 //! `MACH_CLAUDE_BIN` overrides the lot.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use super::config::{AgentConfig, ENV_API_KEY, ENV_AUTH_TOKEN};
@@ -143,7 +144,9 @@ impl BackendPrefs {
 
 /// A brain, resolved: everything needed to start one, with nothing left to look
 /// up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written — see below.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Backend {
     ClaudeCli {
         exe: PathBuf,
@@ -178,6 +181,45 @@ impl Backend {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| program.to_string_lossy().to_string()),
+        }
+    }
+}
+
+/// Written by hand for two reasons, one of which is not obvious.
+///
+/// The obvious one: [`Backend::AnthropicApi`] holds an [`AgentConfig`] holding a
+/// raw API key. `Credential` redacts itself now, so a derived `Debug` here would
+/// happen to be safe — and that is exactly the property worth not depending on.
+/// A guarantee that lives in another file is one refactor from being gone, and
+/// nothing about `#[derive(Debug)]` on this enum records that it was ever
+/// checked.
+///
+/// The one that is easier to miss: [`Backend::Command`]'s `args` come from a
+/// preference the owner typed, verbatim. `docs/agent-backends.md` describes a
+/// program taking a command line, and a command line is where a person puts
+/// `--api-key sk-…` or `--token …` without thinking about it. It is his own
+/// string and Mach never inspects it, which means Mach cannot tell whether it
+/// holds a secret — so it prints the count and not the contents. The program
+/// path stays: that is the one field anybody debugging a backend needs.
+impl fmt::Debug for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Backend::ClaudeCli { exe, model } => f
+                .debug_struct("Backend::ClaudeCli")
+                .field("exe", exe)
+                .field("model", model)
+                .finish(),
+            // The config's own `Debug` redacts the credential; naming the model
+            // here is what makes this line worth printing at all.
+            Backend::AnthropicApi(config) => f
+                .debug_tuple("Backend::AnthropicApi")
+                .field(&config)
+                .finish(),
+            Backend::Command { program, args } => f
+                .debug_struct("Backend::Command")
+                .field("program", program)
+                .field("args", &format_args!("<{} redacted>", args.len()))
+                .finish(),
         }
     }
 }
