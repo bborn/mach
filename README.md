@@ -57,6 +57,16 @@ Working, and what I read my mail in every day:
   from your own sent mail so they sound like you. They stay in local SQLite —
   nothing reaches Gmail's drafts until you pick one — and the app keeps count of
   how often you send one roughly as written.
+- Unsubscribe with `⇧⌘U`: archives the conversation and unsubscribes in the
+  background — one request where the sender supports one-click, the unsubscribe
+  email sent for you where they don't. A sender who offers only a form gets you
+  a button that opens it, because a request that only might have worked is worse
+  than one you made yourself. It refuses to offer on mail that looks like spam,
+  where telling the sender your address is live is the wrong move, and offers the
+  spam report instead.
+- `⌥⌘C` copies what is on screen as plain text — the thread with quotes
+  stripped, or the week, or a search and its results — for pasting into a chat
+  window somewhere else.
 - A sandboxed plugin runtime. See [`PLUGINS.md`](PLUGINS.md).
 
 Expect rough edges: nothing packaged, nothing that updates itself, no onboarding

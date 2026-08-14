@@ -57,7 +57,16 @@ and the versions are [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it does is undoable and lands in the same log as manual actions.
 - Agent-suggested reply stances: two labelled stances on an eligible thread,
   each with its whole reply already written, so picking one is a local read.
-  They live in local SQLite and never become a Gmail draft until one is picked.
+  They live in local SQLite and never become a Gmail draft until one is picked. Generation is capped at twenty an hour and fifty a day, so a
+  flood of mail cannot spend an afternoon's worth of quota.
+- Unsubscribe, `⇧⌘U`: archives the conversation and unsubscribes behind it. One
+  request where the sender supports RFC 8058 one-click, the unsubscribe mail
+  sent for you where they offer only `mailto:`, and a button that opens the page
+  where all they offer is a form — Mach does not click through a page it has not
+  read. It will not offer at all on mail that looks like spam, where confirming
+  the address is live is the wrong move; that gets the spam report instead.
+- `⌥⌘C` copies what is on screen as plain text, quotes stripped, for pasting
+  into a chat window somewhere else.
 - Handoff: a terminal session running inside Mach, up to four at once. An empty
   handoff opens a field with the caret in it rather than an error panel.
 - A plugin runtime. A plugin composes the command layer rather than extending
