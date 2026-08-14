@@ -1974,3 +1974,65 @@ fn the_address_book_still_folds_case_after_the_collation_change() {
         "a message from Owner@Example.com is still a message from this account"
     );
 }
+
+// ---------------------------------------------------------------------------
+// file permissions
+// ---------------------------------------------------------------------------
+
+/// The store is `0600`, and a directory Mach created for it is `0700`.
+///
+/// This matters because the store is not always under `~/Library/Application
+/// Support`, where the directory above it is already `0700`. `MACH_DATA_DIR`
+/// puts a QA instance's store inside the repo, where every directory on the
+/// path is `0755` — and a QA instance holds real mail.
+#[cfg(unix)]
+#[test]
+fn the_store_is_readable_only_by_its_owner() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "mach-perm-test-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let path = dir.join("mach.sqlite3");
+
+    // `open` runs the migrations, so the -wal exists by the time this returns.
+    let db = Db::open(&path).expect("open");
+
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    assert_eq!(
+        mode(&path),
+        0o600,
+        "the store holds every message body in the mailbox"
+    );
+    assert_eq!(
+        mode(&dir),
+        0o700,
+        "a directory Mach created for the store is its own"
+    );
+    for suffix in ["-wal", "-shm"] {
+        let mut journal = path.clone().into_os_string();
+        journal.push(suffix);
+        let journal = PathBuf::from(journal);
+        if journal.exists() {
+            assert_eq!(
+                mode(&journal),
+                0o600,
+                "{} carries committed rows like the store does",
+                journal.display()
+            );
+        }
+    }
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

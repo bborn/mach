@@ -64,7 +64,7 @@ pub mod schema;
 pub mod sync_queries;
 
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -144,11 +144,21 @@ impl Db {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
+                // Only a directory *we* create gets its mode set. A parent that
+                // already existed belongs to whoever made it — and one of the
+                // callers here is a test whose parent is the shared temp
+                // directory, which must keep its `1777`.
+                let ours = !parent.exists();
                 std::fs::create_dir_all(parent)
                     .map_err(|e| DbError::Other(format!("creating {}: {e}", parent.display())))?;
+                if ours {
+                    restrict_to_owner(parent, 0o700);
+                }
             }
         }
-        Db::from_uri(path.to_string_lossy().into_owned())
+        let db = Db::from_uri(path.to_string_lossy().into_owned())?;
+        restrict_store(path);
+        Ok(db)
     }
 
     /// An in-memory database, for tests and throwaway work.
@@ -372,6 +382,62 @@ impl Drop for Reader {
                 idle.push(conn);
             }
             // Otherwise the connection is simply closed.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// file permissions
+// ---------------------------------------------------------------------------
+
+/// Narrow `path` to the owner. Best effort: a store that opened is worth more
+/// than a store that refused to because a chmod failed.
+///
+/// Deliberately silent, and deliberately not a `Result`. Nothing the owner
+/// could do about a failure here, and "failure must be visible" is a rule about
+/// writes Google refused, not about hardening that did not take.
+fn restrict_to_owner(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
+/// Take the store's three files down to `0600`.
+///
+/// # Why this is not already the case
+///
+/// SQLite creates a database file with `0644 & ~umask`, and the default umask
+/// on macOS is `022` — so the store lands world-readable. Under
+/// `~/Library/Application Support` that is invisible, because the directory
+/// above it is `0700` and nothing can traverse in. The store is not always
+/// there: `MACH_DATA_DIR` puts a QA instance's store under `<repo>/.qa/<name>/`
+/// instead, and the whole path from `~/Projects` down is `0755`. `/Users/bruno`
+/// itself is `drwxr-x---` with group `staff`, and on macOS every local account
+/// is in `staff`. So a QA store — which holds real mail, because a QA instance
+/// signs into a real account — is readable by any other account on the machine,
+/// while the owner's own store is not. The app's permissions were carrying that
+/// difference and did not know it.
+///
+/// So the mode is set here rather than left to the directory above, because
+/// this module is the only place that knows where the store actually went.
+///
+/// `-wal` and `-shm` are handled by SQLite once the main file is right: it
+/// copies the database file's mode onto them when it creates them. They are
+/// still set explicitly, because an existing store's journal files were created
+/// before this ran and would keep their old mode until the next checkpoint
+/// deleted them.
+fn restrict_store(path: &Path) {
+    restrict_to_owner(path, 0o600);
+    for suffix in ["-wal", "-shm"] {
+        let mut journal = path.as_os_str().to_owned();
+        journal.push(suffix);
+        let journal = PathBuf::from(journal);
+        if journal.exists() {
+            restrict_to_owner(&journal, 0o600);
         }
     }
 }
