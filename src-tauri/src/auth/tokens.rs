@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Component, Path};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
@@ -388,6 +389,29 @@ impl TokenStore for MemoryTokenStore {
 // TokenManager
 // ---------------------------------------------------------------------------
 
+/// One account's refresh, and the last refusal it produced.
+///
+/// The lock is what makes a refresh single-flight: a caller that finds nothing
+/// usable in the cache takes it, so the second, third and fifth caller for the
+/// same account wait rather than each starting their own. `generation` is
+/// bumped every time an attempt finishes under the lock, and a waiter compares
+/// it against the value it read *before* it started waiting — a higher number
+/// means somebody else's attempt landed while it queued, and that attempt's
+/// answer is this caller's answer too.
+///
+/// Without the generation the waiter cannot tell "the attempt I waited for" from
+/// "an attempt that finished long ago", and adopting the latter would serve a
+/// stale error forever.
+///
+/// Only failures are kept here. A success is already in the token cache — that
+/// is what `persist` does — so recording it a second time would be one more
+/// copy of a refresh token sitting in memory for nothing.
+#[derive(Default)]
+struct RefreshGate {
+    generation: AtomicU64,
+    last_failure: tokio::sync::Mutex<Option<AuthError>>,
+}
+
 /// Holds live tokens for every account and keeps them valid.
 ///
 /// [`Self::access_token`] is the only method the rest of the app should need: it
@@ -396,12 +420,38 @@ impl TokenStore for MemoryTokenStore {
 ///
 /// Generic over the HTTP transport and the store so the refresh logic is
 /// testable with no network and no Keychain prompt.
+///
+/// # One read per account, not one per caller
+///
+/// A launch fans out: the sync engine spawns a task per account, each task runs
+/// several Gmail and Calendar requests concurrently, and every one of them asks
+/// for an access token. On a cold cache each of those was an independent
+/// Keychain read *and* an independent refresh POST — five per account, twenty
+/// five across five accounts, measured in `securityd`'s log as twenty five
+/// password prompts for a single launch.
+///
+/// Two things stop that. [`Self::known_refresh`] remembers a refresh token the
+/// moment it has been read once, so the Keychain is asked at most once per
+/// account for the life of the process; [`RefreshGate`] makes the refresh itself
+/// single-flight, so the callers that arrive during one share its result instead
+/// of each spending a token-endpoint round trip.
 pub struct TokenManager<H, S> {
     config: ClientConfig,
     http: H,
     store: S,
     /// Access tokens are memory-only, so this is the whole of their storage.
     cache: Mutex<HashMap<String, TokenSet>>,
+    /// Refresh tokens already read out of the store, keyed by account.
+    ///
+    /// Only *successful* reads are remembered. A missing entry is not cached,
+    /// because `errSecItemNotFound` costs nothing to repeat — it never raises a
+    /// dialog, there is no item whose ACL macOS would have to ask about — and
+    /// caching it would mean an account authorized after launch stayed
+    /// `NotAuthorized` until the app was restarted.
+    known_refresh: Mutex<HashMap<String, Secret>>,
+    /// One gate per account. Five accounts, five entries; it never grows past
+    /// the number of accounts that have asked for a token.
+    gates: Mutex<HashMap<String, Arc<RefreshGate>>>,
 }
 
 impl<H, S> TokenManager<H, S>
@@ -449,6 +499,88 @@ where
             http,
             store,
             cache: Mutex::new(HashMap::new()),
+            known_refresh: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// This account's refresh gate, created on first use.
+    fn gate(&self, account_email: &str) -> Arc<RefreshGate> {
+        let mut gates = self.gates.lock().expect("token gate mutex");
+        Arc::clone(gates.entry(account_email.to_string()).or_default())
+    }
+
+    /// The cached access token, if it is good for longer than the safety margin.
+    fn cached_access_token(&self, account_email: &str, now: DateTime<Utc>) -> Option<Secret> {
+        let cache = self.cache.lock().expect("token cache mutex");
+        cache
+            .get(account_email)
+            .filter(|tokens| !tokens.needs_refresh_at(now))
+            .map(|tokens| tokens.access_token.clone())
+    }
+
+    /// The refresh token for an account if it is already in memory — either
+    /// riding along on a cached access token, or remembered from an earlier
+    /// store read. Does not touch the store.
+    fn remembered_refresh_token(&self, account_email: &str) -> Option<Secret> {
+        if let Some(token) = self
+            .cache
+            .lock()
+            .expect("token cache mutex")
+            .get(account_email)
+            .and_then(|tokens| tokens.refresh_token.clone())
+        {
+            return Some(token);
+        }
+        self.known_refresh
+            .lock()
+            .expect("known refresh mutex")
+            .get(account_email)
+            .cloned()
+    }
+
+    fn remember_refresh_token(&self, account_email: &str, token: &Secret) {
+        self.known_refresh
+            .lock()
+            .expect("known refresh mutex")
+            .insert(account_email.to_string(), token.clone());
+    }
+
+    /// The refresh token to send to Google, from memory or, once, from the store.
+    fn refresh_token_for(&self, account_email: &str) -> Result<Secret, AuthError> {
+        if let Some(token) = self.remembered_refresh_token(account_email) {
+            return Ok(token);
+        }
+        let token = self
+            .load_refresh_token_unblocking(account_email)?
+            .ok_or_else(|| AuthError::NotAuthorized(account_email.to_string()))?;
+        self.remember_refresh_token(account_email, &token);
+        Ok(token)
+    }
+
+    /// Whether this account still has a stored credential.
+    ///
+    /// The launch-time check (`ipc::state::restore_accounts_into`) used to build
+    /// its own [`KeychainTokenStore`], read every account through it, and throw
+    /// the tokens away — so the read that answered "is this account still signed
+    /// in?" was one prompt, and the first API call a moment later was another
+    /// for the same item. Asking the manager instead keeps what it read, and the
+    /// requests behind it find it in memory.
+    ///
+    /// The store read here is the plain synchronous one, not
+    /// [`Self::load_refresh_token_unblocking`]: this runs on a blocking thread
+    /// that Tauri spawned for exactly this purpose, so there is no async worker
+    /// to yield.
+    pub fn has_stored_credential(&self, account_email: &str) -> Result<bool, AuthError> {
+        if self.remembered_refresh_token(account_email).is_some() {
+            return Ok(true);
+        }
+        match self.store.load_refresh_token(account_email)? {
+            Some(token) => {
+                self.remember_refresh_token(account_email, &token);
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -466,7 +598,14 @@ where
 
     /// Seeds the in-memory cache, e.g. straight after an interactive
     /// authorization performed elsewhere.
+    ///
+    /// A refresh token arriving this way is remembered too — the sign-in flow
+    /// writes to the Keychain through its own store, and without this the next
+    /// request would go and read back the item that was just written.
     pub fn insert_tokens(&self, account_email: &str, tokens: TokenSet) {
+        if let Some(token) = &tokens.refresh_token {
+            self.remember_refresh_token(account_email, token);
+        }
         self.cache
             .lock()
             .expect("token cache mutex")
@@ -474,6 +613,10 @@ where
     }
 
     /// Forgets an account's access token without touching the Keychain.
+    ///
+    /// The remembered refresh token stays: it is what the *next* call would read
+    /// out of the Keychain anyway, and dropping it here would put the prompt
+    /// back. [`Self::sign_out`] is the one that forgets the credential.
     pub fn forget_cached(&self, account_email: &str) {
         self.cache
             .lock()
@@ -481,40 +624,72 @@ where
             .remove(account_email);
     }
 
-    /// Drops the account entirely: cached access token and stored refresh token.
+    /// Drops the account entirely: cached access token, remembered refresh
+    /// token, and the stored one.
     pub fn sign_out(&self, account_email: &str) -> Result<(), AuthError> {
         self.forget_cached(account_email);
+        self.known_refresh
+            .lock()
+            .expect("known refresh mutex")
+            .remove(account_email);
+        self.gates
+            .lock()
+            .expect("token gate mutex")
+            .remove(account_email);
         self.store.delete_refresh_token(account_email)
     }
 
     /// A valid access token for `account_email`, refreshing if it is expired or
     /// within the safety margin.
+    ///
+    /// Concurrent callers for the same account collapse onto one attempt. The
+    /// first through the gate does the Keychain read and the token-endpoint
+    /// POST; the rest wait, and then take either the token it cached or, if it
+    /// failed, a clone of the error it got.
     pub async fn access_token(&self, account_email: &str) -> Result<Secret, AuthError> {
-        let now = Utc::now();
+        if let Some(token) = self.cached_access_token(account_email, Utc::now()) {
+            return Ok(token);
+        }
 
-        // Copy out and drop the guard: the Mutex must not be held across await.
-        let cached = {
-            let cache = self.cache.lock().expect("token cache mutex");
-            cache.get(account_email).cloned()
-        };
+        let gate = self.gate(account_email);
+        // Read before the wait, so anything published while we wait is visibly
+        // newer than what we already knew about.
+        let seen = gate.generation.load(Ordering::Acquire);
+        let mut last_failure = gate.last_failure.lock().await;
 
-        if let Some(tokens) = &cached {
-            if !tokens.needs_refresh_at(now) {
-                return Ok(tokens.access_token.clone());
+        // Somebody may have refreshed while we were queued. A success landed in
+        // the cache, so that check comes first and covers it; only a refusal has
+        // to be read back out of the gate.
+        if let Some(token) = self.cached_access_token(account_email, Utc::now()) {
+            return Ok(token);
+        }
+        if gate.generation.load(Ordering::Acquire) > seen {
+            if let Some(error) = last_failure.as_ref() {
+                return Err(error.clone());
             }
         }
 
-        // Prefer the refresh token we already have in memory; fall back to the
-        // Keychain, which is the cold-start path.
-        let refresh_token = match cached.as_ref().and_then(|t| t.refresh_token.clone()) {
-            Some(rt) => rt,
-            None => self
-                .load_refresh_token_unblocking(account_email)?
-                .ok_or_else(|| AuthError::NotAuthorized(account_email.to_string()))?,
-        };
+        let outcome = self.refresh_once(account_email).await;
+        Self::publish(&gate, &mut last_failure, &outcome);
+        outcome.map(|tokens| tokens.access_token)
+    }
 
-        let tokens = self.refresh_with(account_email, &refresh_token).await?;
-        Ok(tokens.access_token)
+    /// Records an attempt's answer for whoever is waiting behind the gate.
+    fn publish(
+        gate: &RefreshGate,
+        last_failure: &mut Option<AuthError>,
+        outcome: &Result<TokenSet, AuthError>,
+    ) {
+        *last_failure = outcome.as_ref().err().cloned();
+        // Released after the answer is stored, so a waiter that sees the new
+        // generation sees the answer that goes with it.
+        gate.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// One refresh: find the refresh token, spend it. Callers hold the gate.
+    async fn refresh_once(&self, account_email: &str) -> Result<TokenSet, AuthError> {
+        let refresh_token = self.refresh_token_for(account_email)?;
+        self.refresh_with(account_email, &refresh_token).await
     }
 
     /// Trades an authorization code for tokens and persists the refresh token.
@@ -541,20 +716,17 @@ where
     }
 
     /// Forces a refresh regardless of expiry. Prefer [`Self::access_token`].
+    ///
+    /// Takes the account's gate, so it serialises with a lazy refresh rather
+    /// than racing one, and publishes its answer to anything waiting. It does
+    /// *not* adopt a result that landed while it waited — "force" is the whole
+    /// of what this method means.
     pub async fn refresh(&self, account_email: &str) -> Result<TokenSet, AuthError> {
-        let refresh_token = {
-            let cached = {
-                let cache = self.cache.lock().expect("token cache mutex");
-                cache.get(account_email).cloned()
-            };
-            match cached.and_then(|t| t.refresh_token) {
-                Some(rt) => rt,
-                None => self
-                    .load_refresh_token_unblocking(account_email)?
-                    .ok_or_else(|| AuthError::NotAuthorized(account_email.to_string()))?,
-            }
-        };
-        self.refresh_with(account_email, &refresh_token).await
+        let gate = self.gate(account_email);
+        let mut last_failure = gate.last_failure.lock().await;
+        let outcome = self.refresh_once(account_email).await;
+        Self::publish(&gate, &mut last_failure, &outcome);
+        outcome
     }
 
     async fn refresh_with(
@@ -584,8 +756,20 @@ where
 
     fn persist(&self, account_email: &str, tokens: &TokenSet) -> Result<(), AuthError> {
         if let Some(rt) = &tokens.refresh_token {
-            self.store.save_refresh_token(account_email, rt)?;
+            // Only when it has actually changed. A refresh response almost never
+            // carries a new refresh token — [`TokenSet::from_json`] carries the
+            // old one forward — so this used to rewrite the same bytes into the
+            // Keychain after every refresh, once an hour per account.
+            //
+            // A write is not free the way an in-memory one is. It reaches into
+            // the same item, under the same ACL and the same partition list as a
+            // read, and gets asked about on the same terms. Rotation still lands:
+            // a token Google *did* replace differs, and is written.
+            if self.remembered_refresh_token(account_email).as_ref() != Some(rt) {
+                self.store.save_refresh_token(account_email, rt)?;
+            }
         }
+        // Remembers the refresh token as well as caching the access token.
         self.insert_tokens(account_email, tokens.clone());
         Ok(())
     }

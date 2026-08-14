@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
@@ -899,4 +900,343 @@ async fn exchanging_a_code_persists_the_refresh_token_to_the_store() {
     );
     assert_eq!(manager.access_token("a@x.com").await.unwrap().expose(), "ya29.first");
     assert_eq!(manager.http().call_count(), 1, "no refresh needed right after exchange");
+}
+
+// ---------------------------------------------------------------------------
+// TokenManager: one Keychain read and one refresh per account, not one per caller
+// ---------------------------------------------------------------------------
+//
+// A launch fans out. The sync engine spawns a task per account; inside each,
+// several Gmail and Calendar requests run concurrently; every one of them asks
+// the manager for an access token against a cache that is still empty. Before
+// the gate in `TokenManager`, each of those was its own Keychain read and its
+// own POST to Google's token endpoint — measured in `securityd`'s own log as
+// twenty five password prompts for one launch of five accounts:
+//
+//     ACL partition mismatch: client cdhash:8db6f481… ACL ( "cdhash:de119002…" )
+//     kcacl: client is valid, proceeding
+//     kcacl: displaying keychain prompt for …/target/debug/mach
+//         × 25, one process
+//
+// The prompt itself is a signing problem — see `scripts/sign`. The multiplier is
+// this, and it is a bug on its own: four of those five refreshes spent a round
+// trip to Google to be told what the first one was already being told.
+
+/// A store that counts reads, so a test can assert how many the Keychain would
+/// have seen.
+struct CountingStore {
+    inner: MemoryTokenStore,
+    reads: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl CountingStore {
+    fn with(account_email: &str, refresh_token: &str) -> Self {
+        let inner = MemoryTokenStore::default();
+        inner
+            .save_refresh_token(account_email, &Secret::new(refresh_token))
+            .unwrap();
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        }
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    fn writes(&self) -> usize {
+        self.writes.load(Ordering::SeqCst)
+    }
+}
+
+impl TokenStore for CountingStore {
+    fn save_refresh_token(&self, account_email: &str, token: &Secret) -> Result<(), AuthError> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.save_refresh_token(account_email, token)
+    }
+
+    fn load_refresh_token(&self, account_email: &str) -> Result<Option<Secret>, AuthError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.load_refresh_token(account_email)
+    }
+
+    fn delete_refresh_token(&self, account_email: &str) -> Result<(), AuthError> {
+        self.inner.delete_refresh_token(account_email)
+    }
+}
+
+/// A token endpoint that will not answer until the test says so.
+///
+/// Holding the first response open is what puts the other callers where they
+/// are at launch — queued behind a refresh that has not finished — rather than
+/// arriving after it has already landed, which would prove nothing.
+struct GatedHttp {
+    calls: AtomicUsize,
+    response: oauth::HttpResponse,
+    release: tokio::sync::Semaphore,
+}
+
+impl GatedHttp {
+    fn new(response: oauth::HttpResponse) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            response,
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn release_all(&self) {
+        self.release.add_permits(64);
+    }
+}
+
+impl TokenHttp for GatedHttp {
+    fn post_form(
+        &self,
+        _url: &str,
+        _form: &[(String, String)],
+    ) -> impl Future<Output = Result<oauth::HttpResponse, AuthError>> + Send {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        async move {
+            self.release
+                .acquire()
+                .await
+                .expect("gated http released")
+                .forget();
+            Ok(self.response.clone())
+        }
+    }
+}
+
+/// Wait for `condition`, or fail. Polling beats a fixed sleep: as fast as the
+/// machine allows, and no flakier on a loaded one.
+async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// The regression this exists for: five concurrent first-callers, one read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_callers_share_one_keychain_read_and_one_refresh() {
+    let http = GatedHttp::new(FakeHttp::ok(
+        r#"{"access_token":"ya29.shared","expires_in":3600,"token_type":"Bearer"}"#,
+    ));
+    let manager = Arc::new(TokenManager::new(
+        test_config(),
+        http,
+        CountingStore::with("a@x.com", "1//stored"),
+    ));
+
+    // Five callers, the number of independent readers one account actually
+    // produces at launch.
+    let callers: Vec<_> = (0..5)
+        .map(|_| {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.access_token("a@x.com").await })
+        })
+        .collect();
+
+    // One of them is now inside the refresh, holding the gate; the others are
+    // queued behind it, which is the whole claim.
+    eventually("the first refresh to start", || manager.http().calls() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        manager.http().calls(),
+        1,
+        "every caller after the first must wait for the refresh in flight, not start its own"
+    );
+    assert_eq!(
+        manager.store().reads(),
+        1,
+        "the Keychain is read once per account, not once per caller"
+    );
+
+    manager.http().release_all();
+
+    for caller in callers {
+        let token = caller.await.expect("caller task").expect("access token");
+        assert_eq!(token.expose(), "ya29.shared");
+    }
+
+    assert_eq!(manager.http().calls(), 1, "one refresh, five callers");
+    assert_eq!(manager.store().reads(), 1);
+
+    // The account is warm now: a later caller pays for neither.
+    let later = manager.access_token("a@x.com").await.expect("cached token");
+    assert_eq!(later.expose(), "ya29.shared");
+    assert_eq!(manager.http().calls(), 1);
+    assert_eq!(manager.store().reads(), 1);
+}
+
+/// A refusal is shared too, and keeps its classification.
+///
+/// `invalid_grant` is how an account being logged out arrives, and
+/// `ipc::state::ManagedToken` turns exactly that into `CredentialRejected` so
+/// the owner is told to sign in again. Five callers get five copies of that
+/// answer from one POST; the alternative is five dead refreshes per account per
+/// pass against an endpoint that rate-limits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_is_shared_by_everyone_waiting_on_it() {
+    let http = GatedHttp::new(oauth::HttpResponse {
+        status: 400,
+        body: r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#
+            .to_string(),
+    });
+    let manager = Arc::new(TokenManager::new(
+        test_config(),
+        http,
+        CountingStore::with("a@x.com", "1//revoked"),
+    ));
+
+    let callers: Vec<_> = (0..5)
+        .map(|_| {
+            let manager = Arc::clone(&manager);
+            tokio::spawn(async move { manager.access_token("a@x.com").await })
+        })
+        .collect();
+
+    eventually("the first refresh to start", || manager.http().calls() >= 1).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    manager.http().release_all();
+
+    for caller in callers {
+        let error = caller.await.expect("caller task").expect_err("revoked");
+        assert!(
+            error.is_credential_rejected(),
+            "a shared failure keeps the one classification the sync loop reads: got {error:?}"
+        );
+    }
+
+    assert_eq!(
+        manager.http().calls(),
+        1,
+        "a refusal is spent once and handed to everyone waiting"
+    );
+    assert_eq!(manager.store().reads(), 1);
+}
+
+/// The launch check and the first request are one read between them.
+///
+/// `restore_accounts_into` asks whether each account still has a credential
+/// before the first sync pass runs. It used to ask a `KeychainTokenStore` of its
+/// own and discard what it read, so every account was read twice every launch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_launch_credential_check_is_the_read_the_first_request_uses() {
+    let http = FakeHttp::new(vec![FakeHttp::ok(
+        r#"{"access_token":"ya29.warm","expires_in":3600,"token_type":"Bearer"}"#,
+    )]);
+    let manager = TokenManager::new(test_config(), http, CountingStore::with("a@x.com", "1//s"));
+
+    assert!(manager.has_stored_credential("a@x.com").expect("check"));
+    assert_eq!(manager.store().reads(), 1);
+
+    let token = manager.access_token("a@x.com").await.expect("access token");
+    assert_eq!(token.expose(), "ya29.warm");
+    assert_eq!(
+        manager.store().reads(),
+        1,
+        "the launch check already read this item; the request must not read it again"
+    );
+    assert_eq!(
+        form_value(&manager.http().last_form(), "refresh_token"),
+        Some("1//s"),
+        "and it must be the credential that read found"
+    );
+}
+
+/// An account with nothing stored is not memoised as absent.
+///
+/// A missing item is `errSecItemNotFound`, which returns without a dialog, so
+/// there is nothing to save by remembering it — and remembering it would leave
+/// an account that signs in after launch looking unauthorized until a restart.
+#[tokio::test]
+async fn an_account_signed_in_after_the_launch_check_works_without_a_restart() {
+    let http = FakeHttp::new(vec![FakeHttp::ok(
+        r#"{"access_token":"ya29.later","expires_in":3600,"token_type":"Bearer"}"#,
+    )]);
+    let manager = TokenManager::new(
+        test_config(),
+        http,
+        CountingStore::with("someone@x.com", "1//other"),
+    );
+
+    assert!(!manager.has_stored_credential("a@x.com").expect("check"));
+
+    // Sign-in writes the credential, as `exchange_code` does.
+    manager
+        .store()
+        .save_refresh_token("a@x.com", &Secret::new("1//new"))
+        .unwrap();
+
+    let token = manager.access_token("a@x.com").await.expect("access token");
+    assert_eq!(token.expose(), "ya29.later");
+}
+
+/// A refresh does not rewrite a refresh token Google did not change.
+///
+/// Google returns the same refresh token on every refresh, so `persist` used to
+/// write the identical bytes back into the Keychain roughly once an hour per
+/// account. A write goes through the same ACL and the same partition list as a
+/// read, so it is asked about on the same terms — the same bug, from the other
+/// direction.
+#[tokio::test]
+async fn a_refresh_only_writes_a_refresh_token_that_actually_changed() {
+    let http = FakeHttp::new(vec![
+        FakeHttp::ok(r#"{"access_token":"ya29.one","expires_in":3600,"token_type":"Bearer"}"#),
+        FakeHttp::ok(r#"{"access_token":"ya29.two","expires_in":3600,"token_type":"Bearer"}"#),
+        FakeHttp::ok(
+            r#"{"access_token":"ya29.three","expires_in":3600,"refresh_token":"1//rotated","token_type":"Bearer"}"#,
+        ),
+    ]);
+    let manager = TokenManager::new(test_config(), http, CountingStore::with("a@x.com", "1//s"));
+
+    // The credential is already in the store; nothing about these two refreshes
+    // changes it.
+    manager.refresh("a@x.com").await.expect("first refresh");
+    manager.refresh("a@x.com").await.expect("second refresh");
+    assert_eq!(
+        manager.store().writes(),
+        0,
+        "an unchanged refresh token must not be written back"
+    );
+
+    // Rotation still lands.
+    manager.refresh("a@x.com").await.expect("rotating refresh");
+    assert_eq!(manager.store().writes(), 1, "a rotated token must be persisted");
+    assert_eq!(
+        manager.store().load_refresh_token("a@x.com").unwrap().unwrap().expose(),
+        "1//rotated"
+    );
+}
+
+/// Signing out forgets the credential, so the account has to be authorized
+/// again rather than running on a remembered token.
+#[tokio::test]
+async fn signing_out_forgets_the_remembered_refresh_token() {
+    let http = FakeHttp::new(vec![FakeHttp::ok(
+        r#"{"access_token":"ya29.first","expires_in":3600,"token_type":"Bearer"}"#,
+    )]);
+    let manager = TokenManager::new(test_config(), http, CountingStore::with("a@x.com", "1//s"));
+
+    manager.access_token("a@x.com").await.expect("access token");
+    manager.sign_out("a@x.com").expect("sign out");
+
+    let error = manager.access_token("a@x.com").await.expect_err("signed out");
+    assert!(
+        matches!(error, AuthError::NotAuthorized(ref e) if e == "a@x.com"),
+        "got {error:?}"
+    );
 }
