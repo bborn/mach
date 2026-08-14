@@ -1,5 +1,6 @@
 import { Bookmark } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
+import type { ThreadId } from "@/types";
 import { useMach } from "@/hooks/useMach";
 import { mailboxName } from "@/lib/mailboxes";
 import { cn } from "@/lib/utils";
@@ -27,6 +28,22 @@ export function ThreadList() {
   const scroller = useRef<HTMLDivElement>(null);
   const sentinel = useRef<HTMLDivElement>(null);
 
+  // One click handler for every row, for the life of the list.
+  //
+  // `actions` is rebuilt whenever the cursor moves — `ui.threadId` is in its
+  // dependency list, and has to be — so anything derived from it directly would
+  // change identity on every `j`, and a changed prop is a re-render of all three
+  // hundred rows. Reading it through a ref is the same trick `useKeyBindings`
+  // uses for the same reason: the handler always sees the current actions, and
+  // the rows never see a new handler.
+  const latest = useRef(actions);
+  latest.current = actions;
+  const clickThread = useCallback(
+    (id: ThreadId, modifiers: { extend: boolean; toggle: boolean }) =>
+      latest.current.clickThread(id, modifiers),
+    [],
+  );
+
   // Keyboard selection has to drag the viewport with it, but only as far as
   // strictly necessary — `nearest` keeps the list from jumping under the eye.
   useEffect(() => {
@@ -39,19 +56,26 @@ export function ThreadList() {
 
   // Infinite scroll: one more page when the tail comes into view, and never
   // more than one request in flight (`loadMore` is a no-op while loading).
+  //
+  // `actions` is read through the ref here too, and for a sharper reason than
+  // render cost: with it in the dependency list this effect tore down and
+  // rebuilt an `IntersectionObserver` on every cursor move, and an observer
+  // reports nothing until the next layout — so the page that should have been
+  // fetched while the sentinel sat in the 600px margin was fetched a keystroke
+  // later than it should have been.
   useEffect(() => {
     const target = sentinel.current;
     const root = scroller.current;
     if (!target || !root || !hasMore) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) actions.loadMore();
+        if (entries.some((entry) => entry.isIntersecting)) latest.current.loadMore();
       },
       { root, rootMargin: "600px 0px" },
     );
     observer.observe(target);
     return () => observer.disconnect();
-  }, [hasMore, actions, visibleThreads.length]);
+  }, [hasMore, visibleThreads.length]);
 
   const scope = accounts.find((a) => a.id === ui.accountId)?.name ?? "All accounts";
   const label = labels.find((l) => l.id === ui.labelId);
@@ -120,14 +144,8 @@ export function ThreadList() {
                 // fact is news, which is Inbox, a label, or the unified list.
                 draft={ui.labelId !== GMAIL_DRAFT && thread.labelIds.includes(GMAIL_DRAFT)}
                 // Which gesture this is depends on the modifiers; the state
-                // layer owns the rules, this just reports what was held.
-                onSelect={(event) =>
-                  actions.clickThread(thread.id, {
-                    extend: event.shiftKey,
-                    toggle: event.metaKey || event.ctrlKey,
-                  })
-                }
-                onToggle={() => actions.clickThread(thread.id, { extend: false, toggle: true })}
+                // layer owns the rules, the row just reports what was held.
+                onSelect={clickThread}
               />
             ))}
             </ThreadContextMenu>

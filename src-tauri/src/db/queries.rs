@@ -291,7 +291,7 @@ pub fn list_threads(conn: &Connection, query: &ThreadQuery) -> Result<Vec<Thread
         sql.push_str(&format!(" AND t.account_id = ?{}", args.len()));
     }
     if let Some(label) = &query.label_id {
-        sql.push_str(&format!(" AND {}", mailbox_clause(label, &mut args)));
+        sql.push_str(&format!(" AND {}", mailbox_clause(conn, label, &mut args)));
     }
     if query.unread_only {
         sql.push_str(" AND t.is_unread = 1");
@@ -353,7 +353,7 @@ pub fn list_threads(conn: &Connection, query: &ThreadQuery) -> Result<Vec<Thread
 /// Measured against a 47k-thread store, the first page of Archive costs about a
 /// millisecond and the predicate over every row in the table costs about sixty.
 /// No new index earns its write cost here.
-fn mailbox_clause(label: &str, args: &mut Vec<Value>) -> String {
+fn mailbox_clause(conn: &Connection, label: &str, args: &mut Vec<Value>) -> String {
     match label {
         ARCHIVE_MAILBOX => format!(
             "NOT EXISTS (SELECT 1 FROM thread_labels tl \
@@ -362,19 +362,90 @@ fn mailbox_clause(label: &str, args: &mut Vec<Value>) -> String {
             placeholders(&FILED_ELSEWHERE, args)
         ),
         SNOOZED_MAILBOX => SNOOZED.to_string(),
-        DRAFT_LABEL => format!("({} OR {LOCAL_DRAFT})", carries(label, args)),
-        _ => carries(label, args),
+        DRAFT_LABEL => format!("({} OR {LOCAL_DRAFT})", carries(conn, label, args)),
+        _ => carries(conn, label, args),
     }
 }
 
-/// `EXISTS` over one Gmail label id, the ordinary case.
-fn carries(label: &str, args: &mut Vec<Value>) -> String {
+/// A label small enough that it is cheaper to gather its threads than to walk
+/// the stream asking each one whether it carries the label.
+///
+/// The crossover is broad — between about a thousand and three thousand threads
+/// both spellings answer in under a millisecond — so the exact number does not
+/// matter, only that it is on the right side of the sparse mailboxes.
+const SPARSE_LABEL_THREADS: i64 = 2_000;
+
+/// One mailbox's `WHERE` fragment, in whichever of the two spellings is cheap
+/// for *this* label.
+///
+/// # Why there are two spellings
+///
+/// `EXISTS (…)` is a filter on the driving loop, so SQLite walks
+/// `idx_threads_stream` newest-first and asks each thread whether it carries the
+/// label, stopping at fifty hits. When the label is on a large fraction of the
+/// store that is the best plan there is: fifty rows of index, fifty seeks, done.
+///
+/// It degrades in exactly one direction, and it is the direction an inbox-zero
+/// mailbox lives in. A label on 49 of 47,328 threads means SQLite tests all
+/// 47,328 to find them, because there is no way to know from the stream index
+/// where the matches are. Measured against the owner's store, warm:
+///
+/// | label | threads | `EXISTS` | `IN (SELECT …)` |
+/// |---|---|---|---|
+/// | `CATEGORY_UPDATES` | 34,948 | 0.10 ms | 41 ms |
+/// | `IMPORTANT` | 9,759 | 0.13 ms | 3.4 ms |
+/// | `UNREAD` | 2,850 | 0.17 ms | 1.3 ms |
+/// | `SENT` | 960 | 0.56 ms | 0.40 ms |
+/// | **`INBOX`** | **49** | **17.3 ms** | **0.14 ms** |
+/// | a user label | 1 | 17.1 ms | 0.03 ms |
+///
+/// `INBOX` is the view the app opens in. It was the slowest read in the whole
+/// store by two orders of magnitude, and it got slower every time the mailbox
+/// got tidier.
+///
+/// `t.id IN (SELECT …)` inverts the plan: SQLite gathers the label's threads
+/// from `idx_thread_labels_label` — a covering seek — and sorts that set. That
+/// is a temp b-tree, which is why it is not the answer for `CATEGORY_UPDATES`,
+/// where it would sort 35,000 rows to return 50.
+///
+/// So the shape is chosen per query, from a bounded probe: count the label's
+/// rows, stopping at [`SPARSE_LABEL_THREADS`]. The probe is a covering index
+/// scan of at most 2,000 entries and measures under a tenth of a millisecond.
+/// Asking SQLite to work it out instead does not help — `ANALYZE` moves the
+/// `EXISTS` probe onto the covering index and halves the worst case to 8 ms,
+/// but the planner has no way to turn a correlated filter into a driving loop,
+/// so the scan of every thread remains.
+fn carries(conn: &Connection, label: &str, args: &mut Vec<Value>) -> String {
     args.push(Value::Text(label.to_string()));
-    format!(
-        "EXISTS (SELECT 1 FROM thread_labels tl \
-           WHERE tl.thread_id = t.id AND tl.gmail_label_id = ?{})",
-        args.len()
+    let n = args.len();
+    if label_is_sparse(conn, label) {
+        format!(
+            "t.id IN (SELECT tl.thread_id FROM thread_labels tl \
+               WHERE tl.gmail_label_id = ?{n})"
+        )
+    } else {
+        format!(
+            "EXISTS (SELECT 1 FROM thread_labels tl \
+               WHERE tl.thread_id = t.id AND tl.gmail_label_id = ?{n})"
+        )
+    }
+}
+
+/// Whether `label` is on fewer than [`SPARSE_LABEL_THREADS`] threads.
+///
+/// `LIMIT` inside the subquery is what makes this cheap: the count stops as soon
+/// as it has seen enough to answer, so a label on every thread in the store
+/// costs the same as one on two thousand. A failed probe answers "not sparse",
+/// which is the plan this query has always used.
+fn label_is_sparse(conn: &Connection, label: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM thread_labels \
+           WHERE gmail_label_id = ?1 LIMIT ?2)",
+        rusqlite::params![label, SPARSE_LABEL_THREADS],
+        |row| row.get::<_, i64>(0),
     )
+    .map(|n| n < SPARSE_LABEL_THREADS)
+    .unwrap_or(false)
 }
 
 /// `?7, ?8, ?9` — one bound placeholder per value, appended to `args`.
@@ -985,19 +1056,19 @@ pub fn address_book(conn: &Connection, limit: u32) -> Result<Vec<Contact>> {
                    json_extract(v.value, '$.name'), m.internal_date, 1 \
               FROM messages m, json_each(m.to_json) v \
              WHERE m.is_draft = 0 AND json_valid(m.to_json) \
-               AND lower(m.from_email) IN mine \
+               AND m.from_email COLLATE NOCASE IN mine \
             UNION ALL \
             SELECT trim(lower(json_extract(v.value, '$.email'))), \
                    json_extract(v.value, '$.name'), m.internal_date, 1 \
               FROM messages m, json_each(m.cc_json) v \
              WHERE m.is_draft = 0 AND json_valid(m.cc_json) \
-               AND lower(m.from_email) IN mine \
+               AND m.from_email COLLATE NOCASE IN mine \
             UNION ALL \
             SELECT trim(lower(json_extract(v.value, '$.email'))), \
                    json_extract(v.value, '$.name'), m.internal_date, 1 \
               FROM messages m, json_each(m.bcc_json) v \
              WHERE m.is_draft = 0 AND json_valid(m.bcc_json) \
-               AND lower(m.from_email) IN mine \
+               AND m.from_email COLLATE NOCASE IN mine \
         ), \
         kept AS (SELECT * FROM seen WHERE email IS NOT NULL AND email <> ''), \
         folded AS (SELECT email, max(at) AS last_seen, sum(is_send) AS sends \

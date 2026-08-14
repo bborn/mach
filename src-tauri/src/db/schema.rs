@@ -98,6 +98,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 20,
         sql: M20_RECIPIENT_INDEX,
     },
+    Migration {
+        version: 21,
+        sql: M21_SENDER_INDEX_COVERS_NAME,
+    },
 ];
 
 /// Migration 20 — an index the recipient operators can stand on.
@@ -125,6 +129,45 @@ pub const MIGRATIONS: &[Migration] = &[
 const M20_RECIPIENT_INDEX: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_messages_thread_addresses
     ON messages (thread_id, to_json, cc_json, bcc_json);
+"#;
+
+/// Migration 21 — put the sender index back in front of the address book.
+///
+/// [`M14_SENDER_INDEX`] was measured and correct when it landed: covering, so
+/// `address_book` never touched a table whose rows carry the message bodies.
+/// It stopped covering when the query learned to keep the newest *name* beside
+/// each address — `from_name` is selected and is not in the key, so SQLite went
+/// back to `SCAN messages` and back to reading gigabytes to look at a string.
+/// Nothing failed and nobody saw it; the index simply stopped being used and
+/// the comment above it kept saying it was.
+///
+/// The other half is the collation. The recipient arms ask
+/// `lower(m.from_email) IN (my addresses)`, and a function around the column
+/// makes the predicate unsargable however good the index is — 1,785 of the
+/// owner's 67,279 rows do not store the address lowercased, so the `lower()`
+/// cannot simply be dropped. Declaring the leading column `NOCASE` and asking
+/// the question as `m.from_email COLLATE NOCASE IN (…)` is the same set of rows
+/// by an index seek instead of a scan. (SQLite's `NOCASE` folds ASCII only,
+/// which is exactly what its `lower()` does, so the two agree by construction.)
+///
+/// Measured against the owner's store, 67,279 messages in 1.21 GB, warm:
+///
+/// | arm | before | after |
+/// |---|---|---|
+/// | senders (one scan) | 211 ms | 33 ms |
+/// | recipients (three scans) | 52 ms each | 2.4 ms each |
+/// | `address_book` end to end | 523 ms | 121 ms |
+///
+/// 4.1 MB of index, against 2.7 MB for the one it replaces. Nothing waits on
+/// this read — the frontend fires it once after the first render — so this is
+/// not a fix for a stall anybody saw. It is a fix for a launch that pulled
+/// 0.89 GB of message bodies through the page cache to build a list of 3,634
+/// addresses, while the sync it was racing wanted the same disk.
+const M21_SENDER_INDEX_COVERS_NAME: &str = r#"
+DROP INDEX IF EXISTS idx_messages_sender;
+
+CREATE INDEX idx_messages_sender
+    ON messages (from_email COLLATE NOCASE, internal_date, from_name);
 "#;
 
 /// Migration 19 — what each generation cost, so the cap has something to count.
@@ -350,6 +393,10 @@ DELETE FROM threads
 /// Nothing waited on the old version, so this is not a fix for a stall anybody
 /// saw. It is a fix for a boot that spent two seconds of disk against the sync
 /// it was racing.
+///
+/// Superseded by [`M21_SENDER_INDEX_COVERS_NAME`], which replaces this index:
+/// the query later learned to keep a name beside each address, and `from_name`
+/// is not in this key, so it stopped covering.
 const M14_SENDER_INDEX: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_messages_sender
     ON messages (from_email, internal_date);

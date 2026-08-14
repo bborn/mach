@@ -1,6 +1,6 @@
 import { Check, Paperclip, Star } from "lucide-react";
 import { memo, type MouseEvent } from "react";
-import type { Account, Thread } from "@/types";
+import type { Account, Thread, ThreadId } from "@/types";
 import { ACCOUNT_BG } from "@/lib/colors";
 import { listTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -30,8 +30,22 @@ interface ThreadRowProps {
    * the same on every row and the mark would be furniture.
    */
   draft?: boolean;
-  onSelect: (event: MouseEvent) => void;
-  onToggle: () => void;
+  /**
+   * The row was clicked, with whichever modifiers were down.
+   *
+   * It carries its own id and reads the modifiers off the event itself, so that
+   * the list can hand *every* row the same function. The obvious spelling —
+   * `onSelect={(e) => actions.clickThread(thread.id, …)}` written in the list —
+   * builds a new closure per row per render, and a new closure fails the shallow
+   * prop compare, so the `memo` around this component never once held. Moving
+   * the cursor one row re-rendered every row on screen.
+   */
+  onSelect: (id: ThreadId, modifiers: { extend: boolean; toggle: boolean }) => void;
+}
+
+/** What a click means, given what was held down. */
+function modifiersOf(event: MouseEvent): { extend: boolean; toggle: boolean } {
+  return { extend: event.shiftKey, toggle: event.metaKey || event.ctrlKey };
 }
 
 /** The label Gmail files an unsent message under. Not a local invention. */
@@ -85,6 +99,17 @@ export const GMAIL_DRAFT = "DRAFT";
  * they are: an unsent reply read exactly like a received one. So the line is
  * prefixed with **Draft**, in words rather than in colour, which is the same
  * mark the message carries inside the thread.
+ *
+ * # Why the `memo` is worth keeping honest
+ *
+ * A mailbox is up to three hundred of these, and `j`/`k` changes the `cursor`
+ * prop on exactly two of them. Everything else the row is given is already
+ * identity-stable across a cursor move — `thread` survives `reconcile`,
+ * `account` and `unread` come from `useCallback`s — so the `memo` should mean
+ * two renders per keystroke and does.
+ *
+ * It did not, for as long as the list built the click handler inline per row.
+ * That is what `onSelect` taking an id is for; see the prop.
  */
 export const ThreadRow = memo(function ThreadRow({
   thread,
@@ -96,7 +121,6 @@ export const ThreadRow = memo(function ThreadRow({
   context,
   draft = thread.labelIds.includes(GMAIL_DRAFT),
   onSelect,
-  onToggle,
 }: ThreadRowProps) {
   const sender = thread.participants[0]?.name ?? thread.participants[0]?.email ?? "—";
 
@@ -106,7 +130,7 @@ export const ThreadRow = memo(function ThreadRow({
       aria-selected={checked || cursor}
       data-thread-id={thread.id}
       data-checked={checked || undefined}
-      onClick={onSelect}
+      onClick={(event) => onSelect(thread.id, modifiersOf(event))}
       className={cn(
         "group relative flex h-row cursor-default items-center gap-2 px-3",
         "border-b border-border/60 text-list",
@@ -137,7 +161,7 @@ export const ThreadRow = memo(function ThreadRow({
           onClick={(event) => {
             // The row underneath opens the conversation; the tick must not.
             event.stopPropagation();
-            onToggle();
+            onSelect(thread.id, { extend: false, toggle: true });
           }}
           className={cn(
             "flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-[3px] border",

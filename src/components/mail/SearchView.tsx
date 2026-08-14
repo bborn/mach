@@ -27,7 +27,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { Label, Thread, ThreadCursor } from "@/types";
+import type { Label, Thread, ThreadCursor, ThreadId } from "@/types";
 import { getDataSource } from "@/lib/data";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
@@ -230,6 +230,19 @@ export function SearchView({ children }: { children: ReactNode }) {
     },
     [index, openAt, results.length],
   );
+
+  // Stable for the life of the view, so `ThreadRow`'s `memo` holds and moving
+  // the cursor through the results re-renders two rows rather than all of them.
+  // `openAt` is rebuilt whenever `results` changes, which is why it is read
+  // through a ref rather than closed over.
+  const latestOpen = useRef(openAt);
+  latestOpen.current = openAt;
+  const latestResults = useRef(results);
+  latestResults.current = results;
+  const openHit = useCallback((id: ThreadId) => {
+    const at = latestResults.current.findIndex((t) => t.id === id);
+    if (at >= 0) latestOpen.current(at);
+  }, []);
 
   /* ---------------------------------------------------------- keyboard --- */
 
@@ -448,8 +461,7 @@ export function SearchView({ children }: { children: ReactNode }) {
                 // the next sync pass.
                 selecting={false}
                 context={mailboxFor(thread, labels)}
-                onSelect={() => openAt(results.indexOf(thread))}
-                onToggle={() => {}}
+                onSelect={openHit}
               />
             ))}
             {cursor && (
