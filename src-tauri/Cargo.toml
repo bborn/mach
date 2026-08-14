@@ -89,3 +89,21 @@ mac-notification-sys = "0.6.13"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSEvent"] }
 block2 = "0.6.2"
+
+# Every touch of one file rebuilds and relinks this crate, and that wait is the
+# whole cost of a change he can see. Measured at 27s before this block.
+#
+# The debug info is where it goes. Dependencies are compiled once and never
+# stepped through — carrying full DWARF for them costs link time on every
+# build and buys nothing — so they keep their optimisation and lose their
+# symbols. Our own code keeps line tables, which is what a backtrace needs;
+# full debug info is for a debugger nobody here is attached to.
+#
+# What is deliberately not here: a faster linker. The obvious candidates need
+# a pinned nightly on macOS, and a toolchain pin to save a few seconds is a
+# bad trade for a project one person builds.
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
