@@ -44,8 +44,36 @@
  * makes the behaviour testable without a window.
  */
 
-import type { ThreadId } from "@/types";
+import type { AccountId, LabelId, ThreadId } from "@/types";
 import type { Command, CommandResult } from "./data";
+import type { Selection } from "./selection";
+
+/**
+ * Where the list stood when an action was taken.
+ *
+ * Archiving moves the cursor onward, which is right — the conversation is gone
+ * and you want to keep going. Undo puts the conversation back, and until this
+ * existed it left the cursor standing next to it: "when I'm on a message
+ * (selected) and I archive, then undo, i'd expect the same message selected".
+ *
+ * It is remembered rather than derived, because a group cannot be derived from.
+ * Fifty archived conversations restore fifty rows, and the cursor belongs where
+ * the hand actually was — not on whichever member sorts first.
+ *
+ * The mailbox is part of it for the same reason a row id is not enough to name
+ * a row: a cursor only means anything in the list it was in. Restoring one into
+ * a mailbox the user has since navigated away from would move them somewhere
+ * they did not ask to go, so {@link UndoHost.returnTo} declines instead.
+ */
+export interface UndoPlace {
+  /** The cursor row — the conversation under the hand. */
+  threadId: ThreadId | null;
+  /** The ticked rows, whole, so the anchor a ⇧J would grow from comes back too. */
+  selection: Selection;
+  /** The mailbox the list was showing, and the account filter on it. */
+  labelId: LabelId;
+  accountId: AccountId | null;
+}
 
 /**
  * One reversible thing that happened.
@@ -71,6 +99,24 @@ export interface UndoEntry {
    * {@link runUndo} writes back here. Nothing guesses.
    */
   original?: Command | Command[];
+  /**
+   * Where the list stood when the action was taken — what ⌘Z returns to.
+   *
+   * Absent for everything that is not a conversation in a list. A calendar
+   * write and a plugin group both record themselves through
+   * {@link recordUndo} without one, and an entry that never had a place never
+   * acquires one: undoing an RSVP must not move the mail cursor.
+   */
+  place?: UndoPlace;
+  /**
+   * Where it stood *after* the action — what ⇧⌘Z returns to.
+   *
+   * Learned the first time the entry is undone, exactly as {@link
+   * UndoEntry.original} is: at that moment the cursor is still wherever the
+   * original action left it, and nothing recorded at the time could have known
+   * that. Only ever filled in for an entry that has a `place`.
+   */
+  after?: UndoPlace;
   at: number;
 }
 
@@ -107,10 +153,11 @@ export function pushUndo(
   result: CommandResult,
   label: string,
   now: number,
+  place?: UndoPlace,
 ): UndoState {
   if (!result.undo) return state;
   if (result.applied.length === 0) return state;
-  return recordUndo(state, label, result.undo, now, original);
+  return recordUndo(state, label, result.undo, now, original, place);
 }
 
 /**
@@ -125,6 +172,9 @@ export function pushUndo(
  * `original` is optional and normally omitted, because guessing how to
  * re-apply an action is exactly what this stack refuses to do. It is filled in
  * for real the first time the entry is undone.
+ *
+ * `place` is omitted by everything that does not act on the thread list — see
+ * {@link UndoEntry.place}.
  */
 export function recordUndo(
   state: UndoState,
@@ -132,6 +182,7 @@ export function recordUndo(
   inverse: Command | Command[],
   now: number,
   original?: Command | Command[],
+  place?: UndoPlace,
 ): UndoState {
   if (Array.isArray(inverse) && inverse.length === 0) return state;
 
@@ -139,6 +190,7 @@ export function recordUndo(
     id: state.nextId,
     inverse,
     original,
+    place,
     label,
     at: now,
   };
@@ -379,6 +431,27 @@ export interface UndoHost {
    * thread twice lands on the same answer it would have reached one at a time.
    */
   project(commands: Command[]): void;
+  /** Where the cursor and the ticked rows are right now. */
+  place(): UndoPlace;
+  /**
+   * Put the cursor and the ticked rows back where the entry remembers them.
+   *
+   * `arriving` is every conversation the traversal is about to name, which is
+   * the answer to "will the row be there". A remembered cursor is reachable if
+   * it is in the list already or if it is one of these — an entry undone long
+   * after the fact names a row the list dropped hours ago, and the unarchive
+   * about to run is precisely what brings it back.
+   *
+   * Anything else — a different mailbox on screen, a conversation a sync has
+   * moved, a filter that no longer shows it — leaves the cursor exactly where
+   * the user left it. Pointing it at a row that is not coming would be an
+   * invisible cursor, and `j` from an invisible cursor jumps to the top of the
+   * list, which is the broken state this refuses to create.
+   *
+   * Called with `undefined` for every entry that has no place, which is most of
+   * the calendar and all of the plugin host; it does nothing then.
+   */
+  returnTo(place: UndoPlace | undefined, arriving: readonly ThreadId[]): void;
   /**
    * Say what happened, once it has.
    *
@@ -410,13 +483,19 @@ export interface UndoOutcome {
 export async function runUndo(host: UndoHost): Promise<UndoOutcome> {
   const popped = popUndo(host.read());
   if (!popped) return { entry: null, ok: false };
-  host.write(popped.state);
 
-  const entry = popped.entry;
+  // Where the archive left the cursor, read before this undo moves it. Nothing
+  // recorded at the time could have known — an archive's answer says which rows
+  // left, never where the hand went next — so ⇧⌘Z learns it here, the same way
+  // it learns how to re-apply the action at all.
+  const entry = placed(popped.entry) ? { ...popped.entry, after: host.place() } : popped.entry;
+  host.write({ ...popped.state, undone: withEntry(popped.state.undone, entry) });
+
   const steps = undoSteps(entry);
   // Everything the user can see happens here, in the tick the keystroke
-  // produced: every step's rows, and the sentence saying so. See `showSteps`.
-  showSteps(host, steps, `Undid ${uncapitalize(entry.label)}`, "redo");
+  // produced: every step's rows, the cursor, and the sentence saying so. See
+  // `showSteps`.
+  showSteps(host, steps, `Undid ${uncapitalize(entry.label)}`, "redo", entry.place);
 
   const applied = await dispatchSteps(host, steps);
   if (!applied) {
@@ -440,18 +519,22 @@ export async function runRedo(host: UndoHost): Promise<UndoOutcome> {
   const popped = popRedo(host.read());
   if (!popped) return { entry: null, ok: false };
 
-  const entry = popped.entry;
-  const steps = redoSteps(entry);
+  const steps = redoSteps(popped.entry);
   if (steps.length === 0) {
     // Nothing was learned about how to re-apply this, which means the undo
     // that produced it had no inverse of its own. Leave it where it is and say
     // so, rather than moving it and doing nothing.
-    host.say(`Cannot redo ${uncapitalize(entry.label)}`);
-    return { entry, ok: false };
+    host.say(`Cannot redo ${uncapitalize(popped.entry.label)}`);
+    return { entry: popped.entry, ok: false };
   }
 
-  host.write(popped.state);
-  showSteps(host, steps, `Redid ${uncapitalize(entry.label)}`, "undo");
+  // The mirror of the read in `runUndo`. The undo put the cursor back on the
+  // restored conversation; that is where the ⌘Z after this redo should return
+  // to, and it is only the same as what the entry already remembers if the
+  // user has not moved since.
+  const entry = placed(popped.entry) ? { ...popped.entry, place: host.place() } : popped.entry;
+  host.write({ ...popped.state, done: withEntry(popped.state.done, entry) });
+  showSteps(host, steps, `Redid ${uncapitalize(entry.label)}`, "undo", entry.after);
 
   const applied = await dispatchSteps(host, steps);
   if (!applied) {
@@ -495,6 +578,7 @@ function showSteps(
   steps: Command[],
   message: string,
   offer: "undo" | "redo",
+  place?: UndoPlace,
 ): void {
   // Drop the previous guess first, then state the new one: an archive's delta
   // must not still be sitting on the row the unarchive is about to describe.
@@ -503,7 +587,30 @@ function showSteps(
     else if (hidesThreads(command)) host.hide(command.threadIds);
   }
   host.project(steps);
+  // After the projection, because the row the cursor is being put back on is
+  // one the projection is putting back — and in the same tick, because a cursor
+  // that arrived a round trip after its row would be the 966ms lag all over
+  // again, on the one thing the eye is actually following.
+  host.returnTo(place, namedThreads(steps));
   host.say(message, offer);
+}
+
+/** Every conversation a set of steps names, in the order they are dispatched. */
+function namedThreads(steps: Command[]): ThreadId[] {
+  const ids: ThreadId[] = [];
+  for (const command of steps) {
+    if ("threadIds" in command) ids.push(...command.threadIds);
+  }
+  return ids;
+}
+
+/** Whether an entry is one the cursor is tracked for. See {@link UndoEntry.place}. */
+function placed(entry: UndoEntry): boolean {
+  return entry.place !== undefined;
+}
+
+function withEntry(list: UndoEntry[], entry: UndoEntry): UndoEntry[] {
+  return list.map((e) => (e.id === entry.id ? entry : e));
 }
 
 /**

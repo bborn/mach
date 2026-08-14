@@ -22,6 +22,7 @@ import {
   runUndo,
   undoSteps,
   type UndoHost,
+  type UndoPlace,
   type UndoState,
 } from "./undo-stack";
 
@@ -50,15 +51,32 @@ function failed(undo?: Command): CommandResult {
   };
 }
 
+/** A list standing at `threadId`, with `ticked` rows selected. */
+function at(threadId: number | null, ticked: number[] = []): UndoPlace {
+  return {
+    threadId,
+    selection: { ids: ticked, anchor: ticked[0] ?? threadId, base: ticked },
+    labelId: "INBOX",
+    accountId: null,
+  };
+}
+
 /**
  * A stand-in for the app, recording everything a traversal asks of it in the
  * order it asks — which is the half of undo that ordering bugs live in.
+ *
+ * The cursor is modelled, because where it ends up is now part of what a
+ * traversal does. The fake takes every place it is handed; the real host
+ * refuses the ones it cannot reach, which is a question about a list this file
+ * has none of — see `useMach.undo-cursor.test.tsx`.
  */
 function fakeHost(
   initial: UndoState,
   answer: (command: Command) => CommandResult | null = () => ok([1]),
+  standing: UndoPlace = at(null),
 ) {
   let state = initial;
+  let here = standing;
   const events: string[] = [];
   const ran: Command[] = [];
   const host: UndoHost = {
@@ -74,12 +92,24 @@ function fakeHost(
     restore: (ids) => void events.push(`restore:${ids.join(",")}`),
     hide: (ids) => void events.push(`hide:${ids.join(",")}`),
     project: (commands) => void events.push(`project:${commands.map((c) => c.kind).join(",")}`),
+    place: () => here,
+    returnTo: (place, arriving) => {
+      events.push(`return:${place ? place.threadId : "none"}/${arriving.join(",")}`);
+      if (place) here = place;
+    },
     say: (message) => void events.push(`say:${message}`),
   };
   return {
     host,
     events,
     ran,
+    /** Where the cursor is now — the whole point of the two methods above. */
+    get cursor() {
+      return here.threadId;
+    },
+    get ticked() {
+      return here.selection.ids;
+    },
     get state() {
       return state;
     },
@@ -337,6 +367,8 @@ describe("runUndo", () => {
       // One projection carrying every step, in the order they will be
       // dispatched — not one per step, a round trip apart.
       "project:archive,archive,archive",
+      // A plugin group carries no place, so this asks for nothing.
+      "return:none/1,2,3",
       "say:Undid filed 3 conversations",
     ]);
   });
@@ -438,6 +470,119 @@ describe("runUndo", () => {
   });
 });
 
+/**
+ * Where the cursor ends up.
+ *
+ * "when I archive a msg, then undo, my selection is wrong. e.g. the next
+ * message down is selected. that's weird. when I'm on a message (selected) and
+ * I archive, then undo, i'd expect the same message selected."
+ *
+ * Archiving moving the cursor onward is right and is not in question here. What
+ * is: an undo that put the row back and left the hand beside it.
+ */
+describe("the cursor across a traversal", () => {
+  /** Archived while standing on 2, which took the cursor down to 3. */
+  const archivedFromTwo = () =>
+    pushUndo(
+      emptyUndo(),
+      archive([2]),
+      ok([2], unarchive([2])),
+      "Archived 1 conversation",
+      NOW,
+      at(2),
+    );
+
+  it("puts the cursor back on the conversation that came back", async () => {
+    const app = fakeHost(archivedFromTwo(), () => ok([2], archive([2])), at(3));
+    await runUndo(app.host);
+    expect(app.cursor).toBe(2);
+  });
+
+  it("returns a group's cursor to where the hand was, not to a member", async () => {
+    /*
+     * The reason the place is remembered rather than derived. Fifty archived
+     * conversations restore fifty rows; picking one of them would be picking
+     * whichever sorts first, which is not where anybody was standing.
+     */
+    const s = pushUndo(
+      emptyUndo(),
+      archive([4, 5, 6]),
+      ok([4, 5, 6], unarchive([4, 5, 6])),
+      "Archived 3 conversations",
+      NOW,
+      at(9, [4, 5, 6]),
+    );
+    const app = fakeHost(s, () => ok([4, 5, 6], archive([4, 5, 6])), at(10));
+    await runUndo(app.host);
+
+    expect(app.cursor).toBe(9);
+    // And the ticks come back with it, so retrying is one keystroke.
+    expect(app.ticked).toEqual([4, 5, 6]);
+  });
+
+  it("moves the cursor in the same tick as the rows, before any dispatch", async () => {
+    const app = fakeHost(archivedFromTwo(), () => ok([2], archive([2])), at(3));
+    await runUndo(app.host);
+
+    const dispatched = app.events.findIndex((e) => e.startsWith("run:"));
+    // After the projection — the row is being put back — and before the first
+    // command goes anywhere near the network.
+    expect(app.events.slice(0, dispatched)).toEqual([
+      "restore:2",
+      "project:unarchive",
+      "return:2/2",
+      "say:Undid archived 1 conversation",
+    ]);
+  });
+
+  it("redo puts the cursor back where the archive left it", async () => {
+    const app = fakeHost(archivedFromTwo(), () => ok([2], archive([2])), at(3));
+    await runUndo(app.host);
+    expect(app.cursor).toBe(2);
+
+    await runRedo(app.host);
+    // Not on the row it just archived again: where the archive itself had
+    // moved the cursor to, which is the row after it.
+    expect(app.cursor).toBe(3);
+  });
+
+  it("undo after a redo returns to where the cursor was before the redo", async () => {
+    const app = fakeHost(archivedFromTwo(), () => ok([2], archive([2])), at(3));
+    await runUndo(app.host);
+    await runRedo(app.host);
+    await runUndo(app.host);
+    expect(app.cursor).toBe(2);
+  });
+
+  it("leaves the cursor alone for an entry that never had a place", async () => {
+    // The calendar's own write path and the plugin host both record themselves
+    // without one. A ⌘Z over an RSVP has no business moving the mail cursor.
+    const s = recordUndo(emptyUndo(), "Sent an RSVP", { kind: "rsvp", eventId: 3, response: "accepted" }, NOW);
+    const app = fakeHost(s, () => ok([3]), at(7));
+    await runUndo(app.host);
+
+    expect(app.cursor).toBe(7);
+    expect(app.events).toContain("return:none/");
+    expect(peekRedo(app.state)?.after).toBeUndefined();
+  });
+
+  it("hands the traversal's own ids over, so a long-gone row is still reachable", async () => {
+    // Undone an hour later: the list dropped the conversation long ago and the
+    // unarchive about to run is the whole reason it is coming back.
+    const app = fakeHost(archivedFromTwo(), () => ok([2], archive([2])), at(3));
+    await runUndo(app.host);
+    expect(app.events).toContain("return:2/2");
+  });
+
+  it("keeps the place when the undo is refused", async () => {
+    // The invariant: a refused traversal puts the entry back whole, cursor
+    // included, so the ⌘Z offered again means the same thing.
+    const app = fakeHost(archivedFromTwo(), () => failed(), at(3));
+    await runUndo(app.host);
+    expect(peekUndo(app.state)?.place).toEqual(at(2));
+  });
+});
+
 describe("runRedo", () => {
   async function undone() {
     const s = pushUndo(emptyUndo(), archive([1]), ok([1], unarchive([1])), "Archived 1 conversation", NOW);
@@ -454,9 +599,10 @@ describe("runRedo", () => {
     expect(app.ran).toEqual([archive([1])]);
     // Said before the dispatch, exactly as ⌘Z says it: they share the path, so
     // one of them being instant and the other not would be two keys.
-    expect(app.events.slice(0, 3)).toEqual([
+    expect(app.events.slice(0, 4)).toEqual([
       "hide:1",
       "project:archive",
+      "return:none/1",
       "say:Redid archived 1 conversation",
     ]);
     // And ⌘Z can take it back again, with the inverse the redo just returned.

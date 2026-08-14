@@ -66,6 +66,7 @@ import {
   runUndo,
   type UndoHost,
   type UndoOutcome,
+  type UndoPlace,
   type UndoState,
 } from "@/lib/undo-stack";
 import {
@@ -889,6 +890,27 @@ export function MachProvider({ children }: { children: ReactNode }) {
   // recording an action twice.
   const [ui, dispatchUi] = useReducer(uiReducer, initialUi);
   /*
+   * The live state, for the handful of callbacks that must read it without
+   * being rebuilt when it changes.
+   *
+   * `run` and the undo host are both memoised on nothing that moves, which is
+   * what keeps every action in the app from being rebuilt sixty rows at a time
+   * — and both of them have to know where the cursor is. A ref is the only way
+   * to have both.
+   */
+  const uiRef = useRef(ui);
+  uiRef.current = ui;
+  /** Where the list stands: the cursor, the ticked rows, and the mailbox both are in. */
+  const livePlace = useCallback(
+    (): UndoPlace => ({
+      threadId: uiRef.current.threadId,
+      selection: uiRef.current.selection,
+      labelId: uiRef.current.labelId,
+      accountId: uiRef.current.accountId,
+    }),
+    [],
+  );
+  /*
    * The open-dialog count, read off the registry the dialogs claim.
    *
    * Subscribed rather than polled because a gate written as `when: () => …` is
@@ -1603,6 +1625,19 @@ export function MachProvider({ children }: { children: ReactNode }) {
         undoLabel?: string;
         projected?: boolean;
         /**
+         * Where the list stood when the user did this, for ⌘Z to return to.
+         *
+         * Defaults to where it stands now, which is right for every caller that
+         * dispatches nothing before it gets here. `bulk` is the exception and
+         * has to say: it moves the cursor onward *before* calling this — that
+         * is the behaviour being preserved — and a React dispatch is not
+         * visible to `uiRef` until the render it causes, so reading it here
+         * would be reading the pre-move state by accident rather than on
+         * purpose. Saying so outright is what keeps that from being one
+         * refactor away from silently recording the wrong row.
+         */
+        place?: UndoPlace;
+        /**
          * Told about a command that did not entirely succeed.
          *
          * The status line says so already, and for most of the app that is
@@ -1615,6 +1650,16 @@ export function MachProvider({ children }: { children: ReactNode }) {
         onRefused?: (failure: { message: string; command: Command }) => void;
       } = {},
     ): Promise<CommandResult | null> => {
+      /*
+       * Where the list stood, read now rather than when the entry is recorded:
+       * that happens after the round trip, by which time the cursor has moved
+       * on and the selection has been cleared.
+       *
+       * Only for a command that names conversations. A calendar write has no
+       * business remembering the mail cursor, and an entry that carried one
+       * would move the list under a ⌘Z that was about an event.
+       */
+      const place = "threadIds" in command ? (options.place ?? livePlace()) : undefined;
       /*
        * Synchronous, and before the first `await`: everything down to here runs
        * in the same tick as the gesture that called it. Both halves of the
@@ -1759,7 +1804,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
         // A partial failure still records: the inverse the command layer
         // returned covers only the ids that actually applied.
         if (!options.quiet) {
-          commitUndo(pushUndo(undoRef.current, command, result, undoLabel, Date.now()));
+          commitUndo(pushUndo(undoRef.current, command, result, undoLabel, Date.now(), place));
         }
         return result;
       } catch (caught) {
@@ -1779,7 +1824,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
         recorded?.();
       }
     },
-    [commitUndo],
+    [commitUndo, livePlace],
   );
 
   /**
@@ -1855,12 +1900,67 @@ export function MachProvider({ children }: { children: ReactNode }) {
        */
       restore: (threadIds) => dispatchUi({ type: "forget", threadIds }),
       hide: (threadIds) => dispatchUi({ type: "forget", threadIds }),
+      place: livePlace,
+      returnTo: (place, arriving) => {
+        if (!place) return;
+        /*
+         * A cursor only means anything in the list it was in.
+         *
+         * Changed mailbox, changed account filter, and the row it names is not
+         * on the screen the user is looking at — so the undo restores the
+         * conversation where it belongs and leaves the cursor alone. Yanking
+         * someone from Starred back to the Inbox because they pressed ⌘Z would
+         * be a worse bug than the one this fixes.
+         */
+        if (place.labelId !== uiRef.current.labelId) return;
+        if (place.accountId !== uiRef.current.accountId) return;
+        /*
+         * What can be on screen: the loaded list, the rows it remembers having
+         * shown, and the rows this traversal is about to name. The third is the
+         * one that matters for a ⌘Z pressed long after the fact — by then the
+         * list has dropped the archived conversation and `remembered` may have
+         * evicted it, and the unarchive being dispatched is the whole reason it
+         * is coming back.
+         */
+        const reachable = new Set<ThreadId>(arriving);
+        for (const thread of threadsRef.current) reachable.add(thread.id);
+        for (const id of uiRef.current.remembered.keys()) reachable.add(id);
+
+        // The two halves are answered separately, because a cursor that cannot
+        // come back is no reason to leave the ticks off the rows that can.
+        // `keepAnchor`, because the selection restored below carries its own
+        // anchor — the one the action was taken with — and re-pointing it at
+        // the cursor would lose the range a following ⇧J grows from.
+        if (
+          place.threadId !== null &&
+          place.threadId !== uiRef.current.threadId &&
+          reachable.has(place.threadId)
+        ) {
+          dispatchUi({ type: "thread", threadId: place.threadId, keepAnchor: true });
+        }
+        /*
+         * The ticks come back too.
+         *
+         * Tick five, archive, ⌘Z: the five conversations return, and returning
+         * them unticked would mean re-ticking all five to try again. It is the
+         * same answer `reselectFailed` already gives when Google refuses part
+         * of a bulk archive — the survivors come back selected — and undo is
+         * making the larger claim, that things are as they were.
+         *
+         * Pruned against what is actually there, so a member the list has since
+         * lost does not sit in the count as a row nobody can see.
+         */
+        const selection = prune(place.selection, [...reachable]);
+        if (selection.ids.length > 0 || uiRef.current.selection.ids.length > 0) {
+          dispatchUi({ type: "selection", selection });
+        }
+      },
       // A traversal's own message carries no inverse — the entry it moved is
       // the record of it — so it says which button to hold out next instead.
       say: (message, offer) =>
         dispatchUi({ type: "status", status: { message, tone: "info", offer } }),
     }),
-    [commitUndo, projectCommands, run],
+    [commitUndo, livePlace, projectCommands, run],
   );
 
   /**
@@ -1953,6 +2053,16 @@ export function MachProvider({ children }: { children: ReactNode }) {
     const bulk = (command: MailCommand, label?: string, undoLabel?: string) => {
       const ids = command.threadIds;
       if (ids.length === 0) return;
+      // Read before the two dispatches below move it. This is what ⌘Z returns
+      // to, and it is the only moment it can be read: by the time the command
+      // answers and the entry is recorded, the cursor has moved on and the
+      // selection has been cleared.
+      const place: UndoPlace = {
+        threadId: ui.threadId,
+        selection: ui.selection,
+        labelId: ui.labelId,
+        accountId: ui.accountId,
+      };
       const leaving = leavingIds(command, visibleThreads, ui.labelId);
       if (leaving.length > 0) {
         const nextFocus = nextAfterRemoval(listIds, leaving, ui.threadId);
@@ -1961,7 +2071,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
       dispatch({ type: "selection", selection: clearSelection(ui.selection) });
       // Synchronous up to its first `await`, so the rows are gone in the same
       // React batch as the cursor move above rather than a frame after it.
-      void run(command, { reselectFailed: true, label, undoLabel });
+      void run(command, { reselectFailed: true, label, undoLabel, place });
     };
 
     const pin = (favorite: Favorite) => {
