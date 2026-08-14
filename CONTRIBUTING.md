@@ -80,11 +80,67 @@ tools, [Bun](https://bun.sh), and your own Google OAuth client in `.env.local`.
 
 ### Signing your local builds
 
-`scripts/sign` gives every dev build the same identity so the login Keychain
-stops asking for your password on every rebuild. It's a self-signed certificate
-that lives on your machine, it has nothing to do with distribution, and Mach
-builds and runs fine without it — you just get the prompts. `scripts/sign
---setup` prints what to run.
+Refresh tokens live in the login Keychain, and macOS decides whether to ask for
+your password by looking at the code signature of whatever is reading them.
+`cargo build` produces an ad-hoc signature that changes with every build, so
+every rebuild looks like a different program and you get a password prompt per
+account per launch. `scripts/sign` is what fixes that. Mach builds and runs
+without it; you just get the prompts.
+
+There are two identities it can use, and they are not equally good.
+
+**A Developer ID Application certificate** is the one that actually stops the
+prompts. Every Keychain item carries a *partition list* naming the signing
+identities allowed to use it, and the only entry macOS can write for a
+certificate with no Apple Team ID is a hash of the binary — which your next
+build invalidates. A Developer ID carries a real Team ID, so the entry is
+`teamid:<TEAM>`, and that survives rebuilding.
+
+You need an Apple Developer account. In Xcode: Settings → Accounts → your Apple
+ID → Manage Certificates → **+** → **Developer ID Application**. Or create and
+download one at
+<https://developer.apple.com/account/resources/certificates> and double-click
+it to import. Creating a Developer ID certificate may need the Account Holder
+role on the team.
+
+Check that it landed:
+
+```sh
+security find-identity -v -p codesigning
+```
+
+You want a line like `Developer ID Application: Your Name (AB12CD34EF)`. **The
+Team ID in parentheses is the part that matters** — a certificate without one is
+not the certificate you need. `scripts/sign` finds it by shape, so there's
+nothing to configure; run it and it tells you which identity it used and what
+team that is:
+
+```
+sign: identity "Developer ID Application: Your Name (AB12CD34EF)" — team AB12CD34EF
+sign: mach → com.mach.mail (teamid:AB12CD34EF)
+```
+
+The first launch after that still prompts **once per account**, because your
+existing Keychain items were last approved against a binary hash and macOS has
+to write the new `teamid:` entry into their partition lists. Click **Always
+Allow**, not Allow, on each. One prompt per account, and then it stops,
+including across rebuilds.
+
+**The self-signed fallback** (`Mach Dev Signing`) is what you get if no
+Developer ID is installed. It gives every build the same identity, which is
+worth having on its own, and the Keychain keeps asking because a self-signed
+certificate has no team. `scripts/sign` says so plainly when it falls back, and
+`scripts/sign --setup` prints the setup for both routes.
+
+`MACH_SIGN_IDENTITY` overrides the choice if you want a specific one.
+
+Signing enables the hardened runtime (`--options runtime`). No entitlements are
+needed: Mach isn't sandboxed, so the login Keychain needs no entitlement to
+reach, and Mach loads no plugin dylibs — plugins and agents are separate
+processes — so library validation has nothing to reject. One consequence, and
+it applies to the self-signed route too: a hardened binary can't be attached to
+by a debugger. If you want `lldb`, sign with an entitlements file containing
+`com.apple.security.get-task-allow`, and never ship that build.
 
 ### Running a build you made
 

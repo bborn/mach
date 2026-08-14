@@ -71,7 +71,13 @@ pub const ENV_CLIENT_SECRET: &str = "MACH_GOOGLE_CLIENT_SECRET";
 /// Deliberately carries no token material in any variant. [`Self::TokenEndpoint`]
 /// carries Google's *error* response body, which by definition is not a success
 /// response and therefore contains no credentials.
-#[derive(Debug, thiserror::Error)]
+///
+/// `Clone` is here for one caller: [`tokens::TokenManager`] hands the outcome of
+/// a single refresh to every caller that was waiting on it, so five concurrent
+/// requests for one account produce one POST to Google whether it succeeds or
+/// fails. Every variant is already a `String` or a `&'static str`, so cloning
+/// costs an allocation and loses nothing.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AuthError {
     #[error("missing configuration: set {0}")]
     MissingConfig(&'static str),

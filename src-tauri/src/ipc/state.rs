@@ -535,8 +535,29 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
 /// without a dialog because there is no item whose ACL macOS would need to ask
 /// about. Every address is reported as needing reauthorization, which is the
 /// honest answer — a seeded database carries mail, not credentials.
+///
+/// # Through the token manager rather than around it
+///
+/// This used to build a [`KeychainTokenStore`] of its own, read every account
+/// through it, and drop what it read on the floor. That made the launch check a
+/// Keychain read per account which bought nothing: the first Gmail request a
+/// moment later read the same item again, from the manager, and paid the same
+/// price. Going through [`crate::auth::tokens::TokenManager::has_stored_credential`]
+/// keeps the credential where the requests will look for it, so the whole launch
+/// is one read per account.
 pub fn restore_accounts_into(state: &AppState) {
-    match restore_accounts(&state.db, &KeychainTokenStore::default()) {
+    let needs = match &state.tokens {
+        Some(tokens) => restore_accounts_by(&state.db, |email| tokens.has_stored_credential(email)),
+        // No OAuth client configured, so there is no manager to ask. Nothing
+        // can be signed in either, but the read is honest and cheap.
+        None => {
+            let store = KeychainTokenStore::default();
+            restore_accounts_by(&state.db, |email| {
+                store.load_refresh_token(email).map(|t| t.is_some())
+            })
+        }
+    };
+    match needs {
         Ok(emails) => {
             for email in emails {
                 state.mark_needs_reauthorization(&email);
@@ -554,10 +575,21 @@ pub fn restore_accounts_into(state: &AppState) {
 /// user denied access, the entry is corrupt) counts the same as a missing one:
 /// the account needs attention, and the app carries on.
 pub fn restore_accounts(db: &Db, store: &impl TokenStore) -> Result<Vec<String>, IpcError> {
+    restore_accounts_by(db, |email| {
+        store.load_refresh_token(email).map(|t| t.is_some())
+    })
+}
+
+/// [`restore_accounts`] with the per-account check left to the caller, because
+/// the app asks the token manager and the tests ask a store.
+fn restore_accounts_by(
+    db: &Db,
+    mut has_credential: impl FnMut(&str) -> Result<bool, crate::auth::AuthError>,
+) -> Result<Vec<String>, IpcError> {
     let accounts = db.read(queries::list_accounts)?;
     Ok(accounts
         .into_iter()
-        .filter(|account| !matches!(store.load_refresh_token(&account.email), Ok(Some(_))))
+        .filter(|account| !matches!(has_credential(&account.email), Ok(true)))
         .map(|account| account.email)
         .collect())
 }

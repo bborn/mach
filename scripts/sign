@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 #
-# scripts/sign — give every dev build the same identity, so the Keychain stops
-# asking.
+# scripts/sign — give every dev build a code identity the Keychain will accept
+# twice running.
 #
 # ---------------------------------------------------------------------------
 # THE PROBLEM
 # ---------------------------------------------------------------------------
 #
-# Refresh tokens live in the login Keychain. macOS guards each item with an ACL
-# naming the code allowed to read it, and it identifies that code by its
-# signature. `cargo build` produces an ad-hoc, linker-signed binary whose
-# identifier is derived from its own contents:
+# Refresh tokens live in the login Keychain. `cargo build` produces an ad-hoc,
+# linker-signed binary whose identifier is derived from its own contents:
 #
 #     $ codesign -dv target/debug/mach
 #     Identifier=mach-a10f3327a97b6409     <- changes every single build
 #     Signature=adhoc
 #
-# So every rebuild is, to the Keychain, a different program. The ACL never
-# matches twice, and macOS asks for the login password again — over and over,
-# during exactly the edit-run-edit loop where you rebuild most.
+# So every rebuild is, to the Keychain, a different program, and macOS asks for
+# the login password again — over and over, during exactly the edit-run-edit
+# loop where you rebuild most.
 #
 # Worse than the nagging: until somebody answers that dialog, the read *blocks*.
 # That has already cost this project a launch hang with no window at all
@@ -27,36 +25,91 @@ set -euo pipefail
 # sync loop down with it (`auth::tokens::load_refresh_token_unblocking`).
 #
 # ---------------------------------------------------------------------------
+# THERE ARE TWO GATES, AND SIGNING ONLY EVER CLOSED ONE OF THEM
+# ---------------------------------------------------------------------------
+#
+# This script was written to close the *trusted-application* gate: an ACL naming
+# the code allowed to read an item, matched by designated requirement. Signing
+# with a fixed identifier and a stable certificate closes it, and the log says
+# so in as many words:
+#
+#     [com.apple.securityd:kcacl] client is valid, proceeding
+#
+# And then the prompt appears anyway, because there is a second gate. Every item
+# in the login keychain also carries a **partition list** — a set of identifiers
+# saying which *code signing identities* may use it, holding entries like
+# `apple:`, `apple-tool:`, `teamid:<TEAM>` or `cdhash:<HASH>`. It is checked
+# separately, and it was the one failing:
+#
+#     [com.apple.securityd:integrity] ACL partition mismatch:
+#         client cdhash:8db6f481… ACL ( "cdhash:de119002…" )
+#     [com.apple.securityd:kcacl] client is valid, proceeding
+#     [com.apple.securityd:clientid] code requirement check failed (-67050),
+#         client is not Apple-signed
+#     [com.apple.securityd:kcacl] displaying keychain prompt for …/debug/mach
+#
+# A self-signed certificate has **no Apple Team ID** — `codesign -dv` on a
+# binary signed with one reports `TeamIdentifier=not set`. With no team, the
+# only partition macOS can write for it is a `cdhash:`, and the cdhash is a hash
+# of the binary, so it changes on every `cargo build`. Clicking "Always Allow"
+# writes today's cdhash into the list; the next build invalidates it. That is
+# the loop, and no amount of care with designated requirements escapes it.
+#
+# Four other fixes were tried and none of them works: a stable designated
+# requirement (wrong gate), an "any application" ACL (wrong gate), deleting the
+# partition ACL (macOS puts it back), and passing a fabricated
+# `--team-identifier` (AMFI kills the process — a team identifier is only honoured
+# with a provisioning profile to back it).
+#
+# ---------------------------------------------------------------------------
 # THE FIX
 # ---------------------------------------------------------------------------
 #
-# Sign each build with a self-signed certificate and a *fixed* identifier. The
-# Keychain then records a designated requirement of the form
+# Sign with a real **Developer ID Application** certificate. A genuine Apple
+# Team ID means macOS records `teamid:<TEAM>` in the partition list, and a team
+# is a property of the certificate rather than of the bytes — so it survives
+# every rebuild. One "Always Allow" per item, then silence.
 #
-#     identifier "com.mach.mail" and certificate leaf = H"<the cert>"
+# So this script prefers a Developer ID Application identity whenever the
+# machine has one, and falls back to the self-signed "Mach Dev Signing" when it
+# does not. The fallback is the status quo: builds are signed consistently,
+# which is still worth having, and the prompts continue. Install the
+# certificate and they stop, with no change to anything here.
 #
-# which is a property of the certificate and the name, not of the bytes. Rebuild
-# as often as you like: the requirement still matches, and the ACL you approved
-# once keeps applying.
-#
-# You will still be asked *once* per item after the first signed build, because
-# the requirement genuinely changed that once. Click "Always Allow" and that is
-# the end of it.
+# `CONTRIBUTING.md` has the setup, under "Signing your local builds".
 #
 # ---------------------------------------------------------------------------
-# SETUP (once)
+# ON `--options runtime`
 # ---------------------------------------------------------------------------
 #
-# `scripts/sign --setup` prints the commands. The certificate lives in
-# ~/.mach-dev-signing and is imported into the login keychain; trusting it for
-# code signing needs your password, which is why that step is yours to run.
+# Signing enables the hardened runtime, so a dev build has the same shape a
+# release build would rather than being a special case that only exists in
+# development. It needs **no entitlements**, and that is not an assumption:
 #
-# Nothing here is required to build or run Mach. With no identity present this
-# script says so and exits 0, and everything works exactly as it did before —
-# with the prompts.
+#   - Mach is not sandboxed. There is no `com.apple.security.app-sandbox`
+#     anywhere in the tree, so the login keychain is reachable with no
+#     entitlement at all. Access is gated by the item's ACL and partition list,
+#     which is what the whole comment above is about.
+#   - `keychain-access-groups` is for the data-protection keychain and for
+#     sharing items between apps of one team. Mach uses neither; the `keyring`
+#     crate talks to the file-based login keychain, which is the only kind that
+#     has partition lists in the first place.
+#   - The hardened runtime's own entitlements (`com.apple.security.cs.*`) cover
+#     JIT, unsigned executable memory, dyld environment variables and library
+#     validation. Mach loads no plugin dylibs — every plugin and agent it runs is
+#     a separate process — so library validation has nothing to reject.
+#
+# One thing it does cost, and this is already true today with the self-signed
+# certificate: a hardened binary cannot be attached to by a debugger. If you
+# want `lldb` on a dev build, sign it with an entitlements file containing
+# `com.apple.security.get-task-allow` — and never ship that, because it makes
+# the process readable by anything running as you, and Apple will not notarize
+# it.
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IDENTITY="${MACH_SIGN_IDENTITY:-Mach Dev Signing}"
+
+# The self-signed identity, used when there is no Developer ID on the machine.
+FALLBACK_IDENTITY="Mach Dev Signing"
 CERT_DIR="$HOME/.mach-dev-signing"
 
 # Not `$REPO/src-tauri/target`: an agent worktree points cargo at the parent's
@@ -73,43 +126,154 @@ declare -a TARGETS=(
   "debug/plugin_probe:com.mach.mail.plugin-probe"
 )
 
-have_identity() {
-  security find-identity -v -p codesigning 2>/dev/null | grep -qF "$IDENTITY"
+# ---------------------------------------------------------------------------
+# choosing an identity
+# ---------------------------------------------------------------------------
+#
+# `security find-identity -v -p codesigning` prints one line per usable
+# identity, and the name is the only thing in quotes:
+#
+#     1) A1B2C3… "Developer ID Application: Ada Lovelace (AB12CD34EF)"
+#     2) CD151D… "Mach Dev Signing"
+#
+# Matched by shape rather than by name or team, so it works on any machine and
+# for anybody who forks this. `MACH_SIGN_IDENTITY` overrides the choice.
+
+# The quoted name from every `find-identity` line.
+identity_names() {
+  security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n 's/^[[:space:]]*[0-9][0-9]*)[[:space:]]*[0-9A-Fa-f][0-9A-Fa-f]*[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p'
 }
 
-print_setup() {
-  cat <<SETUP
-The signing identity "$IDENTITY" is not available yet.
+# A hash is a legitimate value for `--sign`, but it cannot be compared against
+# what a binary reports as its Authority, so resolve it to the name it belongs
+# to. Anything unrecognised is passed through untouched — `codesign` gets the
+# last word on whether it is usable.
+resolve_to_name() {
+  local wanted="$1" line hash name
+  while IFS= read -r line; do
+    hash="$(sed -n 's/^[[:space:]]*[0-9][0-9]*)[[:space:]]*\([0-9A-Fa-f][0-9A-Fa-f]*\).*/\1/p' <<<"$line")"
+    name="$(sed -n 's/^.*"\(.*\)"[[:space:]]*$/\1/p' <<<"$line")"
+    if [ "$wanted" = "$hash" ] || [ "$wanted" = "$name" ]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  done < <(security find-identity -v -p codesigning 2>/dev/null || true)
+  printf '%s\n' "$wanted"
+}
 
-The certificate and key are already created and imported. What remains needs
-your password, because macOS will not let a program mark a certificate as
-trusted on your behalf:
+choose_identity() {
+  if [ -n "${MACH_SIGN_IDENTITY:-}" ]; then
+    resolve_to_name "$MACH_SIGN_IDENTITY"
+    return 0
+  fi
+  local developer_id
+  developer_id="$(identity_names | grep '^Developer ID Application: ' | head -n 1 || true)"
+  if [ -n "$developer_id" ]; then
+    printf '%s\n' "$developer_id"
+    return 0
+  fi
+  printf '%s\n' "$FALLBACK_IDENTITY"
+}
 
-    security add-trusted-cert -r trustRoot -p codeSign \\
-      -k ~/Library/Keychains/login.keychain-db \\
-      $CERT_DIR/mach-dev.crt
+have_identity() {
+  identity_names | grep -qxF "$1"
+}
 
-Approve the dialog it raises, then run \`scripts/sign\` again.
+# The Team ID is the parenthesised suffix of a Developer ID name. Empty for a
+# self-signed certificate, which is the entire problem this script exists for.
+team_of() {
+  sed -n 's/^.*(\([A-Z0-9][A-Z0-9]*\))$/\1/p' <<<"$1"
+}
 
-To undo all of it:
+# ---------------------------------------------------------------------------
+# reading a signature back
+# ---------------------------------------------------------------------------
 
-    security delete-certificate -c "$IDENTITY"
-    rm -rf $CERT_DIR
-SETUP
+# The leaf Authority — the identity a binary was actually signed with.
+authority_of() {
+  codesign -dv --verbose=2 "$1" 2>&1 | sed -n 's/^Authority=//p' | head -n 1
+}
+
+# `TeamIdentifier=not set` for anything self-signed or ad-hoc.
+team_identifier_of() {
+  codesign -dv --verbose=2 "$1" 2>&1 \
+    | sed -n 's/^TeamIdentifier=//p' | head -n 1 | grep -v '^not set$' || true
 }
 
 # Is this binary already carrying the signature we would give it?
+#
+# The Authority check is what makes switching identities work. Without it, a
+# binary signed yesterday with "Mach Dev Signing" looks done, and installing a
+# Developer ID certificate would change nothing until every artifact happened to
+# be rebuilt.
 already_signed() {
-  local binary="$1" identifier="$2"
+  local binary="$1" identifier="$2" identity="$3"
   local info
   info="$(codesign -dv --verbose=2 "$binary" 2>&1)" || return 1
   grep -qF "Identifier=$identifier" <<<"$info" || return 1
   # An ad-hoc signature is never ours, whatever identifier it carries.
   grep -q "Signature=adhoc" <<<"$info" && return 1
+  [ "$(authority_of "$binary")" = "$identity" ] || return 1
   codesign --verify "$binary" >/dev/null 2>&1
 }
 
+print_setup() {
+  cat <<SETUP
+Two identities will do, and they are not equally good.
+
+1. A **Developer ID Application** certificate, from an Apple Developer account.
+   This is the one that stops the Keychain prompts, because it carries a real
+   Apple Team ID and macOS will write \`teamid:<TEAM>\` into each item's
+   partition list — which survives a rebuild, where a cdhash does not.
+
+   In Xcode: Settings → Accounts → your Apple ID → Manage Certificates → + →
+   Developer ID Application. Or download one from
+   https://developer.apple.com/account/resources/certificates and open it.
+
+   Confirm it landed:
+
+       security find-identity -v -p codesigning
+
+   You want a line reading \`Developer ID Application: <name> (TEAMID)\`. The
+   parenthesised Team ID is the part that matters; without it this is not the
+   certificate you need.
+
+2. The self-signed fallback, "$FALLBACK_IDENTITY". Every build gets the same
+   identity, which is worth having, and the Keychain still asks on every rebuild
+   because a self-signed certificate has no team. The certificate and key are
+   already created and imported; trusting it needs your password, because macOS
+   will not let a program mark a certificate as trusted on your behalf:
+
+       security add-trusted-cert -r trustRoot -p codeSign \\
+         -k ~/Library/Keychains/login.keychain-db \\
+         $CERT_DIR/mach-dev.crt
+
+   To undo all of it:
+
+       security delete-certificate -c "$FALLBACK_IDENTITY"
+       rm -rf $CERT_DIR
+
+Then run \`scripts/sign\` again. Nothing here is required to build or run Mach.
+SETUP
+}
+
 if [ "${1:-}" = "--setup" ]; then
+  # Say where this machine stands before saying what to do about it.
+  current="$(choose_identity)"
+  if have_identity "$current"; then
+    current_team="$(team_of "$current")"
+    if [ -n "$current_team" ]; then
+      echo "Signing with \"$current\" — team $current_team."
+      echo "That is the one that stops the prompts; there is nothing else to do."
+    else
+      echo "Signing with \"$current\", which has no Apple Team ID."
+      echo "That is why the Keychain still asks on every rebuild."
+    fi
+  else
+    echo "No signing identity is available, so builds are left ad-hoc."
+  fi
+  echo
   print_setup
   exit 0
 fi
@@ -126,13 +290,28 @@ if [ "${1:-}" = "--only" ]; then
   shift 3
 fi
 
-if ! have_identity; then
+IDENTITY="$(choose_identity)"
+
+if ! have_identity "$IDENTITY"; then
   # Not an error: signing is an optional comfort, not a build step.
   echo "sign: no \"$IDENTITY\" identity — skipping (run: scripts/sign --setup)" >&2
   exit 0
 fi
 
+# Say which identity, every time. The whole reason this cost days is that the
+# signing step was silent about what it had done, so "signed" and "signed with
+# something that cannot possibly work" looked identical from the outside.
+TEAM="$(team_of "$IDENTITY")"
+if [ -n "$TEAM" ]; then
+  echo "sign: identity \"$IDENTITY\" — team $TEAM"
+else
+  echo "sign: identity \"$IDENTITY\" — no Apple Team ID (self-signed)" >&2
+  echo "sign: the Keychain will keep asking on every rebuild; a Developer ID" >&2
+  echo "sign: Application certificate is what stops it. scripts/sign --setup" >&2
+fi
+
 signed=0
+failed=0
 for entry in "${TARGETS[@]}"; do
   candidate="${entry%%:*}"
   # `--only` passes an absolute path; the table above is relative to the target
@@ -144,20 +323,26 @@ for entry in "${TARGETS[@]}"; do
   identifier="${entry##*:}"
   [ -f "$binary" ] || continue
 
-  if already_signed "$binary" "$identifier"; then
+  if already_signed "$binary" "$identifier" "$IDENTITY"; then
     continue
   fi
 
-  # `--force` because there is always an ad-hoc signature to replace, and
-  # `--options runtime` so the signature is the same shape a release build
-  # would carry rather than a special case that only exists in development.
+  # `--force` because there is always a signature to replace — the ad-hoc one
+  # cargo left, or an older identity — and `--options runtime` so the signature
+  # is the same shape a release build would carry. `--timestamp=none` skips the
+  # round trip to Apple's timestamp authority, which only notarization needs.
   if codesign --force --sign "$IDENTITY" --identifier "$identifier" \
       --options runtime --timestamp=none "$binary" >/dev/null 2>&1; then
-    echo "sign: $(basename "$binary") → $identifier"
+    stamped="$(team_identifier_of "$binary")"
+    echo "sign: $(basename "$binary") → $identifier${stamped:+ (teamid:$stamped)}"
     signed=$((signed + 1))
   else
     echo "sign: could not sign $(basename "$binary")" >&2
+    failed=$((failed + 1))
   fi
 done
 
+if [ "$failed" -gt 0 ]; then
+  exit 1
+fi
 [ "$signed" -gt 0 ] || echo "sign: everything already signed"
