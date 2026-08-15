@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type Ref,
   type RefObject,
 } from "react";
 import { Image as ImageIcon, Paperclip, X } from "lucide-react";
@@ -165,9 +166,16 @@ const SUBJECT_TYPE = "text-list font-medium";
  *    keystroke and rendering the result back would eat the comma the moment you
  *    typed it. The draft carries the parsed value; the field carries what you
  *    are typing.
- *  * **The footer is a legend, not a button bar.** The two exceptions are the
- *    two acts with consequences outside this panel: attaching a file, and
- *    throwing the draft away.
+ *  * **The footer is a button bar that reads as a legend.** It was a legend
+ *    with two buttons hidden in it: `send`, `later` and `close` were `<span>`s,
+ *    `attach`, `discard` and `pop out` were buttons, and all six carried the
+ *    same class. Half the row did nothing when it was clicked and looked
+ *    exactly like the half that did — reported as "these should feel like
+ *    buttons/clickable". Every item is a button now, each one the same box:
+ *    key chip, label, a hit target with padding, hover fill, pressed state and
+ *    the app's focus ring. What makes it still read as a legend rather than a
+ *    toolbar is that the chip is on every one of them, so the row is answering
+ *    "what are the keys" first and "what can I click" second.
  *
  * # Completion
  *
@@ -262,6 +270,16 @@ export function Composer({
   );
 
   /**
+   * What Escape does, and what the footer's `close` does, which must be one
+   * thing: the schedule row is the nearer of the two surfaces, so it goes
+   * first and the panel stays.
+   */
+  const dismiss = useCallback(() => {
+    if (scheduling) setScheduling(false);
+    else onClose();
+  }, [scheduling, onClose]);
+
+  /**
    * Hand the caret up on the way out.
    *
    * Read here rather than in the dock because the editor is this component's:
@@ -275,7 +293,37 @@ export function Composer({
   /* -------------------------------------------------------- the question */
 
   const keymap = useKeymap();
-  const keepButton = useRef<HTMLButtonElement>(null);
+  /** The answer that takes the focus, which is the destructive one. */
+  const discardButton = useRef<HTMLButtonElement>(null);
+  /**
+   * Whether the question may yet be answered *yes*.
+   *
+   * Discard takes the focus, because he asked for it: the question is raised
+   * by a key, answered by a key, and a confirmation whose default answer is
+   * unreachable without moving the hands is a confirmation he has to click.
+   * That makes ⏎ destroy the draft — and ⏎ is one of the keys that can *raise*
+   * the question, by activating the footer's own `discard` while it has focus.
+   * So can ⇧⌘⌫, by repeating: hold either down and the OS sends a second event
+   * a quarter of a second later, at the button that has meanwhile taken the
+   * focus.
+   *
+   * The guard is not a delay. A delay long enough to cover the repeat interval
+   * is long enough to swallow a deliberate second press, which is the thing
+   * this row is fastest at. It is instead that a press still being held down
+   * cannot be a new decision:
+   *
+   *  * the *key* the question is about answers any press that is not the OS
+   *    repeating one already down — see `KeyEventLike.repeat`. Read from the
+   *    event rather than from here, because the keymap's own listener is on
+   *    the window ahead of this one and would see a stale flag;
+   *  * everything else — the button, under ⏎ or a click — waits for this,
+   *    which the first keyup of a real key sets, and so does any pointer press,
+   *    which is what a mouse must do to reach the button at all.
+   *
+   * Either way a second ⇧⌘⌫ still means it with no wait, and a held one never
+   * gets past the question.
+   */
+  const armed = useRef(false);
   /**
    * What had the caret when the question was asked.
    *
@@ -314,19 +362,65 @@ export function Composer({
     return keymap.claimKeyboard();
   }, [confirmingDiscard, keymap]);
 
+  /*
+   * Disarmed the moment the question goes up, and armed by the first thing the
+   * writer *releases* or presses with the pointer. In the capture phase and on
+   * the window, so it is reached whatever has focus and whatever else claims
+   * the event; a modifier coming up on its own is not a release, or letting go
+   * of ⇧ while ⌘⌫ repeats would arm it.
+   *
+   * The discard key does not consult this — see `destroy`.
+   */
+  useLayoutEffect(() => {
+    if (!confirmingDiscard) return;
+    armed.current = false;
+    const MODIFIERS = new Set(["Shift", "Meta", "Control", "Alt"]);
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (!MODIFIERS.has(event.key)) armed.current = true;
+    };
+    const onPointerDown = () => {
+      armed.current = true;
+    };
+    window.addEventListener("keyup", onKeyUp, true);
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("mousedown", onPointerDown, true);
+    return () => {
+      window.removeEventListener("keyup", onKeyUp, true);
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("mousedown", onPointerDown, true);
+    };
+  }, [confirmingDiscard]);
+
   useEffect(() => {
     if (!confirmingDiscard) return;
     const had = document.activeElement as HTMLElement | null;
     // Not the button this is about to focus: in StrictMode the effect runs
     // twice on mount, and the second pass would record its own answer.
-    if (had !== keepButton.current) {
+    if (had !== discardButton.current) {
       askedFrom.current = had;
       // Read while the caret is still in the message. A moment later it is on
       // a button and there is nothing left to read.
       askedAt.current = editor.current?.caret() ?? null;
     }
-    keepButton.current?.focus();
+    discardButton.current?.focus();
   }, [confirmingDiscard]);
+
+  /**
+   * Yes — if this is a decision rather than the press that asked. See `armed`.
+   *
+   * Both ways of saying yes come through here. `decided` is the discard key
+   * saying it already knows: a press that is not a repeat. Everything else asks
+   * whether anything has been released or pressed since the question went up.
+   * Refusing is silent, and has to be: the only presses it refuses are ones the
+   * writer never made.
+   */
+  const destroy = useCallback(
+    (decided = false) => {
+      if (!decided && !armed.current) return;
+      onDiscard();
+    },
+    [onDiscard],
+  );
 
   /**
    * Keep the draft, and give the caret back where it was.
@@ -395,7 +489,7 @@ export function Composer({
       description: "Send",
       allowInInput: true,
       priority: 100,
-      when: () => active && !confirmingDiscard,
+      when: () => active && !busy && !confirmingDiscard,
       handler: () => send(),
     },
     {
@@ -404,7 +498,7 @@ export function Composer({
       description: "Schedule send",
       allowInInput: true,
       priority: 100,
-      when: () => active && !confirmingDiscard,
+      when: () => active && !busy && !confirmingDiscard,
       handler: () => setScheduling((open) => !open),
     },
     {
@@ -423,7 +517,10 @@ export function Composer({
       allowInInput: true,
       priority: 100,
       when: () => active && !busy,
-      handler: () => onDiscard(),
+      // The second press that means it, and only if it is a second press:
+      // holding the key down must not answer its own question. See `armed`.
+      handler: (event) =>
+        confirmingDiscard ? destroy(event.repeat !== true) : onDiscard(),
     },
     {
       keys: COMPOSER_KEYS.popOut,
@@ -465,10 +562,7 @@ export function Composer({
       // — declining here is what lets one Escape dismiss the list and the next
       // one close the composer. See `lib/popups.ts`.
       when: () => active && !anyPopupOpen(),
-      handler: () => {
-        if (scheduling) setScheduling(false);
-        else onClose();
-      },
+      handler: () => dismiss(),
     },
   ]);
 
@@ -677,7 +771,7 @@ export function Composer({
         )}
 
         {/*
-          The legend, and the only way to attach, discard or send with a mouse.
+          The footer: every act this panel offers, and the key for each one.
           It keeps its size while the message gives up as much as the panel
           asks for — see COMPOSER_FIXED_ROW. Named in the DOM because "is the
           footer still inside the panel" is a question worth being able to ask.
@@ -687,27 +781,36 @@ export function Composer({
           height — so answering it costs no layout and the writer's eye does
           not have to go anywhere. See `confirmingDiscard`.
 
-          The tint is the half a swap of words cannot do. Both states are a
+          The band is the half a swap of words cannot do. Both states are a
           line of micro type along the same edge, and read at a glance — which
           is the only way this row is ever read — one line of small grey text
-          looks like the other. The band changes colour under the whole row, so
-          the eye that was on `discard` when it was clicked has an answer at the
-          point it was looking. It carries no padding of its own: the row may
+          looks like the other. The surface changes under the whole row, so the
+          eye that was on `discard` when it was clicked has an answer at the
+          point it was looking.
+
+          It changed colour rather than surface until he saw it: a red strip,
+          which is the alarm a mail client raises for a message that failed to
+          send, spent on a question he asked for. The band is a step of the
+          gray ramp now and the only red in it is on the button that does the
+          destroying. It carries no vertical padding either way: the row may
           not change height, or the message above it moves while being written.
+
+          `-mx-2` pays back the padding the buttons carry, so the first key
+          chip sits on the same left edge as the fields above it.
         */}
         <div
           data-mach-composer-footer=""
           className={cn(
             COMPOSER_FIXED_ROW,
-            "mt-2 flex items-center gap-3 text-micro",
+            "-mx-2 mt-2 flex items-center gap-1 text-micro",
             confirmingDiscard
-              ? "-mx-5 bg-danger/10 px-5 text-muted-foreground"
+              ? "rounded-[var(--radius)] bg-surface-raised text-muted-foreground ring-1 ring-inset ring-border"
               : "text-faint-foreground",
           )}
         >
           {confirmingDiscard ? (
             <>
-              <span className="min-w-0 flex-1 truncate text-foreground">
+              <span className="min-w-0 flex-1 truncate px-2 text-foreground">
                 Discard this draft?
               </span>
               {/*
@@ -716,60 +819,67 @@ export function Composer({
                 a pointer that is already moving is a draft lost to a double
                 click. The answers sit at the far end of the same row, which is
                 also where the bar this replaced put them.
+
+                It has the focus, which the safe answer used to have — his
+                call, and the right one for a question raised and answered by
+                key. What makes that safe is `armed`, not distance: ⏎ can only
+                reach this once the press that raised the question has been let
+                go of. Escape still keeps the draft, from anywhere.
               */}
-              <button
-                type="button"
-                onClick={onDiscard}
-                className="inline-flex shrink-0 items-center gap-1 text-danger hover:brightness-110"
-              >
-                <Kbd keys={COMPOSER_KEYS.discard} /> Discard
-              </button>
-              <button
-                ref={keepButton}
-                type="button"
+              <FooterAction
+                ref={discardButton}
+                keys={COMPOSER_KEYS.discard}
+                label="Discard"
+                tone="destroy"
+                // With nothing: `destroy(decided)` handed anything truthy is
+                // told the press was a decision. See `armed`.
+                onClick={() => destroy()}
+              />
+              <FooterAction
+                keys={COMPOSER_KEYS.close}
+                label="Keep"
+                tone="answer"
                 onClick={keep}
-                className="inline-flex shrink-0 items-center gap-1 hover:text-foreground"
-              >
-                <Kbd keys={COMPOSER_KEYS.close} /> Keep
-              </button>
+              />
             </>
           ) : (
             <>
-              <span className="inline-flex items-center gap-1">
-                <Kbd keys={COMPOSER_KEYS.send} /> send
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <Kbd keys={COMPOSER_KEYS.schedule} /> later
-              </span>
+              <FooterAction
+                keys={COMPOSER_KEYS.send}
+                label="send"
+                tone="primary"
+                disabled={busy}
+                onClick={() => send()}
+              />
+              <FooterAction
+                keys={COMPOSER_KEYS.schedule}
+                label="later"
+                disabled={busy}
+                expanded={scheduling}
+                onClick={() => setScheduling((open) => !open)}
+              />
               {/* Not `onClick={onAttach}`: that hands the click event to `inline`. */}
-              <button
-                type="button"
+              <FooterAction
+                keys={COMPOSER_KEYS.attach}
+                label="attach"
                 disabled={busy}
                 onClick={() => onAttach()}
-                className="inline-flex items-center gap-1 hover:text-foreground"
-              >
-                <Paperclip className="size-3" /> attach
-              </button>
-              <button
-                type="button"
+              />
+              <FooterAction
+                keys={COMPOSER_KEYS.discard}
+                label="discard"
+                tone="danger"
                 disabled={busy}
                 onClick={onDiscard}
-                className="inline-flex items-center gap-1 hover:text-danger"
-              >
-                discard
-              </button>
+              />
               {onPopOut && (
-                <button
-                  type="button"
+                <FooterAction
+                  keys={COMPOSER_KEYS.popOut}
+                  label={poppedOut ? "put back" : "pop out"}
                   onClick={popOut}
-                  className="inline-flex items-center gap-1 hover:text-foreground"
-                >
-                  <Kbd keys={COMPOSER_KEYS.popOut} /> {poppedOut ? "put back" : "pop out"}
-                </button>
+                />
               )}
-              <span className="inline-flex items-center gap-1">
-                <Kbd keys={COMPOSER_KEYS.close} /> close
-              </span>
+              <FooterAction keys={COMPOSER_KEYS.close} label="close" onClick={dismiss} />
               {/*
                 This used to read "draft saved as you type" whenever nothing was
                 happening — the software applauding itself for doing the one
@@ -787,18 +897,124 @@ export function Composer({
                 is a second question and only the first one is worth a line.
               */}
               {isLocalOnly(draft) && (
-                <span className="truncate text-danger" title={draft.remote?.error ?? undefined}>
+                <span
+                  className="truncate px-2 text-danger"
+                  title={draft.remote?.error ?? undefined}
+                >
                   Not in Gmail
                 </span>
               )}
               {/* Not a legend: it says a suggestion is waiting, which is news. */}
               <GhostHint shown={subjectGhost.suggestion !== ""} />
-              <span className="ml-auto truncate">{busy ? "Sending" : null}</span>
+              <span className="ml-auto truncate px-2">{busy ? "Sending" : null}</span>
             </>
           )}
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * How much weight one footer control carries.
+ *
+ * Four steps, and the row uses three of them at a time. `primary` is the app's
+ * one filled button, spent here on the act the panel exists for; `danger` is
+ * quiet until the pointer is on it, because a resting row of six controls with
+ * a red one in it reads as an error; `destroy` and `answer` belong to the
+ * question, where the band underneath has already moved a step up the ramp and
+ * the controls have to move with it.
+ *
+ * The chip moves too. `Kbd` sits on `surface-raised`, which is the band's own
+ * colour and the hover fill's neighbour — left alone it would dissolve into
+ * both exactly when the eye is on it.
+ */
+type FooterTone = "quiet" | "primary" | "danger" | "destroy" | "answer";
+
+const FOOTER_TONES: Record<FooterTone, { button: string; chip: string }> = {
+  quiet: {
+    button: "text-faint-foreground hover:bg-row-hover hover:text-foreground active:bg-border",
+    chip: "group-hover:border-border-strong group-hover:bg-background",
+  },
+  primary: {
+    button: "bg-accent text-accent-foreground hover:brightness-110 active:brightness-95",
+    chip: "border-accent-foreground/30 bg-accent-foreground/15 text-accent-foreground",
+  },
+  danger: {
+    button: "text-faint-foreground hover:bg-danger/10 hover:text-danger active:bg-danger/20",
+    chip: "group-hover:border-danger/40 group-hover:bg-background group-hover:text-danger",
+  },
+  destroy: {
+    button: "bg-danger/10 text-danger hover:bg-danger/20 active:bg-danger/25",
+    chip: "border-danger/30 bg-background text-danger",
+  },
+  answer: {
+    button: "text-muted-foreground hover:bg-border hover:text-foreground active:bg-border-strong",
+    chip: "border-border-strong bg-background",
+  },
+};
+
+/**
+ * One control on the footer row.
+ *
+ * The whole point is that every one of them is the same box: 24px tall, 8px of
+ * padding either side, a key chip and a word. A row where the hit target is the
+ * glyphs and nothing else is a row you have to aim at — and where half the
+ * items were not controls at all, aiming at them did nothing.
+ *
+ * `cursor-pointer` against the app's own grain: `globals.css` sets the arrow
+ * cursor on everything, which is what a Mac application does, and no button in
+ * the app asks for the hand. He asked for it here by name, and the row he asked
+ * about is the one place where the question "is this a control" was live.
+ *
+ * The focus ring is the app's, from `:focus-visible` in `globals.css` — inset,
+ * so it is drawn inside a 24px box instead of over the row above it.
+ */
+function FooterAction({
+  keys,
+  label,
+  tone = "quiet",
+  disabled,
+  expanded,
+  onClick,
+  ref,
+}: {
+  keys: string;
+  label: string;
+  tone?: FooterTone;
+  disabled?: boolean;
+  /** For a control that opens a row of its own — the schedule options. */
+  expanded?: boolean;
+  onClick: () => void;
+  ref?: Ref<HTMLButtonElement>;
+}) {
+  const { button, chip } = FOOTER_TONES[tone];
+  return (
+    <button
+      ref={ref}
+      type="button"
+      disabled={disabled}
+      aria-expanded={expanded}
+      // Called with nothing rather than handed the click: a handler that takes
+      // an optional argument — `destroy(decided)` — would read the MouseEvent
+      // as that argument and be told yes by every click. See `armed`.
+      onClick={() => onClick()}
+      className={cn(
+        "group inline-flex h-6 shrink-0 cursor-pointer select-none items-center gap-1",
+        "rounded-[var(--radius)] px-2 transition-colors",
+        // Not dimmed and still hoverable: a disabled control that lights up
+        // under the pointer is a control that looks broken rather than busy.
+        "disabled:pointer-events-none disabled:opacity-40",
+        button,
+        // The same step the press itself paints, held for as long as the row
+        // it opened is up. A hover-weight fill was invisible on a surface one
+        // step away from it.
+        expanded === true && "bg-border text-foreground",
+      )}
+    >
+      <Kbd keys={keys} className={cn("transition-colors", chip)} />
+      {label}
+    </button>
   );
 }
 

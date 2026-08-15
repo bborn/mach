@@ -89,16 +89,21 @@ function root(host: HTMLElement): HTMLElement {
 }
 
 /**
- * The legend, found by the control it exists for rather than by a marker.
+ * The footer, found by the control it exists for rather than by a marker.
  *
- * `discard` is one of the two acts in that row with consequences outside the
+ * `discard` is one of the acts in that row with consequences outside the
  * panel, and it is a real button either way — so this finds the same element
  * before the fix and after it, which is what makes the failure meaningful.
+ *
+ * The key legend it now carries is decoration here: every control in the row
+ * wears its own chip, and "⇧⌘⌫ discard" is the same control as "discard".
  */
 function footer(host: HTMLElement): HTMLElement {
-  const button = [...host.querySelectorAll("button")].find(
-    (candidate) => candidate.textContent?.trim() === "discard",
-  );
+  const button = [...host.querySelectorAll("button")].find((candidate) => {
+    const copy = candidate.cloneNode(true) as Element;
+    for (const kbd of copy.querySelectorAll("kbd")) kbd.remove();
+    return copy.textContent?.trim() === "discard";
+  });
   if (!button?.parentElement) throw new Error("no discard button in the composer");
   return button.parentElement;
 }

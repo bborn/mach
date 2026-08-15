@@ -54,6 +54,15 @@ export interface KeyEventLike {
    * could never match. Optional so synthetic events in tests stay terse.
    */
   code?: string;
+  /**
+   * The OS repeating a key that is being held, rather than a new press.
+   *
+   * Nothing here treats the two differently — a held `j` should walk the list —
+   * but a binding that asks a question the same key then answers has to. See
+   * the composer's discard. Optional, so synthetic events in tests stay terse;
+   * absent reads as "a press", which is the lenient half.
+   */
+  repeat?: boolean;
   metaKey: boolean;
   ctrlKey: boolean;
   altKey: boolean;

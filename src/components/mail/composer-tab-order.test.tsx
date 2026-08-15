@@ -121,16 +121,24 @@ function stops(over: Partial<Draft> = {}, props: Partial<Parameters<typeof Compo
   return [...host.querySelectorAll(TABBABLE)].map(name);
 }
 
+/*
+ * The footer's own stops, in the order the row draws them.
+ *
+ * There used to be two of these — `attach` and `discard` — because the other
+ * four items in the row were `<span>`s carrying a key legend and nothing else.
+ * They are all buttons now (see the footer's comment in `Composer.tsx`), which
+ * is a real change to this sequence and not a rename: ⇥ from the message walks
+ * six controls before it leaves the composer, where it used to walk two.
+ *
+ * The order is the row's visual order, which is what a tab order has to be.
+ * `send` first because it is the act the panel exists for; `pop out` and
+ * `close` last because they are about the panel rather than about the message.
+ */
+const FOOTER = ["send", "later", "attach", "discard", "close"];
+
 describe("the composer's tab order", () => {
   it("goes from the last address field to the message", () => {
-    expect(stops()).toEqual([
-      "Subject",
-      "cc / bcc",
-      "To",
-      "Message",
-      "attach",
-      "discard",
-    ]);
+    expect(stops()).toEqual(["Subject", "cc / bcc", "To", "Message", ...FOOTER]);
   });
 
   // Revealing Cc takes the button that revealed it away, so this is the whole
@@ -142,8 +150,7 @@ describe("the composer's tab order", () => {
       "Cc",
       "Bcc",
       "Message",
-      "attach",
-      "discard",
+      ...FOOTER,
     ]);
   });
 
@@ -152,8 +159,7 @@ describe("the composer's tab order", () => {
       "cc / bcc",
       "To",
       "Message",
-      "attach",
-      "discard",
+      ...FOOTER,
     ]);
   });
 
@@ -174,8 +180,7 @@ describe("the composer's tab order", () => {
       "To",
       "Message",
       "Remove terms.pdf",
-      "attach",
-      "discard",
+      ...FOOTER,
     ]);
   });
 
@@ -192,8 +197,7 @@ describe("the composer's tab order", () => {
       "Message",
       "Show chart.png in the message",
       "Remove chart.png",
-      "attach",
-      "discard",
+      ...FOOTER,
     ]);
   });
 
@@ -230,20 +234,31 @@ describe("the composer's tab order", () => {
       "Message",
       "Remove logo.svg",
       "Remove terms.pdf",
-      "attach",
-      "discard",
+      ...FOOTER,
     ]);
   });
 
-  it("puts pop out last, after the message it moves", () => {
+  /*
+   * `pop out` is second to last rather than last now, and the change is worth
+   * stating: `close` follows it because the row draws it there, and the row
+   * draws it there because closing the panel is the last thing offered in a
+   * list that starts with sending it. Both are about the panel; the acts on the
+   * message come first. What must not happen is `pop out` drifting back up
+   * among them — it moves the whole composer, and a stop that unmounts what you
+   * were tabbing through belongs at the end.
+   */
+  it("puts pop out and close last, after the acts on the message", () => {
     expect(stops({}, { onPopOut: () => {} })).toEqual([
       "Subject",
       "cc / bcc",
       "To",
       "Message",
+      "send",
+      "later",
       "attach",
       "discard",
       "pop out",
+      "close",
     ]);
   });
 

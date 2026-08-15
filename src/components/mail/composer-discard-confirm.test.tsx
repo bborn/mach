@@ -198,8 +198,14 @@ function mount(over: Partial<Props> = {}) {
 /** The same composer again, with the question now up. Nothing remounts. */
 const rerender = mount;
 
-/** Press a binding at whatever has the caret, the way the window would. */
-function press(binding: string) {
+/**
+ * Press a binding at whatever has the caret, the way the window would.
+ *
+ * `held` is the OS repeating a key that has not been let go of, which is a
+ * different thing from pressing it again and the composer's discard is the one
+ * place that cares. See `armed` in `Composer`.
+ */
+function press(binding: string, { held = false } = {}) {
   const token = normalizeToken(binding, detectModKey());
   const parts = token.split("+");
   const key = parts.pop() ?? "";
@@ -208,6 +214,7 @@ function press(binding: string) {
     (document.activeElement ?? window).dispatchEvent(
       new KeyboardEvent("keydown", {
         key: named[key] ?? key,
+        repeat: held,
         metaKey: parts.includes("meta"),
         ctrlKey: parts.includes("ctrl"),
         altKey: parts.includes("alt"),
@@ -222,14 +229,113 @@ function press(binding: string) {
 const message = () =>
   container.querySelector<HTMLElement>('[role="textbox"][aria-label="Message"]')!;
 
+/** The release that turns a press into a decision. See `armed` in `Composer`. */
+function letGo() {
+  act(() => {
+    window.dispatchEvent(new KeyboardEvent("keyup", { key: "Backspace", bubbles: true }));
+  });
+}
+
 describe("answering it from the keyboard", () => {
-  it("puts the safe answer under the hands", () => {
+  /*
+   * It was the *safe* answer under the hands until he asked for this one:
+   * "why isn't discard confirm focused". A question raised by a key and
+   * answered by a key whose default answer needs the pointer is a question he
+   * has to reach for, and Keep already has a key of its own that works from
+   * anywhere — Escape.
+   *
+   * What makes the destructive default safe is not distance, it is `armed`:
+   * ⏎ lands on this button, and ⏎ is one of the keys that can raise the
+   * question. See the two tests below.
+   */
+  it("puts the answer under the hands, and it is the one he asked for", () => {
     mount();
     expect(document.activeElement).toBe(message());
 
     rerender({ confirmingDiscard: true, onKeepDraft: () => {} });
 
-    expect(document.activeElement?.textContent).toContain("Keep");
+    expect(document.activeElement?.textContent).toContain("Discard");
+  });
+
+  /*
+   * The press that asks cannot also answer.
+   *
+   * Every key that raises the question can repeat: hold ⇧⌘⌫, or hold ⏎ on the
+   * footer's own `discard` while it has focus, and the OS sends a second event
+   * a quarter of a second later — at the button that has meanwhile taken the
+   * focus, which is Discard. Nothing has been released in between, so nothing
+   * has been decided in between.
+   */
+  it("is not answered by the discard key repeating while it is held", () => {
+    const onDiscard = vi.fn();
+    mount({ onDiscard, onKeepDraft: () => {} });
+    rerender({ confirmingDiscard: true, onDiscard, onKeepDraft: () => {} });
+
+    press(COMPOSER_KEYS.discard, { held: true });
+
+    expect(onDiscard).not.toHaveBeenCalled();
+  });
+
+  /* The same press, arriving at the focused button as ⏎ rather than as ⇧⌘⌫. */
+  it("is not answered by the button under a key nothing has released", () => {
+    const onDiscard = vi.fn();
+    mount({ onDiscard, onKeepDraft: () => {} });
+    rerender({ confirmingDiscard: true, onDiscard, onKeepDraft: () => {} });
+
+    act(() => {
+      (document.activeElement as HTMLButtonElement).click();
+    });
+
+    expect(onDiscard).not.toHaveBeenCalled();
+  });
+
+  it("is answered by that button once the hands have let go of something", () => {
+    const onDiscard = vi.fn();
+    mount({ onDiscard, onKeepDraft: () => {} });
+    rerender({ confirmingDiscard: true, onDiscard, onKeepDraft: () => {} });
+
+    letGo();
+    act(() => {
+      (document.activeElement as HTMLButtonElement).click();
+    });
+
+    expect(onDiscard).toHaveBeenCalledTimes(1);
+  });
+
+  /* And a modifier coming up on its own is not letting go of anything. */
+  it("is not armed by releasing the modifier while the key repeats", () => {
+    const onDiscard = vi.fn();
+    mount({ onDiscard, onKeepDraft: () => {} });
+    rerender({ confirmingDiscard: true, onDiscard, onKeepDraft: () => {} });
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keyup", { key: "Shift", bubbles: true }));
+    });
+    act(() => {
+      (document.activeElement as HTMLButtonElement).click();
+    });
+
+    expect(onDiscard).not.toHaveBeenCalled();
+  });
+
+  /*
+   * The pointer arms it on the way in. A mouse cannot reach the button without
+   * pressing on it, and that press is the decision — so there is no delay to
+   * sit through, which is the other way this could have been guarded and the
+   * one that would have made a deliberate second press feel broken.
+   */
+  it("is armed by the pointer, so a click on it means it", () => {
+    const onDiscard = vi.fn();
+    mount({ onDiscard, onKeepDraft: () => {} });
+    rerender({ confirmingDiscard: true, onDiscard, onKeepDraft: () => {} });
+
+    const button = document.activeElement as HTMLButtonElement;
+    act(() => {
+      button.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+      button.click();
+    });
+
+    expect(onDiscard).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the draft on Escape, and gives the caret back to the message", () => {
@@ -277,6 +383,8 @@ describe("answering it from the keyboard", () => {
     mount({ onDiscard, onKeepDraft: () => {} });
     rerender({ confirmingDiscard: true, onDiscard, onKeepDraft: () => {} });
 
+    // A second press is a press, which means the first one ended. No wait, and
+    // nothing to release first — the event says it is not a repeat.
     press(COMPOSER_KEYS.discard);
 
     expect(onDiscard).toHaveBeenCalledTimes(1);

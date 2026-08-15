@@ -29,6 +29,7 @@ export function KeymapProvider({ children }: { children: ReactNode }) {
         altKey: event.altKey,
         shiftKey: event.shiftKey,
         code: event.code,
+        repeat: event.repeat,
         target: event.target as unknown as { tagName?: string; isContentEditable?: boolean },
         preventDefault: () => event.preventDefault(),
         stopPropagation: () => event.stopPropagation(),
