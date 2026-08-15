@@ -24,6 +24,13 @@
  * about nothing on screen. Popping out moves a reply to the second of those
  * without changing anything about the draft — which is why it is a view flag
  * keyed by draft id here, and not a second draft anywhere.
+ *
+ * # A dropped file
+ *
+ * Which is a question about placement too: whether a drag is over a composer is
+ * a hit test against the rectangle the two sections above decided on. The
+ * subscription that delivers the drag is here with it, because the units it
+ * arrives in are the units that hit test has to work in — see {@link DragPoint}.
  */
 
 import { COMPOSER_HEIGHT_BOUNDS } from "@/lib/prefs";
@@ -168,10 +175,25 @@ export const DROP_TARGET = "data-mach-drop-target";
 /**
  * A point, in the units Tauri reports a drag in.
  *
- * `PhysicalPosition` — device pixels, relative to the window's content area.
- * The DOM measures in CSS pixels, which on this machine are two device pixels
- * to one. Converting is [`isOverDropTarget`]'s first job and the reason a
- * drop over the composer on a Retina display was landing in the header.
+ * The payload's type says `PhysicalPosition`, and on macOS that type is a lie.
+ * wry builds the point from two AppKit values — `NSDraggingInfo`'s
+ * `draggingLocation` and the webview's own `frame` — and AppKit measures both
+ * in *points*, never in backing pixels; nothing between there and here
+ * multiplies by the scale factor. See `wry/src/wkwebview/drag_drop.rs` (the
+ * `frame.size.height - dl.y` flip) and `tauri-runtime-wry`, which wraps that
+ * pair in `PhysicalPosition::new` unconverted. On Windows the same field really
+ * is physical — `ScreenToClient` on an HWND — which is where the type name
+ * comes from and why it is wrong here.
+ *
+ * So the point arrives in the same CSS pixels `getBoundingClientRect` returns,
+ * and [`isOverDropTarget`] compares them directly. Dividing by
+ * `devicePixelRatio` is what a reading of the *type* suggests, and on this
+ * Retina machine it halved every coordinate into the top-left quadrant of the
+ * window: the docked composer sits in the bottom-right and could never be hit,
+ * so a file dropped on a reply did nothing at all.
+ *
+ * Mach ships `.app` and `.dmg` and nothing else. A Windows build would have to
+ * scale here, and would find this comment.
  */
 export interface DragPoint {
   x: number;
@@ -190,17 +212,94 @@ export interface DragPoint {
  * More than one composer can be on screen; any of them counts, because
  * dropping on the one in front is the only thing the pointer can be over.
  */
-export function isOverDropTarget(
-  point: DragPoint,
-  doc: Document = document,
-  scale: number = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
-): boolean {
-  const x = point.x / scale;
-  const y = point.y / scale;
+export function isOverDropTarget(point: DragPoint, doc: Document = document): boolean {
   for (const target of doc.querySelectorAll(`[${DROP_TARGET}]`)) {
     const box = target.getBoundingClientRect();
     if (box.width === 0 && box.height === 0) continue;
-    if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) return true;
+    if (
+      point.x >= box.left &&
+      point.x <= box.right &&
+      point.y >= box.top &&
+      point.y <= box.bottom
+    ) {
+      return true;
+    }
   }
   return false;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Hearing about the drag at all                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One thing the window told us about a file being dragged over it.
+ *
+ * A member per `type` rather than `"enter" | "over"` on one of them: a
+ * discriminant that is itself a union does not narrow away in the *negative*
+ * branch, so the drop — the only member carrying paths — could not be reached
+ * by elimination.
+ */
+export type DragDropSignal =
+  | { type: "enter"; position: DragPoint; paths: string[] }
+  | { type: "over"; position: DragPoint }
+  | { type: "drop"; position: DragPoint; paths: string[] }
+  | { type: "leave" };
+
+/** How [`subscribeDragDrop`] reaches Tauri. Injected so tests need no app. */
+export type DragDropRegistrar = (
+  handler: (signal: DragDropSignal) => void,
+) => Promise<() => void>;
+
+/**
+ * Listen for files dragged over this window, with a cleanup that is synchronous.
+ *
+ * The shape is the one `subscribeLinkFailures` already uses, and it exists for
+ * the same reason: **registering is a promise and React's cleanup is not.** An
+ * effect that pushes its `unlisten` into a variable *after* two `await`s hands
+ * back a cleanup that, when it runs first, has nothing to call — so the
+ * listener stays registered for the life of the window and only a captured flag
+ * stops it acting. The composer's effect used to re-run on every keystroke,
+ * because its dependency was a callback closed over the drafts, so that was one
+ * abandoned registration per character typed.
+ *
+ * Tauri does not lose the drop over it — every listener registered for an event
+ * is called, so the live one still heard the file. What it costs is four Rust
+ * listener entries and four JS callbacks per keystroke, all of them woken on
+ * every frame of every drag, forever.
+ *
+ * Either order is now safe: a cleanup that runs before the registration
+ * resolves sets `cancelled`, and the registration undoes itself the moment it
+ * arrives.
+ */
+export function subscribeDragDrop(
+  handler: (signal: DragDropSignal) => void,
+  register: DragDropRegistrar = tauriDragDrop,
+): () => void {
+  let unlisten: (() => void) | null = null;
+  let cancelled = false;
+
+  void register(handler)
+    .then((off) => {
+      if (cancelled) off();
+      else unlisten = off;
+    })
+    // A browser tab has no webview to listen to, and no paths either — the
+    // composer is developed against Vite most of the time. Failing to subscribe
+    // is not something to report through the subscription.
+    .catch(() => {});
+
+  return () => {
+    cancelled = true;
+    unlisten?.();
+    unlisten = null;
+  };
+}
+
+const tauriDragDrop: DragDropRegistrar = async (handler) => {
+  const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+  const off = await getCurrentWebview().onDragDropEvent((event) => {
+    handler(event.payload as DragDropSignal);
+  });
+  return () => void off();
+};

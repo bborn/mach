@@ -37,6 +37,7 @@ import {
   isOverDropTarget,
   isPoppedOut,
   popOutComposerHeight,
+  subscribeDragDrop,
   togglePopOut,
 } from "./composer-layout";
 import { replyTarget } from "./thread-cursor";
@@ -861,6 +862,20 @@ export function ComposerDock() {
   }, []);
 
   /**
+   * The drop, read at the moment it happens rather than when it was subscribed.
+   *
+   * `drop` closes over every open draft, so its identity changes on every
+   * keystroke. Depending on it directly meant tearing down and rebuilding the
+   * subscription per character — see [`subscribeDragDrop`] for what that cost.
+   * A ref is what keeps the listener registered once while still calling the
+   * current callback.
+   */
+  const dropRef = useRef(drop);
+  useEffect(() => {
+    dropRef.current = drop;
+  }, [drop]);
+
+  /**
    * Files dropped on the composer.
    *
    * Tauri reports the drop with the paths, not with a `File`: the webview never
@@ -874,39 +889,23 @@ export function ComposerDock() {
    */
   useEffect(() => {
     if (!drafts.length) return;
-    let cancelled = false;
-    const stop: Array<() => void> = [];
-    void (async () => {
-      try {
-        const { getCurrentWebview } = await import("@tauri-apps/api/webview");
-        const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
-          if (cancelled) return;
-          const payload = event.payload;
-          if (payload.type === "leave") {
-            setDragging(false);
-            setDropping(false);
-            return;
-          }
-          if (payload.type === "enter" || payload.type === "over") {
-            setDragging(true);
-            setDropping(isOverDropTarget(payload.position));
-            return;
-          }
-          const onTarget = isOverDropTarget(payload.position);
-          setDragging(false);
-          setDropping(false);
-          if (onTarget) drop(payload.paths);
-        });
-        stop.push(unlisten);
-      } catch {
-        /* a browser tab has no webview to listen to, and no paths either */
+    return subscribeDragDrop((signal) => {
+      if (signal.type === "leave") {
+        setDragging(false);
+        setDropping(false);
+        return;
       }
-    })();
-    return () => {
-      cancelled = true;
-      for (const unlisten of stop) unlisten();
-    };
-  }, [drafts.length, drop]);
+      if (signal.type === "enter" || signal.type === "over") {
+        setDragging(true);
+        setDropping(isOverDropTarget(signal.position));
+        return;
+      }
+      const onTarget = isOverDropTarget(signal.position);
+      setDragging(false);
+      setDropping(false);
+      if (onTarget) dropRef.current(signal.paths);
+    });
+  }, [drafts.length]);
 
   /* ------------------------------------------------------------------ keys */
 

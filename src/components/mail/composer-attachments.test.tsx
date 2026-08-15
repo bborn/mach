@@ -16,7 +16,7 @@
  */
 
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeymapProvider } from "@/hooks/useKeymap";
 import {
   inlineImageDataUrl,
@@ -30,7 +30,12 @@ import {
   type DraftKind,
 } from "@/lib/compose";
 import { cleanFragment } from "@/lib/email-html";
-import { isOverDropTarget, DROP_TARGET } from "./composer-layout";
+import {
+  isOverDropTarget,
+  subscribeDragDrop,
+  DROP_TARGET,
+  type DragDropSignal,
+} from "./composer-layout";
 import { Composer } from "./Composer";
 
 function file(over: Partial<DraftAttachment> = {}): DraftAttachment {
@@ -223,30 +228,123 @@ describe("the drop target", () => {
   });
 
   /*
-   * Tauri reports a drag in *device* pixels, and the DOM measures in CSS
-   * pixels. On a Retina display those differ by two, and a drop over the
-   * composer was landing in the header — hence the scale, passed in here so the
-   * test does not depend on the machine it runs on.
+   * The regression this file exists for.
+   *
+   * The payload's position is typed `PhysicalPosition`, so the hit test divided
+   * it by `devicePixelRatio` — and on macOS wry reports AppKit points, which are
+   * already the units `getBoundingClientRect` answers in. See `DragPoint`.
+   *
+   * The rectangle below is the docked composer at 1440×900: the bottom of the
+   * reading pane, in the right-hand half of the window. Halving a point inside
+   * it lands in the thread list every time, whatever the drop, which is why
+   * dragging a file onto a reply did nothing at all.
    */
-  it("converts the device pixels Tauri reports into the ones the DOM uses", () => {
-    const host = document.createElement("div");
-    host.setAttribute(DROP_TARGET, "");
-    host.getBoundingClientRect = () =>
-      ({ left: 0, top: 400, right: 800, bottom: 600, width: 800, height: 200 }) as DOMRect;
-    document.body.append(host);
-    try {
-      expect(isOverDropTarget({ x: 200, y: 1000 }, document, 2)).toBe(true);
-      // The same point read as CSS pixels is above the composer.
-      expect(isOverDropTarget({ x: 200, y: 1000 }, document, 1)).toBe(false);
-      // Below it, at either scale.
-      expect(isOverDropTarget({ x: 200, y: 1400 }, document, 2)).toBe(false);
-    } finally {
+  describe("hit-tested in the units the drag actually arrives in", () => {
+    const ratio = window.devicePixelRatio;
+    let host: HTMLDivElement;
+
+    beforeEach(() => {
+      Object.defineProperty(window, "devicePixelRatio", { value: 2, configurable: true });
+      host = document.createElement("div");
+      host.setAttribute(DROP_TARGET, "");
+      host.getBoundingClientRect = () =>
+        ({ left: 842, top: 500, right: 1440, bottom: 880, width: 598, height: 380 }) as DOMRect;
+      document.body.append(host);
+    });
+
+    afterEach(() => {
       host.remove();
-    }
+      Object.defineProperty(window, "devicePixelRatio", { value: ratio, configurable: true });
+    });
+
+    it("lands on a composer in the bottom-right of a Retina window", () => {
+      expect(isOverDropTarget({ x: 1100, y: 700 })).toBe(true);
+      expect(isOverDropTarget({ x: 900, y: 520 })).toBe(true);
+      expect(isOverDropTarget({ x: 1430, y: 875 })).toBe(true);
+    });
+
+    it("does not land where the point would have been read as device pixels", () => {
+      // (1100, 700) halved. Under the old conversion this was the point being
+      // tested, and it is over the thread list.
+      expect(isOverDropTarget({ x: 550, y: 350 })).toBe(false);
+    });
+
+    it("still refuses a drop outside the composer", () => {
+      expect(isOverDropTarget({ x: 1100, y: 200 })).toBe(false);
+      expect(isOverDropTarget({ x: 400, y: 700 })).toBe(false);
+    });
   });
 
   it("is nowhere when no composer is open, so a drop lands on nothing", () => {
-    expect(isOverDropTarget({ x: 10, y: 10 }, document, 1)).toBe(false);
+    expect(isOverDropTarget({ x: 10, y: 10 }, document)).toBe(false);
+  });
+});
+
+/*
+ * The subscription's lifetime, which is not the same question as whether the
+ * handler is right.
+ *
+ * `onDragDropEvent` resolves a promise; React's cleanup runs synchronously. The
+ * effect used to store its `unlisten` after two `await`s, so a cleanup that ran
+ * first found nothing to call and the listener outlived the effect that made
+ * it — one abandoned registration per keystroke, since the dependency was a
+ * callback closed over the drafts.
+ */
+describe("the drag-drop subscription", () => {
+  function deferred() {
+    let settle!: (off: () => void) => void;
+    const promise = new Promise<() => void>((resolve) => {
+      settle = resolve;
+    });
+    return { promise, settle };
+  }
+
+  it("stops a listener whose registration finished after the cleanup ran", async () => {
+    const unlisten = vi.fn();
+    const { promise, settle } = deferred();
+    const stop = subscribeDragDrop(() => {}, () => promise);
+
+    // The effect re-ran — or the composer closed — before Tauri answered.
+    stop();
+    settle(unlisten);
+    await promise;
+    await Promise.resolve();
+
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops it the ordinary way round too, and only once", async () => {
+    const unlisten = vi.fn();
+    const stop = subscribeDragDrop(() => {}, () => Promise.resolve(unlisten));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    stop();
+    stop();
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes the window's own signals straight through", async () => {
+    const seen: DragDropSignal[] = [];
+    let fire!: (signal: DragDropSignal) => void;
+    subscribeDragDrop(
+      (signal) => seen.push(signal),
+      (handler) => {
+        fire = handler;
+        return Promise.resolve(() => {});
+      },
+    );
+    await Promise.resolve();
+
+    fire({ type: "drop", position: { x: 1, y: 2 }, paths: ["/tmp/a.png"] });
+    expect(seen).toEqual([{ type: "drop", position: { x: 1, y: 2 }, paths: ["/tmp/a.png"] }]);
+  });
+
+  it("survives a registration that never succeeds", async () => {
+    const stop = subscribeDragDrop(() => {}, () => Promise.reject(new Error("no webview")));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(() => stop()).not.toThrow();
   });
 });
 
