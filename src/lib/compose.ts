@@ -153,10 +153,23 @@ export function hasWrittenBody(draft: Draft): boolean {
   return !isBlankHtml(written);
 }
 
+/**
+ * Does this message carry a subject the recipient will actually see?
+ *
+ * Trimmed, and that is the whole content of the function: a subject of spaces
+ * is a subject Gmail draws as "(no subject)" at both ends, so whitespace has to
+ * count as nothing or the check it guards is a check the writer can walk past
+ * by holding the space bar. `isDraftEmpty` was already asking exactly this
+ * question inline; the send path asks it too, so it has a name now.
+ */
+export function hasSubject(draft: Pick<Draft, "subject">): boolean {
+  return draft.subject.trim() !== "";
+}
+
 export function isDraftEmpty(draft: Draft): boolean {
   return (
     !hasWrittenBody(draft) &&
-    draft.subject.trim() === "" &&
+    !hasSubject(draft) &&
     draft.to.length === 0 &&
     draft.cc.length === 0 &&
     draft.bcc.length === 0 &&

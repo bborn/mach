@@ -7,6 +7,7 @@ import {
   createAutosave,
   hasWrittenBody,
   humanSize,
+  hasSubject,
   isDraftEmpty,
   formatRecipients,
   isLocalOnly,
@@ -490,6 +491,30 @@ describe("isDraftEmpty", () => {
 
   it("counts typing as content", () => {
     expect(isDraftEmpty(html("<div>ok</div>"))).toBe(false);
+  });
+});
+
+describe("hasSubject", () => {
+  /*
+   * The gate in front of ⌘⏎. It has to agree with what the recipient sees: a
+   * header full of spaces is drawn as "(no subject)" at both ends, so anything
+   * that trims away to nothing is nothing.
+   */
+  it("is false for a subject that trims away to nothing", () => {
+    expect(hasSubject({ subject: "" })).toBe(false);
+    expect(hasSubject({ subject: " " })).toBe(false);
+    expect(hasSubject({ subject: "   \t \n  " })).toBe(false);
+    // A non-breaking space is whitespace to `trim`, and it is what a paste out
+    // of a web page leaves behind.
+    expect(hasSubject({ subject: " " })).toBe(false);
+  });
+
+  it("is true the moment there is a character in it", () => {
+    expect(hasSubject({ subject: "Roof" })).toBe(true);
+    expect(hasSubject({ subject: "  Roof  " })).toBe(true);
+    // `replySubject` at its emptiest, which is why a reply is never asked.
+    expect(hasSubject({ subject: "Re:" })).toBe(true);
+    expect(hasSubject({ subject: "?" })).toBe(true);
   });
 });
 

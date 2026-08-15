@@ -172,6 +172,23 @@ export function ComposerDock() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [pending, setPending] = useState<OutboxEntry | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
+  /**
+   * The draft being asked about before it goes out with no subject, and the
+   * instant it was meant to leave at.
+   *
+   * A sibling of `confirming` rather than a second flag on it: they are two
+   * questions about two different things, and the composer draws whichever one
+   * is up in the same row — so only one may be set, which the two places that
+   * raise them enforce by clearing the other.
+   *
+   * The instant rides along because `later` raises this question too. Dropping
+   * it would turn "send at 8am — yes, really" into a message that leaves now,
+   * which is the one answer nobody gave.
+   */
+  const [confirmingSubject, setConfirmingSubject] = useState<{
+    id: string;
+    at?: number;
+  } | null>(null);
   /** A file is over the composer, and letting go would attach it. */
   const [dropping, setDropping] = useState(false);
   /** A file is over the window at all, wherever the pointer is. */
@@ -340,6 +357,7 @@ export function ComposerDock() {
         return remaining;
       });
       setConfirming((was) => (was === id ? null : was));
+      setConfirmingSubject((was) => (was?.id === id ? null : was));
     },
     [],
   );
@@ -555,6 +573,7 @@ export function ComposerDock() {
       if (!target) return;
       setActiveId(id);
       setConfirming(null);
+      setConfirmingSubject(null);
       // A reply belongs under the message it answers. Switching to one whose
       // conversation is not on screen opens that conversation, which is what
       // puts the composer back in the dock rather than leaving it invisible.
@@ -634,6 +653,10 @@ export function ComposerDock() {
       if (!target) return;
       if (!isDraftEmpty(target) && confirming !== id) {
         setConfirming(id);
+        // One question in the footer at a time. This one is about whether the
+        // draft should go on existing, so it takes the row from a question
+        // about what is in it.
+        setConfirmingSubject(null);
         return;
       }
       autosaves.current.get(id)?.cancel();
@@ -1381,6 +1404,7 @@ export function ComposerDock() {
     }
     openDraft(signed(found));
     setConfirming(found.id);
+    setConfirmingSubject(null);
   }, [threadId, actions, openDraft, signed]);
 
   // A conversation is no longer the only reason this exists: `c` opens a draft
@@ -1596,6 +1620,20 @@ export function ComposerDock() {
       onDiscard={() => discard(visible.id)}
       confirmingDiscard={confirming === visible.id}
       onKeepDraft={() => setConfirming(null)}
+      confirmingSubject={confirmingSubject?.id === visible.id}
+      onConfirmSubject={(at) => setConfirmingSubject({ id: visible.id, at })}
+      /*
+       * Straight to the queue. `send` does not ask about the subject — the
+       * composer's own send path is the one gate, and it has been answered —
+       * so this cannot loop, and nothing between here and the outbox asks
+       * again.
+       */
+      onSendAnyway={() => {
+        const at = confirmingSubject?.at;
+        setConfirmingSubject(null);
+        send(at);
+      }}
+      onKeepWriting={() => setConfirmingSubject(null)}
       onAttach={(inline) => attach(visible.id, inline)}
       onRemoveAttachment={(attachmentId) => unattach(visible.id, attachmentId)}
       onSetInline={(attachmentId, inline) => setInline(visible.id, attachmentId, inline)}

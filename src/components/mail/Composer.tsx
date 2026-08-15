@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
   type Ref,
   type RefObject,
 } from "react";
@@ -27,6 +28,7 @@ import { COMPOSER_COLUMN, COMPOSER_FIXED_ROW } from "./composer-layout";
 import {
   COMPOSER_KEYS,
   formatRecipients,
+  hasSubject,
   humanSize,
   isInlinableImage,
   isLocalOnly,
@@ -71,6 +73,31 @@ interface ComposerProps {
   confirmingDiscard?: boolean;
   /** Keep the draft: the answer that leaves everything exactly as it was. */
   onKeepDraft?: () => void;
+  /**
+   * The footer's other question: this message has no subject.
+   *
+   * A sibling of `confirmingDiscard` and drawn by the same band, because it is
+   * the same act — the footer asking about the thing the footer was just told
+   * to do. Owned where that one is owned, and only one of the two can be up:
+   * see `asking`.
+   *
+   * Unlike a discard this *is* undoable — a queued message waits out its window
+   * with ⌘Z on offer. The question is still worth its keystroke, because the
+   * undo only helps somebody who noticed, and the missing subject is precisely
+   * the thing you do not notice until it is in somebody else's inbox. What that
+   * buys it is one keystroke of cost and no more: it never traps focus, and
+   * Escape is out.
+   */
+  confirmingSubject?: boolean;
+  /**
+   * Raise that question. The instant `later` named rides along, so the answer
+   * sends the schedule rather than a message that leaves now.
+   */
+  onConfirmSubject?: (scheduleAt?: number) => void;
+  /** Yes: send it, subject or not. Immediately — nothing asks twice. */
+  onSendAnyway?: () => void;
+  /** No: put the question away and go on writing. */
+  onKeepWriting?: () => void;
   /** Open the file panel. `inline` asks for the images to go in the body. */
   onAttach: (inline?: boolean) => void;
   onRemoveAttachment: (attachmentId: string) => void;
@@ -202,6 +229,10 @@ export function Composer({
   onDiscard,
   confirmingDiscard = false,
   onKeepDraft,
+  confirmingSubject = false,
+  onConfirmSubject,
+  onSendAnyway,
+  onKeepWriting,
   onAttach,
   onRemoveAttachment,
   onSetInline,
@@ -261,12 +292,29 @@ export function Composer({
 
   const options = useMemo(() => scheduleOptions(), [scheduling]);
 
+  /**
+   * Every way this panel sends: ⌘⏎, the footer's `send`, and each instant on
+   * the `later` row.
+   *
+   * Which is why the subject is checked *here* rather than on the key. A
+   * scheduled message with no subject arrives with no subject — the delay
+   * changes nothing about what lands — so the one gate has to sit where all
+   * three meet, and this is it.
+   *
+   * `onConfirmSubject` gates the gate: a composer rendered without a surface to
+   * hold the question sends the way it always did rather than swallowing the
+   * keystroke into a question nothing can draw.
+   */
   const send = useCallback(
     (at?: number) => {
       setScheduling(false);
+      if (onConfirmSubject && !hasSubject(draft)) {
+        onConfirmSubject(at);
+        return;
+      }
       onSend(at);
     },
-    [onSend],
+    [draft, onSend, onConfirmSubject],
   );
 
   /**
@@ -290,22 +338,51 @@ export function Composer({
     onPopOut?.(editor.current?.caret() ?? null);
   }, [onPopOut]);
 
-  /* -------------------------------------------------------- the question */
+  /* ------------------------------------------------------- the questions */
+
+  /**
+   * Which question the footer is being, if it is being one.
+   *
+   * One value rather than two flags, because there is one row: two questions in
+   * the same box at the same time is not a question, it is a race, and the
+   * writer would answer whichever one his hands were already moving towards.
+   * Neither can raise the other — the key that would is declined while the
+   * other is up, and the control that would is not on screen, since the band
+   * has replaced the whole legend. If both ever arrived anyway the
+   * unrecoverable one wins: a draft that has been asked about is a draft that
+   * may be about to stop existing, and a send can wait for that to be settled.
+   *
+   * Everything below is shared by both: one arming guard, one claim on the
+   * keyboard, one record of where the caret was, one band.
+   */
+  const asking: "discard" | "subject" | null = confirmingDiscard
+    ? "discard"
+    : confirmingSubject
+      ? "subject"
+      : null;
 
   const keymap = useKeymap();
-  /** The answer that takes the focus, which is the destructive one. */
-  const discardButton = useRef<HTMLButtonElement>(null);
+  /**
+   * The answer that takes the focus.
+   *
+   * The affirmative either way — Discard, or Send — because that is the answer
+   * the question was raised *by*: he pressed the key, the panel asked, and the
+   * key he would press to mean it is under his hands already. What makes that
+   * safe is `armed`, not distance.
+   */
+  const answerButton = useRef<HTMLButtonElement>(null);
   /**
    * Whether the question may yet be answered *yes*.
    *
-   * Discard takes the focus, because he asked for it: the question is raised
-   * by a key, answered by a key, and a confirmation whose default answer is
-   * unreachable without moving the hands is a confirmation he has to click.
+   * The affirmative takes the focus, because he asked for it: the question is
+   * raised by a key, answered by a key, and a confirmation whose default answer
+   * is unreachable without moving the hands is a confirmation he has to click.
    * That makes ⏎ destroy the draft — and ⏎ is one of the keys that can *raise*
    * the question, by activating the footer's own `discard` while it has focus.
    * So can ⇧⌘⌫, by repeating: hold either down and the OS sends a second event
    * a quarter of a second later, at the button that has meanwhile taken the
-   * focus.
+   * focus. ⌘⏎ and the subject question are the same shape exactly — held down,
+   * it repeats at a Send button that was not there when the finger went down.
    *
    * The guard is not a delay. A delay long enough to cover the repeat interval
    * is long enough to swallow a deliberate second press, which is the thing
@@ -320,8 +397,8 @@ export function Composer({
    *    which the first keyup of a real key sets, and so does any pointer press,
    *    which is what a mouse must do to reach the button at all.
    *
-   * Either way a second ⇧⌘⌫ still means it with no wait, and a held one never
-   * gets past the question.
+   * Either way a second ⇧⌘⌫ — or a second ⌘⏎ — still means it with no wait, and
+   * a held one never gets past the question.
    */
   const armed = useRef(false);
   /**
@@ -345,22 +422,28 @@ export function Composer({
   const askedAt = useRef<number | null>(null);
 
   /*
-   * A question about something unrecoverable owns the keyboard while it is up.
+   * A question owns the keyboard while it is up.
    *
    * Focus is on a button rather than in the message, so `isTypingTarget` is
    * false and every shell binding — `e` archives, `x` ticks a row — would be
    * live behind a question the writer has not answered yet. The claim silences
    * everything below the overlay floor, which is the same thing every dialog in
    * the app does through `Overlay`. The composer's own keys sit at or above
-   * that floor and survive: ⇧⌘⌫ again is the second press that means it.
+   * that floor and survive: ⇧⌘⌫ again is the second press that means it, and so
+   * is ⌘⏎.
+   *
+   * Owning the keyboard is not trapping focus. ⇥ leaves, the window is still
+   * the window, and Escape is always the way out — which matters more for the
+   * subject question than for the discard, because that one is standing in
+   * front of an act that was already undoable.
    *
    * A layout effect, for the reason the overlay uses one: the claim has to be
    * in force before anything can be typed at the row that has just appeared.
    */
   useLayoutEffect(() => {
-    if (!confirmingDiscard) return;
+    if (!asking) return;
     return keymap.claimKeyboard();
-  }, [confirmingDiscard, keymap]);
+  }, [asking, keymap]);
 
   /*
    * Disarmed the moment the question goes up, and armed by the first thing the
@@ -369,10 +452,11 @@ export function Composer({
    * the event; a modifier coming up on its own is not a release, or letting go
    * of ⇧ while ⌘⌫ repeats would arm it.
    *
-   * The discard key does not consult this — see `destroy`.
+   * Neither key the questions are about consults this — see `destroy` and
+   * `sendAnyway`.
    */
   useLayoutEffect(() => {
-    if (!confirmingDiscard) return;
+    if (!asking) return;
     armed.current = false;
     const MODIFIERS = new Set(["Shift", "Meta", "Control", "Alt"]);
     const onKeyUp = (event: KeyboardEvent) => {
@@ -389,21 +473,21 @@ export function Composer({
       window.removeEventListener("pointerdown", onPointerDown, true);
       window.removeEventListener("mousedown", onPointerDown, true);
     };
-  }, [confirmingDiscard]);
+  }, [asking]);
 
   useEffect(() => {
-    if (!confirmingDiscard) return;
+    if (!asking) return;
     const had = document.activeElement as HTMLElement | null;
     // Not the button this is about to focus: in StrictMode the effect runs
     // twice on mount, and the second pass would record its own answer.
-    if (had !== discardButton.current) {
+    if (had !== answerButton.current) {
       askedFrom.current = had;
       // Read while the caret is still in the message. A moment later it is on
       // a button and there is nothing left to read.
       askedAt.current = editor.current?.caret() ?? null;
     }
-    discardButton.current?.focus();
-  }, [confirmingDiscard]);
+    answerButton.current?.focus();
+  }, [asking]);
 
   /**
    * Yes — if this is a decision rather than the press that asked. See `armed`.
@@ -423,7 +507,25 @@ export function Composer({
   );
 
   /**
-   * Keep the draft, and give the caret back where it was.
+   * The same yes, for the other question. Same guard, and it has to be:
+   * ⌘⏎ raises this one and ⌘⏎ answers it, so the press that asked would
+   * otherwise send the message it was asking about.
+   *
+   * There is nothing after this. The dock sends on the way out of the handler —
+   * the queue, the ten seconds, the undo pill — because a question the writer
+   * has just answered yes to and is then asked again in another form is a
+   * question he stops reading.
+   */
+  const sendAnyway = useCallback(
+    (decided = false) => {
+      if (!decided && !armed.current) return;
+      onSendAnyway?.();
+    },
+    [onSendAnyway],
+  );
+
+  /**
+   * Put the caret back where the question took it from.
    *
    * An address field can have itself back directly — an input restores its own
    * selection, and there are forty characters in it either way. The message
@@ -431,8 +533,7 @@ export function Composer({
    * *told* it has focus (see `focusAndAnnounce`) and because the offset is the
    * only part of "where it was" that survives the round trip.
    */
-  const keep = useCallback(() => {
-    onKeepDraft?.();
+  const restore = useCallback(() => {
     const was = askedFrom.current;
     const at = askedAt.current;
     askedFrom.current = null;
@@ -448,7 +549,37 @@ export function Composer({
         : null;
     if (field) field.focus();
     else editor.current?.focus(at);
-  }, [onKeepDraft]);
+  }, []);
+
+  /** Keep the draft, and leave everything else exactly as it was. */
+  const keep = useCallback(() => {
+    onKeepDraft?.();
+    restore();
+  }, [onKeepDraft, restore]);
+
+  /**
+   * No — and this one does not hand the caret back where it found it.
+   *
+   * The discard question has to, because "keep this draft" is an answer that
+   * changes nothing and a caret moved by a question the writer cancelled is the
+   * bug that question was meant to prevent. This question is different: it was
+   * asked *about a field*, and "no" almost always means "let me write one". So
+   * the field it is about takes the caret and the next thing typed is the
+   * subject — one input from where they were, which ⇥ is not.
+   *
+   * A reply's subject is a heading rather than a field, and there is nothing to
+   * focus. Close to unreachable — `replySubject` returns `Re:` at its very
+   * emptiest, so a reply always has one — and the fallback is the discard
+   * question's answer: back where they were, offset and all.
+   */
+  const keepWriting = useCallback(() => {
+    onKeepWriting?.();
+    if (subjectField.current) {
+      subjectField.current.focus();
+      askedFrom.current = null;
+      askedAt.current = null;
+    } else restore();
+  }, [onKeepWriting, restore]);
 
   /* ------------------------------------------------------------ completion */
 
@@ -473,14 +604,15 @@ export function Composer({
   });
 
   /*
-   * `!confirmingDiscard` on the keys below, and it is not redundant with the
-   * claim above.
+   * `!asking` on the keys below, and it is not redundant with the claim above.
    *
    * The claim silences everything under the overlay floor; the composer's own
-   * keys sit at or above it and survive, which is right for ⇧⌘⌫ — the second
-   * press that means it — and wrong for the rest. A question about whether this
-   * draft should exist that ⌘⏎ can send the draft out from under is not a
-   * question. So they wait for one of the two answers.
+   * keys sit at or above it and survive, which is right for the two keys the
+   * two questions are about — each one is its own second press that means it —
+   * and wrong for the rest. A question about whether this draft should exist
+   * that ⌘⏎ can send the draft out from under is not a question, and neither is
+   * a question about the subject that ⇧⌘⌫ can throw the draft away behind. So
+   * every key that is not an answer waits for one.
    */
   useKeyBindings([
     {
@@ -489,8 +621,12 @@ export function Composer({
       description: "Send",
       allowInInput: true,
       priority: 100,
+      // Live while the subject question is up, because there it *is* the
+      // answer — the same "the key that asked is the key that means it" the
+      // discard key makes one row down.
       when: () => active && !busy && !confirmingDiscard,
-      handler: () => send(),
+      handler: (event) =>
+        confirmingSubject ? sendAnyway(event.repeat !== true) : send(),
     },
     {
       keys: COMPOSER_KEYS.schedule,
@@ -498,7 +634,7 @@ export function Composer({
       description: "Schedule send",
       allowInInput: true,
       priority: 100,
-      when: () => active && !busy && !confirmingDiscard,
+      when: () => active && !busy && !asking,
       handler: () => setScheduling((open) => !open),
     },
     {
@@ -507,7 +643,7 @@ export function Composer({
       description: "Attach files",
       allowInInput: true,
       priority: 100,
-      when: () => active && !busy && !confirmingDiscard,
+      when: () => active && !busy && !asking,
       handler: () => onAttach(),
     },
     {
@@ -516,7 +652,7 @@ export function Composer({
       description: "Discard this draft",
       allowInInput: true,
       priority: 100,
-      when: () => active && !busy,
+      when: () => active && !busy && !confirmingSubject,
       // The second press that means it, and only if it is a second press:
       // holding the key down must not answer its own question. See `armed`.
       handler: (event) =>
@@ -542,6 +678,10 @@ export function Composer({
      * pressed at the wrong moment is not a key, it is a trap — and hands the
      * caret back. `allowInInput` because the answer must arrive whether the
      * writer left the caret in the message or is on the button itself.
+     *
+     * One key out of either question, which is what keeps the subject warning
+     * cheap enough to be worth having: the message it stands in front of was
+     * already recallable, so the question may cost one keystroke and not two.
      */
     {
       keys: COMPOSER_KEYS.close,
@@ -549,8 +689,8 @@ export function Composer({
       description: "Keep the draft",
       allowInInput: true,
       priority: OVERLAY_KEY_FLOOR + 30,
-      when: () => active && confirmingDiscard,
-      handler: () => keep(),
+      when: () => active && asking !== null,
+      handler: () => (confirmingDiscard ? keep() : keepWriting()),
     },
     {
       keys: COMPOSER_KEYS.close,
@@ -777,9 +917,10 @@ export function Composer({
           footer still inside the panel" is a question worth being able to ask.
 
           It has a second state, and it is the same row rather than a row of
-          its own: the question `discard` raises. Same box, same measure, same
-          height — so answering it costs no layout and the writer's eye does
-          not have to go anywhere. See `confirmingDiscard`.
+          its own: the question `discard` raises, and the one a send with no
+          subject raises. Same box, same measure, same height — so answering it
+          costs no layout and the writer's eye does not have to go anywhere.
+          See `confirmingDiscard`, `confirmingSubject` and `asking`.
 
           The band is the half a swap of words cannot do. Both states are a
           line of micro type along the same edge, and read at a glance — which
@@ -803,31 +944,28 @@ export function Composer({
           className={cn(
             COMPOSER_FIXED_ROW,
             "-mx-2 mt-2 flex items-center gap-1 text-micro",
-            confirmingDiscard
+            asking
               ? "rounded-[var(--radius)] bg-surface-raised text-muted-foreground ring-1 ring-inset ring-border"
               : "text-faint-foreground",
           )}
         >
-          {confirmingDiscard ? (
-            <>
-              <span className="min-w-0 flex-1 truncate px-2 text-foreground">
-                Discard this draft?
-              </span>
-              {/*
-                Not where the pointer is. It has just clicked `discard`, a
-                third of the way along this row, and a destructive button under
-                a pointer that is already moving is a draft lost to a double
-                click. The answers sit at the far end of the same row, which is
-                also where the bar this replaced put them.
+          {asking === "discard" ? (
+            /*
+              Not where the pointer is. It has just clicked `discard`, a third
+              of the way along this row, and a destructive button under a
+              pointer that is already moving is a draft lost to a double click.
+              The answers sit at the far end of the same row, which is also
+              where the bar this replaced put them.
 
-                It has the focus, which the safe answer used to have — his
-                call, and the right one for a question raised and answered by
-                key. What makes that safe is `armed`, not distance: ⏎ can only
-                reach this once the press that raised the question has been let
-                go of. Escape still keeps the draft, from anywhere.
-              */}
+              Discard has the focus, which the safe answer used to have — his
+              call, and the right one for a question raised and answered by
+              key. What makes that safe is `armed`, not distance: ⏎ can only
+              reach it once the press that raised the question has been let go
+              of. Escape still keeps the draft, from anywhere.
+            */
+            <ConfirmBand question="Discard this draft?">
               <FooterAction
-                ref={discardButton}
+                ref={answerButton}
                 keys={COMPOSER_KEYS.discard}
                 label="Discard"
                 tone="destroy"
@@ -841,7 +979,36 @@ export function Composer({
                 tone="answer"
                 onClick={keep}
               />
-            </>
+            </ConfirmBand>
+          ) : asking === "subject" ? (
+            /*
+              The same band, and that is the point of it: the second question a
+              composer can ask arrives in the box the eye already knows, at the
+              same height, with the answers at the same end.
+
+              `Send` keeps the accent fill it wears in the legend two states
+              back. It is the act the panel exists for either way, it is not
+              destructive — the message still waits out its window with ⌘Z on
+              offer — and the fill is what makes the answer findable in the
+              hundred milliseconds this row is looked at for.
+            */
+            <ConfirmBand question="Send without a subject?">
+              <FooterAction
+                ref={answerButton}
+                keys={COMPOSER_KEYS.send}
+                label="Send"
+                tone="primary"
+                // With nothing, for the reason `destroy` is: a MouseEvent read
+                // as `decided` would tell every click it was a decision.
+                onClick={() => sendAnyway()}
+              />
+              <FooterAction
+                keys={COMPOSER_KEYS.close}
+                label="Add one"
+                tone="answer"
+                onClick={keepWriting}
+              />
+            </ConfirmBand>
           ) : (
             <>
               <FooterAction
@@ -916,14 +1083,38 @@ export function Composer({
 }
 
 /**
+ * The footer, being a question.
+ *
+ * One component for both of them, because the two must not drift: the whole
+ * reason the second question reads at a glance is that it is the first one
+ * again — same box, same measure, same height, answers at the same end. The
+ * copy takes the measure with `flex-1`, which is what pushes them there and
+ * what keeps a destructive answer out from under the pointer that just clicked.
+ *
+ * The band's surface is on the footer row itself rather than here: the row may
+ * not change height when a question replaces the legend, and a wrapper with its
+ * own box is the easiest way to make it.
+ */
+function ConfirmBand({ question, children }: { question: string; children: ReactNode }) {
+  return (
+    <>
+      <span className="min-w-0 flex-1 truncate px-2 text-foreground">{question}</span>
+      {children}
+    </>
+  );
+}
+
+/**
  * How much weight one footer control carries.
  *
  * Four steps, and the row uses three of them at a time. `primary` is the app's
- * one filled button, spent here on the act the panel exists for; `danger` is
- * quiet until the pointer is on it, because a resting row of six controls with
- * a red one in it reads as an error; `destroy` and `answer` belong to the
- * question, where the band underneath has already moved a step up the ramp and
- * the controls have to move with it.
+ * one filled button, spent on the act the panel exists for — in the legend, and
+ * again as the affirmative answer to the subject question, which is the same
+ * act with one more keystroke in front of it; `danger` is quiet until the
+ * pointer is on it, because a resting row of six controls with a red one in it
+ * reads as an error; `destroy` and `answer` belong to the questions, where the
+ * band underneath has already moved a step up the ramp and the controls have to
+ * move with it.
  *
  * The chip moves too. `Kbd` sits on `surface-raised`, which is the band's own
  * colour and the hover fill's neighbour — left alone it would dissolve into
