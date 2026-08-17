@@ -534,8 +534,16 @@ export function RichTextEditor({
         A box with a pixel height is what the handle on the composer's top edge
         moves, and it is also the one box that has to be allowed to come back
         down when the panel around it is shorter than the window it was
-        measured against — `min-h-0` is what permits that, and the writing area
-        follows it at `h-full` and scrolls the text it can no longer show.
+        measured against — `min-h-0` is what permits that.
+
+        The writing area used to follow it at `h-full`, and that is the bug this
+        comment exists for. A percentage height resolves against the height that
+        was *asked for*, not the one flex settled on, so the instant those two
+        numbers differed the text was taller than the box holding it and painted
+        straight over the footer. `absolute inset-0` resolves against the box's
+        **used** size, so there is no second number left to go stale. Nothing
+        here needs to know how tall the footer is, which is the point: the
+        footer changed once and this broke, and it will change again.
       */}
       <div className={cn("relative", COMPOSER_BODY)} style={{ height }}>
         {empty && (
@@ -553,7 +561,8 @@ export function RichTextEditor({
           aria-label="Message"
           spellCheck
           className={cn(
-            "block h-full w-full overflow-y-auto bg-transparent",
+            // `absolute inset-0`, never `h-full` — see the note above the box.
+            "absolute inset-0 overflow-y-auto bg-transparent",
             "text-reading leading-[1.6] text-foreground focus:outline-none",
             // The editor's own rendering, scoped here rather than added to the
             // global sheet: a `<ul>` inside a contenteditable needs a marker and

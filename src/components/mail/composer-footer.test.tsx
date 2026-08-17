@@ -25,6 +25,14 @@
  * jsdom has no layout engine, so the assertions are about the classes that
  * produce the layout rather than about pixels. The pixels were checked in a
  * real engine and in the real window; see the commit.
+ *
+ * It happened again, from the other direction, and the fix is at the bottom of
+ * this file. The footer became a row of real buttons, the composer stopped
+ * fitting, flex started shrinking the message — and the message's *inner*
+ * scroll box, sized `h-full`, went on resolving that percentage against the
+ * height originally asked for. So the writing area was taller than the box
+ * holding it and painted over the footer. The first fix made the constraint
+ * reach the message; this one makes the message actually take the answer.
  */
 
 import { renderToStaticMarkup } from "react-dom/server";
@@ -199,7 +207,54 @@ describe("the message, which is what gives way", () => {
     const host = render("overlay");
     const area = host.querySelector<HTMLElement>('[role="textbox"][aria-label="Message"]')!;
     expect(area.getAttribute("style")).toBeNull();
-    expect(has(area, "h-full")).toBe(true);
+  });
+
+  /*
+   * The regression the footer's button bar caused, and the reason this file's
+   * previous version of the test above asserted `h-full` — which was the bug.
+   *
+   * `height` on the sized box is a *preference*: a number from the window
+   * (`popOutComposerHeight`) or from the drag handle (`clampComposerHeight`).
+   * Flex is then allowed to shrink it, and does, the moment the furniture
+   * around it grows — which is what turning the footer's thin spans into real
+   * 24px buttons (`19f7a0a`) did. A percentage height inside that box resolves
+   * against the number that was *asked for*, not the one flex settled on, so
+   * the writing area stayed at its full height inside a shorter parent and the
+   * overflow was painted over everything below it. In the popped-out composer
+   * the message ran across the send button and on to the panel's bottom edge.
+   *
+   * `absolute inset-0` is resolved against the box's used size, so there is no
+   * second number that can go stale. Nothing about the footer's height is
+   * pinned here on purpose: pinning it would only move the staleness. What is
+   * pinned is that the two boxes cannot disagree in the first place.
+   */
+  it("takes its size from the box as laid out, not from the number requested", () => {
+    const host = render("overlay");
+    const area = host.querySelector<HTMLElement>('[role="textbox"][aria-label="Message"]')!;
+    expect(has(area, "absolute")).toBe(true);
+    expect(has(area, "inset-0")).toBe(true);
+    // Any of these re-reads the requested height and reintroduces the overlap.
+    for (const stale of ["h-full", "h-screen", "min-h-full", "max-h-full"]) {
+      expect(classes(area)).not.toContain(stale);
+    }
+    // …and the box it fills has to be the positioning context, or `inset-0`
+    // would resolve against the window instead.
+    expect(has(body(host), "relative")).toBe(true);
+  });
+
+  /*
+   * The other half of the same relationship, from the footer's side: the row
+   * that was blamed for the overlap must be the one that never gives way, and
+   * it must be a sibling of the message in the column the panel's height
+   * reaches. Together with the test above, a future footer that grows can push
+   * the message shorter and can no longer land on top of it.
+   */
+  it("gives up its space to nothing, while the message gives up as much as asked", () => {
+    const host = render("overlay");
+    const column = footer(host).parentElement!;
+    expect(has(footer(host), COMPOSER_FIXED_ROW)).toBe(true);
+    expect(column.contains(body(host))).toBe(true);
+    expect(has(body(host), COMPOSER_FIXED_ROW)).toBe(false);
   });
 });
 
