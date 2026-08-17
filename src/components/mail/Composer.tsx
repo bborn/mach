@@ -9,7 +9,7 @@ import {
   type Ref,
   type RefObject,
 } from "react";
-import { Image as ImageIcon, Paperclip, X } from "lucide-react";
+import { Image as ImageIcon, LoaderCircle, Paperclip, X } from "lucide-react";
 import { useKeyBindings, useKeymap } from "@/hooks/useKeymap";
 import { OVERLAY_KEY_FLOOR } from "@/lib/keymap";
 import { useGhostText } from "@/hooks/useGhostText";
@@ -24,7 +24,8 @@ import { anyPopupOpen } from "@/lib/popups";
 import { cn } from "@/lib/utils";
 import { RichTextEditor, type RichTextEditorHandle } from "./RichTextEditor";
 import type { Contact } from "@/lib/contacts";
-import { COMPOSER_COLUMN, COMPOSER_FIXED_ROW } from "./composer-layout";
+import { COMPOSER_COLUMN, COMPOSER_FIXED_ROW, type DropRegion } from "./composer-layout";
+import type { PendingAttachment } from "./composer-attach";
 import {
   COMPOSER_KEYS,
   formatRecipients,
@@ -123,16 +124,38 @@ interface ComposerProps {
   presentation?: ComposerPresentation;
   /** False for a composer sitting behind another one: its keys are not live. */
   active?: boolean;
-  /** Files are being dragged over this composer, and letting go would attach. */
-  dropping?: boolean;
+  /**
+   * Where on this composer the pointer is, while files are over it.
+   *
+   * Two answers rather than one boolean, because letting go has two different
+   * outcomes: over the writing area an image goes *in* the message, anywhere
+   * else it goes beside it. The user is choosing between those before the
+   * release, so the composer has to draw which one is currently selected.
+   */
+  dropTarget?: DropRegion | null;
   /**
    * Files are being dragged over the window, wherever the pointer is.
    *
-   * Separate from `dropping` so the composer can say where the files have to
+   * Separate from `dropTarget` so the composer can say where the files have to
    * land *before* the pointer is there. Without it the only feedback is at the
    * moment of release, by which time the choice has been made.
    */
   dragging?: boolean;
+  /**
+   * Whether a body drop would place these files rather than attach them.
+   *
+   * A guess from the dragged filenames, and it is only ever used to label the
+   * hint — the real decision is Rust's, from the bytes. A `.zip` dragged over
+   * the writing area must not be promised a picture in the message.
+   */
+  draggingInlinable?: boolean;
+  /**
+   * Files let go on this draft that the store has not answered for yet.
+   *
+   * Drawn as chips beside the real ones, from the name in the dropped path.
+   * See `composer-attach.ts` — the round trip is not what has to be fast.
+   */
+  pending?: readonly PendingAttachment[];
   /** `cid:` → `data:` URL for the images that are part of this message. */
   inlineImages?: ReadonlyMap<string, string>;
   /**
@@ -243,8 +266,10 @@ export function Composer({
   busy = false,
   presentation = "dock",
   active = true,
-  dropping = false,
+  dropTarget = null,
   dragging = false,
+  draggingInlinable = false,
+  pending = [],
   inlineImages,
   editorRef,
   toRef,
@@ -748,8 +773,10 @@ export function Composer({
         // shrink — see COMPOSER_COLUMN for what was cut off when it wasn't.
         overlay ? COMPOSER_COLUMN : "shrink-0 border-t border-border bg-surface",
         // A drop target has to say so before the file is let go, or the only
-        // feedback is whether it worked.
-        dropping && "ring-1 ring-inset ring-accent",
+        // feedback is whether it worked. Only for the region that means "beside
+        // the message" — a drop headed for the body is drawn on the body, and
+        // ringing both boxes at once would say the two outcomes are one.
+        dropTarget === "composer" && "ring-1 ring-inset ring-accent",
       )}
     >
       <div
@@ -849,30 +876,34 @@ export function Composer({
           initialCaret={initialCaret}
           bodyRef={bodyRef}
           inlineImages={inlineImages}
+          dropping={dropTarget === "body"}
         />
 
         {/*
-          Where the files have to land.
+          Where the files have to land, and what letting go there will do.
           Drawn while anything is being dragged over the window, not only while
           it is over the composer: a target that appears once the pointer is
-          already on it has told the user nothing they could act on. The ring on
-          the composer's own edge is the second half — see `dropping` above.
+          already on it has told the user nothing they could act on. The ring —
+          on the writing area or on the composer's own edge — is the second
+          half; see `dropTarget` above.
         */}
         {dragging && (
           <div
             className={cn(
               COMPOSER_FIXED_ROW,
               "mt-2 rounded-[var(--radius)] border border-dashed px-3 py-2 text-micro",
-              dropping
+              dropTarget
                 ? "border-accent text-foreground"
                 : "border-border text-faint-foreground",
             )}
           >
-            Drop to attach
+            {dropTarget === "body" && draggingInlinable
+              ? "Drop in the message"
+              : "Drop to attach"}
           </div>
         )}
 
-        {attachments.length > 0 && (
+        {(attachments.length > 0 || pending.length > 0) && (
           <ul className={cn(COMPOSER_FIXED_ROW, "mt-2 flex flex-wrap gap-1.5")}>
             {attachments.map((file) => (
               <AttachmentChip
@@ -882,6 +913,13 @@ export function Composer({
                 onRemove={() => onRemoveAttachment(file.id)}
                 onSetInline={onSetInline}
               />
+            ))}
+            {/*
+              Last, because they are the newest and because the reconciled chip
+              takes the same place in the row the pending one held.
+            */}
+            {pending.map((file) => (
+              <PendingChip key={file.key} file={file} />
             ))}
           </ul>
         )}
@@ -1232,15 +1270,7 @@ function AttachmentChip({
   const inline = file.inline === true;
   const choosable = onSetInline !== undefined && isInlinableImage(file);
   return (
-    <li
-      className={cn(
-        // Wide enough for a real filename next to a size and two controls.
-        // Below this the name is the thing that gives way, and a chip reading
-        // "scree…" is a chip that has stopped saying which file it is.
-        "inline-flex max-w-[40ch] items-center gap-1.5 rounded-[var(--radius)]",
-        "border border-border px-2 py-0.5 text-micro text-muted-foreground",
-      )}
-    >
+    <li className={CHIP}>
       {inline ? (
         <ImageIcon className="size-3 shrink-0" />
       ) : (
@@ -1251,6 +1281,17 @@ function AttachmentChip({
       </span>
       <span className="shrink-0 text-faint-foreground">{humanSize(file.sizeBytes)}</span>
       {choosable && (
+        /*
+         * The button is labelled with the *other* place the file could be, not
+         * with where it is.
+         *
+         * It used to read "attached" on a chip that was itself the attachment —
+         * the software saying out loud what the row it is drawn in already
+         * says, which is the thing CLAUDE.md bans by name. Where the file
+         * stands is carried by the icon and, for an inline image, by the
+         * picture visible in the message a few pixels above; what a button owes
+         * the reader is what pressing it will do.
+         */
         <button
           type="button"
           disabled={disabled}
@@ -1262,7 +1303,7 @@ function AttachmentChip({
           }
           className="shrink-0 text-faint-foreground hover:text-foreground"
         >
-          {inline ? "inline" : "attached"}
+          {inline ? "As file" : "In message"}
         </button>
       )}
       <button
@@ -1277,6 +1318,42 @@ function AttachmentChip({
     </li>
   );
 }
+
+/**
+ * A file the store has not answered for yet.
+ *
+ * The same chip, from the only two things known before the round trip: the name
+ * off the dropped path and which way it was headed. No size, because there is
+ * no honest number to show yet — a chip that guessed one and corrected itself a
+ * moment later would be worse than a chip that waits to say.
+ *
+ * No remove control either. The id Rust will give this file does not exist yet,
+ * so there is nothing to send `attachRemove`; the chip is on screen for as long
+ * as the attach takes and is replaced by one that *can* be removed.
+ */
+function PendingChip({ file }: { file: PendingAttachment }) {
+  return (
+    <li className={CHIP} aria-busy="true">
+      <LoaderCircle
+        className="size-3 shrink-0 animate-spin text-faint-foreground"
+        aria-hidden
+      />
+      <span className="min-w-0 truncate" title={file.filename}>
+        {file.filename}
+      </span>
+    </li>
+  );
+}
+
+/**
+ * Wide enough for a real filename next to a size and two controls. Below this
+ * the name is the thing that gives way, and a chip reading "scree…" is a chip
+ * that has stopped saying which file it is.
+ */
+const CHIP = cn(
+  "inline-flex max-w-[40ch] items-center gap-1.5 rounded-[var(--radius)]",
+  "border border-border px-2 py-0.5 text-micro text-muted-foreground",
+);
 
 /**
  * Cc and Bcc, which unlike To are not held by the parent — each needs its own

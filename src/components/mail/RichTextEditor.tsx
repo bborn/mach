@@ -13,7 +13,12 @@ import { useKeyBindings } from "@/hooks/useKeymap";
 import { cleanFragment, isBlankHtml } from "@/lib/email-html";
 import { cn } from "@/lib/utils";
 import { caretOffsetIn, caretRangeIn } from "./caret-offset";
-import { COMPOSER_BODY, COMPOSER_COLUMN, COMPOSER_FIXED_ROW } from "./composer-layout";
+import {
+  COMPOSER_BODY,
+  COMPOSER_COLUMN,
+  COMPOSER_FIXED_ROW,
+  DROP_BODY,
+} from "./composer-layout";
 
 /**
  * The composer's editor.
@@ -154,6 +159,16 @@ interface RichTextEditorProps {
    * caret and the undo stack with it.
    */
   inlineImages?: ReadonlyMap<string, string>;
+  /**
+   * Files are being dragged over the writing area, and letting go would put an
+   * image *in* the message rather than beside it.
+   *
+   * The editor draws it because the editor owns the box being aimed at — see
+   * `DROP_BODY`, which is on the same element so the hit test and the highlight
+   * cannot come apart. Squire is not involved: this is a ring on the container,
+   * not an edit.
+   */
+  dropping?: boolean;
 }
 
 export function RichTextEditor({
@@ -168,6 +183,7 @@ export function RichTextEditor({
   active = true,
   bodyRef,
   inlineImages,
+  dropping = false,
 }: RichTextEditorProps) {
   const root = useRef<HTMLDivElement>(null);
   const editor = useRef<Squire | null>(null);
@@ -536,16 +552,41 @@ export function RichTextEditor({
         down when the panel around it is shorter than the window it was
         measured against — `min-h-0` is what permits that.
 
-        The writing area used to follow it at `h-full`, and that is the bug this
-        comment exists for. A percentage height resolves against the height that
-        was *asked for*, not the one flex settled on, so the instant those two
-        numbers differed the text was taller than the box holding it and painted
-        straight over the footer. `absolute inset-0` resolves against the box's
-        **used** size, so there is no second number left to go stale. Nothing
-        here needs to know how tall the footer is, which is the point: the
-        footer changed once and this broke, and it will change again.
+        # Why the writing area is out of flow
+
+        It followed at `h-full`, and that is the bug this comment exists for.
+        `height` here is a *preference*: a number computed from the window
+        (`popOutComposerHeight`) or dragged by the owner (`clampComposerHeight`),
+        which flex is then allowed to shrink when the panel around it is
+        shorter. A percentage height inside it resolves against the number that
+        was asked for, not the one flex settled on — so the moment the two
+        differ, the writing area is taller than the box holding it and the
+        overflow is painted over whatever comes next. What came next is the
+        footer, and the message ran across the send button and on to the
+        panel's bottom edge.
+
+        It surfaced when the footer became a row of real buttons rather than
+        thin spans (`19f7a0a`): the furniture grew by a dozen pixels, the
+        composer stopped fitting, and flex started shrinking this box. The
+        footer's height was never the fault. Any change to anything above or
+        below this line would have done it, and the next one will not, because
+        `absolute inset-0` is resolved against the box's **used** size — there
+        is no second number to go stale. See `composer-layout.ts`, which
+        carries the previous instance of this same class of bug.
       */}
-      <div className={cn("relative", COMPOSER_BODY)} style={{ height }}>
+      <div
+        // The rectangle a drop is hit-tested against for "in the message" —
+        // see `dropRegionAt`. On the box with the height rather than on the
+        // contenteditable inside it, so the whole writing area counts, up to
+        // the edge the owner dragged it to.
+        {...{ [DROP_BODY]: "" }}
+        className={cn(
+          "relative",
+          COMPOSER_BODY,
+          dropping && "rounded-[var(--radius)] ring-1 ring-inset ring-accent",
+        )}
+        style={{ height }}
+      >
         {empty && (
           <span className="pointer-events-none absolute left-0 top-0 text-reading leading-[1.6] text-faint-foreground">
             {placeholder}

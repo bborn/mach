@@ -3328,7 +3328,12 @@ fn an_image_too_large_to_draw_is_attached_rather_than_placed_in_the_body() {
         NOW,
     )
     .unwrap();
-    let huge = vec![0u8; (attach::MAX_INLINE_IMAGE_BYTES + 1) as usize];
+    // Real PNG magic, so the *size* is the only thing that can be refusing it.
+    // These were zero bytes, and once `inline_mime` started sniffing they would
+    // have been refused for not being an image at all — the assertion would
+    // still have passed and stopped meaning anything.
+    let mut huge = b"\x89PNG\r\n\x1a\n".to_vec();
+    huge.resize((attach::MAX_INLINE_IMAGE_BYTES + 1) as usize, 0);
     let stored = attach::add_bytes(&db, &draft.id, "raw.png", &huge, true, NOW).unwrap();
     assert!(!stored.inline, "too big for a data URL, small enough to send");
     assert_eq!(attach::list(&db, &draft.id).unwrap().len(), 1);
@@ -5004,3 +5009,195 @@ fn opening_a_composer_does_not_wait_for_the_sync_writer() {
     );
 }
 
+
+// ===========================================================================
+// A file let go on the writing area
+// ===========================================================================
+//
+// `attachAdd` with `inline` set is what a drop on the message body sends, and
+// the flag is a *request*. What decides is the bytes: `attach::inline_mime`
+// sniffs them, so a file that is not really a raster image is attached instead
+// of being placed — quietly, because the chip that appears is the whole answer
+// and there is nothing the writer needs to do about it.
+//
+// The naming here is deliberate. Every case renames the file so the extension
+// and the content disagree, which is the only way to tell which of the two the
+// decision actually reads.
+
+/// A scratch directory that removes itself, and a file in it.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mach-compose-drop-{nanos}-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        Scratch(path)
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) -> String {
+        let path = self.0.join(name);
+        std::fs::write(&path, bytes).expect("write");
+        path.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The smallest thing `sniff_raster_image` calls a PNG: its signature, then
+/// filler. The sniffer reads the first eight bytes and nothing else.
+fn png_bytes(len: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(len.max(8), 0);
+    bytes
+}
+
+/// A draft with a row, ready to hang files on.
+async fn drafted(db: &Db, out: &Outbox, thread: i64) -> String {
+    let prepared = dispatch(
+        db,
+        out,
+        json!({ "op": "prepare", "threadId": thread, "kind": "reply", "now": NOW }),
+    )
+    .await
+    .unwrap();
+    let draft = prepared["draft"].clone();
+    dispatch(db, out, json!({ "op": "saveDraft", "draft": draft, "now": NOW }))
+        .await
+        .unwrap()["draft"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn dropped(
+    db: &Db,
+    out: &Outbox,
+    draft_id: &str,
+    paths: &[String],
+    inline: bool,
+) -> serde_json::Value {
+    dispatch(
+        db,
+        out,
+        json!({
+            "op": "attachAdd",
+            "draftId": draft_id,
+            "paths": paths,
+            "inline": inline,
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_image_let_go_on_the_message_goes_in_the_message() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let scratch = Scratch::new();
+    let id = drafted(&db, &out, thread).await;
+
+    // Named `.dat`, so nothing but the bytes can say this is a picture.
+    let path = scratch.write("screenshot.dat", &png_bytes(2048));
+    let result = dropped(&db, &out, &id, &[path], true).await;
+
+    let added = &result["added"][0];
+    assert_eq!(added["inline"], true, "{result}");
+    // The part is about to be drawn rather than opened, so it carries the type
+    // the bytes really are and not the one the extension claims.
+    assert_eq!(added["mimeType"], "image/png");
+    assert!(
+        added["contentId"].as_str().unwrap().ends_with("@mach.invalid"),
+        "an inline part needs a Content-ID the body can point at: {result}"
+    );
+    assert_eq!(result["refused"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn something_that_is_not_an_image_is_attached_rather_than_placed() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let scratch = Scratch::new();
+    let id = drafted(&db, &out, thread).await;
+
+    // A zip wearing a `.png`. Trusting the name would have put a `cid:` in the
+    // body pointing at an archive, which every client draws as a broken image.
+    let path = scratch.write("holiday.png", b"PK\x03\x04 not an image at all");
+    let result = dropped(&db, &out, &id, &[path], true).await;
+
+    let added = &result["added"][0];
+    assert_eq!(added["inline"], false, "{result}");
+    // It is still attached, and it still leaves. A drop on the body that
+    // refused the file outright would be the app being clever about a mistake
+    // the writer did not make.
+    assert_eq!(
+        result["refused"].as_array().unwrap().len(),
+        0,
+        "attaching is the answer, not an error: {result}"
+    );
+    assert_eq!(result["attachments"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_pdf_let_go_on_the_message_attaches_and_says_nothing() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let scratch = Scratch::new();
+    let id = drafted(&db, &out, thread).await;
+
+    let path = scratch.write("terms.pdf", b"%PDF-1.7\n% a real enough pdf\n");
+    let result = dropped(&db, &out, &id, &[path], true).await;
+
+    assert_eq!(result["added"][0]["inline"], false, "{result}");
+    // The extension still decides what the recipient opens it with.
+    assert_eq!(result["added"][0]["mimeType"], "application/pdf");
+    assert_eq!(result["refused"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_drop_anywhere_else_on_the_composer_never_places_anything() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let scratch = Scratch::new();
+    let id = drafted(&db, &out, thread).await;
+
+    // The same bytes that go inline on the body. Off the body, `inline` is
+    // false and the answer has to be an ordinary attachment.
+    let path = scratch.write("chart.png", &png_bytes(2048));
+    let result = dropped(&db, &out, &id, &[path], false).await;
+
+    assert_eq!(result["added"][0]["inline"], false, "{result}");
+}
+
+#[tokio::test]
+async fn a_file_that_is_refused_is_named_and_the_rest_still_land() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let scratch = Scratch::new();
+    let id = drafted(&db, &out, thread).await;
+
+    let good = scratch.write("chart.png", &png_bytes(64));
+    let missing = scratch.0.join("gone.pdf").to_string_lossy().into_owned();
+    let result = dropped(&db, &out, &id, &[good, missing], false).await;
+
+    assert_eq!(result["added"].as_array().unwrap().len(), 1);
+    let refused = result["refused"].as_array().unwrap();
+    assert_eq!(refused.len(), 1, "{result}");
+    assert!(
+        refused[0].as_str().unwrap().contains("gone.pdf"),
+        "a refusal has to say which file: {refused:?}"
+    );
+}

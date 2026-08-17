@@ -442,11 +442,15 @@ export function humanSize(bytes: number): string {
 /**
  * Whether this file could be drawn in the body.
  *
- * Mirrors `compose::attach::can_be_inline`: a raster image, small enough to
- * carry as a `data:` URL. SVG is excluded on both sides — an inline SVG asks
- * the recipient's client to render a document from this Mac. An image already
- * in the body keeps its control whatever its size, or a picture placed by some
- * other route could never be taken back out.
+ * A raster image, small enough to carry as a `data:` URL. SVG is excluded on
+ * both sides — an inline SVG asks the recipient's client to render a document
+ * from this Mac. An image already in the body keeps its control whatever its
+ * size, or a picture placed by some other route could never be taken back out.
+ *
+ * This reads the *declared* type, because by the time a chip exists Rust has
+ * already stored one. `compose::attach::inline_mime` is the stricter question
+ * and the one that decides: it sniffs the bytes, so a zip named `.png` is
+ * refused the body however this answers.
  */
 export function isInlinableImage(file: DraftAttachment): boolean {
   if (file.inline === true) return true;

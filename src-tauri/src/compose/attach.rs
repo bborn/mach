@@ -101,9 +101,28 @@ impl Attachment {
     }
 }
 
-/// An image small enough to be worth drawing where it sits.
-fn can_be_inline(mime_type: &str, size: u64) -> bool {
-    is_image_mime(mime_type) && size <= MAX_INLINE_IMAGE_BYTES
+/// The type to write on an image small enough to be worth drawing where it sits,
+/// or `None` for anything that may not go in a body.
+///
+/// **Decided from the bytes, never from the name.** This used to read the
+/// Content-Type that [`mime_for`] derives from the extension, which is the right
+/// source for the type a recipient's client will *open* the file with and the
+/// wrong one for whether it may be *drawn*. A body drop is the case that made
+/// the difference matter: letting go of a `.zip` on the writing area is a
+/// request to place it, and a placed part that is not an image is a broken
+/// picture in the recipient's message rather than a file they can save. Renaming
+/// a zip to `.png` would have been enough.
+///
+/// [`names::sniff_raster_image`] is the same function the receive side uses to
+/// decide whether an incoming `cid:` part may be shown, so the two ends of the
+/// same question have one answer. SVG is not in its list, for the reason on
+/// [`is_image_mime`], and neither is HEIC — an image everywhere except in a
+/// recipient's mail client, so it is attached.
+fn inline_mime(bytes: &[u8], size: u64) -> Option<&'static str> {
+    if size > MAX_INLINE_IMAGE_BYTES {
+        return None;
+    }
+    names::sniff_raster_image(bytes)
 }
 
 /// An image by its Content-Type, ignoring parameters.
@@ -127,9 +146,11 @@ pub fn is_image_mime(mime_type: &str) -> bool {
 /// filesystem, and so the one place that turns a user-chosen path into bytes is
 /// the IPC layer, where the choice was made.
 ///
-/// `inline` is a *request*, not an instruction: a file that is not an image
-/// lands as an ordinary attachment whatever was asked for, because the
-/// alternative is a message whose body references a `cid:` no client will draw.
+/// `inline` is a *request*, not an instruction: a file whose bytes are not a
+/// raster image lands as an ordinary attachment whatever was asked for, because
+/// the alternative is a message whose body references a `cid:` no client will
+/// draw. Dropping a PDF on the writing area therefore attaches it, and says
+/// nothing — the chip that appears is the whole answer.
 pub fn add_bytes(
     db: &Db,
     draft_id: &str,
@@ -157,11 +178,18 @@ pub fn add_bytes(
         )));
     }
 
-    let mime_type = mime_for(&filename);
+    // Two different questions with two different sources. What the recipient's
+    // client should open this with comes from the extension, because that is
+    // what every other mail client sends. Whether it may be drawn in the body
+    // comes from the bytes — see [`inline_mime`]. An image that is going in the
+    // body takes the sniffed type as its own: the part is about to be rendered
+    // rather than opened, so its header has to name what the bytes really are.
+    let placed = if inline { inline_mime(bytes, size) } else { None };
+    let mime_type = placed.map_or_else(|| mime_for(&filename), str::to_string);
     let id = format!("att-{now_ms:x}-{:x}", entropy(now_ms));
     let attachment = Attachment {
         content_id: content_id_for(&id),
-        inline: inline && can_be_inline(&mime_type, size),
+        inline: placed.is_some(),
         id: id.clone(),
         draft_id: draft_id.to_string(),
         filename,

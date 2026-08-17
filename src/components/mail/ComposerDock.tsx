@@ -33,13 +33,19 @@ import {
   canPopOut,
   clampComposerHeight,
   composerPlacement,
+  dropRegionAt,
   forgetPopOut,
-  isOverDropTarget,
   isPoppedOut,
   popOutComposerHeight,
   subscribeDragDrop,
   togglePopOut,
+  type DropRegion,
 } from "./composer-layout";
+import {
+  looksInlinable,
+  runAttach,
+  type PendingAttachment,
+} from "./composer-attach";
 import { replyTarget } from "./thread-cursor";
 import { noteSent } from "@/lib/contacts";
 import { clockTime } from "@/lib/time";
@@ -189,10 +195,33 @@ export function ComposerDock() {
     id: string;
     at?: number;
   } | null>(null);
-  /** A file is over the composer, and letting go would attach it. */
-  const [dropping, setDropping] = useState(false);
+  /**
+   * Where on the composer a file is hovering, and what letting go would do.
+   *
+   * Null when the pointer is over the window but not over a composer — which is
+   * a different state from "nothing is being dragged", and the reason `dragging`
+   * is separate.
+   */
+  const [dropTarget, setDropTarget] = useState<DropRegion | null>(null);
   /** A file is over the window at all, wherever the pointer is. */
   const [dragging, setDragging] = useState(false);
+  /**
+   * Whether the files currently in the air could go in a body.
+   *
+   * Read off the filenames Tauri hands over on `enter`, and used for nothing
+   * but the wording of the hint: a `.zip` over the writing area must not be
+   * offered "Drop in the message" when Rust is going to attach it.
+   */
+  const [draggingInlinable, setDraggingInlinable] = useState(false);
+  /**
+   * Files let go but not yet answered for, per draft.
+   *
+   * One entry per drop rather than one flat list, because `settle` has to take
+   * down exactly the chips its own drop put up — two files dropped while a
+   * third is still in flight must not clear each other. The array identity is
+   * the key; see `runAttach`.
+   */
+  const [attaching, setAttaching] = useState<{ id: string; chips: PendingAttachment[] }[]>([]);
   /**
    * `cid:` → `data:` URL for the inline images of every open draft.
    *
@@ -690,10 +719,22 @@ export function ComposerDock() {
     [],
   );
 
+  /** The chips one draft is waiting on, flattened out of the per-drop entries. */
+  const pendingFor = useCallback(
+    (id: string): PendingAttachment[] =>
+      attaching.filter((entry) => entry.id === id).flatMap((entry) => entry.chips),
+    [attaching],
+  );
+
   /**
-   * Attaching writes to the store, and the store keys the files by draft id —
-   * so the draft has to *have* a row before a file can point at it. A composer
-   * opened and never typed in has no row yet, which is why this saves first.
+   * A composer opened and never typed in has no row in the store yet, and one
+   * that has been typed in has an autosave still pending. This settles both, so
+   * the draft the files are going on is the draft the store holds.
+   *
+   * It used to be *awaited before* the attach, on the reasoning that the files
+   * are keyed by draft id and so the draft has to exist first. That is not what
+   * the store requires — see `composer-attach.ts`. The two calls now go
+   * together and the composer draws before either of them.
    */
   const ensureSaved = useCallback(
     async (target: Draft): Promise<Draft> => {
@@ -732,49 +773,87 @@ export function ComposerDock() {
     });
   }, []);
 
+  /**
+   * Put the images that just arrived into the body, at the caret.
+   *
+   * The bytes have to be fetched before the `<img>` goes in, or the editor
+   * would draw a `cid:` that resolves to nothing for as long as the fetch
+   * takes. Shared by the panel and by a drop on the writing area, which are the
+   * two routes that can produce an inline file.
+   */
+  const placeInline = useCallback(
+    async (draftId: string, placed: Draft["attachments"] = []) => {
+      await loadImages(draftId);
+      for (const file of placed) {
+        bodyEditor.current?.insert(inlineImageMarkup(file.contentId!, file.filename));
+      }
+    },
+    [loadImages],
+  );
+
   const attach = useCallback(
     (id: string, inline = false) => {
       const target = drafts.find((entry) => entry.id === id);
       if (!target) return;
+      /*
+       * No pending chip on this route, and there cannot be one: `attachChoose`
+       * opens the system panel *and* attaches in a single call, so the paths
+       * are never on this side of the boundary on their own. The panel is its
+       * own feedback while it is up, and what follows it is one round trip
+       * rather than two.
+       */
       void (async () => {
-        await ensureSaved(target);
-        const result = await chooseAttachments(id, inline).catch((error: unknown) => {
-          actions.setStatus(errorMessage(error), "error");
-          return null;
-        });
+        const [, result] = await Promise.all([
+          ensureSaved(target),
+          chooseAttachments(id, inline).catch((error: unknown) => {
+            actions.setStatus(errorMessage(error), "error");
+            return null;
+          }),
+        ]);
         if (!result) return;
         applyAttachments(id, result.attachments);
         const placed = result.added.filter((file) => file.inline && file.contentId);
-        if (placed.length > 0) {
-          await loadImages(id);
-          for (const file of placed) {
-            bodyEditor.current?.insert(inlineImageMarkup(file.contentId!, file.filename));
-          }
-        }
+        if (placed.length > 0) await placeInline(id, placed);
         // A file that was refused must say so by name. Silently attaching three
         // of four is the failure this project has paid most for.
         if (result.refused.length > 0) actions.setStatus(result.refused[0], "error");
       })();
     },
-    [drafts, ensureSaved, applyAttachments, actions, loadImages],
+    [drafts, ensureSaved, applyAttachments, actions, placeInline],
   );
 
+  /**
+   * Files let go on the composer.
+   *
+   * `region` is where inside it the pointer was. On the writing area an image
+   * goes *in* the message, which is what Gmail does and what the chip's own
+   * control has always implied; anywhere else it goes beside it. Asking for the
+   * body is only ever a request — Rust sniffs the bytes and attaches anything
+   * that is not a raster image, so a PDF dropped on the message attaches rather
+   * than failing.
+   *
+   * The chips go up before either call is made. See `composer-attach.ts`.
+   */
   const drop = useCallback(
-    (paths: string[]) => {
+    (paths: string[], region: DropRegion) => {
       const target = drafts.find((entry) => entry.id === activeId);
       if (!target || paths.length === 0) return;
-      void (async () => {
-        await ensureSaved(target);
-        const result = await attachPaths(target.id, paths).catch((error: unknown) => {
-          actions.setStatus(errorMessage(error), "error");
-          return null;
-        });
-        if (!result) return;
-        applyAttachments(target.id, result.attachments);
-        if (result.refused.length > 0) actions.setStatus(result.refused[0], "error");
-      })();
+      const id = target.id;
+      const inline = region === "body";
+      void runAttach({
+        paths,
+        inline,
+        save: () => ensureSaved(target),
+        attach: (chosen, wantsInline) => attachPaths(id, [...chosen], wantsInline),
+        show: (chips) => setAttaching((current) => [...current, { id, chips }]),
+        settle: (chips) =>
+          setAttaching((current) => current.filter((entry) => entry.chips !== chips)),
+        applied: (attachments) => applyAttachments(id, attachments),
+        placed: (placed) => placeInline(id, placed),
+        failed: (message) => actions.setStatus(message, "error"),
+      });
     },
-    [drafts, activeId, ensureSaved, applyAttachments, actions],
+    [drafts, activeId, ensureSaved, applyAttachments, actions, placeInline],
   );
 
   /**
@@ -904,29 +983,34 @@ export function ComposerDock() {
    * Tauri reports the drop with the paths, not with a `File`: the webview never
    * sees the bytes, and Rust reads them from disk.
    *
-   * The position decides whether it lands. A drop over the thread list is not a
-   * drop on the message being written, and attaching from there would be the
-   * app guessing — so the composer draws a target while anything is being
-   * dragged (`dragging`), lights it while the pointer is on it (`dropping`),
-   * and a release anywhere else does nothing.
+   * The position decides whether it lands, and where. A drop over the thread
+   * list is not a drop on the message being written, and attaching from there
+   * would be the app guessing — so the composer draws a target while anything
+   * is being dragged (`dragging`), lights the half the pointer is over
+   * (`dropTarget`), and a release anywhere else does nothing.
+   *
+   * Only `enter` and `drop` carry the paths, so the filenames are kept from the
+   * `enter` for as long as the drag lasts — `over` fires many times a second
+   * and knows nothing about what is being dragged.
    */
   useEffect(() => {
     if (!drafts.length) return;
     return subscribeDragDrop((signal) => {
       if (signal.type === "leave") {
         setDragging(false);
-        setDropping(false);
+        setDropTarget(null);
         return;
       }
       if (signal.type === "enter" || signal.type === "over") {
         setDragging(true);
-        setDropping(isOverDropTarget(signal.position));
+        setDropTarget(dropRegionAt(signal.position));
+        if (signal.type === "enter") setDraggingInlinable(looksInlinable(signal.paths));
         return;
       }
-      const onTarget = isOverDropTarget(signal.position);
+      const region = dropRegionAt(signal.position);
       setDragging(false);
-      setDropping(false);
-      if (onTarget) dropRef.current(signal.paths);
+      setDropTarget(null);
+      if (region) dropRef.current(signal.paths, region);
     });
   }, [drafts.length]);
 
@@ -1602,8 +1686,10 @@ export function ComposerDock() {
       // A brand-new message has no conversation to continue, so there is
       // nothing for the model to finish from.
       ghostContext={visible.kind === "new" ? undefined : ghostContext}
-      dropping={dropping}
+      dropTarget={dropTarget}
       dragging={dragging}
+      draggingInlinable={draggingInlinable}
+      pending={pendingFor(visible.id)}
       inlineImages={inlineUrls}
       toRef={toField}
       bodyRef={bodyField}

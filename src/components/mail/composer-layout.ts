@@ -31,6 +31,10 @@
  * a hit test against the rectangle the two sections above decided on. The
  * subscription that delivers the drag is here with it, because the units it
  * arrives in are the units that hit test has to work in — see {@link DragPoint}.
+ *
+ * The answer is a {@link DropRegion} rather than a boolean, because a file let
+ * go on the writing area means something different from one let go on the
+ * footer: the first goes in the message, the second goes beside it.
  */
 
 import { COMPOSER_HEIGHT_BOUNDS } from "@/lib/prefs";
@@ -173,6 +177,28 @@ export const COMPOSER_BODY = "min-h-0";
 export const DROP_TARGET = "data-mach-drop-target";
 
 /**
+ * The attribute the writing area carries, inside that root.
+ *
+ * The composer answers a drop two different ways depending on where inside it
+ * the pointer was, so the hit test needs a second rectangle. It is an attribute
+ * rather than a ref for the same reason [`DROP_TARGET`] is: the box being
+ * tested is whatever is laid out at the moment of the drop, and the height of
+ * the writing area is a number the owner drags.
+ */
+export const DROP_BODY = "data-mach-drop-body";
+
+/**
+ * Where inside a composer a drop landed.
+ *
+ * `body` is the writing area, and means the file goes *in* the message —
+ * `<img src="cid:…">` at the caret, the way Gmail does it. `composer` is
+ * everywhere else on the composer, and means the file goes beside it. Only
+ * images can take the first road; a PDF dropped on the body is attached, which
+ * is [`attach::add_bytes`]'s rule and not this one's.
+ */
+export type DropRegion = "body" | "composer";
+
+/**
  * A point, in the units Tauri reports a drag in.
  *
  * The payload's type says `PhysicalPosition`, and on macOS that type is a lie.
@@ -201,7 +227,7 @@ export interface DragPoint {
 }
 
 /**
- * Is this drag over a composer?
+ * Which part of a composer this drag is over, if any.
  *
  * Asked of the document rather than of React state, for the same reason
  * `keyboardInComposer` is: the composer's rectangle is a fact about what is
@@ -211,21 +237,48 @@ export interface DragPoint {
  *
  * More than one composer can be on screen; any of them counts, because
  * dropping on the one in front is the only thing the pointer can be over.
+ *
+ * The writing area is looked for *within* the composer that was hit rather
+ * than across the document, so a second composer's editor can never claim a
+ * drop that landed on this one's footer.
+ */
+export function dropRegionAt(point: DragPoint, doc: Document = document): DropRegion | null {
+  for (const target of doc.querySelectorAll(`[${DROP_TARGET}]`)) {
+    if (!contains(target, point)) continue;
+    for (const body of target.querySelectorAll(`[${DROP_BODY}]`)) {
+      if (contains(body, point)) return "body";
+    }
+    return "composer";
+  }
+  return null;
+}
+
+/**
+ * Is this drag over a composer at all?
+ *
+ * The question the guard on the drop still asks — a release outside every
+ * composer does nothing, whichever region the inside would have been.
  */
 export function isOverDropTarget(point: DragPoint, doc: Document = document): boolean {
-  for (const target of doc.querySelectorAll(`[${DROP_TARGET}]`)) {
-    const box = target.getBoundingClientRect();
-    if (box.width === 0 && box.height === 0) continue;
-    if (
-      point.x >= box.left &&
-      point.x <= box.right &&
-      point.y >= box.top &&
-      point.y <= box.bottom
-    ) {
-      return true;
-    }
-  }
-  return false;
+  return dropRegionAt(point, doc) !== null;
+}
+
+/**
+ * A point inside an element's box, in the units [`DragPoint`] arrives in.
+ *
+ * A box of no size is skipped rather than tested: a composer being unmounted,
+ * or a writing area inside a `display: none` background composer, reports
+ * `0,0,0,0`, and the origin of the window would otherwise be inside all of them.
+ */
+function contains(element: Element, point: DragPoint): boolean {
+  const box = element.getBoundingClientRect();
+  if (box.width === 0 && box.height === 0) return false;
+  return (
+    point.x >= box.left &&
+    point.x <= box.right &&
+    point.y >= box.top &&
+    point.y <= box.bottom
+  );
 }
 
 /* -------------------------------------------------------------------------- */
