@@ -33,13 +33,22 @@
 //! barrier, so the tail of every batch ran at falling concurrency and the whole
 //! batch waited on its slowest response; and no request at all was in flight
 //! while the transaction was open. Measured against a real mailbox that came to
-//! 11 messages a second against a ceiling of 50.
+//! 11 messages a second, against a Gmail ceiling that was then 50.
 //!
 //! [`MailSync::drain_queue`] is now a pipeline instead. One task keeps
 //! `backfill_fetch_concurrency` `messages.get` calls in flight without ever
 //! draining to zero, and hands completed messages to a *single* writer task —
 //! single because SQLite has one writer, and fanning transactions out would only
 //! move the queue from the wire to the mutex. Neither side waits for the other.
+//!
+//! Google revised the Gmail quota on 1 May 2026 and that ceiling is now five
+//! fetches a second, so the pipeline no longer buys throughput — lockstep's 11 a
+//! second was already above what the quota allows. What it still buys is that
+//! the width is honestly the width: `backfill_fetch_concurrency` requests are in
+//! flight the whole time rather than on average, so sizing it against the quota
+//! (see [`crate::sync::default_backfill_fetch_concurrency`]) means something.
+//! The cost of the revision is real and there is nowhere to put it: a year of a
+//! twenty-thousand-message mailbox takes about eighty minutes now.
 //!
 //! Nothing about the correctness properties changed: the writer still deletes a
 //! queue row in the same transaction that stores its message, and the watermark
@@ -228,9 +237,9 @@ impl MailSync {
     /// [`CALENDAR_LIST_MAX_AGE_MS`](crate::sync::calendar::CALENDAR_LIST_MAX_AGE_MS),
     /// where six hours is right because the calendar list moves a few times a
     /// year and re-fetching it every minute bought nothing. Here the same
-    /// arithmetic points the other way: five quota units against a daily budget
-    /// of 1.2 million, and the thing being fetched is what makes the feature
-    /// work.
+    /// arithmetic points the other way: `drafts.list` is five quota units
+    /// against the 6,000 a minute Gmail allows one user, and the thing being
+    /// fetched is what makes the feature work.
     ///
     /// # Why a failure is not the pass's failure
     ///

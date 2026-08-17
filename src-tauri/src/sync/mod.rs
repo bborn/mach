@@ -28,7 +28,9 @@
 //!   queue, then keeps `backfill_fetch_concurrency` `messages.get` calls in
 //!   flight continuously while a single writer task commits completed messages
 //!   `message_batch_size` at a time. Fetching does not stop while a transaction
-//!   is open, which is what separates 40 messages a second from 11.
+//!   is open. That mattered more when Gmail's quota allowed 50 fetches a second;
+//!   it now allows five, and the width is set by the quota rather than by how
+//!   much the wire can be kept full. See [`GMAIL_QUOTA_UNITS_PER_USER_PER_MINUTE`].
 //! * **Cancellation is structural.** Every task holds a [`CancelToken`]; the
 //!   engine aborts its loop on drop. No detached work outlives shutdown.
 //!
@@ -100,6 +102,81 @@ impl SyncError {
 }
 
 // ===========================================================================
+// Gmail's quota
+// ===========================================================================
+//
+// Google revised the Gmail quota on 1 May 2026. `messages.get` went from 5
+// units to 20 and the per-user ceiling became 6,000 units a minute, so the
+// width that used to sit just under the ceiling is now eight times over it.
+// The width had been a literal with a paragraph of arithmetic beside it, and
+// the paragraph is what went stale. It is constants and a `const fn` now, and a
+// test pins the relationship between them.
+
+/// Gmail's per-user ceiling.
+///
+/// > Per minute per user per project — 6,000 quota units
+///
+/// — [Gmail API usage limits][quota]
+///
+/// That page also says a Cloud project which used the API between November 2025
+/// and April 2026 keeps its previous quotas, and that projects created on or
+/// after 1 May 2026 get these. Mach ships no credentials: every user registers
+/// their own Cloud project (see the README), so anybody installing it now has a
+/// project created after the revision. The default has to assume the new
+/// numbers, and an older grandfathered project simply runs under its budget.
+///
+/// [quota]: https://developers.google.com/workspace/gmail/api/reference/quota
+pub const GMAIL_QUOTA_UNITS_PER_USER_PER_MINUTE: u32 = 6_000;
+
+/// What one `users.messages.get` costs, from the same table.
+///
+/// This is the number that moved. It was 5, which is why 16 requests in flight
+/// used to be a reasonable width and now is eight times the whole budget.
+pub const GMAIL_MESSAGES_GET_UNITS: u32 = 20;
+
+/// The share of a user's per-minute quota the backfill may spend.
+///
+/// The rest pays for everything the same account does while a backfill runs:
+/// `history.list` at 2 units, `drafts.list` at 5, `messages.modify` at 5 for
+/// every archive or star, `messages.attachments.get` at 20, and whatever the
+/// person reading their mail asks for. Spending the whole ceiling on the
+/// backfill would make the app unusable for as long as the backfill lasts.
+pub const BACKFILL_QUOTA_SHARE_PERCENT: u32 = 80;
+
+/// Round trip of one `messages.get`, measured against a real mailbox.
+///
+/// Only used to turn a rate into a width. Throughput of a pure-latency pipeline
+/// is *concurrency ÷ round trip* and nothing else, so this is the other half of
+/// the sum. It is the half that is a measurement rather than a published fact,
+/// which is why the width rounds up: overshooting costs a 429 the client
+/// already backs off from, and undershooting costs throughput silently.
+pub const BACKFILL_ROUND_TRIP_MS: u32 = 400;
+
+/// `messages.get` calls a minute the backfill is allowed to make.
+///
+/// 6,000 units × 80% ÷ 20 units = 240 a minute, four a second. The same sum
+/// under the old quota gave forty a second.
+pub const fn backfill_fetches_per_minute() -> u32 {
+    GMAIL_QUOTA_UNITS_PER_USER_PER_MINUTE * BACKFILL_QUOTA_SHARE_PERCENT
+        / 100
+        / GMAIL_MESSAGES_GET_UNITS
+}
+
+/// The width that spends [`backfill_fetches_per_minute`] and no more.
+///
+/// `rate × round trip`, rounded up: 240 a minute over a 400 ms round trip is
+/// 1.6 requests in flight, so 2.
+pub const fn default_backfill_fetch_concurrency() -> usize {
+    let per_minute = backfill_fetches_per_minute() as u64;
+    let width = (per_minute * BACKFILL_ROUND_TRIP_MS as u64 + 59_999) / 60_000;
+    if width < 1 {
+        1
+    } else {
+        width as usize
+    }
+}
+
+// ===========================================================================
 // configuration
 // ===========================================================================
 
@@ -118,8 +195,8 @@ pub struct SyncConfig {
     /// waits for at most one batch in progress — and against the owner's
     /// mailbox a batch of 25 messages measured p99 111 ms, versus 27 ms at 10.
     /// The cost is 14% fewer messages a second written locally, which buys
-    /// nothing: the backfill is bounded by Gmail's quota at roughly 40 messages
-    /// a second, and this writes over a thousand.
+    /// nothing: the backfill is bounded by Gmail's quota at four messages a
+    /// second, and this writes over a thousand.
     pub message_batch_size: usize,
     /// `maxResults` for `messages.list` during the backfill.
     pub list_page_size: u32,
@@ -131,21 +208,22 @@ pub struct SyncConfig {
     pub request_concurrency: usize,
     /// `messages.get` calls one account's backfill keeps in flight.
     ///
-    /// This is the throughput knob. Gmail allows 250 quota units per second per
-    /// user and a `messages.get` costs 5, so the per-account ceiling is 50
-    /// fetches a second — and throughput is *concurrency ÷ round-trip*, nothing
-    /// else, because the backfill is pure latency. At the ~0.4 s round trip
-    /// measured against a real mailbox, 16 in flight is ~40 fetches a second:
-    /// close to the ceiling with about a fifth of the quota left for
-    /// `history.list`, attachment fetches and whatever the UI is doing.
+    /// This is the throughput knob, and it is not a free choice: it is Gmail's
+    /// per-user quota divided by what a `messages.get` costs, times the round
+    /// trip. [`default_backfill_fetch_concurrency`] does that sum from named
+    /// constants so the next revision to the quota is one edit to one number.
     ///
     /// Never effectively larger than `request_concurrency`, which bounds every
     /// account together — going wider than the global bound would only park
     /// tasks on the shared semaphore.
     ///
-    /// Deliberately *not* paired with a rate limiter: the client's
-    /// [`RetryPolicy`] already backs off with jitter on a 429, and a second
-    /// governor would only argue with it.
+    /// Not paired with a rate limiter. The client's [`RetryPolicy`] already
+    /// backs off with jitter on a 429 and honours a `Retry-After`, so the
+    /// consequence of the round-trip estimate being optimistic is a retry, not
+    /// a stampede. The estimate is the weak part of this, and if it ever needs
+    /// to stop being a guess the answer is a token bucket metered in quota
+    /// units rather than a wider or narrower semaphore — concurrency cannot
+    /// express "four a second" at all when four a second is two requests.
     pub backfill_fetch_concurrency: usize,
     pub calendar_past_days: i64,
     pub calendar_future_days: i64,
@@ -167,9 +245,12 @@ impl Default for SyncConfig {
             history_page_size: 500,
             account_concurrency: 5,
             // Five mailboxes onboarding at once share this; one mailbox on its
-            // own is bounded by `backfill_fetch_concurrency` below.
+            // own is bounded by `backfill_fetch_concurrency` below. The quota
+            // is per user, so five backfills at their own width are within
+            // budget individually and this only has to stop the pathological
+            // case — every account also fetching attachments and drafts at once.
             request_concurrency: 32,
-            backfill_fetch_concurrency: 16,
+            backfill_fetch_concurrency: default_backfill_fetch_concurrency(),
             calendar_past_days: 90,
             calendar_future_days: 365,
             calendar_page_size: 250,
@@ -934,4 +1015,79 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sum these constants exist to make visible, spelled out. Change a
+    /// quota number and this is the test that tells you what it did.
+    #[test]
+    fn the_backfill_budget_is_the_published_quota_divided_by_the_published_cost() {
+        assert_eq!(GMAIL_QUOTA_UNITS_PER_USER_PER_MINUTE, 6_000);
+        assert_eq!(GMAIL_MESSAGES_GET_UNITS, 20);
+        assert_eq!(backfill_fetches_per_minute(), 240);
+        assert_eq!(default_backfill_fetch_concurrency(), 2);
+    }
+
+    /// The property, independent of today's numbers: the backfill's own
+    /// spending is inside the share it was given, and the share is inside the
+    /// quota.
+    #[test]
+    fn the_backfill_never_budgets_more_than_its_share_of_the_quota() {
+        assert!(BACKFILL_QUOTA_SHARE_PERCENT <= 100);
+        let spent = backfill_fetches_per_minute() * GMAIL_MESSAGES_GET_UNITS;
+        assert!(
+            spent <= GMAIL_QUOTA_UNITS_PER_USER_PER_MINUTE / 100 * BACKFILL_QUOTA_SHARE_PERCENT,
+            "backfill budgets {spent} units a minute, above its \
+             {BACKFILL_QUOTA_SHARE_PERCENT}% share of \
+             {GMAIL_QUOTA_UNITS_PER_USER_PER_MINUTE}"
+        );
+        assert!(spent < GMAIL_QUOTA_UNITS_PER_USER_PER_MINUTE);
+    }
+
+    /// The width is the *smallest* one that reaches the budgeted rate at the
+    /// measured round trip. One narrower would leave quota unspent; one wider
+    /// buys nothing but 429s. This is what pins the rounding direction, which
+    /// is the part of the sum a future edit is most likely to get wrong.
+    #[test]
+    fn the_width_is_the_narrowest_that_spends_the_budget() {
+        let width = default_backfill_fetch_concurrency() as u64;
+        let round_trip = BACKFILL_ROUND_TRIP_MS as u64;
+        let budget = backfill_fetches_per_minute() as u64;
+
+        let reached = width * 60_000 / round_trip;
+        assert!(
+            reached >= budget,
+            "{width} in flight over {round_trip} ms reaches {reached} fetches a \
+             minute, short of the {budget} the quota allows"
+        );
+        let narrower = width.saturating_sub(1) * 60_000 / round_trip;
+        assert!(
+            narrower < budget,
+            "{} in flight already reaches {narrower} fetches a minute, so \
+             {width} is wider than the quota justifies",
+            width - 1
+        );
+    }
+
+    /// The default config uses the derived number rather than a copy of it, and
+    /// the global bound does not quietly override it.
+    #[test]
+    fn the_default_config_carries_the_derived_width() {
+        let config = SyncConfig::default();
+        assert_eq!(
+            config.backfill_fetch_concurrency,
+            default_backfill_fetch_concurrency()
+        );
+        assert!(config.backfill_fetch_concurrency >= 1);
+        assert!(config.backfill_fetch_concurrency <= config.request_concurrency);
+        // Five accounts at full width still has to fit the stampede guard, or
+        // the width in the config is not the width on the wire.
+        assert!(
+            config.account_concurrency * config.backfill_fetch_concurrency
+                <= config.request_concurrency
+        );
+    }
 }
