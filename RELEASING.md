@@ -69,9 +69,11 @@ before it builds anything and tells you to run `scripts/version`.
 
 ## The ad-hoc build, which is what this is
 
-Mach has no Apple Developer ID, so releases are not notarized. macOS attaches
-`com.apple.quarantine` to anything downloaded from the internet and refuses to
-open a quarantined app it cannot verify.
+Releases are not notarized. I have a Developer ID now, so this is a matter of
+adding the secrets below rather than of buying anything — until then the
+workflow builds the ad-hoc bundle. macOS attaches `com.apple.quarantine` to
+anything downloaded from the internet and refuses to open a quarantined app it
+cannot verify.
 
 **There are three states, and they are not degrees of the same thing:**
 
@@ -140,6 +142,10 @@ is a second distribution channel to maintain, so it is not here.
 
 You need the Apple Developer Program, which is $99/year. A free Apple ID cannot
 issue a Developer ID certificate and cannot notarize.
+
+Steps 1 and 2 are done — the certificate is `Developer ID Application: Bruno
+Bornsztein (7YBX3359H4)` and it is in the login Keychain. What is left is the
+export and the secrets.
 
 1. In the Apple Developer account, create a **Developer ID Application**
    certificate and install it in your login Keychain.

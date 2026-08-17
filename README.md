@@ -41,7 +41,8 @@ Working, and what I read my mail in every day:
 - Search in Gmail's operator syntax, parsed as you type and compiled to SQL
   against the FTS5 index, plus a `⌘K` palette for everything else.
 - Composer with signatures, a send delay you can cancel, and scheduled send.
-- Attachments: fetch, cache, open, save, and inline `cid:` images.
+- Attachments both ways: drag a file onto a composer or press `⇧⌘A` to send
+  one; fetch, cache, open, save, and inline `cid:` images on the way in.
 - Day, week and month calendar with drag-to-create and drag-to-move, and an
   event view carrying guests and their answers, recurrence, reminders and the
   Meet link.
@@ -182,6 +183,12 @@ changes.
 
 Sync is a 12-month backfill per account, then incremental `users.history.list`
 from a stored watermark, with a full resync when Google expires the history ID.
+
+The backfill is slow, and the reason is Gmail's. A `messages.get` costs 20
+quota units against 6,000 per user per minute, so five a second is the ceiling
+and 20,000 messages take somewhere over an hour. The width is derived from
+those numbers in `sync/mod.rs` rather than guessed. Nothing about the app waits
+on it — mail appears as it lands, newest first.
 
 Search is local. The query is parsed in TypeScript
 (`src/lib/search-query.ts`) so the box can show its interpretation as you type,
