@@ -164,8 +164,15 @@ Then, per item:
 2. The subagent implements and tests. It runs no git command.
 3. Bring the work in yourself: `git -C <worktree> add -A`, take the diff, apply
    it to the main checkout, commit there.
-4. `scripts/qa restart` when Rust changed. Frontend edits hot-reload into the
-   running window already.
+4. `scripts/qa restart` when Rust changed.
+
+**Frontend edits do not hot-reload in a worktree.** `vite.config.ts` ignores
+`**/.claude/**` so the dev server is not watching fifteen agent checkouts, and
+agent worktrees live under `.claude/worktrees/`. Vite goes on serving the
+module as it was before the edit. Two agents have now lost an hour each to a
+screenshot that showed old styling of an element whose served source was
+verifiably new. In a worktree, `qa down && qa up` after every frontend change,
+and distrust any screenshot that disagrees with the code.
 
 The point is the round trip. An item submitted while he is using the app should
 be back in the app in minutes.
