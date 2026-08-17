@@ -600,6 +600,12 @@ cmd_up() {
   ensure_vite
   pin_binary
 
+  # The `Mach.app` that makes a banner say "Mach" instead of "Terminal". It is
+  # an Info.plist and an icon for LaunchServices to read; nothing runs from it,
+  # and the binary launched below is unchanged. Idempotent and a fifth of a
+  # second once it exists. See `scripts/dev-bundle`.
+  "$REPO/scripts/dev-bundle" || true
+
   # Same signature every build, so the Keychain stops treating each rebuild as
   # a new program and re-asking for the login password. A no-op until the
   # identity exists; see `scripts/sign --setup`.

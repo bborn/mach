@@ -115,6 +115,13 @@ and the versions are [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Mail banners carry Mach's name and icon instead of Terminal's. A development
+  build is a bare binary with no bundle identifier, so `mac-notification-sys`
+  borrowed one, and the only identifier it will accept is one LaunchServices can
+  resolve. `scripts/dev-bundle` registers a minimal `Mach.app` — an `Info.plist`
+  and the icon, with nothing executing from it — and the notifier now asks for
+  Mach's own identifier. macOS asks for notification permission once, because
+  this is a new application to it.
 - ⌘Z puts an archived row back in 13ms instead of 966. Five causes, all in the
   seam between an optimistic guess and the list it is drawn against.
 - One trackpad flick moves one period. The re-arm rule now reads speed, which

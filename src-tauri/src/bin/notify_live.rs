@@ -29,6 +29,11 @@ use mach_lib::notify::{
     Banner, PendingOpen, Permission,
 };
 
+/// The identifier in `tauri.conf.json`. Repeated rather than read, because this
+/// binary has no Tauri config loaded and one string is cheaper than a parser.
+/// `scripts/dev-bundle` and `scripts/sign` hold the same one.
+const IDENTIFIER: &str = "com.mach.mail";
+
 /// A host that only records, so the click can be printed rather than emitted
 /// into a window this process does not have.
 struct Printer {
@@ -121,8 +126,11 @@ fn main() {
     });
     notify::host::install(printer.clone());
 
-    // The identifier a development build borrows; see `notify::mac`.
-    let delivery = notify::mac::deliver(&banner, &target, "com.apple.Terminal");
+    // Mach's own identifier, the same one `notify::host` passes. It only
+    // resolves once `scripts/dev-bundle` has registered a `Mach.app`; without
+    // that, `mac-notification-sys` falls back to Terminal's and `notify::mac`
+    // prints why. See its module doc.
+    let delivery = notify::mac::deliver(&banner, &target, IDENTIFIER);
     println!("delivery {delivery:?} — click the banner, or clear it, to finish");
 
     // `NSUserNotificationCenter` calls its delegate on the main thread, so the

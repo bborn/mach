@@ -142,6 +142,44 @@ it applies to the self-signed route too: a hardened binary can't be attached to
 by a debugger. If you want `lldb`, sign with an entitlements file containing
 `com.apple.security.get-task-allow`, and never ship that build.
 
+### Notifications in a development build
+
+Mail banners used to arrive wearing Terminal's name and Terminal's icon.
+`scripts/dev-bundle` is what stops that. It writes a minimal `Mach.app` into the
+target directory and registers it with LaunchServices, and both ways of starting
+the app already run it: `scripts/qa up` before it launches, and
+`beforeDevCommand` for `bun run tauri dev`.
+
+A development build is a bare binary with no bundle, and `NSUserNotification`
+will not deliver for a process without a bundle identifier.
+`mac-notification-sys` gets around that by swizzling
+`-[NSBundle bundleIdentifier]` to return a borrowed string, and it accepts only
+a string LaunchServices can resolve. When it cannot, it falls back to a literal
+`com.apple.Terminal` compiled into the crate, which is where the icon came from.
+
+The bundle is an `Info.plist` and an icon. Nothing executes from it: the binary
+is still `target/debug/mach`, launched and signed the way it always was. Moving
+it inside the bundle would change the executable's path and make the process
+bundle code as far as the Security framework is concerned, and the login
+Keychain matches its ACLs against code identity — a wall of password prompts for
+a wrong icon.
+
+Expect one thing once. `com.mach.mail` is a new application as far as macOS is
+concerned, so the first banner asks for notification permission; allow it.
+System Settings → Notifications grows a "Mach" entry, and whatever was set
+against Terminal no longer governs Mach's mail.
+
+`cargo run --bin notify_live` puts one real banner on screen through the same
+code the sync loop uses, and prints which conversation the click routed to. It
+is the only way to look at a banner, and
+
+```sh
+/usr/bin/log show --last 5m --predicate 'process == "usernoted"' --style compact | grep Presenting
+```
+
+is how you check whose name is on it. Use the full path; `log` is shadowed in
+zsh.
+
 ### Running a build you made
 
 A `.app` you built yourself carries no quarantine attribute, so it opens

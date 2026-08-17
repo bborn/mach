@@ -17,29 +17,59 @@
 //! identifier, but it arrives on the thread that sent that one banner, and that
 //! thread closed over the conversation the banner was about.
 //!
-//! # What was measured, in the build the owner actually runs
+//! # The identifier, and why banners used to wear Terminal's face
 //!
 //! Mach in development is the bare `target/debug/mach`, not a `.app`. That
 //! matters, because `NSUserNotification` refuses to deliver for a process with
 //! no bundle identifier. `mac-notification-sys` works around it by swizzling
 //! `-[NSBundle bundleIdentifier]` to return a *borrowed* one, and
 //! `tauri-plugin-notification` picks `com.apple.Terminal` when `tauri::is_dev()`.
-//! Keeping that exact choice is why banners still arrive at all here. Measured
-//! on macOS 15.2, against this dependency tree:
+//! Mach copied that choice, and so every banner in the build the owner actually
+//! runs arrived as somebody else's application:
 //!
-//! * the banner **is** delivered — `usernoted` logs it as
-//!   `Presenting <NotificationRecord app:"com.apple.Terminal" …> as banner`;
+//! ```text
+//! usernoted: Presenting <NotificationRecord app:"com.apple.Terminal" …> as banner
+//! ```
+//!
+//! Two facts turn out to decide this, and **neither one is enough alone**:
+//!
+//! 1. The identifier is a *string*, not the process's own identity. Whatever it
+//!    names is the name and the icon macOS puts on the banner, whether or not
+//!    the delivering process has anything to do with that application.
+//! 2. `setApplication` refuses a string LaunchServices cannot resolve, and when
+//!    it refuses, the swizzled `-bundleIdentifier` returns a literal
+//!    `@"com.apple.Terminal"` compiled into the crate. So passing
+//!    `com.mach.mail` while no such application is registered changes nothing
+//!    at all — measured: `LSCopyApplicationURLsForBundleIdentifier` answered
+//!    NULL, because the only record LaunchServices held pointed at a
+//!    `target/debug/bundle/macos/Mach.app` that had been deleted.
+//!
+//! So [`super::host`] now passes Mach's own identifier, and `scripts/dev-bundle`
+//! writes a minimal `Mach.app` — an `Info.plist` and the icon, no more — and
+//! registers it, which is all `LSCopyApplicationURLsForBundleIdentifier` needs.
+//! The binary is **not** moved into that bundle: it stays `target/debug/mach`,
+//! launched and signed exactly as before, because moving it would change the
+//! path and the code identity the login Keychain's ACLs are matched against.
+//! `scripts/dev-bundle` has the whole argument.
+//!
+//! Measured on macOS 15.2, against this dependency tree:
+//!
+//! * the banner is delivered under Mach's identifier and wears Mach's icon —
+//!   `Presenting <NotificationRecord app:"com.mach.mail" …> as banner`;
 //! * `subtitle` renders, as a second bold line above the body;
 //! * a click on it comes back as `Ok(NotificationResponse::Click)`;
-//! * and it does **not** launch or activate Terminal. Because this process holds
-//!   the notification-centre connection for that identifier, macOS routes the
-//!   activation here rather than to the app whose name is on it. So the window
-//!   that comes forward is ours, raised by [`Host::reopen`] below, and never
-//!   somebody else's terminal.
+//! * and it does **not** launch anything. Because this process holds the
+//!   notification-centre connection for that identifier, macOS routes the
+//!   activation here rather than to whatever the record points at. So the
+//!   window that comes forward is ours, raised by [`Host::reopen`] below. That
+//!   was the property that made borrowing Terminal's identifier survivable, and
+//!   it is the same property that makes this work with a bundle nothing ever
+//!   executes from.
 //!
-//! The borrowed identifier is still visible: the banner wears Terminal's icon in
-//! a development build. A bundled build uses the real identifier and its own
-//! icon, and nothing else about this path changes.
+//! One consequence to expect once, and never again: banners under a new
+//! identifier are a new application as far as Notification Centre is concerned,
+//! so System Settings → Notifications grows a "Mach" entry, and whatever was set
+//! against "Terminal" no longer governs Mach's mail.
 //!
 //! # Why one thread per banner, and why they are capped
 //!
@@ -72,6 +102,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use mac_notification_sys::error::{ApplicationError, Error as NotificationError};
 use mac_notification_sys::{set_application, Notification, NotificationResponse};
 
 use super::host::{self, Delivery};
@@ -90,14 +121,25 @@ static WATCHED: AtomicUsize = AtomicUsize::new(0);
 /// Show a banner, and arrange for its click to open `target`.
 ///
 /// `identifier` is the bundle identifier to deliver under — see the module doc
-/// on why a development build borrows one. Returns without waiting: the
-/// blocking half is on a thread of its own.
+/// for what it has to be, and what happens when macOS has never heard of it.
+/// Returns without waiting: the blocking half is on a thread of its own.
 pub fn deliver(banner: &Banner, target: &PendingOpen, identifier: &str) -> Delivery {
-    // Installed once per process, by whichever banner is first. `Err` here is
-    // the ordinary "already set" on every banner after that; a genuine failure
-    // shows up as a delivery error below, which is the one worth saying out
-    // loud.
-    let _ = set_application(identifier);
+    // Installed once per process, by whichever banner is first.
+    //
+    // `AlreadySet` is the ordinary answer on every banner after that. The other
+    // one used to be swallowed with it, and it means something: LaunchServices
+    // does not know this identifier. The banner still goes out, because the crate
+    // falls back to Terminal's, so the only symptom is somebody else's icon on
+    // your own mail and nothing anywhere saying why.
+    match set_application(identifier) {
+        Ok(()) | Err(NotificationError::Application(ApplicationError::AlreadySet(_))) => {}
+        Err(error) => {
+            eprintln!(
+                "{error} — macOS has no application registered as {identifier}, \
+                 so banners will wear Terminal's name and icon. Run scripts/dev-bundle."
+            );
+        }
+    }
 
     let watched = claim_watch_slot();
     let (title, subtitle, body) = (

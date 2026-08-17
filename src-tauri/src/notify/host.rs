@@ -222,20 +222,25 @@ impl<R: Runtime> Host for TauriHost<R> {
             return Delivery::Silent;
         }
 
-        // The identifier `mac-notification-sys` will deliver under. The rule is
-        // copied from `tauri-plugin-notification`'s desktop path rather than
-        // invented: a development build is a bare binary with no bundle, and
-        // `NSUserNotification` will not deliver for one, so it borrows
-        // Terminal's identifier. See `notify::mac` for what that does and does
-        // not cost.
+        // The identifier `mac-notification-sys` will deliver under: Mach's own,
+        // in a development build as much as a bundled one.
+        //
+        // This used to branch on `tauri::is_dev()` and hand macOS
+        // `com.apple.Terminal` — copied from `tauri-plugin-notification`'s
+        // desktop path, where it is there because a bare binary has no bundle
+        // and `NSUserNotification` will not deliver for a process without a
+        // bundle identifier. The cost was that every banner in the build the
+        // owner actually runs arrived wearing Terminal's name and icon.
+        //
+        // What the identifier has to be is one **LaunchServices can resolve**,
+        // not one the process owns: it is a swizzled string, which is exactly
+        // why banners could wear Terminal's face with no Terminal involved.
+        // `scripts/dev-bundle` registers a minimal `Mach.app` so this one
+        // resolves. When it has not been run, `mac-notification-sys` falls back
+        // to Terminal on its own and `notify::mac` says so.
         #[cfg(target_os = "macos")]
         {
-            let identifier = if tauri::is_dev() {
-                "com.apple.Terminal"
-            } else {
-                &self.app.config().identifier
-            };
-            super::mac::deliver(banner, target, identifier)
+            super::mac::deliver(banner, target, &self.app.config().identifier)
         }
 
         // Everywhere else the plugin is still the notifier. It has no subtitle,

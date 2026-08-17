@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# scripts/dev-bundle — give the development build an identity macOS recognises.
+#
+# ---------------------------------------------------------------------------
+# THE PROBLEM
+# ---------------------------------------------------------------------------
+#
+# Mach in development is the bare `target/debug/mach`, which is how hot reload
+# stays fast — the binary is launched directly and vite serves the frontend. A
+# bare Mach-O has no bundle, so it has no bundle identifier, and
+# `NSUserNotification` will not deliver for a process without one.
+#
+# `mac-notification-sys` works around that by swizzling
+# `-[NSBundle bundleIdentifier]` to return a borrowed string. The borrowed
+# string has to name an application LaunchServices knows about — `setApplication`
+# checks with `LSCopyApplicationURLsForBundleIdentifier` and refuses anything
+# else — and when it refuses, the swizzle falls back to a literal
+# `@"com.apple.Terminal"` compiled into the crate. So every mail banner arrived
+# wearing Terminal's name and Terminal's icon:
+#
+#     usernoted: Presenting <NotificationRecord app:"com.apple.Terminal" …> as banner
+#
+# ---------------------------------------------------------------------------
+# THE FIX, AND WHAT IT DOES NOT DO
+# ---------------------------------------------------------------------------
+#
+# This builds a minimal `Mach.app` — an `Info.plist` naming `com.mach.mail`, and
+# the icon — and registers it with LaunchServices. That is all
+# `LSCopyApplicationURLsForBundleIdentifier` needs, and `usernoted` reads the
+# name and icon from the same record, so the banner becomes Mach's.
+#
+# It does not move the running binary into the bundle. Nothing about delivery
+# cares where the delivering process lives: the identifier is a swizzled string
+# rather than the process's own identity, which is why banners could wear
+# Terminal's face with no Terminal involved. Running from inside a bundle would
+# change the executable's path and make the process bundle code as far as the
+# Security framework is concerned, and refresh tokens sit in the login Keychain
+# behind ACLs matched against code identity. `scripts/sign` is the record of what
+# that costs when it goes wrong: days, and a password prompt per account per
+# launch.
+#
+# So: the bundle is an identity record. The binary is still `target/debug/mach`,
+# launched exactly as before, signed exactly as before, hot-reloading exactly as
+# before.
+#
+# `Contents/MacOS/mach` is a stub that opens an alert and exits. Some executable
+# has to be there — measured: with `CFBundleExecutable` missing,
+# `LSCopyApplicationURLsForBundleIdentifier` answers NULL and the whole thing is
+# worthless — but a symlink to `target/debug/mach` would put a launchable "Mach"
+# in Spotlight that starts the real app against the real store with no
+# `.env.local`, reporting "not configured", alongside the copy already running.
+# A stub costs nothing and can do nothing.
+#
+# ---------------------------------------------------------------------------
+# WHY `com.mach.mail` AND NOT A `.dev` SUFFIX
+# ---------------------------------------------------------------------------
+#
+# The development build *is* the app here — it is what the owner reads his mail
+# in every day. A separate `com.mach.mail.dev` identity would mean notification
+# permission granted twice, two entries in System Settings → Notifications, and
+# every preference set against the identity that is not the one a release build
+# would ship under. Sharing the identifier means the settings he chooses today
+# are the ones a bundled build inherits, and TCC records match too, because the
+# designated requirement (identifier plus team) is the same for both.
+#
+# The price is that a release bundle claims the same identifier from a different
+# path. LaunchServices holds a record per path and answers with whichever it
+# likes; both are Mach, with the same name and the same icon, so there is
+# nothing to tell apart.
+#
+# Records outlive the bundles they describe. There was one for a
+# `target/debug/bundle/macos/Mach.app` deleted long ago, and while it was the
+# only record for this identifier, `LSCopyApplicationURLsForBundleIdentifier`
+# answered NULL. It has been removed:
+#
+#     lsregister -u <path>
+#
+# and if `com.mach.mail` ever stops resolving after moving a build directory,
+# that is where to look. `lsregister -dump | grep -A6 com.mach.mail` lists them.
+#
+# ---------------------------------------------------------------------------
+# WHEN THIS RUNS
+# ---------------------------------------------------------------------------
+#
+# Both ways of starting the app already call it: `scripts/qa up` before it
+# launches the binary, and `beforeDevCommand` in `tauri.conf.json` for
+# `bun run tauri dev`. It is idempotent and costs about a fifth of a second when
+# there is nothing to do, so there is no version of this you have to remember.
+# `cargo clean` takes the bundle with the rest of the target directory; the next
+# launch puts it back, and `lsregister` runs again only because it moved.
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The identifier the app ships under. Kept in step with `tauri.conf.json` and
+# with the `debug/mach` row in `scripts/sign` — three places, one string, and
+# the notification path is the one that fails visibly when they disagree.
+IDENTIFIER="com.mach.mail"
+NAME="Mach"
+
+# Not `$REPO/src-tauri/target`: a worktree points cargo at the parent's cache.
+# One bundle per target directory therefore serves every worktree sharing it,
+# which is what we want — they are all the same application.
+TARGET_DIR="$("$REPO/scripts/cargo-target-dir" "$REPO")"
+APP="$TARGET_DIR/debug/$NAME.app"
+
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+VERSION="$(python3 - "$REPO/package.json" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))["version"])
+except Exception:
+    print("0.0.0")
+PY
+)"
+
+info_plist() {
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>$NAME</string>
+	<key>CFBundleExecutable</key>
+	<string>mach</string>
+	<key>CFBundleIconFile</key>
+	<string>icon.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>$IDENTIFIER</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$NAME</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$VERSION</string>
+	<key>CFBundleVersion</key>
+	<string>$VERSION</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+}
+
+mkdir -p "$TARGET_DIR/debug" "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+changed=0
+
+# Written through a temporary file and compared, so an unchanged plist does not
+# get a new mtime — `lsregister` is skipped when nothing moved, and this runs on
+# every launch.
+new_plist="$APP/Contents/Info.plist.new"
+info_plist >"$new_plist"
+if ! cmp -s "$new_plist" "$APP/Contents/Info.plist"; then
+  mv "$new_plist" "$APP/Contents/Info.plist"
+  changed=1
+else
+  rm -f "$new_plist"
+fi
+
+if [ ! -f "$APP/Contents/PkgInfo" ]; then
+  printf 'APPL????' >"$APP/Contents/PkgInfo"
+  changed=1
+fi
+
+ICON="$REPO/src-tauri/icons/icon.icns"
+if [ -f "$ICON" ] && ! cmp -s "$ICON" "$APP/Contents/Resources/icon.icns"; then
+  cp "$ICON" "$APP/Contents/Resources/icon.icns"
+  changed=1
+fi
+
+# The stub. It exists so LaunchServices will register the bundle at all, and it
+# says what it is rather than bouncing once and vanishing, because a "Mach" in
+# Spotlight that does nothing when you press Return is worse than no Mach.
+new_stub="$APP/Contents/MacOS/mach.new"
+cat >"$new_stub" <<'STUB'
+#!/bin/sh
+# Not the app. This bundle carries Mach's identity so development banners have a
+# name and an icon; see scripts/dev-bundle. The app is target/debug/mach.
+exec /usr/bin/osascript -e 'display alert "Mach — development identity" message "The app is target/debug/mach. Start it with scripts/qa up."'
+STUB
+if ! cmp -s "$new_stub" "$APP/Contents/MacOS/mach"; then
+  mv "$new_stub" "$APP/Contents/MacOS/mach"
+  chmod +x "$APP/Contents/MacOS/mach"
+  changed=1
+else
+  rm -f "$new_stub"
+fi
+
+# LaunchServices does not notice a bundle appearing under a build directory on
+# its own, and it is the whole point: `setApplication` asks it whether this
+# identifier names an application, and delivers under Terminal's when it does
+# not.
+if [ "$changed" = 1 ] || [ ! -x "$LSREGISTER" ]; then
+  if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
+    echo "dev-bundle: $APP ($IDENTIFIER)"
+  else
+    echo "dev-bundle: no lsregister on this machine — banners will not carry Mach's icon" >&2
+  fi
+fi

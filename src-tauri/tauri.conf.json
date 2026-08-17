@@ -5,7 +5,7 @@
   "identifier": "com.mach.mail",
   "mainBinaryName": "mach",
   "build": {
-    "beforeDevCommand": "bun run dev",
+    "beforeDevCommand": "scripts/dev-bundle || true; bun run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "bun run build",
     "frontendDist": "../dist"
