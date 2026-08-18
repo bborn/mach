@@ -134,6 +134,23 @@ Headless Chrome against Vite (`scripts/webqa.ts`) is still right for component
 and logic work, where a second engine costs nothing. It is not evidence about
 the app as a Mac application.
 
+### Every instance runs a private copy of the binary
+
+Fifteen worktrees share one `src-tauri/target`, so `target/debug/mach` is
+whatever compiled last, from whichever checkout. `qa up` copies that artifact to
+`.qa/<instance>/bin/mach` and launches the copy, having first checked it was
+built here. Somebody else's `cargo build` can no longer change the bytes a
+running instance is executing. This covers the owner's own app as well as an
+agent's, and it did not: he read real mail for a day in an unmerged build an
+agent had compiled in a worktree.
+
+`qa state` prints the checkout the running process says it was built from, and
+warns when that is not this one. `qa restart` rebuilds and re-pins.
+
+A window that comes up blank was launched before its dev server was listening.
+It now says so — the URL it is waiting for, and that it is retrying — and loads
+the frontend as soon as the server answers.
+
 The window is `titleBarStyle: "Overlay"` with `hiddenTitle`, so macOS paints the
 traffic lights over the top-left of *our* content. Anything filling the window
 owes them `pl-[5.5rem]` — `chrome/TitleBar.tsx` is the reference.

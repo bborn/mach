@@ -131,7 +131,17 @@ pub fn apply_qa_policy<R: Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()>
     // Labelled "main" so `capabilities/default.json` applies — capabilities are
     // keyed on the label, and a differently-named window silently loses its
     // permissions.
-    tauri::WebviewWindowBuilder::new(app, MAIN_WINDOW, tauri::WebviewUrl::default())
+    //
+    // The URL is normally the default — the frontend, resolved against
+    // `dev_url`. It is the wait page when the dev server was not answering at
+    // startup, which the configured window gets from the same place; see
+    // `qa::dev::start_url`.
+    #[cfg(debug_assertions)]
+    let start = crate::qa::dev::start_url();
+    #[cfg(not(debug_assertions))]
+    let start = tauri::WebviewUrl::default();
+
+    tauri::WebviewWindowBuilder::new(app, MAIN_WINDOW, start)
         .title("Mach (QA)")
         .inner_size(1440.0, 900.0)
         .visible(true)

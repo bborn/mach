@@ -36,9 +36,68 @@
 //!
 //! `main` — the owner's instance, no `MACH_DATA_DIR` — is left exactly as it
 //! was: the compiled-in 1420, unless he sets `MACH_DEV_URL` himself.
+//!
+//! # A dev server that is not up yet is a blank white window
+//!
+//! Whatever the URL turns out to be, the window loads it over HTTP, and twice
+//! in one day the app was started a moment before vite was listening. WKWebView
+//! gets `ECONNREFUSED`, renders nothing, and never asks again: a white
+//! rectangle, no message, no error, no retry, with a frontend that was healthy
+//! the whole time. It looks exactly like the app being broken.
+//!
+//! So the URL is probed before the window is built. A few hundred milliseconds
+//! of grace covers the ordinary race — started a beat early — with nothing on
+//! screen. Past that the window is pointed at [`WAIT_URL`] instead, a page
+//! served from this process saying which URL it is waiting for, and a thread
+//! keeps trying until the server answers and then navigates the window onto it.
+//!
+//! A custom scheme rather than a `data:` URL because WebKit refuses a top-level
+//! navigation to `data:`, and rather than an inlined `eval` because the window
+//! has to be able to *start* on the page, before any of the app's JavaScript
+//! exists to be evaluated.
+//!
+//! All of it is behind [`tauri::is_dev`], which is the same condition — `cfg(dev)`
+//! in `Manager::get_app_url` — that decides a build loads from a URL at all. A
+//! release build reads its frontend out of the bundle, where there is nothing to
+//! refuse a connection and nothing to retry.
+
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use tauri::http::{Request, Response};
+use tauri::Manager;
 
 /// The port the owner's app loads from. Off limits to every QA instance.
 pub const OWNER_PORT: u16 = 1420;
+
+/// The scheme the "waiting for the dev server" page is served from.
+pub const WAIT_SCHEME: &str = "machwait";
+
+/// Where the window sits while the dev server is not answering.
+pub const WAIT_URL: &str = "machwait://localhost/";
+
+/// How long a connection attempt may hang before it counts as a refusal.
+///
+/// A refused connection comes back immediately; this bounds the other case, a
+/// host that swallows the SYN. Short, because it is paid once per address per
+/// attempt and the whole point is to keep answering "not yet" quickly.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Between attempts, before the window exists and after.
+const RETRY_EVERY: Duration = Duration::from_millis(500);
+
+/// How long to wait at startup before giving up on a silent start.
+///
+/// The window comes up on the real frontend either way; this is only about
+/// whether the wait page is ever *seen*. Two seconds covers `scripts/qa up`
+/// racing its own `bun run dev`, and is short enough that a server which is
+/// genuinely absent says so rather than appearing to hang.
+const GRACE: Duration = Duration::from_secs(2);
+
+/// The URL the window is meant to end up on, when it could not be reached at
+/// startup. Unset in every other case, including a release build.
+static DEFERRED: OnceLock<tauri::Url> = OnceLock::new();
 
 /// Which checkout compiled this binary.
 ///
@@ -116,6 +175,171 @@ pub fn apply(context: &mut tauri::Context) {
             std::process::exit(1);
         }
     }
+
+    // Only a build that loads its frontend over HTTP has a connection to be
+    // refused. `is_dev` is `cfg(dev)`, which is the same flag `get_app_url`
+    // reads when it chooses `dev_url` over the bundled assets.
+    if tauri::is_dev() {
+        defer_until_the_dev_server_answers(context);
+    }
+}
+
+/// Can something be reached at this URL right now?
+///
+/// A TCP connect rather than a request: vite serves as soon as it is listening,
+/// and a bare connect needs no HTTP client and cannot be confused by a status
+/// code. Every resolved address is tried, because `localhost` resolves to `::1`
+/// first on this machine and a server bound only to `127.0.0.1` would otherwise
+/// read as absent — the same trap `scripts/qa`'s `port_is_free` documents.
+fn answers(url: &tauri::Url) -> bool {
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    let Ok(addresses) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addresses.into_iter().any(|address| {
+        TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).is_ok()
+    })
+}
+
+/// Point the window at the wait page when the dev server is not up yet.
+///
+/// Called with the config already carrying whichever URL this instance is meant
+/// to load. Returns having changed nothing in the ordinary case.
+///
+/// # The window's URL, and not `build.dev_url`
+///
+/// Rewriting `dev_url` is the obvious move and it breaks the app. `dev_url` is
+/// what [`WebviewWindow::is_local_url`] measures an origin against, and that is
+/// the gate on IPC: point it at the wait page and the real frontend, once
+/// loaded, is a *remote* document — every `invoke` refused, which is a far
+/// worse failure than the white window, and a silent one.
+///
+/// So `dev_url` keeps naming the dev server, and only the window's starting URL
+/// moves. `WebviewUrl::App` — the default — is resolved against `dev_url` at
+/// creation time; `External` is taken literally.
+fn defer_until_the_dev_server_answers(context: &mut tauri::Context) {
+    let Some(url) = context.config().build.dev_url.clone() else {
+        return;
+    };
+
+    let deadline = std::time::Instant::now() + GRACE;
+    loop {
+        if answers(&url) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(RETRY_EVERY);
+    }
+
+    eprintln!("mach: nothing is answering at {url} — showing the waiting page and retrying");
+    let _ = DEFERRED.set(url);
+
+    // The owner's instance opens the window Tauri builds from config. A QA
+    // instance builds its own in `setup` and reads [`start_url`] there instead;
+    // `suppress_configured_window` has already cleared `create` on this one.
+    let wait = start_url();
+    for window in context.config_mut().app.windows.iter_mut() {
+        window.url = wait.clone();
+    }
+}
+
+/// Where a window should open: the wait page, or the frontend as usual.
+///
+/// `scripts/qa`'s instances build their own window rather than taking the
+/// configured one, so they have to ask.
+pub fn start_url() -> tauri::WebviewUrl {
+    match DEFERRED.get() {
+        Some(_) => tauri::WebviewUrl::External(
+            tauri::Url::parse(WAIT_URL).expect("WAIT_URL is a literal"),
+        ),
+        None => tauri::WebviewUrl::default(),
+    }
+}
+
+/// Serve the wait page. Registered on [`WAIT_SCHEME`] in `lib.rs`.
+pub fn wait_page(_request: &Request<Vec<u8>>) -> Response<Vec<u8>> {
+    // Whatever we are waiting for, named on screen. `DEFERRED` is always set by
+    // the time a request can arrive — the window only exists at this URL
+    // because it was.
+    let url = DEFERRED
+        .get()
+        .map(tauri::Url::to_string)
+        .unwrap_or_else(|| "the dev server".to_string());
+
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/html; charset=utf-8")
+        // No scripts, no network. The page is a sentence and a pulsing dot.
+        .header(
+            "content-security-policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
+        .header("x-content-type-options", "nosniff")
+        .body(wait_html(&url).into_bytes())
+        .expect("static wait response")
+}
+
+/// The page itself, kept separate so a test can read it without a webview.
+fn wait_html(url: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<meta charset="utf-8">
+<title>Waiting for the dev server</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  html, body {{ height: 100%; margin: 0; }}
+  body {{
+    display: flex; flex-direction: column; gap: .75rem;
+    align-items: center; justify-content: center;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #fbfbfd; color: #1d1d1f;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    body {{ background: #1c1c1e; color: #f2f2f7; }}
+  }}
+  h1 {{ font-size: 15px; font-weight: 600; margin: 0; }}
+  code {{ font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }}
+  p {{ margin: 0; opacity: .6; }}
+  .dot {{
+    width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+    opacity: .35; animation: pulse 1.4s ease-in-out infinite;
+  }}
+  @keyframes pulse {{ 0%, 100% {{ opacity: .15 }} 50% {{ opacity: .7 }} }}
+</style>
+<div class="dot"></div>
+<h1>No dev server at <code>{url}</code></h1>
+<p>Retrying. This window loads as soon as it answers.</p>
+<p>Start one with <code>bun run dev</code>.</p>
+"#
+    )
+}
+
+/// Keep trying, and load the real frontend the moment it is there.
+///
+/// A no-op unless [`defer_until_the_dev_server_answers`] gave up at startup.
+/// `navigate` goes through the webview dispatcher, which posts to the event
+/// loop, so calling it from this thread is fine.
+pub fn resume_when_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let Some(url) = DEFERRED.get().cloned() else {
+        return;
+    };
+    let app = app.clone();
+    std::thread::spawn(move || loop {
+        if answers(&url) {
+            eprintln!("mach: {url} is answering — loading it");
+            if let Some(window) = app.get_webview_window(crate::shell::MAIN_WINDOW) {
+                if let Err(e) = window.navigate(url.clone()) {
+                    eprintln!("mach: could not navigate to {url}: {e}");
+                }
+            }
+            return;
+        }
+        std::thread::sleep(RETRY_EVERY);
+    });
 }
 
 #[cfg(test)]
@@ -165,5 +389,49 @@ mod tests {
     #[test]
     fn nonsense_is_a_refusal_rather_than_a_fallback() {
         assert!(resolve(true, Some("not a url")).is_err());
+    }
+
+    /// The question the retry loop asks, and the one the startup grace asks.
+    /// Both directions, because "always true" and "always false" are the two
+    /// ways this fails silently — one hides the wait page, the other shows it
+    /// over a perfectly good dev server.
+    #[test]
+    fn a_listening_port_answers_and_a_closed_one_does_not() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let url = tauri::Url::parse(&format!("http://127.0.0.1:{port}/")).expect("url");
+
+        assert!(answers(&url), "a bound port must read as up");
+
+        drop(listener);
+        assert!(!answers(&url), "a refused connection must read as down");
+    }
+
+    #[test]
+    fn the_wait_page_says_what_it_is_waiting_for() {
+        let html = wait_html("http://localhost:1573/");
+        assert!(html.contains("http://localhost:1573/"), "{html}");
+        assert!(html.contains("Retrying"), "{html}");
+    }
+
+    /// The wait page must not be able to reach the network or run script. It is
+    /// the first thing a window loads in the one state where nothing else has
+    /// checked anything.
+    #[test]
+    fn the_wait_page_is_inert() {
+        let request = Request::builder()
+            .uri("machwait://localhost/")
+            .body(Vec::new())
+            .expect("request");
+        let response = wait_page(&request);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("a policy")
+            .to_str()
+            .expect("ascii");
+
+        assert!(csp.starts_with("default-src 'none'"), "{csp}");
+        assert!(!csp.contains("script-src"), "no script at all: {csp}");
     }
 }

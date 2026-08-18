@@ -158,11 +158,18 @@ a string LaunchServices can resolve. When it cannot, it falls back to a literal
 `com.apple.Terminal` compiled into the crate, which is where the icon came from.
 
 The bundle is an `Info.plist` and an icon. Nothing executes from it: the binary
-is still `target/debug/mach`, launched and signed the way it always was. Moving
-it inside the bundle would change the executable's path and make the process
-bundle code as far as the Security framework is concerned, and the login
-Keychain matches its ACLs against code identity — a wall of password prompts for
-a wrong icon.
+is a plain Mach-O, signed the way it always was. Moving it inside the bundle
+would make the process *bundle code* as far as the Security framework is
+concerned, and the login Keychain matches its ACLs against code identity — a
+wall of password prompts for a wrong icon.
+
+The path, on its own, is not part of that identity. `scripts/qa up` launches
+every instance from a private copy under `.qa/<instance>/bin/mach` rather than
+from `target/debug/mach`, so that one agent's `cargo build` cannot swap the code
+another instance is running. The copy is signed with the same identifier and the
+same Developer ID, which is the whole of what the ACL and the partition list
+check: `codesign -d --requirements -` on the copy and on the artifact print the
+same designated requirement, and neither mentions a path.
 
 Expect one thing once. `com.mach.mail` is a new application as far as macOS is
 concerned, so the first banner asks for notification permission; allow it.

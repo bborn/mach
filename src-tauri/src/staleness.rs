@@ -30,15 +30,37 @@
 //!
 //! In a shipped bundle this is inert: nothing rewrites the executable of an
 //! installed app, so it reports current forever.
+//!
+//! # …except the executable is no longer the file cargo writes
+//!
+//! Every instance `scripts/qa` starts, the owner's included, now runs from a
+//! private copy under `.qa/<instance>/bin/mach` rather than from the shared
+//! `target/debug/mach`. That is what stops one agent's `cargo build` swapping
+//! the code somebody else is running mid-session, and it costs this file its
+//! premise: a copy is written once and never again, so `current_exe()` reports
+//! "current" forever and the banner silently stops existing.
+//!
+//! So the path being watched is separable from the path being executed.
+//! [`BUILD_WATCH_VAR`] carries the artifact the copy was taken from — the file
+//! that does move — and `current_exe()` remains the answer when nobody says
+//! otherwise, which covers a shipped bundle and anyone running the binary by
+//! hand.
 
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
+
+/// The file to stat instead of `current_exe()`, set by `scripts/qa`.
+///
+/// It holds the shared `target/debug/mach` that this process's private copy was
+/// taken from. Unset — a release build, or a binary launched by hand — and the
+/// executable itself is watched, exactly as before.
+pub const BUILD_WATCH_VAR: &str = "MACH_BUILD_WATCH";
 
 /// What the UI needs to say "restart to pick up a newer build".
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildStatus {
-    /// Modification time of the executable this process was launched from,
+    /// Modification time of the build artifact this process came from,
     /// captured at startup. Milliseconds since the epoch.
     pub running_build_ms: i64,
     /// Modification time of that same path right now.
@@ -47,7 +69,7 @@ pub struct BuildStatus {
     pub stale: bool,
 }
 
-/// The running process's own executable and the mtime it had at startup.
+/// The build artifact this process came from, and the mtime it had at startup.
 ///
 /// Captured once, because the whole comparison depends on remembering what we
 /// were launched from *before* anything replaced it.
@@ -57,15 +79,27 @@ pub struct BuildWatch {
     launched_with_ms: i64,
 }
 
+/// What to stat: `MACH_BUILD_WATCH` when set, the executable otherwise.
+///
+/// An empty value is treated as unset. Exported variables get emptied by
+/// accident far more often than they get deleted, and "watch the empty path"
+/// would silently mean "never report a newer build".
+fn watched_path() -> Option<PathBuf> {
+    match std::env::var_os(BUILD_WATCH_VAR) {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        _ => std::env::current_exe().ok(),
+    }
+}
+
 impl BuildWatch {
-    /// Records the executable's current mtime. Call once, at startup.
+    /// Records the watched file's current mtime. Call once, at startup.
     pub fn capture() -> BuildWatch {
-        let exe = std::env::current_exe().ok();
+        let exe = watched_path();
         let launched_with_ms = exe.as_deref().and_then(mtime_ms).unwrap_or(0);
         BuildWatch { exe, launched_with_ms }
     }
 
-    /// Re-stats the executable and reports whether it has been replaced.
+    /// Re-stats the watched file and reports whether it has been replaced.
     ///
     /// A missing or unreadable file reports *not* stale. The executable being
     /// unstattable is not evidence that a newer one exists, and a false
@@ -188,4 +222,44 @@ mod tests {
         let watch = BuildWatch { exe: None, launched_with_ms: now_ms() };
         assert!(!watch.status().stale);
     }
+
+    /// The property the whole `MACH_BUILD_WATCH` detour exists for: an instance
+    /// launched from a pinned copy still notices a build landing on the shared
+    /// artifact. Watching `current_exe()` — a file written once and never again
+    /// — would report "current" forever.
+    ///
+    /// Serial with the test below, and not `#[test]`-parallel with anything
+    /// else touching the same variable: the environment is process-global.
+    #[test]
+    fn the_watched_file_may_be_somewhere_other_than_the_executable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let artifact = temp_exe("shared-artifact");
+        std::env::set_var(BUILD_WATCH_VAR, &artifact);
+        let watch = BuildWatch::capture();
+        assert_eq!(watch.exe.as_deref(), Some(artifact.as_path()));
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&artifact, b"somebody else's build").expect("rebuild");
+        assert!(
+            watch.status().stale,
+            "a build landing on the shared artifact must still be reported"
+        );
+
+        std::env::remove_var(BUILD_WATCH_VAR);
+        std::fs::remove_file(&artifact).ok();
+    }
+
+    #[test]
+    fn an_empty_watch_path_falls_back_to_the_executable() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::set_var(BUILD_WATCH_VAR, "");
+        assert_eq!(watched_path(), std::env::current_exe().ok());
+
+        std::env::remove_var(BUILD_WATCH_VAR);
+        assert_eq!(watched_path(), std::env::current_exe().ok());
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

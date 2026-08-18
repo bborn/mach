@@ -82,7 +82,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     qa::dev::apply(&mut context);
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // Links in message bodies. A plugin because the hook it needs
         // (`on_navigation`) is below the web engine, which is the only layer a
@@ -102,10 +102,31 @@ pub fn run() {
         // *response header* — see `plugins::protocol`.
         .register_uri_scheme_protocol(plugins::SCHEME, |_ctx, request| {
             plugins::protocol::respond(&request)
-        })
+        });
+
+    // Where the window sits when the dev server is not listening yet. WKWebView
+    // renders a refused connection as a blank white page and never retries;
+    // this is the page that says so instead, and it is navigated away from as
+    // soon as vite answers — see `qa::dev`.
+    //
+    // A separate statement rather than another link in the chain so it can be
+    // conditional. A release build reads its frontend out of the bundle: there
+    // is no connection to refuse, so there is no wait page and no scheme.
+    #[cfg(debug_assertions)]
+    let builder = builder.register_uri_scheme_protocol(qa::dev::WAIT_SCHEME, |_ctx, request| {
+        qa::dev::wait_page(&request)
+    });
+
+    builder
         .setup(|app| {
             // Before anything is shown: a QA instance must never take focus.
             shell::apply_qa_policy(app)?;
+
+            // …and if the window came up on the wait page, keep trying until
+            // the dev server is there and then load it. Returns immediately
+            // when it was never needed.
+            #[cfg(debug_assertions)]
+            qa::dev::resume_when_ready(app.handle());
 
             // One block in the application's own event stream, reading the
             // scroll phase off each NSEvent and handing the event straight

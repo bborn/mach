@@ -8,7 +8,7 @@ set -euo pipefail
 #   qa down          stop it
 #   qa restart       rebuild and relaunch — what you want after a `git pull`
 #   qa shoot NAME    screenshot the window -> .qa/<instance>/NAME.png
-#   qa state         process, window, accounts, sync watermark, row counts
+#   qa state         process, window, which checkout built it, accounts, rows
 #   qa logs [n]      tail the log
 #   qa key BINDING   press a key in the window: 'mod+2', 'g i', 'c', '?'
 #   qa click CSS     click the first match: '[data-thread-id="41774"]'
@@ -188,13 +188,20 @@ set -euo pipefail
 # binary that cargo actually wrote; neither hardcodes `src-tauri/target` any
 # more, and nobody has to symlink one in by hand.
 #
-# That shared cache has a second consequence: another agent's `cargo build`
-# replaces the file the running instance was launched from, mid-run. A QA
-# instance is therefore launched from a *hard link* taken at `up` time, under
-# .qa/<instance>/bin/mach. Cargo replaces `debug/mach` by unlinking and
-# relinking, which leaves our link pointing at the inode we built and tested —
-# same bytes, same signature, immune to somebody else's build. `qa state` says
-# when the shared binary has moved on underneath you.
+# That shared cache has a second consequence, and it is the nastiest thing in
+# this file: `debug/mach` is whatever compiled last, from whichever checkout.
+# Launch it in place and you are running that. The owner spent a day reading
+# real mail in a binary an agent had built in a worktree, from code that was
+# never merged, and the only sign of it was one line in the log:
+#
+#     mach: built from …/.claude/worktrees/agent-a85e4779ab396da01/src-tauri
+#
+# So EVERY instance — `main` included — is launched from its own copy under
+# .qa/<instance>/bin/mach, taken at `up` time from an artifact this checkout is
+# verified to have built. Whatever anyone compiles afterwards, the bytes on
+# screen are the bytes that were pinned. `qa state` reports what the running
+# process says it was built from, and says when the shared artifact has moved
+# on underneath the pin.
 #
 # ---------------------------------------------------------------------------
 # `qa shoot` DOES NOT CAPTURE CONTEXT MENUS
@@ -242,10 +249,6 @@ if [ "$INSTANCE" = "main" ]; then
   # The one instance that may have 1420, because it is the one the owner's
   # window loads from.
   VITE_PORT=1420
-  # Run the artifact itself: `staleness.rs` watches `current_exe()` to offer
-  # "a newer build is waiting", and a hard link's mtime never changes, so
-  # linking here would quietly retire that banner for the owner.
-  LAUNCH_BIN="$BIN"
 else
   DATA_DIR="$QA_DIR/data"
   DB="$DATA_DIR/mach.sqlite3"
@@ -257,8 +260,12 @@ else
   [ -n "$SLUG" ] || SLUG="unnamed"
   KEYCHAIN_SERVICE="com.mach.mail.oauth.qa-$SLUG"
   VITE_PORT=""   # decided by `ensure_vite`, and never 1420
-  LAUNCH_BIN="$QA_DIR/bin/mach"
 fi
+
+# Never `$BIN`. See `pin_binary`: the shared artifact is whoever built last, and
+# `main` is not exempt from that — it was the one instance that ran it in place,
+# and it is the one where being wrong costs the owner his day.
+LAUNCH_BIN="$QA_DIR/bin/mach"
 
 mkdir -p "$QA_DIR"
 
@@ -504,22 +511,40 @@ cmd_seed() {
 # agent caught it by grepping the running binary for a symbol it did not
 # recognise; the rest would not have noticed at all.
 #
-# So a QA instance is launched from its own copy, taken at `up`, under
+# So every instance is launched from its own copy, taken at `up`, under
 # .qa/<instance>/bin/mach. Whatever anyone builds afterwards, the process you
 # are screenshotting is running the bytes you tested.
 #
+# `main` was the exception until it wasn't. It ran `debug/mach` in place, and
+# the owner spent a day in an agent's unmerged build without noticing — the app
+# looked completely normal. Two things had to move with it:
+#
+#   - `staleness.rs` asked "has a newer build landed since I started?" by
+#     stat-ing `current_exe()`, which is now a copy whose mtime never moves. It
+#     reads MACH_BUILD_WATCH instead, exported below and pointing at the shared
+#     artifact — the thing that actually changes. The banner keeps working.
+#   - `main` used to sign `debug/mach` itself, being "the one case where it *is*
+#     the thing about to run". It no longer is, so the copy is what gets signed.
+#     That costs no Keychain prompt: the designated requirement a Developer ID
+#     signature carries names the identifier and the team and says nothing about
+#     a path, and the partition-list entry is `teamid:` for the same reason. Same
+#     identifier, same certificate, same identity — a different path is invisible
+#     to both gates. `scripts/sign` explains why that is the only thing that ever
+#     mattered.
+#
 # A copy rather than a hard link, and the seventy megabytes are the price of the
 # second property: the copy is signed on its own (`scripts/sign --only`), so an
-# agent's QA run never rewrites the artifact the owner's own app was launched
+# agent's QA run never rewrites the artifact somebody else's app was launched
 # from. A hard link is the same inode, so signing one signs the other.
 #
 # It is not a complete answer: it protects the run in progress and says nothing
-# about *whose* code you built in the first place. `cargo build` still
-# serialises on the target lock, and two agents editing the same crate still
-# overwrite each other's artifact between runs. The honest advice is to build
-# and `up` in one breath, and to read the drift line in `qa state`.
+# about *whose* code you built in the first place. That is what `built_here`
+# below is for — the copy is only ever taken from an artifact carrying this
+# checkout's path, and `up` rebuilds rather than pin somebody else's. `cargo
+# build` still serialises on the target lock, and two agents editing the same
+# crate still overwrite each other's artifact between runs. The honest advice is
+# to build and `up` in one breath, and to read the drift line in `qa state`.
 pin_binary() {
-  [ "$LAUNCH_BIN" = "$BIN" ] && return 0
   built_here || rebuild_ours
   mkdir -p "$(dirname "$LAUNCH_BIN")"
   rm -f "$LAUNCH_BIN"
@@ -568,6 +593,21 @@ json.dump({"path": sys.argv[1], "inode": info.st_ino, "size": info.st_size,
 PY
 }
 
+# The checkout the process in the window was compiled from, as it said itself.
+#
+# Read off the log rather than out of the binary: `> "$LOG"` truncates at every
+# `up`, so the first line belongs to the run that is on screen. Grepping
+# `$LAUNCH_BIN` would answer a question about a *file*, and the file is not
+# necessarily what the live process is executing — `qa up` unlinks the old copy
+# and the running process keeps its inode.
+running_built_from() {
+  [ -f "$LOG" ] || return 1
+  local from
+  from="$(LC_ALL=C sed -n 's/^mach: built from //p' "$LOG" | head -n1)"
+  [ -n "$from" ] || return 1
+  printf '%s\n' "$from"
+}
+
 # "" when the instance is still on what it was launched from, a sentence when
 # the shared artifact has moved on underneath it.
 binary_drift() {
@@ -610,15 +650,23 @@ cmd_up() {
   # a new program and re-asking for the login password. A no-op until the
   # identity exists; see `scripts/sign --setup`.
   #
-  # A QA instance signs only its own copy. The shared `debug/mach` may be the
-  # file a running app — possibly the owner's — was launched from, and
-  # `codesign --force` rewrites it; an agent's QA run has no business doing
-  # that. `main` signs the artifact itself, which is the one case where it *is*
-  # the thing about to run.
-  if [ "$LAUNCH_BIN" = "$BIN" ]; then
-    "$REPO/scripts/sign" >/dev/null 2>&1 || true
-  else
-    "$REPO/scripts/sign" --only "$LAUNCH_BIN" com.mach.mail >/dev/null 2>&1 || true
+  # The copy is what launches, so the copy is what has to carry the signature.
+  # Same identifier and same identity as the artifact would have got, which is
+  # what keeps the Keychain quiet: a Developer ID designated requirement names
+  # the identifier and the team, not a path.
+  #
+  # Nobody signs the shared `debug/mach` any more. It may be the file a running
+  # app — possibly the owner's — was launched from, and `codesign --force`
+  # rewrites it.
+  "$REPO/scripts/sign" --only "$LAUNCH_BIN" com.mach.mail >/dev/null 2>&1 || true
+
+  # The helper binaries read the Keychain on their own account and are run from
+  # the target directory directly, so they still need a stable identity. Only
+  # the owner's instance does this: they are shared, like everything else in
+  # there, and an agent has no business re-signing them mid-run.
+  if [ "$INSTANCE" = "main" ]; then
+    "$REPO/scripts/sign" --only "$TARGET_DIR/debug/calendar_live" com.mach.mail.calendar-live >/dev/null 2>&1 || true
+    "$REPO/scripts/sign" --only "$TARGET_DIR/debug/plugin_probe" com.mach.mail.plugin-probe >/dev/null 2>&1 || true
   fi
 
   # `exec` matters: without it the subshell stays alive as the parent and $!
@@ -638,6 +686,12 @@ cmd_up() {
     # publication without photographing somebody's real inbox. The port is still
     # checked below, so a hand-written value cannot aim at 1420 either.
     export MACH_DEV_URL="${MACH_DEV_URL:-$(dev_url)}"
+    # What "a newer build is waiting" is measured against. `staleness.rs` used
+    # to stat `current_exe()`, which was `debug/mach` back when instances ran it
+    # in place; the pinned copy above never changes, so watching it would report
+    # "current" forever and quietly retire the banner. The artifact is what
+    # moves, so the artifact is what gets watched.
+    export MACH_BUILD_WATCH="$BIN"
     exec "$LAUNCH_BIN" >"$LOG" 2>&1
   ) &
   echo $! >"$PIDFILE"
@@ -833,6 +887,28 @@ cmd_state() {
   fi
 
   echo "binary  : $LAUNCH_BIN"
+
+  # Which checkout compiled the code in that window.
+  #
+  # This is the line that would have saved a day. The owner used his mail client
+  # for one, on a binary an agent had built in a worktree from code that was
+  # never merged; he found it by chance, in the log. So it is reported here,
+  # from the process's own first line rather than from anything about a file —
+  # `qa::dev::apply` prints `mach: built from <CARGO_MANIFEST_DIR>` at startup
+  # precisely so the question has a cheap, honest answer.
+  local built; built="$(running_built_from || true)"
+  if [ -z "$built" ]; then
+    echo "built   : <no 'built from' line in $LOG>"
+  else
+    echo "built   : $built"
+    if [ "$built" != "$REPO/src-tauri" ]; then
+      echo "WARNING : that is not this checkout ($REPO/src-tauri). The window you are" >&2
+      echo "          looking at is running somebody else's Rust — every worktree" >&2
+      echo "          shares one target dir and the last build wins the name." >&2
+      echo "          \`qa restart\` rebuilds from here and relaunches onto it." >&2
+    fi
+  fi
+
   local drift; drift="$(binary_drift)"
   [ -n "$drift" ] && echo "WARNING : $drift" >&2
 
