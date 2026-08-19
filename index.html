@@ -5,6 +5,124 @@
     <link rel="icon" type="image/svg+xml" href="./assets/logo/icon-small.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Mach</title>
+
+    <!--
+      The window that comes up white and says nothing.
+
+      This is the failure that cost a morning. A dev server that had been up for
+      two days re-optimised its dependencies and started serving `react.js?v=A`
+      alongside `react-dom_client.js?v=B`, neither matching what was on disk. The
+      module graph never resolved, `main.tsx` never ran, React never mounted, and
+      the window was white — indistinguishable from a crashed frontend, a hung
+      app, or a dev server that was never there. Reloading re-requested the same
+      dead URLs. The diagnosis took an hour and ended in a hand-comparison of
+      dependency hashes.
+
+      Nothing in the app could have caught it, because the app never started. So
+      the watchdog is here, in the document, in plain script that no bundler
+      touches and no import can break: if `#root` is still empty a few seconds
+      in, say so, and say what was being loaded and what went wrong on the way.
+
+      `ErrorBoundary` in `src/components/chrome/ErrorBoundary.tsx` is the other
+      half — it catches the app throwing *after* it mounts. This half catches the
+      app never arriving at all.
+    -->
+    <script>
+      (function () {
+        // Resource failures — a script tag that 404s — do not bubble, so the
+        // capture phase on window is the only place they can be seen.
+        var failures = [];
+        var note = function (what) {
+          if (failures.length < 6) failures.push(what);
+        };
+        addEventListener(
+          "error",
+          function (event) {
+            var target = event.target;
+            if (target && target !== window && target.src) note("could not load " + target.src);
+            else if (event.message) note(event.message);
+          },
+          true,
+        );
+        addEventListener("unhandledrejection", function (event) {
+          var reason = event.reason;
+          note(String((reason && (reason.stack || reason.message)) || reason));
+        });
+
+        // Long enough that a cold start on a slow machine is not accused of
+        // failing, short enough to beat somebody reaching for the reload key.
+        var GRACE_MS = 6000;
+
+        setTimeout(function () {
+          var root = document.getElementById("root");
+          if (!root || root.childElementCount > 0) return;
+
+          // `globals.css` is imported by the module that did not run, so this
+          // panel cannot use a single token and styles itself from nothing.
+          var panel = document.createElement("div");
+          panel.setAttribute("data-mach-did-not-start", "");
+          panel.style.cssText =
+            "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;" +
+            "font:13px/1.55 ui-sans-serif,-apple-system,system-ui,sans-serif;" +
+            "background:Canvas;color:CanvasText;padding:2rem;-webkit-user-select:text;user-select:text";
+
+          var box = document.createElement("div");
+          box.style.cssText = "max-width:34rem";
+
+          var head = document.createElement("div");
+          head.textContent = "Mach didn’t start";
+          head.style.cssText = "font-size:15px;font-weight:600;margin-bottom:.5rem";
+
+          var body = document.createElement("div");
+          body.style.cssText = "opacity:.7";
+          body.textContent =
+            "The interface never loaded. The window is fine; something upstream of it is not.";
+
+          var where = document.createElement("div");
+          where.style.cssText =
+            "margin-top:1rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;opacity:.7;word-break:break-all";
+          where.textContent = location.href;
+
+          if (failures.length) {
+            var list = document.createElement("ul");
+            list.style.cssText =
+              "margin:.75rem 0 0;padding:0 0 0 1rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;" +
+              "font-size:12px;opacity:.85;word-break:break-all";
+            failures.forEach(function (line) {
+              var li = document.createElement("li");
+              li.textContent = line;
+              list.appendChild(li);
+            });
+            where.appendChild(list);
+          }
+
+          // The remedy, because it is not guessable and it is nearly always the
+          // same one: a dev server that has been up too long.
+          var fix = document.createElement("div");
+          fix.style.cssText = "margin-top:1rem;opacity:.7";
+          fix.textContent =
+            "A dev server that has been running for days is the usual cause. Restart it — " +
+            "rm -rf node_modules/.vite, then bun run dev — and reload.";
+
+          var button = document.createElement("button");
+          button.textContent = "Reload";
+          button.style.cssText =
+            "margin-top:1.25rem;font:inherit;padding:.35rem .9rem;border-radius:6px;" +
+            "border:1px solid CanvasText;background:transparent;color:inherit";
+          button.onclick = function () {
+            location.reload();
+          };
+
+          box.appendChild(head);
+          box.appendChild(body);
+          box.appendChild(where);
+          box.appendChild(fix);
+          box.appendChild(button);
+          panel.appendChild(box);
+          document.body.appendChild(panel);
+        }, GRACE_MS);
+      })();
+    </script>
   </head>
 
   <body>

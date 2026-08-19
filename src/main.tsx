@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { ErrorBoundary } from "@/components/chrome/ErrorBoundary";
 import { fixtureSource, setDataSource } from "@/lib/data";
 import { createTauriSource, isTauri } from "@/lib/ipc";
 import "./styles/globals.css";
@@ -62,7 +63,15 @@ if ((globalThis as Record<string, unknown>).__MACH_PLUGIN_PROBE__) {
 
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
-      <App />
+      {/*
+        Outside `App` and inside `StrictMode`, which is the only placement that
+        catches everything the app can throw while still being caught itself by
+        nothing — there is no boundary above this one, so it must not be part of
+        the tree it is guarding.
+      */}
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
     </React.StrictMode>,
   );
 }
