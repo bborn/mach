@@ -151,6 +151,20 @@ if (!process.env.MACH_WEB_URL && DEV_PORT === null && URL_UNDER_TEST.includes(":
  */
 const STATE_DIR = `${process.cwd()}/.qa`;
 const STATE_FILE = `${STATE_DIR}/chrome-${PORT}.json`;
+/**
+ * Where the browser's own profile goes: the OS temp directory, not the repo.
+ *
+ * Keyed by port for the same reason the state file is, and by the checkout so
+ * two clones cannot collide. Nothing here is worth keeping between runs — if it
+ * is lost, Chrome makes another one.
+ */
+const PROFILE_DIR = (() => {
+  // macOS hands TMPDIR back with a trailing slash and Linux does not, which is
+  // the difference between `/tmp/mach-webqa` and `/tmpmach-webqa`.
+  const tmp = (process.env.TMPDIR ?? "/tmp").replace(/\/+$/, "");
+  const checkout = process.cwd().replace(/[^a-zA-Z0-9]/g, "-");
+  return `${tmp}/mach-webqa/${checkout}-${PORT}`;
+})();
 
 /** Minutes of no CDP traffic before the watchdog closes the browser. */
 const IDLE_MINUTES = Number(process.env.WEBQA_IDLE_TIMEOUT ?? 30);
@@ -344,13 +358,19 @@ async function ensureChrome(): Promise<void> {
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-gpu",
-      // Its own profile, so it cannot touch the user's Chrome session — and
-      // one per debugger port, because Chrome takes an exclusive lock on a
-      // profile directory. Every instance shared `.qa/chrome`, so the careful
-      // work above to give each one its own port bought nothing: the second
-      // browser to start could not start at all, and said only "headless
-      // Chrome did not come up".
-      `--user-data-dir=${STATE_DIR}/chrome-${PORT}`,
+      // Its own profile, so it cannot touch the user's Chrome session — one per
+      // debugger port, because Chrome takes an exclusive lock on a profile
+      // directory, and **outside the repository**, because a Chrome profile is
+      // ten thousand files that Chrome rewrites while it runs.
+      //
+      // It lived at `.qa/chrome-<port>` for exactly one morning. Vite watches
+      // the project, answered every one of those writes with a page reload, and
+      // flooded the owner's own window with hundreds of them until the dev
+      // server wedged and his app came up white. `vite.config.ts` now ignores
+      // `.qa/` as well, and this moves the profile out of the tree entirely:
+      // two independent fixes, because a browser profile has no business in a
+      // source directory whoever happens to be watching it.
+      `--user-data-dir=${PROFILE_DIR}`,
       URL_UNDER_TEST,
     ],
     // Its stderr goes to a file rather than to /dev/null. A browser that fails

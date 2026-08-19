@@ -116,7 +116,20 @@ export default defineConfig(async () => ({
       // anywhere under the root by clearing its cache and forcing a full
       // reload. Deleting a merged worktree therefore reloaded the running app
       // against a tree that had just stopped existing, and it came back blank.
-      ignored: ["**/src-tauri/**", "**/.claude/**"],
+      //
+      // ...and `.qa/`, which is where every QA instance keeps its state and,
+      // worse, where `scripts/webqa.ts` parks a headless Chrome profile. A
+      // Chrome profile is ten thousand files: extensions, caches, a dozen
+      // LevelDBs, all of it rewritten constantly while the browser runs. The
+      // watcher answered each one with a page reload, so a QA run in one window
+      // flooded the owner's window with hundreds of them —
+      //
+      //   [vite] (client) page reload .qa/chrome-9482/Default/Extensions/…/vault.html
+      //
+      // — and the server wedged mid dependency re-optimisation. His app came up
+      // white. Nothing under `.qa/` is source; none of it should move this
+      // server.
+      ignored: ["**/src-tauri/**", "**/.claude/**", "**/.qa/**"],
     },
   },
 
