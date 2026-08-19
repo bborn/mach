@@ -134,7 +134,7 @@ export const ThreadRow = memo(function ThreadRow({
       data-checked={checked || undefined}
       onClick={(event) => onSelect(thread.id, modifiersOf(event))}
       className={cn(
-        "group relative flex h-row cursor-default items-center gap-2 px-3",
+        "group relative flex h-row cursor-default items-center gap-2 pl-4 pr-3",
         "border-b border-border/60 text-list",
         checked
           ? "bg-row-selected"
@@ -176,11 +176,20 @@ export const ThreadRow = memo(function ThreadRow({
         </button>
       )}
 
-      {/* Unread, in the left margin beside all three lines rather than on one
-          of them: it is a fact about the conversation, not about its sender. */}
+      {/*
+        Unread, in the left margin beside all three lines rather than on one of
+        them: it is a fact about the conversation, not about its sender.
+
+        Absolutely placed, next to the account bar, because it used to sit in
+        the row's flex flow and *reserve* its 6px whether or not it was drawn.
+        On a read row that is 6px of nothing plus the 8px gap after it, so the
+        monogram carried 26px of clear space on its left and 8px on its right —
+        a tile that looked shoved against the text it belongs beside. Out of
+        flow it costs the row nothing when it is invisible, which is most rows.
+      */}
       <span
         className={cn(
-          "h-1.5 w-1.5 shrink-0 rounded-full",
+          "absolute left-[7px] h-1.5 w-1.5 rounded-full",
           unread ? "bg-accent" : "bg-transparent",
         )}
       />
@@ -193,7 +202,7 @@ export const ThreadRow = memo(function ThreadRow({
         already reads. This is for the eye, which cannot read forty rows and
         does not have to.
       */}
-      <Monogram name={from?.name} email={from?.email} />
+      <Monogram name={from?.name} email={from?.email} className="mr-2" />
 
       {/*
         4px between the three lines. It was 1px, and the row read "a little

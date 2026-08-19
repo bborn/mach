@@ -146,6 +146,27 @@ describe("the thread row", () => {
     expect(weighted(read)).toBe(0);
   });
 
+  /**
+   * The gutter is symmetrical, and it is symmetrical on a *read* row.
+   *
+   * The unread dot used to sit in the row's flex flow and reserve its 6px
+   * whether or not it was drawn, so a read row spent 12px of padding, 6px of
+   * nothing and an 8px gap before the monogram, and 8px after it. On screen the
+   * tile looked shoved against the text. The dot is out of flow now; this pins
+   * that it stays out of flow, because putting it back is a one-word change
+   * that looks like nothing in a diff.
+   */
+  it("keeps the sender's tile off the text, on read rows and unread alike", () => {
+    for (const unread of [true, false]) {
+      const markup = row({}, { unread });
+      // Absolutely placed, so it costs the row no horizontal space.
+      expect(markup).toMatch(/class="[^"]*absolute left-\[7px\][^"]*rounded-full/);
+      // And the tile carries its own right margin rather than leaning on the
+      // row gap, which is what makes the two sides equal.
+      expect(markup).toMatch(/class="[^"]*mr-2[^"]*"[^>]*style="width:26px/);
+    }
+  });
+
   it("draws the tick column only while a selection is live", () => {
     expect(row({}, { selecting: false })).not.toContain('role="checkbox"');
     const selecting = row({}, { selecting: true, checked: true });
