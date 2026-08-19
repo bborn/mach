@@ -677,7 +677,9 @@
         <figcaption>
           <h3>Five accounts in one inbox</h3>
           <p>
-            One list, in date order, with a colour bar on each row telling you whose it is. That's the test suite's fixture data — the marker in the status bar says so — so nobody in this picture is real.
+            Everything in date order, with a colour bar for whose account it is. None of
+            it's real mail, though. That's the test suite's fixture data, and the
+            status bar says so.
           </p>
         </figcaption>
         <div class="shot">
@@ -764,7 +766,7 @@
           <div>
             <dt>Attachments</dt>
             <dd>
-              Drag a file onto a composer to send it, or press ⇧⌘A. Incoming
+              Drag a file onto a composer to send it, or press <kbd>⇧⌘A</kbd>. Incoming
               ones are fetched, cached, opened and saved, with inline images
               drawn in the message. What kind of file it is comes from the bytes
               themselves, not from what the sender claimed, and executables
@@ -850,7 +852,8 @@
           <figcaption>
             <h3>Five calendars in one grid</h3>
             <p>
-              Day, week and month, and you can drag to make an event or drag it somewhere else. Fixture data again.
+              Week view, with every event tinted by the calendar it came from and a
+              red line on the current time. Fixture data again.
             </p>
           </figcaption>
           <div class="shot">
@@ -892,7 +895,8 @@
           <figcaption>
             <h3>The agent shows its work</h3>
             <p>
-              Every tool it called and what each one returned, in a drawer under the list. This session drafted a reply and stopped for approval before sending it.
+              Here it drafted a reply, then stopped and waited for me to say send.
+              The monospaced lines are the tools it called on the way.
             </p>
           </figcaption>
           <div class="shot">
@@ -924,7 +928,9 @@
           <figcaption>
             <h3>Or hand the thread somewhere else</h3>
             <p>
-              The same conversation on its way out to Claude Code in a terminal. The first time you use a target it shows you the command, the directory, and every word it's about to send.
+              The same conversation on its way to Claude Code in a terminal. The
+              first time you send a thread somewhere new, you get to read the whole
+              thing first: the command, the directory, and the text itself.
             </p>
           </figcaption>
           <div class="shot">
@@ -1066,8 +1072,8 @@ bun run tauri dev</code></pre>
           don't use are probably broken.
         </p>
         <p class="measure">
-          Expect rough edges. Nothing is packaged, nothing updates itself, there
-          is no onboarding past adding an account, and marketing mail still
+          Nothing is packaged, nothing updates itself, there's no onboarding past
+          adding an account, and marketing mail still
           renders like a ransom note more often than I'd like.
           <code>cargo test</code> and <code>bunx vitest run</code> are the whole
           safety net — no end-to-end suite. <kbd>⌘K</kbd> →
