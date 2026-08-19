@@ -117,7 +117,7 @@ The setup skill below encodes all of this. It is the fiddly part of the install.
 Point Claude Code (or any agent that can drive a browser) at it and it will walk
 the Google Cloud console with you: creating the project, enabling the two APIs,
 configuring the consent screen, creating a **Desktop app** OAuth client, adding
-the six scopes, publishing to production, and writing `.env.local`. It stops and
+the seven scopes, publishing to production, and writing `.env.local`. It stops and
 hands the keyboard back for the parts that are yours, which are your password
 and accepting the User Data Policy.
 
@@ -232,7 +232,7 @@ Rust is authoritative.
 
 ## Scopes
 
-Mach requests six scopes:
+Mach requests seven scopes:
 
 | Scope | Tier | Why |
 |---|---|---|
@@ -240,8 +240,15 @@ Mach requests six scopes:
 | `userinfo.email` | non-sensitive | which account just authorized, so tokens key by email |
 | `gmail.modify` | **restricted** | read, label, archive, trash. Narrower than `mail.google.com`, which would also grant permanent delete |
 | `gmail.send` | sensitive | the composer |
+| `gmail.settings.basic` | sensitive | filters, and only filters. `gmail.settings.sharing` is the one above it and is deliberately not requested — that one can send as another address and register a new forwarding destination |
 | `calendar` | sensitive | calendar list and settings |
 | `calendar.events` | sensitive | event read and write |
+
+`contacts.other.readonly` is **not** requested. It was, briefly, to put a real
+photograph on each sender instead of their initials. Against a real mailbox
+Google returned 8,854 contacts, every one of them carrying a photo object and
+8,853 of those the default grey silhouette — one real picture in nine thousand.
+Google does not hand out a profile picture because somebody emailed you.
 
 ## License
 

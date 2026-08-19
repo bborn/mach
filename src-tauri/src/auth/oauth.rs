@@ -66,29 +66,36 @@ pub const CALLBACK_PATH: &str = "/oauth/callback";
 /// address the account has already verified — a gate Mach neither owns nor can
 /// open with this scope.
 ///
-/// `contacts.other.readonly` is the narrowest scope that can return a picture
-/// of the person who sent you something.
+/// **`contacts.other.readonly` was requested, measured and taken back out.**
 ///
-/// "Other contacts" is Google's own auto-collected list of the addresses you
-/// have corresponded with and never saved, which is where nearly everybody in a
-/// real mailbox lives — the saved address book is a rounding error beside it.
-/// `otherContacts.list` accepts `photos` in its `readMask`, so one call gets a
-/// name, an address and a picture for that whole set.
+/// The thread list draws a monogram per sender and the obvious next step was a
+/// real photograph, so the scope went in and one account re-consented.
+/// `otherContacts.list` — Google's own auto-collected list of everyone you have
+/// corresponded with — takes `photos` in its `readMask`, and against a real
+/// mailbox it returned:
 ///
-/// The scopes that were considered and are **not** requested:
+/// ```text
+/// other contacts   : 8854
+/// photo field set  : 8854  (100.0%)
+/// REAL picture     : 1     (0.0%)
+///   default=true   : 8853
+/// ```
 ///
-///  * `contacts.readonly` reads the saved address book, and would also grant
-///    every field on it — birthdays, postal addresses, notes. Mach wants a
-///    32px square, not somebody's medical appointments.
-///  * `contacts` adds write. There is nothing here that should edit an address
-///    book.
-///  * `directory.readonly` is Workspace-only and returns colleagues, which for
-///    a personal mailbox is the smallest of the three sets.
+/// Every entry carries a `Photo`, and 8,853 of them are `default: true` —
+/// Google's grey silhouette. Google does not hand out a profile picture because
+/// somebody emailed you, which is the right call on their part and the end of
+/// the idea on ours. A scope on the consent screen that buys one face in nine
+/// thousand is surface with nothing behind it.
 ///
-/// What it will not produce is worth stating plainly, because the feature it
-/// serves will look broken otherwise: no-reply@, notifications@, billing@ and
-/// the rest of the machines have no Google profile, and they are the senders
-/// you see most. This buys faces for the people, and nothing for the robots.
+/// The local address book was measured next, since that is where Apple Mail
+/// gets its faces (`CNContactImageDataKey`). Of 728 macOS contacts, 196 have a
+/// photo, 110 have an email address, 68 have both — and **six** of those have
+/// ever sent mail to this account, covering 1.4% of the store and 1.3% of the
+/// last ninety days. Reachable, but it needs a Swift shim linked into the
+/// binary and a TCC prompt, for six faces.
+///
+/// So the monogram is not a placeholder waiting for a picture. It is the
+/// answer, and the colour rather than the letters is the part doing the work.
 ///
 /// **Adding a scope invalidates every existing grant.** A refresh token issued
 /// before this line changed keeps working for mail and calendar and gets a 403
@@ -107,7 +114,6 @@ pub const SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/calendar.events",
-    "https://www.googleapis.com/auth/contacts.other.readonly",
 ];
 
 /// The space-delimited `scope` parameter value.
@@ -767,4 +773,67 @@ pub fn exchange_form_secret(
     redirect_uri: &str,
 ) -> Vec<(String, String)> {
     exchange_form(config, code, code_verifier.expose(), redirect_uri)
+}
+
+#[cfg(test)]
+mod scope_documentation {
+    use super::SCOPES;
+
+    /// The setup guide and this list must name the same scopes.
+    ///
+    /// They did not, and the way it failed is the reason this test exists.
+    /// `gmail.settings.basic` was added to [`SCOPES`] and to nothing else, so
+    /// the guide went on saying "six scopes", listed six, and its own
+    /// verification step — *all six scopes are listed* — confirmed the wrong
+    /// number. Anyone following it built a consent screen the app did not match
+    /// and got a 403 from the filter commands with nothing to point at.
+    ///
+    /// Reading the markdown is not elegant. It is, however, the only check that
+    /// fails when somebody changes one list and not the other, which is exactly
+    /// what happened.
+    const SKILL: &str = include_str!("../../../skills/mach-setup/SKILL.md");
+    const README: &str = include_str!("../../../README.md");
+
+    #[test]
+    fn the_setup_guide_lists_every_scope_and_no_others() {
+        for scope in SCOPES {
+            assert!(
+                SKILL.contains(scope),
+                "skills/mach-setup/SKILL.md does not list `{scope}`; \
+                 anyone following it will build a consent screen that is missing it"
+            );
+        }
+        // The other direction: a scope dropped from the code but left in the
+        // guide asks people to grant something Mach no longer uses.
+        for line in SKILL.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("https://www.googleapis.com/auth/") {
+                let scope = format!("https://www.googleapis.com/auth/{rest}");
+                assert!(
+                    SCOPES.contains(&scope.as_str()),
+                    "the setup guide asks for `{scope}`, which Mach does not request"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_readme_counts_the_scopes_correctly() {
+        let spelled = match SCOPES.len() {
+            6 => "six",
+            7 => "seven",
+            8 => "eight",
+            n => panic!("no spelling for {n} scopes — add one here and in the docs"),
+        };
+        assert!(
+            README.contains(&format!("Mach requests {spelled} scopes")),
+            "README.md does not say `Mach requests {spelled} scopes`"
+        );
+        for scope in SCOPES {
+            let short = scope.rsplit('/').next().unwrap_or(scope);
+            assert!(
+                README.contains(short),
+                "README.md's scope table is missing `{short}`"
+            );
+        }
+    }
 }

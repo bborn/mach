@@ -1,6 +1,6 @@
 ---
 name: mach-setup
-description: Set up Mach's Google OAuth credentials end to end — create a Google Cloud project, enable the Gmail, Calendar and People APIs, configure the Google Auth Platform consent screen, create a Desktop app OAuth client, add the eight scopes, publish to production so refresh tokens stop expiring after 7 days, write .env.local, and verify with the oauth_smoke example. Use when someone is setting up or re-setting-up Mach, hits "not configured", sees "Google hasn't verified this app", is being asked to re-authorize every week, or asks how to get Mach's Google credentials.
+description: Set up Mach's Google OAuth credentials end to end — create a Google Cloud project, enable the Gmail and Calendar APIs, configure the Google Auth Platform consent screen, create a Desktop app OAuth client, add the seven scopes, publish to production so refresh tokens stop expiring after 7 days, write .env.local, and verify with the oauth_smoke example. Use when someone is setting up or re-setting-up Mach, hits "not configured", sees "Google hasn't verified this app", is being asked to re-authorize every week, or asks how to get Mach's Google credentials.
 ---
 
 # Setting up Mach's Google OAuth client
@@ -87,13 +87,12 @@ Creating takes a few seconds and shows a notification when done. Capture the
 **project ID** — it is the name plus a numeric suffix, e.g. `mach-4f2c81`. You
 need it for the `?project=` query parameter.
 
-## Step 2 — Enable the three APIs
+## Step 2 — Enable the two APIs
 
-Mach uses exactly three. Enabling anything else widens the app for no reason.
+Mach uses exactly two. Enabling anything else widens the app for no reason.
 
 1. `https://console.cloud.google.com/apis/library/gmail.googleapis.com?project=<id>` → **Enable**
 2. `https://console.cloud.google.com/apis/library/calendar-json.googleapis.com?project=<id>` → **Enable**
-3. `https://console.cloud.google.com/apis/library/people.googleapis.com?project=<id>` → **Enable**
 
 Each takes 5–20 seconds. The button becomes **Manage** when it has worked. If it
 still says "Enable" after a reload, it did not work — retry before continuing.
@@ -102,10 +101,9 @@ still says "Enable" after a reload, it did not work — retry before continuing.
 > `calendar.googleapis.com`. Searching the library for "Google Calendar API" is
 > the reliable way to find it.
 
-> The People API is the one that carries `contacts.other.readonly`. Granting the
-> scope without enabling the API is the failure that looks like nothing at all:
-> consent succeeds, the token comes back carrying the scope, and every call
-> returns 403 `SERVICE_DISABLED`.
+> If you ever add a scope, enable its API in this step too. Granting a scope
+> whose API is off fails in the worst way available: consent succeeds, the token
+> comes back carrying the scope, and every call returns 403 `SERVICE_DISABLED`.
 
 ## Step 3 — Configure the consent screen
 
@@ -166,10 +164,10 @@ both).
 
 Write them to `.env.local` immediately — Step 6 — before doing anything else.
 
-## Step 5 — Add the eight scopes
+## Step 5 — Add the seven scopes
 
 `https://console.cloud.google.com/auth/scopes?project=<id>` → **Add or remove
-scopes**. Paste all eight into the "manually add scopes" box, comma- or
+scopes**. Paste all seven into the "manually add scopes" box, comma- or
 newline-separated, then **Add to table** → **Update** → **Save**.
 
 ```
@@ -180,7 +178,6 @@ https://www.googleapis.com/auth/gmail.send
 https://www.googleapis.com/auth/gmail.settings.basic
 https://www.googleapis.com/auth/calendar
 https://www.googleapis.com/auth/calendar.events
-https://www.googleapis.com/auth/contacts.other.readonly
 ```
 
 How Google tiers them — this determines what warnings appear later:
@@ -194,7 +191,6 @@ How Google tiers them — this determines what warnings appear later:
 | `gmail.settings.basic` | sensitive | filters, and only filters |
 | `calendar` | sensitive | calendar list and settings |
 | `calendar.events` | sensitive | event read and write |
-| `contacts.other.readonly` | sensitive | the sender's picture, where there is one |
 
 `gmail.modify` is the one restricted scope, and it is deliberate: the broader
 `https://mail.google.com/` would also grant permanent delete, and Mach does not
@@ -279,7 +275,7 @@ A successful run prints:
 
 ```
   authorized  : <the account that consented>
-  scopes      : ... eight scopes ...
+  scopes      : ... seven scopes ...
   expires_at  : <a timestamp>
   refresh tok : issued and saved to the Keychain
 ```
@@ -291,7 +287,7 @@ Three things must be true:
    grant from a previous attempt. Revoke it at
    `https://myaccount.google.com/permissions` and run the smoke test again;
    Google only issues a refresh token on first consent.
-2. **All eight scopes** are listed. A missing one means Step 5 did not save.
+2. **All seven scopes** are listed. A missing one means Step 5 did not save.
 3. **macOS may prompt for Keychain access.** That is expected — the user
    clicks Allow (or Always Allow). Each freshly compiled unsigned binary is a
    new item to macOS and can prompt again.
