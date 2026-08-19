@@ -134,8 +134,12 @@ export const ThreadRow = memo(function ThreadRow({
       data-checked={checked || undefined}
       onClick={(event) => onSelect(thread.id, modifiersOf(event))}
       className={cn(
-        "group relative flex h-row cursor-default items-center gap-2 pl-4 pr-3",
+        "group relative flex h-row cursor-default items-center pl-4 pr-3",
         "border-b border-border/60 text-list",
+        // The tint under the cursor and under a tick are the same two
+        // colours the calendar's blocks cross-fade between; this row was
+        // the only surface still snapping to them.
+        "transition-colors duration-100 ease-out motion-reduce:transition-none",
         checked
           ? "bg-row-selected"
           : cursor
@@ -154,27 +158,55 @@ export const ThreadRow = memo(function ThreadRow({
         title={account?.email}
       />
 
-      {selecting && (
+      {/*
+        The tick column, opening and closing rather than appearing.
+
+        It is drawn on every row now and given a width of zero when there is no
+        selection, which is the same bargain the old conditional made — §the row
+        pays nothing for it until the mode exists — reached by a route that can
+        be animated. Entering selection used to shove the sender, the subject
+        and the preview 22px to the right between one frame and the next, on
+        every visible row at once.
+
+        One property animates: the wrapper's width. The 8px that separates the
+        tick from the tile is `mr-2` *inside* the wrapper, so it is carried by
+        the same transition instead of being a flex gap that snaps. `overflow-
+        hidden` is what lets the button keep its 14px while the column around it
+        is still narrower than that.
+
+        Out of the accessibility tree and off the tab ring while it is shut: a
+        checkbox nobody can see is not a checkbox anybody should reach.
+      */}
+      <span
+        aria-hidden={!selecting}
+        className={cn(
+          "flex shrink-0 items-center overflow-hidden",
+          "transition-[width] duration-150 ease-out motion-reduce:transition-none",
+          selecting ? "w-[22px]" : "w-0",
+        )}
+      >
         <button
           type="button"
           role="checkbox"
           aria-checked={checked}
           aria-label={checked ? "Deselect conversation" : "Select conversation"}
+          tabIndex={selecting ? undefined : -1}
           onClick={(event) => {
             // The row underneath opens the conversation; the tick must not.
             event.stopPropagation();
             onSelect(thread.id, { extend: false, toggle: true });
           }}
           className={cn(
-            "flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-[3px] border",
+            "mr-2 flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-[3px] border",
+            "transition-colors duration-100 ease-out motion-reduce:transition-none",
             checked
               ? "border-accent bg-accent text-accent-foreground"
               : "border-border-strong text-transparent",
           )}
         >
-          <Check size={10} strokeWidth={3} />
+          {selecting && <Check size={10} strokeWidth={3} />}
         </button>
-      )}
+      </span>
 
       {/*
         Unread, in the left margin beside all three lines rather than on one of
@@ -182,7 +214,7 @@ export const ThreadRow = memo(function ThreadRow({
 
         Absolutely placed, next to the account bar, because it used to sit in
         the row's flex flow and *reserve* its 6px whether or not it was drawn.
-        On a read row that is 6px of nothing plus the 8px gap after it, so the
+        On a read row that is 6px of nothing plus the gap after it, so the
         monogram carried 26px of clear space on its left and 8px on its right —
         a tile that looked shoved against the text it belongs beside. Out of
         flow it costs the row nothing when it is invisible, which is most rows.
@@ -194,15 +226,7 @@ export const ThreadRow = memo(function ThreadRow({
         )}
       />
 
-      {/*
-        Who it is from, next to the unread mark and against all three lines.
-
-        It is `aria-hidden` and it costs the row nothing in meaning: the sender
-        is written out in full on line one, which is what a screen reader
-        already reads. This is for the eye, which cannot read forty rows and
-        does not have to.
-      */}
-      <Monogram name={from?.name} email={from?.email} className="mr-2" />
+      <Monogram name={from?.name} email={from?.email} className="mr-4" />
 
       {/*
         4px between the three lines. It was 1px, and the row read "a little

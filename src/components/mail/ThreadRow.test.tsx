@@ -161,18 +161,44 @@ describe("the thread row", () => {
       const markup = row({}, { unread });
       // Absolutely placed, so it costs the row no horizontal space.
       expect(markup).toMatch(/class="[^"]*absolute left-\[7px\][^"]*rounded-full/);
-      // And the tile carries its own right margin rather than leaning on the
-      // row gap, which is what makes the two sides equal.
-      expect(markup).toMatch(/class="[^"]*mr-2[^"]*"[^>]*style="width:26px/);
+      // And the tile owns the whole 16px on its right — `pl-4` on one side,
+      // `mr-4` on the other. It used to be `mr-2` against a `gap-2` on the row;
+      // the gap went when the tick column started animating its own 8px, and
+      // the tile absorbed it rather than losing it.
+      expect(markup).toMatch(/class="[^"]*mr-4[^"]*"[^>]*style="width:26px/);
     }
   });
 
-  it("draws the tick column only while a selection is live", () => {
-    expect(row({}, { selecting: false })).not.toContain('role="checkbox"');
-    const selecting = row({}, { selecting: true, checked: true });
-    expect(selecting).toContain('role="checkbox"');
-    expect(selecting).toContain('aria-checked="true"');
-    expect(selecting).toContain('aria-label="Deselect conversation"');
+  /**
+   * The tick column costs nothing until a selection exists — and it opens
+   * rather than appears.
+   *
+   * It used to be `{selecting && <button/>}`, which is free when shut and
+   * un-animatable: entering selection shoved the sender, subject and preview
+   * 22px right between one frame and the next, on every visible row at once.
+   * The button is drawn always now and its column widened from zero, so the
+   * bargain is the same and the change is something the eye can follow.
+   *
+   * Both halves are asserted, because either alone would let the other rot: a
+   * width that never returns to zero is the permanent column the row refused,
+   * and a column with no transition is the snap that was reported.
+   */
+  it("keeps the tick column shut and free until a selection is live", () => {
+    const idle = row({}, { selecting: false });
+    expect(idle).toContain('role="checkbox"');
+    expect(idle).toContain("w-0");
+    // Shut means shut: not reachable by tab, not announced.
+    expect(idle).toContain('aria-hidden="true"');
+    expect(idle).toContain('tabindex="-1"');
+  });
+
+  it("opens the tick column rather than snapping it open", () => {
+    const live = row({}, { selecting: true });
+    expect(live).toContain("w-[22px]");
+    expect(live).toContain("transition-[width]");
+    expect(live).toContain("motion-reduce:transition-none");
+    // Scoped to the tick's own wrapper — the monogram is aria-hidden too.
+    expect(live).toMatch(/aria-hidden="false"[^>]*transition-\[width\]/);
   });
 
   it("says which row the cursor and the selection are on", () => {
