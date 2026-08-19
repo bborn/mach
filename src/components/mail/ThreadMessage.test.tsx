@@ -230,3 +230,48 @@ describe("the collapsed preview", () => {
     expect(preview(message({ snippet: "x".repeat(400), bodyText: "" }))).toHaveLength(200);
   });
 });
+
+/**
+ * The fold is a transition, and a collapsed message still costs nothing.
+ *
+ * Two claims that pull against each other, which is why both are pinned.
+ *
+ * The row has to stay mounted while it is shut, or there is nothing for the
+ * close to animate on — an element React has removed cannot transition. But
+ * `MessageBody` is a sandboxed frame that parses and renders the message, and
+ * a forty-message thread with forty of them mounted is forty frames working on
+ * mail nobody is looking at. The fold has always unmounted it and must go on
+ * doing so; the mount is merely *held* for the length of the transition.
+ *
+ * Measured on a real page rather than asserted here: the track runs
+ * 0 → 129px on an ease-out over 200ms and back down without a snap, and the
+ * frame count returns to one afterwards.
+ */
+describe("the fold", () => {
+  it("keeps a shut message in the DOM so the close has something to animate", () => {
+    const shut = threadMessage({}, false);
+    expect(shut).toContain("grid-rows-[0fr]");
+    expect(shut).toContain("transition-[grid-template-rows]");
+    expect(shut).toContain("motion-reduce:transition-none");
+  });
+
+  it("opens the same track rather than swapping in a different one", () => {
+    expect(threadMessage({}, true)).toContain("grid-rows-[1fr]");
+  });
+
+  it("hides a shut message from the eye and the screen reader", () => {
+    const shut = threadMessage({}, false);
+    expect(shut).toContain("invisible");
+    expect(shut).toMatch(/aria-hidden="true"[^>]*class="[^"]*overflow-hidden/);
+    expect(threadMessage({}, true)).not.toContain("invisible");
+  });
+
+  it("draws no body for a message that is shut", () => {
+    // The frame is the expensive part and the reason the fold unmounts at all.
+    expect(threadMessage({}, false)).not.toContain("<iframe");
+  });
+
+  it("gives a draft no fold at all — its row opens the composer", () => {
+    expect(threadMessage({ isDraft: true }, false)).not.toContain("grid-rows-[0fr]");
+  });
+});

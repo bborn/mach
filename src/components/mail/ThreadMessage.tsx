@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -93,6 +93,15 @@ export interface ThreadMessageProps {
  * than from a row of buttons under every message: eleven of those is a wall of
  * controls in a conversation that is meant to be read.
  */
+/**
+ * How long the fold takes, in one place.
+ *
+ * The CSS transition and the timer that releases the body's mount have to agree
+ * — a timer shorter than the transition unmounts the frame mid-slide, and a
+ * longer one leaves it mounted after the row has visibly shut.
+ */
+const FOLD_MS = 200;
+
 export function ThreadMessage({
   message,
   live,
@@ -103,6 +112,30 @@ export function ThreadMessage({
 }: ThreadMessageProps) {
   const attachments = message.attachments;
   const draft = message.isDraft;
+
+  /*
+   * The body outlives the fold, by exactly one transition.
+   *
+   * `MessageBody` is a sandboxed frame that parses and renders the message, and
+   * a thread of forty of them mounted at once is forty frames doing that work
+   * for messages nobody is looking at — which is why the fold has always
+   * unmounted it. But an element that unmounts cannot animate out: React
+   * removes the content, the grid track's `1fr` collapses to the meta line in
+   * the same frame, and the close reads as a snap followed by a small slide.
+   *
+   * So the mount is held for the length of the transition and then released.
+   * Expanded is immediate in both directions — this only delays the *unmount*,
+   * so nothing is ever slower to open.
+   */
+  const [bodyMounted, setBodyMounted] = useState(expanded);
+  useEffect(() => {
+    if (expanded) {
+      setBodyMounted(true);
+      return;
+    }
+    const timer = window.setTimeout(() => setBodyMounted(false), FOLD_MS);
+    return () => window.clearTimeout(timer);
+  }, [expanded]);
   const invitation = invitationOn(message);
   /*
    * The body is only folded when the card above it can actually answer. With
@@ -217,8 +250,41 @@ export function ThreadMessage({
         )}
       </div>
 
-      {expanded && !draft && (
-        <>
+      {/*
+        The body, unfolding rather than appearing.
+
+        `grid-template-rows: 0fr → 1fr` is the one way to animate to a height
+        nobody can know in advance, and here nobody can: `MessageBody` reports
+        its own height "over several frames as the height arrives in steps", so
+        there is no pixel value to transition towards. `1fr` means *whatever the
+        content is now*, so the frame growing mid-flight simply moves the target
+        along with it. The steps were there before this and are no worse for it;
+        what has gone is the header snapping open on a message you only meant to
+        glance at.
+
+        The row stays mounted while it is shut, which is what lets it animate
+        closed as well as open — the fold used to unmount and there is nothing to
+        transition on an element that no longer exists. `invisible` and
+        `aria-hidden` keep the closed one out of the way of the eye and the
+        screen reader both; `overflow-hidden` on the track is what does the
+        clipping.
+
+        A draft never gets this: its row opens the composer instead of unfolding,
+        so there is nothing here to reveal.
+      */}
+      {!draft && (
+        <div
+          className={cn(
+            "grid transition-[grid-template-rows] ease-out",
+            "motion-reduce:transition-none",
+            expanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
+          )}
+          style={{ transitionDuration: `${FOLD_MS}ms` }}
+        >
+          <div
+            aria-hidden={!expanded}
+            className={cn("overflow-hidden", !expanded && "invisible")}
+          >
           <div className="mt-1 truncate text-micro text-faint-foreground">
             to {message.to.map((p) => p.name).join(", ") || "—"}
             {message.cc.length > 0 && ` · cc ${message.cc.map((p) => p.name).join(", ")}`}
@@ -256,10 +322,13 @@ export function ThreadMessage({
             </div>
           )}
 
-          {(!foldable || bodyOpen) && <MessageBody message={message} live={live} />}
+          {(!foldable || bodyOpen) && bodyMounted && (
+            <MessageBody message={message} live={live} />
+          )}
 
           {attachments.length > 0 && <AttachmentRow attachments={attachments} live={live} />}
-        </>
+          </div>
+        </div>
       )}
     </article>
   );
