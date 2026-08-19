@@ -405,41 +405,107 @@
        * scanned rather than read, and the eleven-em label column that forced
        * every description into 39 characters goes with them.
        */
-      dl.feats {
+      /* ------------------------------------------------------- capabilities
+       *
+       * Twelve things, twelve lines.
+       *
+       * These were twelve paragraphs. They were accurate, and they were a
+       * screenful of body copy in the middle of a page whose job is to show
+       * somebody an app — "no one is going to read all this", which is right,
+       * and the pictures above were doing all the work while the longest block
+       * on the page did none.
+       *
+       * So the claim is a line and the detail is behind a disclosure. An icon
+       * per row, because an icon is read before the words next to it and this
+       * grid is meant to be scanned in the time it takes to scroll past.
+       */
+      ul.caps {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+        gap: 1.5rem 2rem;
         max-width: none;
-        columns: 3;
-        column-gap: 1rem;
       }
-      @media (max-width: 72rem) {
-        dl.feats {
-          columns: 2;
-        }
+      ul.caps > li {
+        display: grid;
+        grid-template-columns: 1.5rem 1fr;
+        gap: 0 0.85rem;
+        align-items: start;
       }
-      @media (max-width: 46rem) {
-        dl.feats {
+      ul.caps svg {
+        grid-row: span 2;
+        width: 1.25rem;
+        height: 1.25rem;
+        margin-top: 0.1rem;
+        color: var(--muted-foreground);
+      }
+      ul.caps b {
+        font-size: var(--text-body);
+        font-weight: 600;
+        letter-spacing: -0.004em;
+      }
+      ul.caps span {
+        font-size: var(--text-body);
+        line-height: 1.5;
+        color: var(--muted-foreground);
+        text-wrap: pretty;
+      }
+
+      /* The long version, for the one reader who wants it. Collapsed, because
+         the twelve lines above are the answer for everybody else. */
+      details.long {
+        margin-top: 2.5rem;
+        border-top: 1px solid var(--border);
+        padding-top: 1.25rem;
+      }
+      details.long > summary {
+        cursor: default;
+        list-style: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: var(--text-body);
+        color: var(--muted-foreground);
+      }
+      details.long > summary::-webkit-details-marker {
+        display: none;
+      }
+      details.long > summary::before {
+        content: "";
+        width: 0;
+        height: 0;
+        border-left: 4px solid currentColor;
+        border-top: 3.5px solid transparent;
+        border-bottom: 3.5px solid transparent;
+        transition: transform 120ms ease;
+      }
+      details.long[open] > summary::before {
+        transform: rotate(90deg);
+      }
+      details.long > summary:hover {
+        color: var(--foreground);
+      }
+      dl.rows {
+        margin-top: 1.5rem;
+        columns: 2;
+        column-gap: 2.5rem;
+        max-width: none;
+      }
+      @media (max-width: 52rem) {
+        dl.rows {
           columns: 1;
         }
       }
-      /* Multi-column rather than grid, for the reason the shortcut sheet uses
-         it: these twelve entries are between two lines and twelve lines long,
-         and a grid sizes every cell in a row to the tallest one in it. The
-         agent's paragraph was leaving a hand's width of empty panel beside
-         Calendar and Notifications. Columns flow, so nothing pays for its
-         neighbour. */
-      dl.feats > div {
+      dl.rows > div {
         break-inside: avoid;
-        margin-bottom: 1rem;
-        padding: 1rem 1.15rem;
-        background: var(--surface);
-        border-radius: calc(var(--radius) * 1.5);
+        margin-bottom: 1.1rem;
       }
-      dl.feats dt {
+      dl.rows dt {
         font-size: var(--text-body);
         font-weight: 600;
         line-height: 1.5;
       }
-      dl.feats dd {
-        margin-top: 0.3rem;
+      dl.rows dd {
+        margin-top: 0.2rem;
         color: var(--muted-foreground);
         font-size: var(--text-body);
         line-height: 1.55;
@@ -476,36 +542,6 @@
       }
       .cta .secondary:hover {
         background: var(--surface-raised);
-      }
-
-      /* ------------------------------------------------------------- dl */
-      dl.rows {
-        max-width: var(--measure-wide);
-        border-top: 1px solid var(--border);
-      }
-      dl.rows > div {
-        display: grid;
-        grid-template-columns: 11rem 1fr;
-        gap: 0 2rem;
-        padding: 0.9rem 0;
-        border-bottom: 1px solid var(--border);
-      }
-      dl.rows dt {
-        font-size: var(--text-body);
-        font-weight: 600;
-        line-height: 1.5;
-        padding-top: 0.06rem;
-      }
-      dl.rows dd {
-        color: var(--muted-foreground);
-        font-size: var(--text-body);
-        line-height: 1.55;
-      }
-      @media (max-width: 40rem) {
-        dl.rows > div {
-          grid-template-columns: 1fr;
-          gap: 0.2rem;
-        }
       }
 
       /* ------------------------------------------------------------ lists */
@@ -715,7 +751,72 @@
           the same database.
         </p>
 
-        <dl class="feats" style="margin-top: 1.75rem">
+        <ul class="caps" style="margin-top: 1.75rem">
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+            <b>Local data</b>
+            <span>Twelve months per account, on your disk. Sync fills in behind you.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <b>Search</b>
+            <span>Gmail's operators, compiled to SQL. 61,000 messages, no waiting.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></svg>
+            <b>Keyboard</b>
+            <span>Gmail's own keys, so there's nothing to learn twice.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/></svg>
+            <b>Every account</b>
+            <span>One list. Replies go out from the account the mail came in on.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>
+            <b>Calendar</b>
+            <span>Day, week and month. Drag to make an event, or to move one.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5 12.5 19a5 5 0 0 1-7-7l7.5-7.5a3.5 3.5 0 0 1 5 5L10.5 17"/></svg>
+            <b>Attachments</b>
+            <span>Drag a file in to send it. The type comes from the bytes.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 9a6 6 0 1 0-12 0c0 5-2 6-2 6h16s-2-1-2-6Z"/><path d="M13.7 20a2 2 0 0 1-3.4 0"/></svg>
+            <b>Notifications</b>
+            <span>Only for mail that earned one. Newsletters stay quiet.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 16.5 19.7 18.3 21.5 19 19.7 19.7 19 21.5 18.3 19.7 16.5 19 18.3 18.3Z"/></svg>
+            <b>The agent</b>
+            <span>Runs on your Claude Code CLI. Stops before anything leaves.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 15 4 10l5-5"/><path d="M4 10h8a8 8 0 0 1 8 8v1"/></svg>
+            <b>Suggested replies</b>
+            <span>Two stances with the whole reply behind each, in your own words.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="m3 7 9 6 9-6"/><path d="M15 17h5"/></svg>
+            <b>Unsubscribe</b>
+            <span>One key archives it and unsubscribes. Spam gets reported instead.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="3" width="12" height="16" rx="2"/><path d="M16 19v1a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h1"/></svg>
+            <b>Copy for a chatbot</b>
+            <span>The thread as plain text, quotes stripped, ready to paste.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3v5M14 3v5"/><path d="M6 8h12v4a6 6 0 0 1-12 0V8Z"/><path d="M12 18v3"/></svg>
+            <b>Plugins</b>
+            <span>Sandboxed: no network, no files, none of your credentials.</span>
+          </li>
+        </ul>
+
+        <details class="long">
+          <summary>The long version</summary>
+                  <dl class="rows">
           <div>
             <dt>Local data</dt>
             <dd>
@@ -847,6 +948,7 @@
             </dd>
           </div>
         </dl>
+        </details>
 
         <figure class="card">
           <figcaption>
