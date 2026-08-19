@@ -84,6 +84,20 @@
 
   /* Per-account identity bars. Five accounts, five hues, all legible on both
      light and dark surfaces at 2px wide. */
+  /*
+   * How hard a sender's monogram tile is tinted, and how much of the hue
+   * survives in its letters. Two numbers rather than one pair of colours,
+   * because `ui/monogram.tsx` mixes them against `--background` and
+   * `--foreground` and those already swap with the theme.
+   *
+   * They are not the same in both themes. A hue mixed into white washes out
+   * faster than the same hue mixed into near-black, so the light values are
+   * the stronger pair; held equal, dark mode's worst tile measured 4.35:1
+   * against the 4.5 this palette holds itself to everywhere else.
+   */
+  --monogram-tint: 24%;
+  --monogram-ink: 82%;
+
   --account-1: oklch(0.62 0.19 255);
   --account-2: oklch(0.65 0.19 155);
   --account-3: oklch(0.68 0.19 75);
@@ -125,6 +139,9 @@
   --danger: oklch(0.65 0.2 27);
   --success: oklch(0.68 0.14 155);
   --warning: oklch(0.78 0.15 75);
+
+  --monogram-tint: 22%;
+  --monogram-ink: 66%;
 
   --account-1: oklch(0.68 0.17 255);
   --account-2: oklch(0.72 0.17 155);

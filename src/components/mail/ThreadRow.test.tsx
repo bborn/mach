@@ -128,12 +128,22 @@ describe("the thread row", () => {
   });
 
   it("marks unread with the dot and the weight, on the sender and the subject", () => {
+    // Counted over the whole row this used to be `>= 2` and `not.toContain`,
+    // which held only for as long as nothing else in the row was ever medium.
+    // The monogram's letters are, so the assertion now looks at the two
+    // elements it is actually about: the line-one sender, and the subject.
+    const weighted = (markup: string) =>
+      [...markup.matchAll(/class="([^"]*)"[^>]*>(?:[^<]*)/g)]
+        .filter(([, cls]) => /truncate/.test(cls) && !/tabular-nums/.test(cls))
+        .filter(([, cls]) => /font-medium/.test(cls)).length;
+
     const unread = row({ unread: true });
     expect(unread).toContain("bg-accent");
-    expect([...unread.matchAll(/font-medium/g)].length).toBeGreaterThanOrEqual(2);
+    expect(weighted(unread)).toBeGreaterThanOrEqual(2);
+
     const read = row();
     expect(read).toContain("bg-transparent");
-    expect(read).not.toContain("font-medium");
+    expect(weighted(read)).toBe(0);
   });
 
   it("draws the tick column only while a selection is live", () => {

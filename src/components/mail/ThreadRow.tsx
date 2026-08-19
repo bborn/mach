@@ -2,6 +2,7 @@ import { Check, Paperclip, Star } from "lucide-react";
 import { memo, type MouseEvent } from "react";
 import type { Account, Thread, ThreadId } from "@/types";
 import { ACCOUNT_BG } from "@/lib/colors";
+import { Monogram } from "@/components/ui/monogram";
 import { listTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
@@ -122,7 +123,8 @@ export const ThreadRow = memo(function ThreadRow({
   draft = thread.labelIds.includes(GMAIL_DRAFT),
   onSelect,
 }: ThreadRowProps) {
-  const sender = thread.participants[0]?.name ?? thread.participants[0]?.email ?? "—";
+  const from = thread.participants[0];
+  const sender = from?.name ?? from?.email ?? "—";
 
   return (
     <div
@@ -182,6 +184,16 @@ export const ThreadRow = memo(function ThreadRow({
           unread ? "bg-accent" : "bg-transparent",
         )}
       />
+
+      {/*
+        Who it is from, next to the unread mark and against all three lines.
+
+        It is `aria-hidden` and it costs the row nothing in meaning: the sender
+        is written out in full on line one, which is what a screen reader
+        already reads. This is for the eye, which cannot read forty rows and
+        does not have to.
+      */}
+      <Monogram name={from?.name} email={from?.email} />
 
       {/*
         4px between the three lines. It was 1px, and the row read "a little

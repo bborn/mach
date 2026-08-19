@@ -37,6 +37,7 @@ import { Button } from "@/components/ui/button";
 import { Invitation } from "./Invitation";
 import { MessageBody } from "./MessageBody";
 import { MESSAGE_CURSOR, MESSAGE_DRAFT, MESSAGE_ROW } from "./thread-cursor";
+import { Monogram } from "@/components/ui/monogram";
 
 export interface ThreadMessageProps {
   message: Message;
@@ -141,6 +142,23 @@ export function ThreadMessage({
             <span className="shrink-0 rounded-[3px] border border-danger px-1 font-medium text-micro uppercase tracking-wide text-danger">
               Draft
             </span>
+          )}
+          {/*
+            The same tile the thread list draws, one step down.
+
+            It is here so that opening a conversation is visibly the same
+            conversation you clicked: the colour beside the name in the list is
+            the colour beside the name in the pane. `self-center` because the
+            row is baseline-aligned for its type, and a 20px square has no
+            baseline worth aligning to.
+          */}
+          {!draft && (
+            <Monogram
+              name={message.from.name}
+              email={message.from.email}
+              size={20}
+              className="self-center"
+            />
           )}
           <span className="shrink-0 truncate text-body font-medium text-foreground">
             {message.from.name}
