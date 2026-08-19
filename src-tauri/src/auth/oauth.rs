@@ -66,6 +66,30 @@ pub const CALLBACK_PATH: &str = "/oauth/callback";
 /// address the account has already verified — a gate Mach neither owns nor can
 /// open with this scope.
 ///
+/// `contacts.other.readonly` is the narrowest scope that can return a picture
+/// of the person who sent you something.
+///
+/// "Other contacts" is Google's own auto-collected list of the addresses you
+/// have corresponded with and never saved, which is where nearly everybody in a
+/// real mailbox lives — the saved address book is a rounding error beside it.
+/// `otherContacts.list` accepts `photos` in its `readMask`, so one call gets a
+/// name, an address and a picture for that whole set.
+///
+/// The scopes that were considered and are **not** requested:
+///
+///  * `contacts.readonly` reads the saved address book, and would also grant
+///    every field on it — birthdays, postal addresses, notes. Mach wants a
+///    32px square, not somebody's medical appointments.
+///  * `contacts` adds write. There is nothing here that should edit an address
+///    book.
+///  * `directory.readonly` is Workspace-only and returns colleagues, which for
+///    a personal mailbox is the smallest of the three sets.
+///
+/// What it will not produce is worth stating plainly, because the feature it
+/// serves will look broken otherwise: no-reply@, notifications@, billing@ and
+/// the rest of the machines have no Google profile, and they are the senders
+/// you see most. This buys faces for the people, and nothing for the robots.
+///
 /// **Adding a scope invalidates every existing grant.** A refresh token issued
 /// before this line changed keeps working for mail and calendar and gets a 403
 /// from `users.settings.filters`, because the token carries the scopes it was
@@ -83,6 +107,7 @@ pub const SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/contacts.other.readonly",
 ];
 
 /// The space-delimited `scope` parameter value.
