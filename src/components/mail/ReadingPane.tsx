@@ -22,6 +22,7 @@ import {
 } from "./thread-cursor";
 import { unsubscribeAction } from "./unsubscribe-offer";
 import { PluginViews } from "@/components/plugins/PluginView";
+import { openableLatestId } from "./opening-message";
 
 /**
  * The conversation.
@@ -230,7 +231,18 @@ export function ReadingPane() {
 
   const { thread, messages } = detail;
   const account = accountById(thread.accountId);
-  const latestId = messages.length > 0 ? messages[messages.length - 1]!.id : null;
+  /*
+   * The message the pane opens on.
+   *
+   * The newest one, *except* when the newest one is a draft. A draft row never
+   * unfolds — activating it opens the composer instead, which is the only thing
+   * anyone wants from it — so pointing this at a draft opens the conversation
+   * with every message shut and a screen of white space where the mail should
+   * be. A thread you have half-answered is exactly the thread you opened to
+   * re-read, so it falls back to the newest message that can actually show
+   * itself.
+   */
+  const latestId = openableLatestId(messages);
   const favorited = isFavorite(threadFavorite);
   // What `r` will actually do. Every composer route resumes an existing draft
   // on this thread rather than preparing a fresh one (`ComposerDock.open`), so
