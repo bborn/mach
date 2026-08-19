@@ -75,6 +75,37 @@ pub const MENU_EVENT: &str = "mach://menu";
 /// from this one without a second copy of the string.
 pub const MAIN_WINDOW: &str = "main";
 
+/// Where macOS puts the close/minimise/zoom buttons, in logical pixels.
+///
+/// Kept beside `tauri.conf.json`'s `trafficLightPosition`, which must carry the
+/// same pair — the configured window reads that one and the QA window reads
+/// this one, and a QA instance whose buttons sit somewhere else is a QA
+/// instance that cannot be used to check where the buttons sit.
+///
+/// The y is not the macOS default, and it is not the number it looks like.
+///
+/// The title bar is 40px with its contents centred, so the wordmark and the
+/// search field sit on y=20. The buttons are 12px and default to a top of 8,
+/// centring them on 13.75 — six pixels high of everything beside them, which is
+/// what the report was.
+///
+/// Tauri's `trafficLightPosition` is *not* the button's top edge, whatever it
+/// reads like. Measured on a real window:
+///
+/// ```text
+///   requested      button top      centre
+///   (unset)             8.0        13.75
+///        14            10.0        15.75
+///        18            14.0        19.75   ← this one
+/// ```
+///
+/// A constant −4, so 18 is what puts the centre on 19.75 against a header
+/// centre of 20. Anybody changing this should measure rather than compute: two
+/// points established the offset and the third confirmed it, and none of that
+/// is in Tauri's documentation.
+#[cfg(target_os = "macos")]
+pub const TRAFFIC_LIGHTS: (f64, f64) = (8.0, 18.0);
+
 /// True when this process is one of `scripts/qa`'s side instances.
 ///
 /// `MACH_DATA_DIR` is the signal because it is already the thing that makes an
@@ -141,12 +172,35 @@ pub fn apply_qa_policy<R: Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()>
     #[cfg(not(debug_assertions))]
     let start = tauri::WebviewUrl::default();
 
-    tauri::WebviewWindowBuilder::new(app, MAIN_WINDOW, start)
+    // The chrome has to be the owner's chrome.
+    //
+    // This builder sets what it needs and inherits nothing from
+    // `tauri.conf.json` — window config keys are per-window, and a window built
+    // in code starts from the defaults. So for as long as these three lines were
+    // missing, every QA instance had an ordinary macOS title bar with a visible
+    // "Mach (QA)" in it, while the window it stands in for has the traffic
+    // lights drawn *over* the app's own content.
+    //
+    // That is not a cosmetic difference, it is the difference that makes this
+    // instance worth screenshotting. The traffic-light alignment was measured
+    // here, on a title bar the real app does not have, and the number was only
+    // right by accident.
+    let builder = tauri::WebviewWindowBuilder::new(app, MAIN_WINDOW, start)
         .title("Mach (QA)")
         .inner_size(1440.0, 900.0)
         .visible(true)
-        .focused(foreground)
-        .build()?;
+        .focused(foreground);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(
+            TRAFFIC_LIGHTS.0,
+            TRAFFIC_LIGHTS.1,
+        ));
+
+    builder.build()?;
 
     Ok(())
 }

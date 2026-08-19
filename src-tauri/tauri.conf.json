@@ -20,6 +20,10 @@
         "minHeight": 600,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 8,
+          "y": 18
+        },
         "acceptFirstMouse": true
       }
     ],
@@ -29,7 +33,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "category": "Productivity",
     "shortDescription": "A fast Google-only mail and calendar client",
     "icon": [
