@@ -96,13 +96,62 @@
             where.appendChild(list);
           }
 
-          // The remedy, because it is not guessable and it is nearly always the
-          // same one: a dev server that has been up too long.
+          // What the server says for itself.
+          //
+          // The first version of this panel reported only what it had *seen* —
+          // a script tag that 404s, a rejected import. The second white window
+          // produced neither: the dev server had wedged and stopped answering
+          // `GET /` altogether, so nothing failed loudly, the list was empty,
+          // and the panel said no more than the blank page had. The two cases
+          // want opposite remedies and looked identical.
+          //
+          // So it asks. The panel is drawn first and this fills in underneath,
+          // because a diagnosis that delays the message is worse than a slow
+          // one.
           var fix = document.createElement("div");
           fix.style.cssText = "margin-top:1rem;opacity:.7";
-          fix.textContent =
-            "A dev server that has been running for days is the usual cause. Restart it — " +
-            "rm -rf node_modules/.vite, then bun run dev — and reload.";
+          fix.textContent = "Asking the server what it can still do…";
+
+          var probe = function () {
+            var done = false;
+            var settle = function (text) {
+              if (done) return;
+              done = true;
+              fix.textContent = text;
+            };
+            // No cache, so a stale entry cannot answer on the server's behalf.
+            setTimeout(function () {
+              settle(
+                "The dev server at " +
+                  location.origin +
+                  " did not answer within three seconds. It is wedged or gone — " +
+                  "restart it and reload.",
+              );
+            }, 3000);
+            fetch(location.href, { cache: "no-store" })
+              .then(function (r) {
+                settle(
+                  r.ok
+                    ? "The dev server is answering (" +
+                        r.status +
+                        "), so the page is being served and the modules on it are not. " +
+                        "That is nearly always a dev server that has been up too long: " +
+                        "rm -rf node_modules/.vite, then bun run dev, and reload."
+                    : "The dev server answered " +
+                        r.status +
+                        " for this page. Restart it and reload.",
+                );
+              })
+              .catch(function (e) {
+                settle(
+                  "The dev server at " +
+                    location.origin +
+                    " refused the request (" +
+                    (e && e.message ? e.message : e) +
+                    "). Start it and reload.",
+                );
+              });
+          };
 
           var button = document.createElement("button");
           button.textContent = "Reload";
@@ -120,6 +169,7 @@
           box.appendChild(button);
           panel.appendChild(box);
           document.body.appendChild(panel);
+          probe();
         }, GRACE_MS);
       })();
     </script>
