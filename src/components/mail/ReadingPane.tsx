@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Archive, Bookmark, Clock, CornerUpLeft, MailX, PencilLine, ShieldAlert } from "lucide-react";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { ACCOUNT_BG } from "@/lib/colors";
@@ -8,7 +7,6 @@ import { MESSAGE_COLUMN_MAX } from "@/lib/message-body";
 import { fullDate } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import type { MessageId, ThreadId } from "@/types";
-import { Button } from "@/components/ui/button";
 import { ContextMenu, ContextMenuItem } from "@/components/ui/context-menu";
 import { Hint } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -20,7 +18,6 @@ import {
   moveMessageCursor,
   replyTarget,
 } from "./thread-cursor";
-import { unsubscribeAction } from "./unsubscribe-offer";
 import { PluginViews } from "@/components/plugins/PluginView";
 import { openableLatestId } from "./opening-message";
 
@@ -47,8 +44,7 @@ import { openableLatestId } from "./opening-message";
  * nothing here has to reimplement what Enter on a button means.
  */
 export function ReadingPane() {
-  const { detail, detailLoading, ui, accountById, actions, live, isFavorite, threadFavorite } =
-    useMach();
+  const { detail, detailLoading, ui, accountById, actions, live } = useMach();
   const threadId = detail?.thread.id ?? null;
 
   // Which messages the reader has opened or closed by hand. Everything else
@@ -243,113 +239,36 @@ export function ReadingPane() {
    * itself.
    */
   const latestId = openableLatestId(messages);
-  const favorited = isFavorite(threadFavorite);
-  // What `r` will actually do. Every composer route resumes an existing draft
-  // on this thread rather than preparing a fresh one (`ComposerDock.open`), so
-  // while one exists "Reply" is the wrong word for the button that answers.
-  const pendingDraft = messages.find((message) => message.isDraft) ?? null;
-  // Which message carries the offer, and what the button says about it. The
-  // same function `actions.unsubscribe` resolves through, so the label and the
-  // gesture cannot disagree about which sender they mean.
-  const unsubscribe = unsubscribeAction(messages);
 
   return (
     <>
       <header className="shrink-0 border-b border-border px-5 py-3">
-        <div className="flex items-start gap-3">
-          <div className="min-w-0 flex-1">
-            {/* The one `text-title` in mail: what this pane is about. It was
-                `text-reading`, the same size as the message bodies below it. */}
-            <h1 className="truncate text-title font-semibold text-foreground">{thread.subject}</h1>
-            <div className="mt-1 flex min-w-0 items-center gap-2 text-micro text-faint-foreground">
-              {account && (
-                <span className="flex min-w-0 items-center gap-1">
-                  <span
-                    className={cn(
-                      "h-1.5 w-1.5 shrink-0 rounded-full",
-                      ACCOUNT_BG[account.colorIndex],
-                    )}
-                  />
-                  <span className="truncate">{account.email}</span>
-                </span>
-              )}
-              <span aria-hidden>·</span>
-              <span className="shrink-0">
-                {thread.messageCount} message{thread.messageCount === 1 ? "" : "s"}
-              </span>
-              <span aria-hidden>·</span>
-              <span className="truncate">{fullDate(thread.timestamp)}</span>
-            </div>
-          </div>
-
-          <div className="flex shrink-0 items-center gap-1">
-            <Button
-              size="icon"
-              title={favorited ? "Remove from favorites (⇧F)" : "Add to favorites (⇧F)"}
-              aria-pressed={favorited}
-              className={favorited ? "text-accent" : undefined}
-              onClick={actions.toggleFavoriteThread}
-            >
-              <Bookmark
-                size={14}
-                strokeWidth={1.75}
-                fill={favorited ? "currentColor" : "none"}
-              />
-            </Button>
-            <Button size="icon" title="Archive (e)" onClick={actions.archiveSelected}>
-              <Archive size={14} strokeWidth={1.75} />
-            </Button>
-            {/*
-              Only for a conversation that has an offer, which is a small
-              minority of them. A permanently present, permanently disabled
-              button would be four more pixels of chrome on every thread of two
-              people talking, explaining a feature neither of them needs.
-
-              The two faces are not two shades of the same thing. `Unsubscribe`
-              writes to the sender; `Report spam` tells Google. Which one is
-              offered is Rust's answer, not this pane's — see `unsubscribeAction`.
-            */}
-            {unsubscribe && (
-              <Button
-                size="icon"
-                data-testid="unsubscribe-action"
-                title={unsubscribe.label}
-                aria-label={unsubscribe.label}
-                onClick={actions.unsubscribe}
-              >
-                {unsubscribe.offer.offer === "unsubscribe" ? (
-                  <MailX size={14} strokeWidth={1.75} />
-                ) : (
-                  <ShieldAlert size={14} strokeWidth={1.75} />
+        {/*
+          Subject and metadata only. Archive, snooze, reply and the rest are
+          the composer footer and the keys; a second icon row here was the
+          same actions drawn twice. Unsubscribe stays on ⇧⌘U, the context
+          menu and ⌘K — a header button for a rare offer was four extra
+          pixels of chrome on every thread of two people talking.
+        */}
+        <h1 className="truncate text-title font-semibold text-foreground">{thread.subject}</h1>
+        <div className="mt-1 flex min-w-0 items-center gap-2 text-micro text-faint-foreground">
+          {account && (
+            <span className="flex min-w-0 items-center gap-1">
+              <span
+                className={cn(
+                  "h-1.5 w-1.5 shrink-0 rounded-full",
+                  ACCOUNT_BG[account.colorIndex],
                 )}
-              </Button>
-            )}
-            {/*
-              `b`, not `h`. Both keys snooze — `h` is the Superhuman habit this
-              app shipped with and still answers to — but `b` is Gmail's, it is
-              the one `MailMode` publishes to the shortcut sheet and the status
-              bar, and it is the one a Gmail hand will reach for. A tooltip that
-              names the undocumented alias teaches the wrong key.
-            */}
-            <Button size="icon" title="Snooze (b)" onClick={() => actions.setSnooze(true)}>
-              <Clock size={14} strokeWidth={1.75} />
-            </Button>
-            <Button
-              size="icon"
-              title={pendingDraft ? "Edit draft (r)" : "Reply (r)"}
-              onClick={
-                pendingDraft
-                  ? () => openDraft(pendingDraft.id, thread.id)
-                  : actions.replySelected
-              }
-            >
-              {pendingDraft ? (
-                <PencilLine size={14} strokeWidth={1.75} />
-              ) : (
-                <CornerUpLeft size={14} strokeWidth={1.75} />
-              )}
-            </Button>
-          </div>
+              />
+              <span className="truncate">{account.email}</span>
+            </span>
+          )}
+          <span aria-hidden>·</span>
+          <span className="shrink-0">
+            {thread.messageCount} message{thread.messageCount === 1 ? "" : "s"}
+          </span>
+          <span aria-hidden>·</span>
+          <span className="truncate">{fullDate(thread.timestamp)}</span>
         </div>
       </header>
 

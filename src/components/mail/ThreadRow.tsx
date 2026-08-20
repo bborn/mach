@@ -1,14 +1,12 @@
 import { Check, Paperclip, Star } from "lucide-react";
 import { memo, type MouseEvent } from "react";
-import type { Account, Thread, ThreadId } from "@/types";
-import { ACCOUNT_BG } from "@/lib/colors";
+import type { Thread, ThreadId } from "@/types";
 import { Monogram } from "@/components/ui/monogram";
 import { listTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
 interface ThreadRowProps {
   thread: Thread;
-  account: Account | undefined;
   unread: boolean;
   /** The cursor is on this row — what `e`, `r` and the reading pane follow. */
   cursor: boolean;
@@ -106,7 +104,7 @@ export const GMAIL_DRAFT = "DRAFT";
  * A mailbox is up to three hundred of these, and `j`/`k` changes the `cursor`
  * prop on exactly two of them. Everything else the row is given is already
  * identity-stable across a cursor move — `thread` survives `reconcile`,
- * `account` and `unread` come from `useCallback`s — so the `memo` should mean
+ * `unread` comes from a `useCallback` — so the `memo` should mean
  * two renders per keystroke and does.
  *
  * It did not, for as long as the list built the click handler inline per row.
@@ -114,7 +112,6 @@ export const GMAIL_DRAFT = "DRAFT";
  */
 export const ThreadRow = memo(function ThreadRow({
   thread,
-  account,
   unread,
   cursor,
   checked,
@@ -149,15 +146,6 @@ export const ThreadRow = memo(function ThreadRow({
             : "hover:bg-row-hover",
       )}
     >
-      {/* Per-account identity. The one place colour is allowed to be decorative. */}
-      <span
-        className={cn(
-          "absolute inset-y-0 left-0 w-[2px]",
-          account ? ACCOUNT_BG[account.colorIndex] : "bg-border",
-        )}
-        title={account?.email}
-      />
-
       {/*
         The tick column, opening and closing rather than appearing.
 
@@ -212,16 +200,16 @@ export const ThreadRow = memo(function ThreadRow({
         Unread, in the left margin beside all three lines rather than on one of
         them: it is a fact about the conversation, not about its sender.
 
-        Absolutely placed, next to the account bar, because it used to sit in
-        the row's flex flow and *reserve* its 6px whether or not it was drawn.
-        On a read row that is 6px of nothing plus the gap after it, so the
-        monogram carried 26px of clear space on its left and 8px on its right —
-        a tile that looked shoved against the text it belongs beside. Out of
-        flow it costs the row nothing when it is invisible, which is most rows.
+        Absolutely placed, because it used to sit in the row's flex flow and
+        *reserve* its 6px whether or not it was drawn. On a read row that is
+        6px of nothing plus the gap after it, so the monogram carried a hole
+        on its left and looked shoved against the text it belongs beside. Out
+        of flow it costs the row nothing when it is invisible, which is most
+        rows.
       */}
       <span
         className={cn(
-          "absolute left-[7px] h-1.5 w-1.5 rounded-full",
+          "absolute left-2 h-1.5 w-1.5 rounded-full",
           unread ? "bg-accent" : "bg-transparent",
         )}
       />

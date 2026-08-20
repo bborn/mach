@@ -100,7 +100,7 @@ import {
   toggleAll,
   type Selection,
 } from "@/lib/selection";
-import { mailboxName, withVirtualMailboxes } from "@/lib/mailboxes";
+import { mailboxName, PRIMARY_LABEL, withVirtualMailboxes } from "@/lib/mailboxes";
 import type { Contact } from "@/lib/contacts";
 import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
@@ -425,7 +425,7 @@ export const initialUi: UiState = {
   calendarView: "week",
   anchor: Date.now(),
   accountId: null,
-  labelId: "INBOX",
+  labelId: PRIMARY_LABEL,
   threadId: null,
   selection: emptySelection,
   focus: "list",

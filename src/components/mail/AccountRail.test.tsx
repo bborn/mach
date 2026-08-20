@@ -73,7 +73,6 @@ const CALLS: string[] = [];
 const HANDLERS: RailHandlers = {
   open: (accountId, labelId) => CALLS.push(`open:${accountId ?? "all"}:${labelId}`),
   openLabel: (labelId) => CALLS.push(`label:${labelId}`),
-  openCalendar: () => CALLS.push("calendar"),
   openFavorite: () => CALLS.push("favorite"),
   unfavorite: (key) => CALLS.push(`unfavorite:${key}`),
   toggle: (section) => CALLS.push(`toggle:${section}`),
@@ -114,14 +113,10 @@ describe("the rail's shape", () => {
     expect(items[1]?.level).toBe(2);
   });
 
-  it("puts Calendar beside Inbox rather than inside a section", () => {
+  it("does not put Calendar in the rail — that is a surface of the window", () => {
     const items = build();
-    const calendar = items.find((i) => i.key === "surface:calendar");
-    expect(calendar?.level).toBe(1);
-    expect(calendar?.surface).toBe(true);
-    // Immediately after the accounts, and before the folders.
-    expect(keys(items).indexOf("surface:calendar")).toBe(4);
-    expect(keys(items).indexOf("section:folders")).toBe(5);
+    expect(keys(items)).not.toContain("surface:calendar");
+    expect(keys(items).indexOf("section:folders")).toBe(4);
   });
 
   it("does not repeat Inbox among the folders", () => {
@@ -204,6 +199,15 @@ describe("what a row means", () => {
     CALLS.length = 0;
     build()[0]?.activate?.();
     expect(CALLS).toEqual(["open:all:INBOX"]);
+  });
+
+  it("opens Primary when that is what Inbox means", () => {
+    CALLS.length = 0;
+    const items = build({ inboxId: "PRIMARY", labelId: "PRIMARY" });
+    items[0]?.activate?.();
+    items.find((i) => i.key === "account:2")?.activate?.();
+    expect(CALLS).toEqual(["open:all:PRIMARY", "open:2:PRIMARY"]);
+    expect(selected(items)).toEqual(["section:inbox"]);
   });
 
   it("leaves a folder row's account filter alone", () => {
@@ -289,8 +293,6 @@ describe("the arrow keys", () => {
   it("does nothing at the edges rather than wrapping", () => {
     expect(railStep(open, index(open, "mailbox:ARCHIVE"), "in")).toEqual({ kind: "none" });
     expect(railStep(open, 999, "out")).toEqual({ kind: "none" });
-    // Calendar is a peer with no children and no heading above it that could
-    // fold it away, so `←` has nowhere to go.
     expect(railStep(open, 0, "out")).toEqual({ kind: "toggle", section: "inbox" });
   });
 });
@@ -330,16 +332,27 @@ describe("a rail row", () => {
   });
 
   it("omits the disclosure on a row that has nothing to fold", () => {
-    const calendar = build().find((i) => i.key === "surface:calendar")!;
-    expect(row(calendar)).not.toContain("aria-label=\"Collapse");
-    expect(row(calendar)).not.toContain("aria-expanded");
+    const sent = build().find((i) => i.key === "mailbox:SENT")!;
+    expect(row(sent)).not.toContain('aria-label="Collapse');
+    expect(row(sent)).not.toContain("aria-expanded");
   });
 
   it("truncates a long address but keeps the whole of it in the tooltip", () => {
     const account = build().find((i) => i.key === "account:1")!;
     const html = row(account);
     expect(html).toContain("truncate");
-    expect(html).toContain('title="alex@northwind.example"');
+    expect(account.title).toBe("alex@northwind.example");
+    expect(account.shortcut).toBe("ctrl+1");
+    // The address is the row's label and the tooltip's, so a truncated paint
+    // still has the whole string to hover.
+    expect(html).toContain("alex@northwind.example");
+  });
+
+  it("puts the jump key on Inbox and the folders it opens", () => {
+    const items = build();
+    expect(items.find((i) => i.key === "section:inbox")?.shortcut).toBe("g i");
+    expect(items.find((i) => i.key === "mailbox:STARRED")?.shortcut).toBe("g s");
+    expect(items.find((i) => i.key === "mailbox:SENT")?.shortcut).toBe("g t");
   });
 
   it("puts the keyboard's cursor in the tab order and nothing else", () => {

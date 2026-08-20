@@ -51,13 +51,17 @@ import { SyncIndicator } from "./SyncIndicator";
  * control. Both were a second copy of a number already on screen.
  */
 export function StatusBar() {
-  const { ui, live } = useMach();
+  const { ui, live, progress } = useMach();
   const pending = usePendingSequence();
   const selected = ui.mode === "mail" ? ui.selection.ids.length : 0;
+  const syncing = progress.active || progress.errors.length > 0;
+  // Empty chrome is also bland. A strip that says nothing — no selection, no
+  // pending `g …`, live data, idle sync — costs 24px forever to be a second
+  // copy of the window's bottom edge. Collapse it; the container in App.tsx
+  // hides itself when every child is gone.
+  if (selected === 0 && !pending && live && !syncing) return null;
 
   return (
-    // No border of its own: the container in `App.tsx` draws the one edge the
-    // bottom of the window needs, whichever of these strips is topmost.
     <footer className="flex h-6 shrink-0 items-center gap-3 overflow-hidden bg-surface px-3">
       {/* How many rows the next keystroke will act on. It sits *beside* the
           status message rather than inside it: the message is transient, and

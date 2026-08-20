@@ -100,6 +100,12 @@ interface TimeGridProps {
 
 const HEADER_HEIGHT = 30;
 
+/** Gutter + one track per day. Header, all-day and the timed grid share this
+ *  so their vertical rules cannot round to different pixels. */
+function weekTracks(count: number): string {
+  return `${TIME_GUTTER}px repeat(${count}, minmax(0, 1fr))`;
+}
+
 /** Where a drag started, plus everything needed to paint its ghost. */
 interface DragSession {
   kind: "move" | "resize";
@@ -559,8 +565,11 @@ export function TimeGrid({
         event.stopPropagation();
       }}
     >
-      <div className="sticky top-0 z-30 flex border-b border-border bg-background">
-        <div className="shrink-0 border-r border-border" style={{ width: TIME_GUTTER }} />
+      <div
+        className="sticky top-0 z-30 grid border-b border-border bg-background"
+        style={{ gridTemplateColumns: weekTracks(days.length) }}
+      >
+        <div className="border-r border-border" />
         {/*
           The column header carries the biggest type in the grid, and it is the
           only thing that does.
@@ -574,7 +583,7 @@ export function TimeGrid({
         {days.map((day) => (
           <div
             key={day.getTime()}
-            className="flex min-w-0 flex-1 items-baseline gap-2 border-r border-border px-2 last:border-r-0"
+            className="flex min-w-0 items-baseline gap-2 border-r border-border px-2 last:border-r-0"
             style={{ height: HEADER_HEIGHT }}
           >
             <span
@@ -602,29 +611,36 @@ export function TimeGrid({
           into a popover, which would cover the grid you were comparing to. */}
       {rowCount > 0 && (
         <div
-          className="sticky z-20 flex border-b border-border bg-background"
-          style={{ top: HEADER_HEIGHT }}
+          className="sticky z-20 grid border-b border-border bg-background"
+          style={{ top: HEADER_HEIGHT, gridTemplateColumns: weekTracks(days.length) }}
         >
           <div
-            className="shrink-0 border-r border-border pt-1 text-right text-micro text-faint-foreground"
-            style={{ width: TIME_GUTTER, paddingRight: TIME_GUTTER_INSET }}
+            className="border-r border-border pt-1 text-right text-micro text-faint-foreground"
+            style={{ paddingRight: TIME_GUTTER_INSET }}
           >
             all-day
           </div>
-          {/* No padding: every child here is absolutely positioned, and an
-              absolutely positioned box is laid out against the padding box, so
-              the 2px this used to carry moved nothing at all. */}
+          {/* Column rules live on the same tracks as the header. The chips
+              still sit in a percentage overlay, which is how a bar can span
+              Thursday into Friday without being two cells. */}
           <div
-            className="relative min-w-0 flex-1"
-            style={{ height: shownRows * ALL_DAY_ROW_PITCH + 4 }}
+            className="relative min-w-0"
+            style={{
+              gridColumn: `2 / span ${days.length}`,
+              height: shownRows * ALL_DAY_ROW_PITCH + 4,
+            }}
           >
-            {days.map((_, index) => (
-              <div
-                key={index}
-                className="absolute inset-y-0 border-r border-border last:border-r-0"
-                style={{ left: `${(index * 100) / days.length}%`, width: `${100 / days.length}%` }}
-              />
-            ))}
+            <div
+              className="pointer-events-none absolute inset-0 grid"
+              style={{ gridTemplateColumns: `repeat(${days.length}, minmax(0, 1fr))` }}
+            >
+              {days.map((day) => (
+                <div
+                  key={day.getTime()}
+                  className="border-r border-border last:border-r-0"
+                />
+              ))}
+            </div>
             {bars
               .filter((bar) => bar.row < shownRows)
               .map((bar) => {
@@ -676,8 +692,12 @@ export function TimeGrid({
         </div>
       )}
 
-      <div ref={body} className="relative flex" style={{ height: 24 * HOUR_HEIGHT }}>
-        <div className="relative shrink-0 border-r border-border" style={{ width: TIME_GUTTER }}>
+      <div
+        ref={body}
+        className="relative grid"
+        style={{ height: 24 * HOUR_HEIGHT, gridTemplateColumns: weekTracks(days.length) }}
+      >
+        <div className="relative border-r border-border">
           {/* No label for hour 0: it would collide with the all-day row. */}
           {Array.from({ length: 23 }, (_, i) => i + 1).map((hour) => (
             <div
@@ -1016,7 +1036,7 @@ function DayColumn({
 
   return (
     <div
-      className="relative min-w-0 flex-1 border-r border-border last:border-r-0"
+      className="relative min-w-0 border-r border-border last:border-r-0"
       style={{
         backgroundImage: `repeating-linear-gradient(to bottom, var(--border) 0 1px, transparent 1px ${HOUR_HEIGHT}px)`,
       }}

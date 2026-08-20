@@ -26,10 +26,10 @@ export function AgentPill({
   return (
     <span
       className={cn(
-        "group flex h-6 shrink-0 items-center gap-1.5 rounded-[var(--radius)] border pl-2 pr-1 text-micro",
-        active ? "border-border-strong bg-surface-raised" : "border-border bg-background",
-        waiting && "border-warning text-warning",
-        failed && "border-danger text-danger",
+        "group flex h-6 shrink-0 items-center gap-1.5 rounded-[var(--radius)] pl-2 pr-1 text-micro",
+        active ? "bg-surface-raised text-foreground" : "text-muted-foreground hover:text-foreground",
+        waiting && "bg-warning/15 text-warning",
+        failed && "text-danger",
       )}
     >
       <button

@@ -15,6 +15,19 @@
 
 import type { AccountId, Label, LabelId, LabelKind } from "@/types";
 
+/**
+ * Gmail's Primary tab. When the store has it, Inbox means this rather than
+ * every message that happens to carry `INBOX` — Promotions included.
+ */
+/**
+ * Virtual, like Archive. Not Gmail's `CATEGORY_PERSONAL` — asking for that
+ * label returns every conversation Google ever filed under Primary, including
+ * archived login codes. This id is unknown to an older binary, so it cannot
+ * accidentally do that; the current one answers it as inbox minus bulk.
+ */
+export const PRIMARY_LABEL: LabelId = "PRIMARY";
+export const PROMOTIONS_LABEL: LabelId = "CATEGORY_PROMOTIONS";
+
 /** The mailboxes the rail shows, in the order it shows them. */
 export const RAIL_ORDER: readonly LabelId[] = [
   "INBOX",
@@ -25,7 +38,45 @@ export const RAIL_ORDER: readonly LabelId[] = [
   "ARCHIVE",
   "SPAM",
   "TRASH",
+  PROMOTIONS_LABEL,
 ];
+
+/**
+ * Gmail's bulk tabs. Primary is the inbox minus these — not mail tagged
+ * `CATEGORY_PERSONAL`. Most real mail has no category at all; Promotions /
+ * Social / Updates / Forums are the ones Google actually stamps, and that is
+ * the same cut notifications already use.
+ */
+export const BULK_CATEGORIES: readonly LabelId[] = [
+  "CATEGORY_PROMOTIONS",
+  "CATEGORY_SOCIAL",
+  "CATEGORY_UPDATES",
+  "CATEGORY_FORUMS",
+];
+
+export function isBulk(labelIds: readonly string[]): boolean {
+  return labelIds.some((id) => (BULK_CATEGORIES as readonly string[]).includes(id));
+}
+
+export function hasBulkTabs(labels: readonly Label[]): boolean {
+  return labels.some((label) => (BULK_CATEGORIES as readonly string[]).includes(label.id));
+}
+
+/** Where Inbox, `g i`, and a new window land. Always Primary, not the catch-all. */
+export function inboxLabelId(): LabelId {
+  return PRIMARY_LABEL;
+}
+
+/**
+ * Gmail's category tabs: still in the inbox.
+ *
+ * Primary is inbox minus bulk. Promotions is inbox ∩ promotions. Archive
+ * takes `INBOX` off and leaves the category, so a query that only asked for
+ * the category would keep showing mail you had filed away.
+ */
+export function isInboxTab(labelId: LabelId): boolean {
+  return labelId === "INBOX" || labelId === PRIMARY_LABEL || labelId === PROMOTIONS_LABEL;
+}
 
 /**
  * The two mailboxes Gmail has no label for, and which the store answers itself.
@@ -49,6 +100,7 @@ export const RAIL_ORDER: readonly LabelId[] = [
 export const VIRTUAL_MAILBOXES: readonly Label[] = [
   { id: "SNOOZED", accountId: null, name: "Snoozed", kind: "system" },
   { id: "ARCHIVE", accountId: null, name: "Archive", kind: "system" },
+  { id: PRIMARY_LABEL, accountId: null, name: "Inbox", kind: "system" },
 ];
 
 /**
@@ -83,6 +135,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   UNREAD: "Unread",
   IMPORTANT: "Important",
   CHAT: "Chat",
+  PRIMARY: "Inbox",
   CATEGORY_PERSONAL: "Primary",
   CATEGORY_SOCIAL: "Social",
   CATEGORY_PROMOTIONS: "Promotions",
@@ -115,9 +168,16 @@ export function railMailboxes(labels: readonly Label[]): Label[] {
   for (const label of labels) {
     if (label.kind === "system" && !system.has(label.id)) system.set(label.id, label);
   }
+  const tabs = hasBulkTabs(labels);
   return RAIL_ORDER.flatMap((id) => {
     const label = system.get(id);
-    return label ? [{ ...label, name: mailboxName(label) }] : [];
+    if (!label) return [];
+    // Inbox is the heading, and the heading is Primary. The full INBOX stays
+    // reachable as "All" so promotions are one row away rather than mixed
+    // into the thing you triage. Hidden when Google has no bulk tabs, because
+    // then Primary and All are the same query.
+    if (id === "INBOX") return tabs ? [{ ...label, name: "All" }] : [];
+    return [{ ...label, name: mailboxName(label) }];
   });
 }
 

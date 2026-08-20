@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, type ReactNode, type RefObject } from "react";
-import { useKeymap } from "@/hooks/useKeymap";
+import { useEffect, useLayoutEffect, useRef, type KeyboardEvent, type ReactNode, type RefObject } from "react";
+import { useKeyBindings, useKeymap } from "@/hooks/useKeymap";
+import { anyPopupOpen } from "@/lib/popups";
 import { cn } from "@/lib/utils";
 
 interface OverlayProps {
@@ -35,18 +36,17 @@ interface OverlayProps {
 /**
  * A modal surface with a real focus trap, focus restoration, and the keyboard.
  *
- * Escape is *not* handled here — it belongs to the keymap registry so that
- * precedence between the palette, an open thread and the shell is decided in
- * one place instead of by whoever bubbles first.
+ * Escape closes. The keymap binding is the one that wins while the caret is
+ * in a field (capture, `allowInInput`); the React handler is the backup for
+ * a key that never reached the window listener. A nested prompt — "this or
+ * all events", "email the guests" — outranks this at a higher priority, so
+ * the first Escape peels that off and the second closes.
  *
- * The keyboard is. A focus trap only decides where the caret is, and the app's
- * bindings never asked: they are window-level, so with preferences open `e`
- * still archived the conversation underneath it, `x` still ticked a row nobody
- * could see, and the only overlay any of them had heard of was the palette. So
- * an open overlay claims the keyboard from the registry for as long as it is
- * up, which fixes the whole class at the one place every dialog in the app
- * already passes through rather than one dialog at a time. `claimKeyboard`
- * explains what survives a claim.
+ * A focus trap only decides where the caret is, and the app's bindings never
+ * asked: they are window-level, so with preferences open `e` still archived
+ * the conversation underneath it. An open overlay claims the keyboard from
+ * the registry for as long as it is up. `claimKeyboard` explains what
+ * survives a claim.
  */
 export function Overlay({
   open,
@@ -72,6 +72,23 @@ export function Overlay({
     if (!open) return;
     return keymap.claimKeyboard();
   }, [open, keymap]);
+
+  useKeyBindings([
+    {
+      keys: "escape",
+      priority: 105,
+      allowInInput: true,
+      when: () => open && !anyPopupOpen(),
+      handler: () => onClose(),
+    },
+  ]);
+
+  const onEscape = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Escape") return;
+    if (anyPopupOpen()) return;
+    event.preventDefault();
+    onClose();
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -120,6 +137,7 @@ export function Overlay({
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}
+      onKeyDown={onEscape}
     >
       <div
         ref={panel}

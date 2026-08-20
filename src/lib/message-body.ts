@@ -378,7 +378,7 @@ const LIGHT_GROUND: FrameTokens = {
   "--muted-foreground": "oklch(0.556 0 0)",
   "--faint-foreground": "oklch(0.708 0 0)",
   "--background": "oklch(1 0 0)",
-  "--border": "oklch(0.922 0 0)",
+  "--border": "oklch(0.90 0.004 250)",
   "--accent": "oklch(0.55 0.18 255)",
 };
 

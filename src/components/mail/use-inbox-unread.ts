@@ -24,7 +24,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import type { AccountId, Thread, ThreadId } from "@/types";
+import type { AccountId, LabelId, Thread, ThreadId } from "@/types";
 import { getDataSource, type Unsubscribe } from "@/lib/data";
 
 /**
@@ -71,7 +71,9 @@ export function countByAccount(
  * Exported separately from {@link useInboxUnread} so the counting can be tested
  * as a pure function without a data source.
  */
-export function useUnreadInboxThreads(): { threads: Thread[]; capped: boolean } {
+export function useUnreadInboxThreads(
+  labelId: LabelId = "INBOX",
+): { threads: Thread[]; capped: boolean } {
   const [state, setState] = useState<{ threads: Thread[]; capped: boolean }>({
     threads: [],
     capped: false,
@@ -86,7 +88,7 @@ export function useUnreadInboxThreads(): { threads: Thread[]; capped: boolean } 
       void getDataSource()
         .listThreads({
           accountId: null,
-          labelId: "INBOX",
+          labelId,
           unreadOnly: true,
           limit: UNREAD_LIMIT,
         })
@@ -123,14 +125,17 @@ export function useUnreadInboxThreads(): { threads: Thread[]; capped: boolean } 
       if (timer !== null) window.clearTimeout(timer);
       off?.();
     };
-  }, []);
+  }, [labelId]);
 
   return state;
 }
 
 /** The counts the rail paints, with the optimistic layer already applied. */
-export function useInboxUnread(suppressed: ReadonlySet<ThreadId>): InboxUnread {
-  const { threads, capped } = useUnreadInboxThreads();
+export function useInboxUnread(
+  suppressed: ReadonlySet<ThreadId>,
+  labelId: LabelId = "INBOX",
+): InboxUnread {
+  const { threads, capped } = useUnreadInboxThreads(labelId);
   return useMemo(() => {
     const byAccount = countByAccount(threads, suppressed);
     let total = 0;

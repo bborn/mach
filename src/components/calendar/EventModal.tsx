@@ -451,7 +451,7 @@ export function EventModal({
     );
   };
 
-  /** ⇥ takes the grey text; Escape refuses it without closing the modal. */
+  /** ⇥ takes the grey text. Escape closes the modal — it is not a second mode. */
   const ghostKeys =
     (ghost: { suggestion: string; accept: () => string | null; dismiss: () => void }, apply: (value: string) => void) =>
     (keyEvent: ReactKeyboardEvent) => {
@@ -461,12 +461,6 @@ export function EventModal({
         keyEvent.stopPropagation();
         const next = ghost.accept();
         if (next !== null) apply(next);
-        return;
-      }
-      if (keyEvent.key === "Escape") {
-        keyEvent.preventDefault();
-        keyEvent.stopPropagation();
-        ghost.dismiss();
       }
     };
 

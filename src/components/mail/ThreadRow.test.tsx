@@ -15,7 +15,7 @@
 
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import type { Account, Thread } from "@/types";
+import type { Thread } from "@/types";
 import { ThreadRow } from "./ThreadRow";
 
 const LONG_SUBJECT =
@@ -38,19 +38,10 @@ function thread(over: Partial<Thread> = {}): Thread {
   };
 }
 
-const account: Account = {
-  id: 1,
-  email: "alex@northwind.example",
-  name: "Northwind",
-  colorIndex: 1,
-  kind: "personal",
-};
-
 function row(over: Partial<Thread> = {}, props: Partial<Parameters<typeof ThreadRow>[0]> = {}) {
   return renderToStaticMarkup(
     <ThreadRow
       thread={thread(over)}
-      account={account}
       unread={over.unread ?? false}
       cursor={false}
       checked={false}
@@ -160,7 +151,7 @@ describe("the thread row", () => {
     for (const unread of [true, false]) {
       const markup = row({}, { unread });
       // Absolutely placed, so it costs the row no horizontal space.
-      expect(markup).toMatch(/class="[^"]*absolute left-\[7px\][^"]*rounded-full/);
+      expect(markup).toMatch(/class="[^"]*absolute left-2[^"]*rounded-full/);
       // And the tile owns the whole 16px on its right — `pl-4` on one side,
       // `mr-4` on the other. It used to be `mr-2` against a `gap-2` on the row;
       // the gap went when the tick column started animating its own 8px, and
@@ -205,10 +196,6 @@ describe("the thread row", () => {
     expect(row({}, { cursor: true })).toContain('aria-selected="true"');
     expect(row({}, { checked: true })).toContain('aria-selected="true"');
     expect(row()).toContain('aria-selected="false"');
-  });
-
-  it("keeps the account colour bar and names the account on it", () => {
-    expect(row()).toContain('title="alex@northwind.example"');
   });
 
   it("shows the mailbox a search result came from, on the sender line", () => {

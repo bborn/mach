@@ -26,7 +26,8 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { anyPopupOpen, resetPopups, setPopupOpen } from "@/lib/popups";
 import type { Account, Calendar, CalendarEvent } from "@/types";
 import { KeymapProvider } from "@/hooks/useKeymap";
 import type { EventForm } from "@/lib/calendar-edit";
@@ -50,6 +51,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  resetPopups();
   globalThis.IS_REACT_ACT_ENVIRONMENT = undefined;
 });
 
@@ -149,6 +151,39 @@ function type(selector: string, value: string) {
 function text(): string {
   return document.body.textContent ?? "";
 }
+
+function press(key: string, at: EventTarget = document.activeElement ?? window) {
+  act(() => {
+    at.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+  });
+}
+
+describe("Escape", () => {
+  it("does not think a popup is open just because the form has selects", () => {
+    mount();
+    expect(anyPopupOpen()).toBe(false);
+  });
+
+  it("closes from the title field", () => {
+    const onClose = vi.fn();
+    mount({ onClose });
+    const title = document.querySelector('input[aria-label="Title"]') as HTMLInputElement;
+    expect(title).toBeTruthy();
+    act(() => title.focus());
+    press("Escape", title);
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("closes even if a popup claimed itself open without being on screen", () => {
+    const onClose = vi.fn();
+    mount({ onClose });
+    setPopupOpen("leaked", true);
+    const title = document.querySelector('input[aria-label="Title"]') as HTMLInputElement;
+    act(() => title.focus());
+    press("Escape", title);
+    expect(onClose).toHaveBeenCalled();
+  });
+});
 
 describe("telling the guests", () => {
   it("asks before emailing them, and sends what was asked for", () => {

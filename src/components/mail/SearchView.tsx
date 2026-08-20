@@ -58,7 +58,7 @@ const PAGE_SIZE = 60;
 const DEBOUNCE_MS = 120;
 
 export function SearchView({ children }: { children: ReactNode }) {
-  const { ui, dispatch, actions, accounts, labels, accountById, isUnread } = useMach();
+  const { ui, dispatch, actions, accounts, labels, isUnread } = useMach();
 
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -452,7 +452,6 @@ export function SearchView({ children }: { children: ReactNode }) {
               <ThreadRow
                 key={thread.id}
                 thread={thread}
-                account={accountById(thread.accountId)}
                 unread={isUnread(thread)}
                 cursor={thread.id === ui.threadId}
                 checked={false}

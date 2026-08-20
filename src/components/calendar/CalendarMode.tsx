@@ -1,4 +1,4 @@
-import { AlertTriangle, ChevronLeft, ChevronRight, Mail, X } from "lucide-react";
+import { AlertTriangle, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CalendarEvent, CalendarId, EventId, Rsvp } from "@/types";
 import { useKeyBindings } from "@/hooks/useKeymap";
@@ -63,6 +63,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
+import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { MonthGrid } from "./MonthGrid";
 import { TimeGrid, type EventDraft as GridDraft, type EventMove } from "./TimeGrid";
 import { CalendarSidebar, calendarLabel, type CalendarSettings } from "./CalendarSidebar";
@@ -1461,22 +1462,21 @@ export function CalendarMode() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex h-8 shrink-0 items-center gap-2 border-b border-border px-2">
-        {/* The way back to mail. The rail states the app's two surfaces, but
-            the rail is inert here — so calendar mode carries its own return,
-            and the trip is never keyboard-only. */}
-        <Button size="sm" title="Mail — ⌘1" onClick={() => actions.setMode("mail")}>
-          <Mail size={13} strokeWidth={1.75} />
-          Mail
-        </Button>
-        <Button size="icon" title="Previous (k)" onClick={() => actions.shiftPeriod(-1)}>
-          <ChevronLeft size={14} strokeWidth={1.75} />
-        </Button>
-        <Button size="icon" title="Next (j)" onClick={() => actions.shiftPeriod(1)}>
-          <ChevronRight size={14} strokeWidth={1.75} />
-        </Button>
-        <Button size="sm" title="Today (t)" onClick={goToday}>
-          Today
-        </Button>
+        <ShortcutTooltip label="Previous" keys="k">
+          <Button size="icon" onClick={() => actions.shiftPeriod(-1)}>
+            <ChevronLeft size={14} strokeWidth={1.75} />
+          </Button>
+        </ShortcutTooltip>
+        <ShortcutTooltip label="Next" keys="j">
+          <Button size="icon" onClick={() => actions.shiftPeriod(1)}>
+            <ChevronRight size={14} strokeWidth={1.75} />
+          </Button>
+        </ShortcutTooltip>
+        <ShortcutTooltip label="Today" keys="t">
+          <Button size="sm" onClick={goToday}>
+            Today
+          </Button>
+        </ShortcutTooltip>
 
         {dateOpen ? (
           <GoToDate
@@ -1487,24 +1487,24 @@ export function CalendarMode() {
             onCancel={() => setDateOpen(false)}
           />
         ) : (
-          <button
-            type="button"
-            onClick={() => setDateOpen(true)}
-            title="Go to date (g then d)"
-            // The period the view is showing is what the whole header is about,
-            // and it used to be 13px medium — the same size as the buttons
-            // either side of it. `text-reading` semibold puts two steps of the
-            // ramp between it and them.
-            className="ml-1 min-w-0 truncate text-reading font-semibold text-foreground hover:text-accent"
-          >
-            {title}
-          </button>
+          <ShortcutTooltip label="Go to date" keys="g d">
+            <button
+              type="button"
+              onClick={() => setDateOpen(true)}
+              // The period the view is showing is what the whole header is about,
+              // and it used to be 13px medium — the same size as the buttons
+              // either side of it. `text-reading` semibold puts two steps of the
+              // ramp between it and them.
+              className="ml-1 min-w-0 truncate text-reading font-semibold text-foreground hover:text-accent"
+            >
+              {title}
+            </button>
+          </ShortcutTooltip>
         )}
 
         <div className="ml-auto flex shrink-0 items-center gap-2">
           <Button
             size="sm"
-            title="Create event (c)"
             onClick={() => {
               setCreateSeed(undefined);
               setCreateOpen(true);

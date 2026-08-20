@@ -1,4 +1,3 @@
-import { Sparkles } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -319,11 +318,10 @@ export function AgentDock() {
           `App.tsx` draws the one edge the bottom of the window needs. */}
       <div
         aria-label="Agent sessions"
-        className="flex h-8 shrink-0 items-center gap-1.5 overflow-x-auto bg-surface px-3"
+        className="flex h-7 shrink-0 items-center gap-1 overflow-x-auto px-2"
       >
-        <Sparkles size={12} strokeWidth={1.75} className="shrink-0 text-faint-foreground" />
         {starting && sessions.length === 0 && (
-          <span className="text-micro text-faint-foreground">Starting…</span>
+          <span className="px-1 text-micro text-faint-foreground">Starting…</span>
         )}
         {sessions.map((session) => (
           <AgentPill

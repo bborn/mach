@@ -5,6 +5,7 @@ import { useMach } from "@/hooks/useMach";
 import { mailboxName } from "@/lib/mailboxes";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { MailboxNotice } from "./MailboxNotice";
 import { ThreadContextMenu } from "./ThreadContextMenu";
 import { GMAIL_DRAFT, ThreadRow } from "./ThreadRow";
@@ -22,7 +23,6 @@ export function ThreadList() {
     isFavorite,
     isRowSelected,
     viewFavorite,
-    accountById,
     actions,
   } = useMach();
   const scroller = useRef<HTMLDivElement>(null);
@@ -77,7 +77,7 @@ export function ThreadList() {
     return () => observer.disconnect();
   }, [hasMore, visibleThreads.length]);
 
-  const scope = accounts.find((a) => a.id === ui.accountId)?.name ?? "All accounts";
+  const scope = accounts.find((a) => a.id === ui.accountId)?.name;
   const label = labels.find((l) => l.id === ui.labelId);
   const mailbox = label ? mailboxName(label) : ui.labelId;
   const unreadCount = visibleThreads.filter(isUnread).length;
@@ -90,11 +90,14 @@ export function ThreadList() {
     <>
       <header className="group flex h-8 shrink-0 items-center gap-2 border-b border-border px-3">
         <span className="truncate text-list font-medium text-foreground">{mailbox}</span>
-        <span className="truncate text-micro text-faint-foreground">{scope}</span>
+        {scope && <span className="truncate text-micro text-faint-foreground">{scope}</span>}
+        <ShortcutTooltip
+          label={favorited ? "Remove from favorites" : "Add to favorites"}
+          keys="shift+f"
+        >
         <button
           type="button"
           onClick={actions.toggleFavoriteView}
-          title={favorited ? "Remove from favorites (⇧F)" : "Add to favorites (⇧F)"}
           aria-pressed={favorited}
           aria-label={favorited ? "Remove from favorites" : "Add to favorites"}
           className={cn(
@@ -110,6 +113,7 @@ export function ThreadList() {
             fill={favorited ? "currentColor" : "none"}
           />
         </button>
+        </ShortcutTooltip>
         {/* While a selection is live the header counts that instead: it is the
             number the next keystroke is about to act on. */}
         {selectedCount > 0 ? (
@@ -135,7 +139,6 @@ export function ThreadList() {
               <ThreadRow
                 key={thread.id}
                 thread={thread}
-                account={accountById(thread.accountId)}
                 unread={isUnread(thread)}
                 cursor={thread.id === ui.threadId}
                 checked={isRowSelected(thread.id)}

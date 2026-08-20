@@ -55,10 +55,17 @@
  */
 
 :root {
-  /* Surfaces, lightest to heaviest */
+  /* Surfaces, lightest to heaviest.
+   *
+   * `--background` is the paper: the conversation list, the reading pane, the
+   * calendar grid. `--surface` is the chrome: title bar, rail, status bar, the
+   * furniture at the bottom of the window. They used to sit 1.5% apart, which
+   * made the three columns one sheet of paper with hairlines drawn on it.
+   * A cool grey chrome against white paper is the Mail.app split, and the
+   * cheapest way to make this look like a Mac app rather than a webview. */
   --background: oklch(1 0 0);
-  --surface: oklch(0.985 0 0);
-  --surface-raised: oklch(0.97 0 0);
+  --surface: oklch(0.961 0.004 250);
+  --surface-raised: oklch(0.935 0.006 250);
 
   /* Ink */
   --foreground: oklch(0.145 0 0);
@@ -66,17 +73,18 @@
   --faint-foreground: oklch(0.708 0 0);
 
   /* Lines */
-  --border: oklch(0.922 0 0);
-  --border-strong: oklch(0.87 0 0);
+  --border: oklch(0.90 0.004 250);
+  --border-strong: oklch(0.84 0.006 250);
 
   /* The one accent. Selection, focus, unread. */
   --accent: oklch(0.55 0.18 255);
   --accent-foreground: oklch(0.985 0 0);
   --accent-subtle: oklch(0.95 0.03 255);
 
-  /* Row states */
-  --row-hover: oklch(0.97 0 0);
-  --row-selected: oklch(0.95 0.03 255);
+  /* Row states. The cursor is the loudest thing in a keyboard app; the old
+     wash was a 5% blue tint you could miss between two keystrokes. */
+  --row-hover: oklch(0.97 0.008 250);
+  --row-selected: oklch(0.93 0.045 255);
 
   --danger: oklch(0.58 0.22 27);
   --success: oklch(0.6 0.14 155);
@@ -134,7 +142,7 @@
   --accent-subtle: oklch(0.28 0.06 255);
 
   --row-hover: oklch(0.21 0 0);
-  --row-selected: oklch(0.28 0.06 255);
+  --row-selected: oklch(0.33 0.08 255);
 
   --danger: oklch(0.65 0.2 27);
   --success: oklch(0.68 0.14 155);

@@ -47,6 +47,8 @@ export const labels: Label[] = [
   // them to whatever label list arrives. Listing them here would have the
   // fixture app agree with a shape the real one cannot have.
   { id: "INBOX", accountId: null, name: "Inbox", kind: "system" },
+  { id: "CATEGORY_PERSONAL", accountId: null, name: "CATEGORY_PERSONAL", kind: "system" },
+  { id: "CATEGORY_PROMOTIONS", accountId: null, name: "CATEGORY_PROMOTIONS", kind: "system" },
   { id: "STARRED", accountId: null, name: "Starred", kind: "system" },
   { id: "SENT", accountId: null, name: "Sent", kind: "system" },
   { id: "L_INVESTORS", accountId: null, name: "Investors", kind: "user" },
@@ -116,6 +118,19 @@ export const people: Participant[] = [
 
 function person(email: string): Participant {
   return people.find((p) => p.email === email) ?? { name: email, email };
+}
+
+/** Senders whose mail Gmail files under Promotions rather than Primary. */
+const PROMOTIONAL = new Set([
+  "billing-noreply@google.com",
+  "receipts@anthropic.com",
+  "sam@stripe.com",
+]);
+
+function withCategory(labelIds: string[], fromEmail: string): string[] {
+  if (!labelIds.includes("INBOX")) return labelIds;
+  const extra = PROMOTIONAL.has(fromEmail) ? "CATEGORY_PROMOTIONS" : "CATEGORY_PERSONAL";
+  return labelIds.includes(extra) ? labelIds : [...labelIds, extra];
 }
 
 /** [accountId, fromEmail, subject, snippet, hoursAgo, unread, attachment, labels] */
@@ -229,7 +244,7 @@ function build(): { threads: Thread[]; messages: Map<number, Message[]> } {
       starred: i % 9 === 0,
       hasAttachment,
       messageCount,
-      labelIds,
+      labelIds: withCategory(labelIds, fromEmail),
     });
 
     const thread: Message[] = [];

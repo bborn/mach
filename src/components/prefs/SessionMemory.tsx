@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useMach } from "@/hooks/useMach";
 import type { LabelId } from "@/types";
+import { PRIMARY_LABEL } from "@/lib/mailboxes";
 import { usePreferencesStore } from "./PreferencesProvider";
 
 /**
@@ -59,7 +60,17 @@ export function SessionMemory() {
     if (session.accountId !== undefined) {
       dispatch({ type: "account", accountId: session.accountId });
     }
-    if (session.labelId) dispatch({ type: "label", labelId: session.labelId as LabelId });
+    if (session.labelId) {
+      // Inbox used to be Gmail's catch-all, promotions included. It is
+      // Primary now; a stored INBOX is the old name for that heading, not
+      // a request for All.
+      const labelId = (
+        session.labelId === "INBOX" || session.labelId === "CATEGORY_PERSONAL"
+          ? PRIMARY_LABEL
+          : session.labelId
+      ) as LabelId;
+      dispatch({ type: "label", labelId });
+    }
     if (session.listWidth !== undefined) {
       dispatch({ type: "listWidth", width: session.listWidth });
     }

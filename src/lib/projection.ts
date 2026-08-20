@@ -79,6 +79,7 @@ import {
   type EventPatch,
   type MailCommand,
 } from "./data";
+import { isBulk, isInboxTab, PRIMARY_LABEL } from "./mailboxes";
 
 /** Gmail's system labels this module names directly, as `commands::mail` does. */
 export const INBOX = "INBOX";
@@ -360,7 +361,10 @@ export function leavesMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
   // that files it somewhere — see `db::queries::mailbox_clause`, which asks the
   // same question of SQLite.
   if (labelId === ARCHIVE) return guess.add.some((l) => MEMBERSHIP.includes(l));
-  return guess.remove.includes(labelId);
+  if (guess.remove.includes(labelId)) return true;
+  // Primary and Promotions are inbox tabs: archive takes INBOX off and the
+  // category stays, so the tab's own label never appears in `remove`.
+  return isInboxTab(labelId) && guess.remove.includes(INBOX);
 }
 
 /**
@@ -380,11 +384,23 @@ export function leavesMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
  * {@link leavesMailbox} asks about `remove`: it is the claim the command made,
  * rather than a property of the label set it leaves behind.
  */
-export function entersMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
+export function entersMailbox(
+  guess: ThreadGuess,
+  labelId: LabelId,
+  labels?: readonly LabelId[],
+): boolean {
   // The mirror of the archive case above: a command that takes the conversation
   // out of everywhere else is what puts it in the archive.
   if (labelId === ARCHIVE) return guess.remove.some((l) => MEMBERSHIP.includes(l));
-  return guess.add.includes(labelId);
+  if (guess.add.includes(labelId)) return true;
+  if (isInboxTab(labelId) && guess.add.includes(INBOX)) {
+    if (labelId === INBOX) return true;
+    // Primary is inbox minus bulk, not mail tagged CATEGORY_PERSONAL.
+    if (labelId === PRIMARY_LABEL) return !isBulk(labels ?? []);
+    // Promotions: only if the category is still on the row.
+    return labels?.includes(labelId) ?? false;
+  }
+  return false;
 }
 
 /**
@@ -421,9 +437,9 @@ export function returningRows(
     const id = Number(key);
     if (loaded.has(id)) continue;
     const guess = guesses[id]!;
-    if (!entersMailbox(guess, labelId)) continue;
     const row = remembered.get(id);
     if (!row) continue;
+    if (!entersMailbox(guess, labelId, row.labelIds)) continue;
     if (accountId !== null && row.accountId !== accountId) continue;
     out.push(applyGuess(row, guess));
   }

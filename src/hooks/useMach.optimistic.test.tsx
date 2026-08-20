@@ -49,7 +49,7 @@ function thread(id: number, over: Partial<Thread> = {}): Thread {
     starred: false,
     hasAttachment: false,
     messageCount: 1,
-    labelIds: ["INBOX"],
+    labelIds: ["INBOX", "CATEGORY_PERSONAL"],
     ...over,
   };
 }

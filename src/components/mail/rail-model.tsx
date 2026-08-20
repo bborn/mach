@@ -20,12 +20,12 @@
 import {
   Archive,
   Bookmark,
-  Calendar,
   Clock,
   FileText,
   Folder,
   Inbox,
   Mail,
+  Megaphone,
   Send,
   Star,
   Tag,
@@ -36,8 +36,6 @@ import {
 import type { Account, AccountId, Label, LabelId, ThreadId } from "@/types";
 import type { Favorite } from "@/lib/favorites";
 import { favoriteKey } from "@/lib/favorites";
-import { ACCOUNT_BG } from "@/lib/colors";
-import { cn } from "@/lib/utils";
 import type { InboxUnread } from "./use-inbox-unread";
 
 const SYSTEM_ICONS: Record<string, LucideIcon> = {
@@ -49,6 +47,16 @@ const SYSTEM_ICONS: Record<string, LucideIcon> = {
   ARCHIVE: Archive,
   SPAM: TriangleAlert,
   TRASH: Trash2,
+  CATEGORY_PROMOTIONS: Megaphone,
+};
+
+/** The Gmail jump keys, on the rows they land on. */
+const MAILBOX_SHORTCUTS: Record<string, string> = {
+  STARRED: "g s",
+  SNOOZED: "g b",
+  DRAFT: "g d",
+  SENT: "g t",
+  ARCHIVE: "g a",
 };
 
 /**
@@ -64,7 +72,7 @@ export interface RailItem {
   level: 1 | 2;
   /** Heads a section: carries the disclosure. */
   heading?: boolean;
-  /** A surface — Inbox, Calendar — rather than a grouping. Heavier. */
+  /** A top-level destination rather than a grouping. Heavier. */
   surface?: boolean;
   /** The section this row folds, when it has one. */
   section?: RailSection;
@@ -77,6 +85,8 @@ export interface RailItem {
   /** `"+"` when the count is a floor rather than a total. */
   countSuffix?: string;
   title?: string;
+  /** Keymap binding this row opens, shown on a hover-hold. */
+  shortcut?: string;
   onRemove?: () => void;
   removeTitle?: string;
   /** Air above, so the sections read as sections. */
@@ -90,6 +100,11 @@ export interface RailInput {
   favorites: readonly Favorite[];
   accountId: AccountId | null;
   labelId: LabelId;
+  /**
+   * What "Inbox" means for this mailbox. `PRIMARY` — inbox minus bulk —
+   * once labels have loaded. Account rows and the heading both open this.
+   */
+  inboxId?: LabelId;
   threadId: ThreadId | null;
   unread: InboxUnread;
   collapsed: readonly string[];
@@ -99,7 +114,6 @@ export interface RailHandlers {
   /** Go to a mailbox, optionally narrowing to one account. */
   open: (accountId: AccountId | null, labelId: LabelId) => void;
   openLabel: (labelId: LabelId) => void;
-  openCalendar: () => void;
   openFavorite: (favorite: Favorite) => void;
   unfavorite: (key: string) => void;
   toggle: (section: RailSection) => void;
@@ -107,18 +121,19 @@ export interface RailHandlers {
 
 export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
   const { accounts, mailboxes, favorites, accountId, labelId, threadId, unread } = input;
+  const inboxId = input.inboxId ?? "INBOX";
   const open = (section: RailSection) => !input.collapsed.includes(section);
-  const atInbox = labelId === "INBOX";
+  const atInbox = labelId === inboxId;
 
-  const accountRows: RailItem[] = accounts.map((account) => ({
+  const accountRows: RailItem[] = accounts.map((account, index) => ({
     key: `account:${account.id}`,
     level: 2,
     // Picking an account under Inbox means that account's inbox, which is what
     // the nesting says it means. ⌃1–5 is the other reading — keep this mailbox,
     // change the account — and both are worth having.
     active: atInbox && accountId === account.id,
-    activate: () => on.open(account.id, "INBOX"),
-    leading: <span className={cn("h-3.5 w-[3px] rounded-full", ACCOUNT_BG[account.colorIndex])} />,
+    activate: () => on.open(account.id, inboxId),
+    leading: null,
     // The full address, not the local part. With five accounts the bit before
     // the @ is often identical across them, which makes the rail ambiguous
     // exactly when it matters most.
@@ -126,10 +141,12 @@ export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
     count: unread.byAccount.get(account.id) ?? 0,
     countSuffix: unread.capped ? "+" : undefined,
     title: account.email,
+    shortcut: index < 5 ? `ctrl+${index + 1}` : undefined,
   }));
 
   const mailboxRows: RailItem[] = mailboxes.map((label) => {
-    const Icon = SYSTEM_ICONS[label.id] ?? Tag;
+    // INBOX in this list is "All" — the heading already owns the inbox icon.
+    const Icon = label.id === "INBOX" ? Mail : (SYSTEM_ICONS[label.id] ?? Tag);
     return {
       key: `mailbox:${label.id}`,
       level: 2,
@@ -137,6 +154,7 @@ export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
       activate: () => on.openLabel(label.id),
       leading: <Icon size={13} strokeWidth={1.75} className="text-faint-foreground" />,
       label: label.name,
+      shortcut: MAILBOX_SHORTCUTS[label.id],
     };
   });
 
@@ -182,39 +200,14 @@ export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
       section: "inbox",
       expanded: open("inbox"),
       active: (atInbox && accountId === null) || carries("inbox", accountRows),
-      activate: () => on.open(null, "INBOX"),
+      activate: () => on.open(null, inboxId),
       leading: <Inbox size={13} strokeWidth={1.75} />,
       label: "Inbox",
       count: unread.total,
       countSuffix: unread.capped ? "+" : undefined,
-      title: "All accounts",
+      shortcut: "g i",
     },
     ...(open("inbox") ? accountRows : []),
-    /*
-     * Calendar, a peer of Inbox rather than a tab in the window chrome.
-     *
-     * This is the one place Spark's structure and Mach's disagreed about what
-     * kind of thing the calendar is. Spark's own shortcuts settle it — ⌘⇧1 is
-     * Inbox and ⌘⇧2 is Calendar, a matched pair — so the two are surfaces of
-     * equal standing, and the rail is where an app states what its surfaces
-     * are. Mach spelled the same pair ⌘1/⌘2 but drew it as a segmented control
-     * in the title bar, which put the calendar in the furniture rather than in
-     * the navigation.
-     *
-     * It never shows as selected, because the rail is inert in calendar mode —
-     * so the way back out is a Mail button in the calendar's own header rather
-     * than a row here.
-     */
-    {
-      key: "surface:calendar",
-      level: 1,
-      surface: true,
-      active: false,
-      activate: on.openCalendar,
-      leading: <Calendar size={13} strokeWidth={1.75} />,
-      label: "Calendar",
-      title: "Calendar — ⌘2",
-    },
     {
       key: "section:folders",
       level: 1,

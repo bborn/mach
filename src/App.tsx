@@ -3,6 +3,7 @@ import { KeymapProvider, useKeyBindings, useKeymap } from "@/hooks/useKeymap";
 import type { KeyBinding } from "@/lib/keymap";
 import { connectQaBridge } from "@/lib/qa-bridge";
 import type { LabelId } from "@/types";
+import { inboxLabelId } from "@/lib/mailboxes";
 import { MachProvider, useMach } from "@/hooks/useMach";
 import { cn } from "@/lib/utils";
 import { StatusBar } from "@/components/chrome/StatusBar";
@@ -234,7 +235,7 @@ function Shell() {
       keys: "g i",
       group: "Go to",
       description: "Inbox",
-      handler: () => goToMailbox("INBOX"),
+      handler: () => goToMailbox(inboxLabelId()),
     },
     {
       keys: "g s",
@@ -321,7 +322,7 @@ function Shell() {
         inherits the single edge, and when the drawer is open that edge is also
         what you drag.
       */}
-      <div className="flex shrink-0 flex-col border-t border-border">
+      <div className="flex shrink-0 flex-col border-t border-border bg-surface empty:hidden">
         {/* A handoff that stayed in the window. Renders nothing until one is
             running, and takes the top edge when it is. */}
         <SessionPane />

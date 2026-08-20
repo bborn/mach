@@ -208,6 +208,26 @@ describe("what a command is known to do", () => {
     expect(guess.remove).toEqual(["TRASH", "SPAM"]);
   });
 
+  it("treats Primary as inbox minus bulk: archive hides, unarchive restores unless the row is bulk", () => {
+    const archived = project({ kind: "archive", threadIds: [1] }, [])![1]!;
+    expect(leavesMailbox(archived, "PRIMARY")).toBe(true);
+    expect(leavesMailbox(archived, "CATEGORY_PROMOTIONS")).toBe(true);
+    expect(leavesMailbox(archived, "Receipts")).toBe(false);
+
+    const restored = project(
+      {
+        kind: "unarchive",
+        threadIds: [1],
+        restore: [{ threadId: 1, labelIds: ["INBOX"], isUnread: true }],
+      },
+      [],
+    )![1]!;
+    expect(entersMailbox(restored, "INBOX")).toBe(true);
+    expect(entersMailbox(restored, "PRIMARY", ["INBOX"])).toBe(true);
+    expect(entersMailbox(restored, "PRIMARY", ["INBOX", "CATEGORY_PROMOTIONS"])).toBe(false);
+    expect(entersMailbox(restored, "CATEGORY_PROMOTIONS", ["INBOX"])).toBe(false);
+  });
+
   /*
    * `is_unread` and the `UNREAD` label come from different columns, and
    * `set_thread_state` writes both verbatim. A guess that "corrected" one of

@@ -222,7 +222,7 @@ export function MailMode() {
   return (
     <div className="flex h-full min-h-0">
       <AccountRail />
-      <Pane width={ui.listWidth}>
+      <Pane width={ui.listWidth} className="bg-background">
         {/* Search is a mode of this pane, not a screen of its own: it takes the
             list over while a query is live and hands it straight back when the
             query goes away. Its own keys (`/`, ⌘F) live inside it. */}

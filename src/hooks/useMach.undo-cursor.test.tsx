@@ -48,7 +48,7 @@ function thread(id: number, over: Partial<Thread> = {}): Thread {
     starred: false,
     hasAttachment: false,
     messageCount: 1,
-    labelIds: ["INBOX"],
+    labelIds: ["INBOX", "CATEGORY_PERSONAL"],
     ...over,
   };
 }
@@ -97,7 +97,14 @@ function stubSource(initial: Thread[]) {
       return [];
     },
     async listThreads({ labelId }) {
-      return { threads: rows.filter((r) => r.labelIds.includes(labelId ?? "INBOX")), nextCursor: null };
+      return {
+        threads: rows.filter((r) =>
+          labelId === "PRIMARY" || labelId === undefined
+            ? r.labelIds.includes("INBOX")
+            : r.labelIds.includes(labelId),
+        ),
+        nextCursor: null,
+      };
     },
     async getThread(threadId): Promise<ThreadDetail | null> {
       const found = rows.find((r) => r.id === threadId);

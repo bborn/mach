@@ -70,7 +70,7 @@ function thread(id: number): Thread {
     starred: false,
     hasAttachment: false,
     messageCount: 1,
-    labelIds: ["INBOX"],
+    labelIds: ["INBOX", "CATEGORY_PERSONAL"],
   };
 }
 

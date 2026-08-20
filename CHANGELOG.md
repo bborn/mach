@@ -7,6 +7,16 @@ and the versions are [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Mail and Calendar live in the title bar. Inbox is the inbox minus bulk
+  (Promotions, Social, Updates, Forums), so those stay in their folders.
+- Account colour ticks are gone from the thread list and the mail rail.
+- Hold a labelled control and it names its shortcut.
+- Escape closes the event editor, including from the title field.
+- The week grid's column rules share one set of tracks with the day headers.
+- The Dock badge counts the same unread the Inbox does.
+
 ### Added
 
 - Multi-account Gmail sync into one thread list, with a reading pane over

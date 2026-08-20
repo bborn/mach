@@ -38,9 +38,21 @@ export function setPopupOpen(id: string, isOpen: boolean): void {
   emit();
 }
 
-/** True while any select menu, popover or tooltip popup is on screen. */
+/**
+ * True while a select menu or popover is actually on screen.
+ *
+ * The counter is the fast path, but it can leak: a Select that set itself
+ * open and never called back closed leaves Escape doing nothing in the event
+ * modal — the binding declines so Base UI can close a menu that is not there.
+ * Believe the counter only when the DOM agrees (`data-open` on a popup).
+ */
 export function anyPopupOpen(): boolean {
-  return open.size > 0;
+  if (open.size === 0) return false;
+  if (typeof document === "undefined") return true;
+  return (
+    document.querySelector("[data-mach-popup][data-open], [data-mach-popup] [data-open]") !==
+    null
+  );
 }
 
 export function subscribePopups(listener: () => void): () => void {

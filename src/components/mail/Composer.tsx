@@ -1408,7 +1408,7 @@ function AddressField({
   return (
     <div className="relative">
       <label className="flex min-w-0 items-baseline gap-2">
-        <span className="w-7 shrink-0 text-micro uppercase tracking-wide text-faint-foreground">
+        <span className="w-7 shrink-0 text-micro text-faint-foreground">
           {label}
         </span>
         <input

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Label } from "@/types";
 import {
+  inboxLabelId,
+  isInboxTab,
   mailboxName,
   mailboxTargets,
+  PRIMARY_LABEL,
   railMailboxes,
   withVirtualMailboxes,
 } from "./mailboxes";
@@ -39,7 +42,6 @@ describe("mailboxName", () => {
 
 describe("railMailboxes", () => {
   const labels = [
-    system("CATEGORY_FORUMS"),
     system("SENT"),
     system("UNREAD"),
     system("INBOX"),
@@ -48,22 +50,41 @@ describe("railMailboxes", () => {
   ];
 
   it("keeps the canonical mailboxes, in canonical order", () => {
-    expect(railMailboxes(labels).map((l) => l.id)).toEqual(["INBOX", "SENT", "TRASH"]);
+    expect(railMailboxes(labels).map((l) => l.id)).toEqual(["SENT", "TRASH"]);
   });
 
   it("drops the noise — categories, UNREAD, and every user label", () => {
-    const ids = railMailboxes(labels).map((l) => l.id);
+    const ids = railMailboxes([...labels, system("CATEGORY_FORUMS")]).map((l) => l.id);
     expect(ids).not.toContain("CATEGORY_FORUMS");
     expect(ids).not.toContain("UNREAD");
     expect(ids).not.toContain("Label_1");
   });
 
   it("renames as it goes, so the rail never shows an id", () => {
-    expect(railMailboxes(labels).map((l) => l.name)).toEqual(["Inbox", "Sent", "Trash"]);
+    expect(railMailboxes(labels).map((l) => l.name)).toEqual(["Sent", "Trash"]);
   });
 
   it("shows nothing rather than guessing when no labels have loaded", () => {
     expect(railMailboxes([])).toEqual([]);
+  });
+
+  it("always lands Inbox on Primary", () => {
+    expect(inboxLabelId()).toBe(PRIMARY_LABEL);
+  });
+
+  it("keeps the full inbox as All when Google has bulk tabs", () => {
+    const withTabs = [...labels, system("CATEGORY_PROMOTIONS")];
+    expect(railMailboxes(withTabs).map((l) => [l.id, l.name])).toEqual([
+      ["INBOX", "All"],
+      ["SENT", "Sent"],
+      ["TRASH", "Trash"],
+      ["CATEGORY_PROMOTIONS", "Promotions"],
+    ]);
+    expect(isInboxTab("INBOX")).toBe(true);
+    expect(isInboxTab(PRIMARY_LABEL)).toBe(true);
+    expect(isInboxTab("CATEGORY_PROMOTIONS")).toBe(true);
+    expect(isInboxTab("CATEGORY_UPDATES")).toBe(false);
+    expect(isInboxTab("SENT")).toBe(false);
   });
 });
 
@@ -84,11 +105,11 @@ describe("withVirtualMailboxes", () => {
     const ids = withVirtualMailboxes(stored).map((l) => l.id);
     expect(ids).toContain("ARCHIVE");
     expect(ids).toContain("SNOOZED");
+    expect(ids).toContain(PRIMARY_LABEL);
   });
 
   it("puts them in the rail, where the keyboard already went", () => {
     expect(railMailboxes(withVirtualMailboxes(stored)).map((l) => l.name)).toEqual([
-      "Inbox",
       "Starred",
       "Snoozed",
       "Drafts",

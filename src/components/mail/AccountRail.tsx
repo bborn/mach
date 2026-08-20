@@ -4,11 +4,12 @@ import type { ThreadId } from "@/types";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { useUiSession } from "@/components/prefs/PreferencesProvider";
-import { railMailboxes } from "@/lib/mailboxes";
+import { inboxLabelId, railMailboxes } from "@/lib/mailboxes";
 import { RAIL_WIDTH_BOUNDS } from "@/lib/prefs";
 import { suppressedIds } from "@/lib/projection";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ShortcutTooltip } from "@/components/ui/tooltip";
 import { RESIZE_STEP, Resizer } from "@/components/ui/split";
 import { DEFAULT_RAIL_WIDTH, clampRailWidth } from "./rail-layout";
 import { railItems, railStep, type RailItem, type RailSection } from "./rail-model";
@@ -111,14 +112,16 @@ export function AccountRail() {
     () => suppressedIds(ui.guesses, "INBOX"),
     [ui.guesses],
   );
-  const unread = useInboxUnread(suppressed);
+  const inboxId = inboxLabelId();
+  const unread = useInboxUnread(suppressed, inboxId);
 
   // The rail carries the mailboxes you navigate to, not every label Gmail has.
   // Labels live in ⌘K, and the ones worth a permanent row you favorite. Inbox
-  // is not among them any more: it is the section these sit under.
+  // is not among them any more: it is the section these sit under. When Gmail
+  // has tabs, that heading is Primary and `INBOX` stays in the folders as All.
   const mailboxes = useMemo(
-    () => railMailboxes(labels).filter((label) => label.id !== "INBOX"),
-    [labels],
+    () => railMailboxes(labels).filter((label) => label.id !== inboxId),
+    [labels, inboxId],
   );
 
   const items = useMemo<RailItem[]>(
@@ -130,6 +133,7 @@ export function AccountRail() {
           favorites,
           accountId: ui.accountId,
           labelId: ui.labelId,
+          inboxId,
           threadId: ui.threadId,
           unread,
           collapsed,
@@ -140,7 +144,6 @@ export function AccountRail() {
             dispatch({ type: "label", labelId });
           },
           openLabel: (labelId) => dispatch({ type: "label", labelId }),
-          openCalendar: () => actions.setMode("calendar"),
           openFavorite: (favorite) => actions.openFavorite(favorite),
           unfavorite: (key) => actions.unfavorite(key),
           toggle: toggleSection,
@@ -157,6 +160,7 @@ export function AccountRail() {
       collapsed,
       ui.accountId,
       ui.labelId,
+      inboxId,
       ui.threadId,
       dispatch,
       actions,
@@ -324,7 +328,7 @@ export function AccountRail() {
         ref={scroller}
         role="tree"
         aria-label="Mailboxes"
-        className="w-rail flex-none border-r border-border bg-surface py-1"
+        className="w-rail flex-none border-r border-border bg-surface"
       >
         {items.map((item, index) => {
           const section = item.section;
@@ -366,46 +370,10 @@ export function RailRow({
   focused: boolean;
   onToggle?: () => void;
 }) {
-  const { active, label, count, countSuffix, title, leading, onRemove, removeTitle } = item;
+  const { active, label, count, countSuffix, title, shortcut, leading, onRemove, removeTitle } =
+    item;
   const surface = item.surface === true;
-  return (
-    // The row is a button, so the unpin control cannot be nested inside it —
-    // it sits alongside, and the group hover is what ties them together. The
-    // disclosure is a third button for the same reason, and because folding a
-    // section and navigating into it are different intents.
-    <div
-      className={cn("group relative flex h-7 w-full items-center px-1", item.spaced && "mt-2")}
-    >
-      <div
-        className={cn(
-          // Edge to edge, not an inset pill: the rail is a column of places and
-          // the selected one is the whole width of the column. Selected and
-          // focused are different facts — which mailbox you are in, and where
-          // the keyboard is — so they get different marks.
-          "pointer-events-none absolute inset-0",
-          active && "bg-row-selected",
-          focused && "ring-1 ring-inset ring-accent",
-        )}
-      />
-      {onToggle ? (
-        <button
-          type="button"
-          // Not in the tab order and not a rail index: `←`/`→` operate it, and a
-          // second stop per section would double the length of the walk.
-          tabIndex={-1}
-          aria-label={`${item.expanded ? "Collapse" : "Expand"} ${label}`}
-          onClick={onToggle}
-          className="z-10 flex h-full w-3.5 shrink-0 items-center justify-center text-muted-foreground hover:text-foreground"
-        >
-          {item.expanded ? (
-            <ChevronDown size={11} strokeWidth={2} />
-          ) : (
-            <ChevronRight size={11} strokeWidth={2} />
-          )}
-        </button>
-      ) : (
-        <span className="w-3.5 shrink-0" />
-      )}
+  const rowButton = (
       <button
         type="button"
         data-rail-index={index}
@@ -416,7 +384,6 @@ export function RailRow({
         aria-expanded={item.section ? item.expanded : undefined}
         tabIndex={focused ? 0 : -1}
         onClick={item.activate ?? onToggle}
-        title={title}
         className={cn(
           // Every row is a row, including the ones that head a section. A
           // section heading drawn as a tiny uppercase label reads as a caption,
@@ -454,6 +421,59 @@ export function RailRow({
           </span>
         ) : null}
       </button>
+  );
+  return (
+    // The row is a button, so the unpin control cannot be nested inside it —
+    // it sits alongside, and the group hover is what ties them together. The
+    // disclosure is a third button for the same reason, and because folding a
+    // section and navigating into it are different intents.
+    <div
+      className={cn(
+        "group relative flex w-full items-center px-1",
+        // Inbox sits on the same 32px band as the list header, so the two
+        // columns share a top edge under the title bar. Folder rows stay a
+        // step tighter.
+        surface ? "h-8" : "h-7",
+        item.spaced && "mt-2",
+      )}
+    >
+      <div
+        className={cn(
+          // Edge to edge, not an inset pill: the rail is a column of places and
+          // the selected one is the whole width of the column. Selected and
+          // focused are different facts — which mailbox you are in, and where
+          // the keyboard is — so they get different marks.
+          "pointer-events-none absolute inset-0",
+          active && "bg-row-selected",
+          focused && "ring-1 ring-inset ring-accent",
+        )}
+      />
+      {onToggle ? (
+        <button
+          type="button"
+          // Not in the tab order and not a rail index: `←`/`→` operate it, and a
+          // second stop per section would double the length of the walk.
+          tabIndex={-1}
+          aria-label={`${item.expanded ? "Collapse" : "Expand"} ${label}`}
+          onClick={onToggle}
+          className="z-10 flex h-full w-3.5 shrink-0 items-center justify-center text-muted-foreground hover:text-foreground"
+        >
+          {item.expanded ? (
+            <ChevronDown size={11} strokeWidth={2} />
+          ) : (
+            <ChevronRight size={11} strokeWidth={2} />
+          )}
+        </button>
+      ) : (
+        <span className="w-3.5 shrink-0" />
+      )}
+      {shortcut || title ? (
+        <ShortcutTooltip label={title ?? label} keys={shortcut} side="right">
+          {rowButton}
+        </ShortcutTooltip>
+      ) : (
+        rowButton
+      )}
       {onRemove && (
         <button
           type="button"
