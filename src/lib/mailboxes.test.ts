@@ -5,6 +5,7 @@ import {
   isInboxTab,
   mailboxName,
   mailboxTargets,
+  needsInbox,
   PRIMARY_LABEL,
   railMailboxes,
   withVirtualMailboxes,
@@ -20,7 +21,8 @@ function user(id: string, name: string, accountId: number | null = null): Label 
 
 describe("mailboxName", () => {
   it("translates Gmail's shouting into words", () => {
-    expect(mailboxName(system("INBOX"))).toBe("Inbox");
+    expect(mailboxName(system("INBOX"))).toBe("All");
+    expect(mailboxName(system("PRIMARY"))).toBe("Inbox");
     expect(mailboxName(system("CATEGORY_PROMOTIONS"))).toBe("Promotions");
     expect(mailboxName(system("DRAFT"))).toBe("Drafts");
   });
@@ -37,6 +39,15 @@ describe("mailboxName", () => {
 
   it("accepts a system label whose name, not id, is the Gmail constant", () => {
     expect(mailboxName({ id: "5", accountId: 1, name: "SENT", kind: "system" })).toBe("Sent");
+  });
+});
+
+describe("needsInbox", () => {
+  it("says whether moving to Inbox would change anything", () => {
+    expect(needsInbox(["INBOX"])).toBe(false);
+    expect(needsInbox(["INBOX", "CATEGORY_UPDATES"])).toBe(true);
+    expect(needsInbox(["INBOX", "CATEGORY_FORUMS", "UNREAD"])).toBe(true);
+    expect(needsInbox(["STARRED"])).toBe(true);
   });
 });
 
@@ -160,7 +171,8 @@ describe("mailboxTargets", () => {
 
   it("leaves a unified label alone — it has no one account to name", () => {
     const targets = mailboxTargets([system("INBOX"), user("L1", "Inbox", 1)], accountName);
-    expect(targets.map((t) => t.name)).toEqual(["Inbox", "Inbox · Northwind"]);
+    // INBOX is All, so a user label called Inbox is not the same word twice.
+    expect(targets.map((t) => t.name)).toEqual(["All", "Inbox"]);
   });
 
   it("carries the kind through, so results can say mailbox or label", () => {

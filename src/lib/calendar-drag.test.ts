@@ -6,8 +6,11 @@ import {
   crossesDay,
   dayIndexAt,
   dragLabel,
+  cellIndexAt,
   isCopyDrag,
   isDrag,
+  moveByDays,
+  shiftAllDay,
   moveResult,
   msToPixels,
   nudge,
@@ -242,6 +245,42 @@ describe("isCopyDrag", () => {
 
   it("ignores alt on a resize, which has nothing to copy", () => {
     expect(isCopyDrag("resize", true)).toBe(false);
+  });
+});
+
+describe("moveByDays", () => {
+  it("keeps an all-day event on UTC dates, including across DST", () => {
+    // 8 Mar 2026 is the US spring-forward. Adding a local day to 7 Mar 00:00
+    // UTC lands at 23:00 UTC, which the grid would draw on the 7th.
+    const start = Date.UTC(2026, 2, 7);
+    const end = Date.UTC(2026, 2, 8);
+    expect(shiftAllDay(start, 1)).toBe(Date.UTC(2026, 2, 8));
+    expect(moveByDays({ start, end, allDay: true }, 1)).toEqual({
+      start: Date.UTC(2026, 2, 8),
+      end: Date.UTC(2026, 2, 9),
+    });
+  });
+
+  it("keeps a timed event's wall clock", () => {
+    const moved = moveByDays({ start: NINE, end: NINE + HOUR, allDay: false }, 2);
+    expect(new Date(moved.start).getHours()).toBe(9);
+    expect(new Date(moved.start).getDate()).toBe(9);
+    expect(moved.end - moved.start).toBe(HOUR);
+  });
+});
+
+describe("cellIndexAt", () => {
+  const bounds = { left: 0, top: 0, width: 700, height: 600 };
+
+  it("reads a 7-column month grid", () => {
+    expect(cellIndexAt(50, 50, bounds, 7, 6)).toBe(0);
+    expect(cellIndexAt(150, 50, bounds, 7, 6)).toBe(1);
+    expect(cellIndexAt(50, 150, bounds, 7, 6)).toBe(7);
+  });
+
+  it("clamps off-grid pointers to an edge cell", () => {
+    expect(cellIndexAt(-10, -10, bounds, 7, 6)).toBe(0);
+    expect(cellIndexAt(800, 700, bounds, 7, 6)).toBe(41);
   });
 });
 

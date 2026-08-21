@@ -669,6 +669,7 @@ export function EventChip({
   showTime = false,
   style,
   onSelect,
+  onGrab,
   blockRef,
 }: {
   event: CalendarEvent;
@@ -683,6 +684,8 @@ export function EventChip({
   showTime?: boolean;
   style?: CSSProperties;
   onSelect: () => void;
+  /** Pointer went down on the chip — month and all-day bars drag from here. */
+  onGrab?: (event: ReactPointerEvent) => void;
   blockRef?: (node: HTMLButtonElement | null) => void;
 }) {
   const painted = paintFor(color, tone, { dark, past });
@@ -697,10 +700,12 @@ export function EventChip({
       data-event-id={event.id}
       aria-current={selected ? "true" : undefined}
       onClick={onSelect}
+      onPointerDown={onGrab}
       title={event.title}
       className={cn(
         "relative flex items-center gap-1 overflow-hidden text-left",
         "transition-[box-shadow,background-color] duration-[120ms] ease-out motion-reduce:transition-none",
+        onGrab && "cursor-grab active:cursor-grabbing",
       )}
       style={{
         borderRadius: BLOCK_RADIUS,
@@ -723,6 +728,7 @@ export function EventChip({
         // no second line for the weight to be contrasted against — so it takes
         // the same weight the title takes everywhere else on the grid.
         fontWeight: 600,
+        touchAction: onGrab ? "none" : undefined,
         ...style,
       }}
     >

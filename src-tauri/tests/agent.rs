@@ -2689,6 +2689,7 @@ fn the_event_schema_no_longer_describes_a_shape_that_is_refused() {
     assert_eq!(draft["recurrence"]["items"]["type"], "string");
     assert_eq!(draft["reminderMinutes"]["type"], "array");
     assert_eq!(draft["reminderMinutes"]["items"]["type"], "integer");
+    assert_eq!(draft["transparency"]["enum"], json!(["opaque", "transparent"]));
 
     // Both spellings of each reach the same command, so a model writing the
     // singular does not lose a turn to a serde error.

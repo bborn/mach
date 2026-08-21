@@ -301,8 +301,8 @@ export function paintFor(
   return paint;
 }
 
-/** Map an RSVP (and whether the event has already happened) onto a tone. */
-export function toneFor(rsvp: string | undefined): EventTone {
+/** Map an RSVP — and, for an owned event, whether it defends the time — onto a tone. */
+export function toneFor(rsvp: string | undefined, transparency?: string): EventTone {
   switch (rsvp) {
     case "needsAction":
       return "outline";
@@ -311,7 +311,9 @@ export function toneFor(rsvp: string | undefined): EventTone {
     case "declined":
       return "declined";
     default:
-      // No RSVP at all means it is not an invitation: you own it.
-      return "solid";
+      // Free events share the unanswered treatment: they occupy the slot
+      // without defending it. RSVP still wins — a declined invite that is
+      // also free stays struck through.
+      return transparency === "transparent" ? "outline" : "solid";
   }
 }

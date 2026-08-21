@@ -53,6 +53,7 @@ const SAMPLES: Record<CommandKind, Command> = {
   markRead: { kind: "markRead", threadIds: [1], read: true },
   star: { kind: "star", threadIds: [1], starred: true },
   label: { kind: "label", threadIds: [1], labelId: "Label_1", add: true },
+  moveToInbox: { kind: "moveToInbox", threadIds: [1] },
   reportSpam: { kind: "reportSpam", threadIds: [1] },
   notSpam: { kind: "notSpam", threadIds: [1] },
   trash: { kind: "trash", threadIds: [1] },

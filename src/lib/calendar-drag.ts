@@ -20,6 +20,7 @@
  *     are separate functions for that reason.
  */
 
+import type { EventId } from "@/types";
 import { DEFAULT_EVENT_MINUTES, HOUR_HEIGHT, SNAP_MINUTES, snapTime } from "./calendar-geometry";
 import { DAY, HOUR, MINUTE, addDays, startOfDay } from "./time";
 
@@ -43,6 +44,17 @@ export interface DragOrigin {
 export interface DragOutcome {
   start: number;
   end: number;
+}
+
+/** What a finished drag asks the calendar to save. */
+export interface EventMove {
+  eventId: EventId;
+  start: number;
+  end: number;
+  /** Alt was held: leave the original where it is and create a copy here. */
+  copy: boolean;
+  /** The source was all-day; the write must stay all-day. */
+  allDay: boolean;
 }
 
 /** Pixels of vertical travel, as milliseconds. */
@@ -239,6 +251,68 @@ export function crossesDay(outcome: DragOutcome, dayStart: number): boolean {
  */
 export function isCopyDrag(kind: DragKind, altKey: boolean): boolean {
   return kind === "move" && altKey;
+}
+
+/**
+ * Shift an all-day instant by whole UTC calendar days.
+ *
+ * All-day rows are pinned to UTC midnight. `shiftDays` walks the *local*
+ * calendar, so across a DST boundary a Tuesday holiday becomes 23:00 UTC and
+ * the grid draws it on Monday. Adding to the UTC date keeps the day Google
+ * named.
+ */
+export function shiftAllDay(ts: number, days: number): number {
+  if (days === 0) return ts;
+  const d = new Date(ts);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + days);
+}
+
+/**
+ * Slide an event by whole days, preserving duration and all-day-ness.
+ *
+ * Month-grid drags and all-day week drags have no hour to aim at — only a
+ * column — so they go through here rather than through `moveResult`.
+ */
+export function moveByDays(
+  origin: { start: number; end: number; allDay: boolean },
+  dayDelta: number,
+): DragOutcome {
+  if (dayDelta === 0) return { start: origin.start, end: origin.end };
+  if (origin.allDay) {
+    return {
+      start: shiftAllDay(origin.start, dayDelta),
+      end: shiftAllDay(origin.end, dayDelta),
+    };
+  }
+  return {
+    start: shiftDays(origin.start, dayDelta),
+    end: shiftDays(origin.end, dayDelta),
+  };
+}
+
+/**
+ * Which cell of a row-major day grid the pointer is in.
+ *
+ * Clamped: dragging off the month parks on the nearest edge rather than
+ * inventing a week that is not rendered.
+ */
+export function cellIndexAt(
+  clientX: number,
+  clientY: number,
+  bounds: { left: number; top: number; width: number; height: number },
+  columns: number,
+  rows: number,
+): number {
+  if (columns <= 0 || rows <= 0 || bounds.width <= 0 || bounds.height <= 0) return 0;
+  const col = Math.min(
+    Math.max(Math.floor(((clientX - bounds.left) / bounds.width) * columns), 0),
+    columns - 1,
+  );
+  const row = Math.min(
+    Math.max(Math.floor(((clientY - bounds.top) / bounds.height) * rows), 0),
+    rows - 1,
+  );
+  return row * columns + col;
 }
 
 /** Has the pointer moved far enough to count as a drag rather than a click? */

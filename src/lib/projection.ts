@@ -79,7 +79,7 @@ import {
   type EventPatch,
   type MailCommand,
 } from "./data";
-import { isBulk, isInboxTab, PRIMARY_LABEL } from "./mailboxes";
+import { BULK_CATEGORIES, isBulk, isInboxTab, PRIMARY_LABEL } from "./mailboxes";
 
 /** Gmail's system labels this module names directly, as `commands::mail` does. */
 export const INBOX = "INBOX";
@@ -227,23 +227,26 @@ function guessFor(
         : { add: [], remove: [command.labelId] };
 
     /*
-     * The three that undo dispatches, and the only three whose target is a set.
+     * The ones whose target is a set.
      *
      * `restore` carries the labels the thread actually had before the action
      * being taken back — that is what makes undo exact rather than a guess at
      * `INBOX`. With no restore at all the fallback is what the backend falls
-     * back to: put `INBOX` on, take `TRASH` (or `SPAM`) off.
+     * back to: put `INBOX` on, take `TRASH` / `SPAM` / the bulk tabs off.
      */
     case "unarchive":
     case "notSpam":
-    case "untrash": {
+    case "untrash":
+    case "moveToInbox": {
       const state = command.restore?.find((s) => s.threadId === id);
       if (!state) {
-        return command.kind === "untrash"
-          ? { add: [INBOX], remove: [TRASH] }
-          : command.kind === "notSpam"
-            ? { add: [INBOX], remove: [SPAM] }
-            : { add: [INBOX], remove: [] };
+        return command.kind === "moveToInbox"
+          ? { add: [INBOX], remove: [...BULK_CATEGORIES] }
+          : command.kind === "untrash"
+            ? { add: [INBOX], remove: [TRASH] }
+            : command.kind === "notSpam"
+              ? { add: [INBOX], remove: [SPAM] }
+              : { add: [INBOX], remove: [] };
       }
       /*
        * The label set as the command layer will write it, verbatim.
@@ -362,8 +365,14 @@ export function leavesMailbox(guess: ThreadGuess, labelId: LabelId): boolean {
   // same question of SQLite.
   if (labelId === ARCHIVE) return guess.add.some((l) => MEMBERSHIP.includes(l));
   if (guess.remove.includes(labelId)) return true;
-  // Primary and Promotions are inbox tabs: archive takes INBOX off and the
-  // category stays, so the tab's own label never appears in `remove`.
+  // Primary is inbox minus bulk. Archive takes INBOX off; putting a bulk tab
+  // back on (undo of move-to-Inbox) takes Primary off without touching INBOX.
+  if (labelId === PRIMARY_LABEL) {
+    if (guess.remove.includes(INBOX)) return true;
+    return guess.add.some((l) => (BULK_CATEGORIES as readonly string[]).includes(l));
+  }
+  // Promotions is an inbox tab: archive takes INBOX off and the category stays,
+  // so the tab's own label never appears in `remove`.
   return isInboxTab(labelId) && guess.remove.includes(INBOX);
 }
 
@@ -393,10 +402,16 @@ export function entersMailbox(
   // out of everywhere else is what puts it in the archive.
   if (labelId === ARCHIVE) return guess.remove.some((l) => MEMBERSHIP.includes(l));
   if (guess.add.includes(labelId)) return true;
+  if (labelId === PRIMARY_LABEL) {
+    const inbox = guess.add.includes(INBOX) || (labels ?? []).includes(INBOX);
+    if (!inbox) return false;
+    // Unarchive of mail that is not bulk: INBOX comes back, Primary comes back.
+    if (guess.add.includes(INBOX) && !isBulk(labels ?? [])) return true;
+    // Move to Inbox: the bulk tabs come off and INBOX stays (or is added).
+    return guess.remove.some((l) => (BULK_CATEGORIES as readonly string[]).includes(l));
+  }
   if (isInboxTab(labelId) && guess.add.includes(INBOX)) {
     if (labelId === INBOX) return true;
-    // Primary is inbox minus bulk, not mail tagged CATEGORY_PERSONAL.
-    if (labelId === PRIMARY_LABEL) return !isBulk(labels ?? []);
     // Promotions: only if the category is still on the row.
     return labels?.includes(labelId) ?? false;
   }
@@ -600,6 +615,7 @@ export type EventFields = Partial<
     | "rsvp"
     | "calendarId"
     | "accountId"
+    | "transparency"
   >
 >;
 
@@ -694,6 +710,7 @@ function patchFields(patch: EventPatch): EventFields | null {
   if (patch.description !== undefined) fields.description = patch.description;
   if (patch.attendees !== undefined) fields.attendees = patch.attendees;
   if (patch.recurrence !== undefined) fields.recurrence = patch.recurrence;
+  if (patch.transparency !== undefined) fields.transparency = patch.transparency;
   return Object.keys(fields).length > 0 ? fields : null;
 }
 
@@ -744,6 +761,7 @@ export function placeholderEvent(
     description: draft.description,
     attendees: draft.attendees,
     recurrence: draft.recurrence.length > 0 ? draft.recurrence : undefined,
+    transparency: draft.transparency,
   };
 }
 

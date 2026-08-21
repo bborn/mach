@@ -355,6 +355,12 @@ describe("a rail row", () => {
     expect(items.find((i) => i.key === "mailbox:SENT")?.shortcut).toBe("g t");
   });
 
+  it("puts All's jump on the All row, not on Inbox", () => {
+    const items = build({ mailboxes: [mailbox("INBOX", "All"), ...MAILBOXES] });
+    expect(items.find((i) => i.key === "mailbox:INBOX")?.shortcut).toBe("g shift+i");
+    expect(items.find((i) => i.key === "section:inbox")?.shortcut).toBe("g i");
+  });
+
   it("puts the keyboard's cursor in the tab order and nothing else", () => {
     expect(row(build()[0]!, true)).toContain('tabindex="0"');
     expect(row(build()[0]!, false)).toContain('tabindex="-1"');

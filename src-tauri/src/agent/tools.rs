@@ -148,6 +148,7 @@ pub const AUTO_COMMANDS: &[&str] = &[
     "markRead",
     "star",
     "label",
+    "moveToInbox",
     "notSpam",
     "trash",
     "untrash",
@@ -402,6 +403,11 @@ fn event_object(is_draft: bool) -> Value {
                 "type": "string",
                 "enum": ["meet", "none"],
                 "description": "meet adds a Google Meet link; none removes the call.",
+            },
+            "transparency": {
+                "type": "string",
+                "enum": ["opaque", "transparent"],
+                "description": "opaque is busy (the default); transparent is free.",
             },
             "notify": {
                 "type": "string",
@@ -1873,8 +1879,8 @@ mod policy_tests {
         assert_eq!(
             AUTO_COMMANDS,
             &[
-                "archive", "unarchive", "markRead", "star", "label", "notSpam", "trash",
-                "untrash", "snooze", "unsnooze"
+                "archive", "unarchive", "markRead", "star", "label", "moveToInbox", "notSpam",
+                "trash", "untrash", "snooze", "unsnooze"
             ]
         );
     }

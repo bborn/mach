@@ -40,12 +40,23 @@ const ICONS: Record<PaletteResultKind, typeof Mail> = {
 const COMMANDS: PaletteCommand[] = [
   { id: "compose", title: "New message", hint: "C", keywords: "compose write new mail send" },
   { id: "go-mail", title: "Go to mail", hint: "G then M", keywords: "inbox mail" },
+  { id: "go-all", title: "Go to All", hint: "G then ⇧I", keywords: "all inbox catch-all updates forums promotions bulk" },
   { id: "go-calendar", title: "Go to calendar", hint: "G then C", keywords: "calendar week" },
   { id: "view-day", title: "Calendar: day view", hint: "1", keywords: "day" },
   { id: "view-week", title: "Calendar: week view", hint: "2", keywords: "week" },
   { id: "view-month", title: "Calendar: month view", hint: "3", keywords: "month" },
   { id: "today", title: "Jump to today", hint: "T", keywords: "now today" },
   { id: "archive", title: "Archive conversation", hint: "E", keywords: "archive done" },
+  {
+    id: "move-to-inbox",
+    title: "Move to Inbox",
+    keywords: "inbox primary tab categorize updates forums promotions social github",
+  },
+  {
+    id: "always-inbox",
+    title: "Always Inbox from this sender",
+    keywords: "filter inbox always forever sender github updates forums",
+  },
   { id: "snooze", title: "Snooze conversation", hint: "B", keywords: "snooze later" },
   {
     id: "report-spam",
@@ -208,6 +219,9 @@ export function CommandPalette() {
           );
         case "go-mail":
           return actions.setMode("mail");
+        case "go-all":
+          actions.setMode("mail");
+          return dispatch({ type: "label", labelId: "INBOX" });
         case "go-calendar":
           return actions.setMode("calendar");
         case "view-day":
@@ -223,6 +237,10 @@ export function CommandPalette() {
           return actions.goToday();
         case "archive":
           return actions.archiveSelected();
+        case "move-to-inbox":
+          return actions.moveToInboxSelected();
+        case "always-inbox":
+          return actions.alwaysInboxFromSender();
         case "report-spam":
           return actions.reportSpamSelected();
         // Reads the open conversation for itself, exactly as the key does, and

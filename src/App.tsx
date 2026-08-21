@@ -3,7 +3,7 @@ import { KeymapProvider, useKeyBindings, useKeymap } from "@/hooks/useKeymap";
 import type { KeyBinding } from "@/lib/keymap";
 import { connectQaBridge } from "@/lib/qa-bridge";
 import type { LabelId } from "@/types";
-import { inboxLabelId } from "@/lib/mailboxes";
+import { hasBulkTabs, inboxLabelId } from "@/lib/mailboxes";
 import { MachProvider, useMach } from "@/hooks/useMach";
 import { cn } from "@/lib/utils";
 import { StatusBar } from "@/components/chrome/StatusBar";
@@ -52,7 +52,7 @@ export default function App() {
 }
 
 function Shell() {
-  const { ui, actions, dispatch } = useMach();
+  const { ui, actions, dispatch, labels } = useMach();
   const keymap = useKeymap();
 
   /**
@@ -236,6 +236,18 @@ function Shell() {
       group: "Go to",
       description: "Inbox",
       handler: () => goToMailbox(inboxLabelId()),
+    },
+    {
+      // All is the rest of the inbox — INBOX including Promotions, Updates,
+      // the lot. Gmail has no jump for that cut: `g a` is All Mail, which
+      // here is Archive. Same letter as Inbox, shifted, so the two stay a
+      // pair. Hidden when Google has no bulk tabs, because then All and
+      // Inbox are the same query.
+      keys: "g shift+i",
+      group: "Go to",
+      description: "All",
+      when: () => hasBulkTabs(labels),
+      handler: () => goToMailbox("INBOX"),
     },
     {
       keys: "g s",

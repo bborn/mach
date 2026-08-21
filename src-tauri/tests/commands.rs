@@ -428,6 +428,132 @@ async fn adding_and_removing_a_label_are_inverses_of_each_other() {
     assert_eq!(thread_labels(&db, thread), sorted(&["INBOX", "Label_7"]));
 }
 
+// ======================================================================= inbox
+//
+// Mach's Inbox is Gmail's Primary: INBOX minus the bulk tabs. GitHub mail
+// arrives with CATEGORY_UPDATES (and often CATEGORY_FORUMS) still on, so it
+// sits in All and not Inbox until those come off.
+
+#[tokio::test]
+async fn moving_to_inbox_strips_bulk_tabs_and_keeps_inbox() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(
+        &db,
+        account,
+        "t1",
+        &["INBOX", "CATEGORY_UPDATES", "CATEGORY_FORUMS", "UNREAD"],
+    );
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MoveToInbox {
+            thread_ids: vec![thread],
+            restore: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(result.message, "Moved 1 conversation to Inbox");
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX", "UNREAD"]));
+
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(ids_of(&body, "addLabelIds"), Vec::<String>::new());
+    assert_eq!(
+        ids_of(&body, "removeLabelIds"),
+        vec!["CATEGORY_FORUMS", "CATEGORY_UPDATES"]
+    );
+}
+
+#[tokio::test]
+async fn moving_to_inbox_from_archive_adds_inbox() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["CATEGORY_UPDATES"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    d.execute(Command::MoveToInbox {
+        thread_ids: vec![thread],
+        restore: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX"]));
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(ids_of(&body, "addLabelIds"), vec!["INBOX"]);
+    assert_eq!(ids_of(&body, "removeLabelIds"), vec!["CATEGORY_UPDATES"]);
+}
+
+#[tokio::test]
+async fn undoing_move_to_inbox_restores_the_bulk_tabs() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(
+        &db,
+        account,
+        "t1",
+        &["INBOX", "CATEGORY_UPDATES", "CATEGORY_FORUMS"],
+    );
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MoveToInbox {
+            thread_ids: vec![thread],
+            restore: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.undo,
+        Some(Command::MoveToInbox {
+            thread_ids: vec![thread],
+            restore: vec![ThreadLabelState {
+                thread_id: thread,
+                label_ids: sorted(&["CATEGORY_FORUMS", "CATEGORY_UPDATES", "INBOX"]),
+                is_unread: false,
+            }],
+        })
+    );
+
+    d.execute(result.undo.unwrap()).await.unwrap();
+    assert_eq!(
+        thread_labels(&db, thread),
+        sorted(&["CATEGORY_FORUMS", "CATEGORY_UPDATES", "INBOX"]),
+    );
+}
+
+#[tokio::test]
+async fn moving_to_inbox_is_a_noop_when_already_there() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let thread = seed_thread(&db, account, "t1", &["INBOX", "STARRED"]);
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::MoveToInbox {
+            thread_ids: vec![thread],
+            restore: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.undo, None);
+    assert_eq!(thread_labels(&db, thread), sorted(&["INBOX", "STARRED"]));
+    assert!(transport.requests().is_empty());
+}
+
 #[tokio::test]
 async fn trashing_one_message_uses_the_trash_endpoint() {
     let db = Db::open_in_memory().unwrap();
@@ -1122,7 +1248,13 @@ async fn ids_named_to_gmail(make: &dyn Fn(i64) -> Command) -> (Vec<String>, bool
     let db = Db::open_in_memory().unwrap();
     let account = seed_account(&db, "a@example.com");
     seed_label(&db, account, "Label_snooze", "Mach/Snoozed");
-    let thread = seed_thread_with_messages(&db, account, "t1", &["INBOX", "UNREAD"], 2);
+    let thread = seed_thread_with_messages(
+        &db,
+        account,
+        "t1",
+        &["INBOX", "UNREAD", "CATEGORY_UPDATES"],
+        2,
+    );
     seed_unsent_message(&db, account, thread, "mach-draft:d1", true);
     seed_unsent_message(&db, account, thread, "mach-outbox:o1", false);
 
@@ -1185,6 +1317,13 @@ async fn no_mail_command_names_an_unsent_message_to_gmail() {
                 thread_ids: vec![t],
                 label_id: "Label_7".into(),
                 add: true,
+            }),
+        ),
+        (
+            "move to inbox",
+            Box::new(|t| Command::MoveToInbox {
+                thread_ids: vec![t],
+                restore: Vec::new(),
             }),
         ),
     ];
@@ -2174,13 +2313,13 @@ fn every_command_variant_appears_in_the_catalogue() {
     let catalogue = Command::catalogue();
     let kinds: Vec<&str> = catalogue.iter().map(|spec| spec.kind).collect();
     for expected in [
-        "archive", "unarchive", "markRead", "star", "label", "reportSpam", "notSpam", "trash",
-        "untrash", "snooze", "unsnooze", "rsvp", "createEvent", "updateEvent", "deleteEvent",
-        "moveEvent", "unsubscribe",
+        "archive", "unarchive", "markRead", "star", "label", "moveToInbox", "reportSpam",
+        "notSpam", "trash", "untrash", "snooze", "unsnooze", "rsvp", "createEvent",
+        "updateEvent", "deleteEvent", "moveEvent", "unsubscribe",
     ] {
         assert!(kinds.contains(&expected), "{expected} missing from catalogue");
     }
-    assert_eq!(kinds.len(), 17);
+    assert_eq!(kinds.len(), 18);
     // Every spec is serialisable, which is what makes it an agent tool schema.
     let json = serde_json::to_value(catalogue).unwrap();
     assert!(json.is_array());
@@ -3386,6 +3525,97 @@ async fn a_reminder_edit_inverts_only_when_the_prior_state_can_be_spoken() {
         .find(|e| e.id == defaulted)
         .unwrap();
     assert_eq!(stored.reminders.unwrap().overrides[0].minutes, 30);
+}
+
+#[tokio::test]
+async fn a_transparency_edit_writes_the_column_and_inverts() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+    let event_id = seed_event(
+        &db,
+        account,
+        NewEvent {
+            calendar_id: "primary".into(),
+            google_event_id: "evt-1".into(),
+            title: "Standup".into(),
+            start_ts: NOON,
+            end_ts: NOON + HOUR_MS,
+            status: "confirmed".into(),
+            ..Default::default()
+        },
+    );
+
+    let transport = FakeTransport::always_ok();
+    let d = dispatcher(&db, transport.clone());
+    let result = d
+        .execute(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                transparency: Some("transparent".into()),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(
+        all_events(&db)[0].transparency.as_deref(),
+        Some("transparent")
+    );
+
+    let body = body_json(&transport.requests()[0]);
+    assert_eq!(body["transparency"], "transparent");
+    assert!(body["summary"].is_null(), "an untouched field was sent");
+
+    // A missing column reads as busy, so the inverse of "make this free" is
+    // an explicit opaque rather than a silent omit.
+    assert_eq!(
+        result.undo,
+        Some(Command::UpdateEvent {
+            event_id,
+            patch: EventPatch {
+                transparency: Some("opaque".into()),
+                ..Default::default()
+            },
+            scope: EventScope::This,
+        })
+    );
+}
+
+#[tokio::test]
+async fn creating_a_free_event_sends_transparency() {
+    let db = Db::open_in_memory().unwrap();
+    let account = seed_account(&db, "a@example.com");
+
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        200,
+        r#"{"id":"evt-free"}"#,
+    ))]);
+    let d = dispatcher(&db, transport.clone());
+
+    let result = d
+        .execute(Command::CreateEvent {
+            account_id: account,
+            calendar_id: "primary".into(),
+            draft: EventDraft {
+                title: "Out of office".into(),
+                start_ts: NOON,
+                end_ts: NOON + HOUR_MS,
+                transparency: Some("transparent".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert_eq!(
+        all_events(&db)[0].transparency.as_deref(),
+        Some("transparent")
+    );
+    assert_eq!(body_json(&transport.requests()[0])["transparency"], "transparent");
 }
 
 #[tokio::test]

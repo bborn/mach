@@ -156,6 +156,10 @@ pub struct EventDraft {
     /// Ask Google to mint a Meet link for this event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conferencing: Option<Conferencing>,
+    /// `opaque` (busy) or `transparent` (free). `None` leaves Google's default,
+    /// which is busy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparency: Option<String>,
     /// Who hears about it. Absent means [`Notify::Guests`] — see [`Notify`].
     ///
     /// It rides on the draft rather than on [`Command::CreateEvent`] because the
@@ -191,6 +195,8 @@ pub struct EventPatch {
     pub reminder_minutes: Option<Vec<i64>>,
     /// Add or remove the video call. See [`Conferencing`].
     pub conferencing: Option<Conferencing>,
+    /// `opaque` (busy) or `transparent` (free).
+    pub transparency: Option<String>,
     /// Who hears about it. Absent means [`Notify::Guests`] — see [`Notify`].
     pub notify: Option<Notify>,
 }
@@ -218,6 +224,8 @@ impl EventPatch {
     /// The time, the place, the name, the call and the guest list are all things
     /// a person acts on. A reminder offset is between the organizer and their own
     /// phone, and Google itself does not treat it as an update worth mailing.
+    /// Busy-versus-free is the same: it changes how *your* calendar reads, not
+    /// anyone else's invitation.
     pub fn guests_would_care(&self) -> bool {
         self.title.is_some()
             || self.description.is_some()
@@ -280,6 +288,31 @@ pub enum Command {
         thread_ids: Vec<i64>,
         label_id: String,
         add: bool,
+    },
+
+    /// Gmail's "Move to Primary": INBOX on, bulk category tabs off.
+    ///
+    /// A command of its own rather than a handful of [`Command::Label`]s, for
+    /// the same three reasons [`Command::ReportSpam`] is not `Label { SPAM }`:
+    ///
+    ///  * `Label` moves **one** label. Landing in Mach's Inbox is two things —
+    ///    keep `INBOX`, strip Promotions / Social / Updates / Forums — and the
+    ///    composition would be several remote calls and several undo entries
+    ///    for one keystroke.
+    ///  * Between those calls a thread can sit in Updates *and* Primary, and a
+    ///    failure of the second leaves it there.
+    ///  * The inverse of removing `CATEGORY_UPDATES` is adding it back, which
+    ///    is only faithful if that was the tab it came from. A GitHub thread
+    ///    often carries Forums *and* Updates; the inverse names the exact
+    ///    prior set, the way [`Command::NotSpam`] does.
+    ///
+    /// The plain form (no `restore`) is what a user dispatches. Undo produces
+    /// the restore form.
+    #[serde(rename_all = "camelCase")]
+    MoveToInbox {
+        thread_ids: Vec<i64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restore: Vec<ThreadLabelState>,
     },
 
     /// Report as spam: add SPAM, drop INBOX. Gmail's `!`.
@@ -455,6 +488,7 @@ impl Command {
             Command::MarkRead { .. } => "markRead",
             Command::Star { .. } => "star",
             Command::Label { .. } => "label",
+            Command::MoveToInbox { .. } => "moveToInbox",
             Command::ReportSpam { .. } => "reportSpam",
             Command::NotSpam { .. } => "notSpam",
             Command::Trash { .. } => "trash",
@@ -479,6 +513,7 @@ impl Command {
             | Command::MarkRead { thread_ids, .. }
             | Command::Star { thread_ids, .. }
             | Command::Label { thread_ids, .. }
+            | Command::MoveToInbox { thread_ids, .. }
             | Command::ReportSpam { thread_ids }
             | Command::NotSpam { thread_ids, .. }
             | Command::Trash { thread_ids }

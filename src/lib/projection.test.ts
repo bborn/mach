@@ -117,6 +117,40 @@ describe("what a command is known to do", () => {
     });
   });
 
+  it("moves to Inbox by adding INBOX and stripping bulk tabs", () => {
+    expect(project({ kind: "moveToInbox", threadIds: [1] }, [])).toEqual({
+      1: {
+        add: ["INBOX"],
+        remove: [
+          "CATEGORY_PROMOTIONS",
+          "CATEGORY_SOCIAL",
+          "CATEGORY_UPDATES",
+          "CATEGORY_FORUMS",
+        ],
+      },
+    });
+    const guess = project({ kind: "moveToInbox", threadIds: [1] }, [])![1]!;
+    expect(entersMailbox(guess, "PRIMARY", ["INBOX", "CATEGORY_UPDATES"])).toBe(true);
+    expect(leavesMailbox(guess, "INBOX")).toBe(false);
+    expect(leavesMailbox(guess, "CATEGORY_UPDATES")).toBe(true);
+
+    const restored = project(
+      {
+        kind: "moveToInbox",
+        threadIds: [1],
+        restore: [
+          {
+            threadId: 1,
+            labelIds: ["INBOX", "CATEGORY_UPDATES", "CATEGORY_FORUMS"],
+            isUnread: true,
+          },
+        ],
+      },
+      [{ id: 1, labelIds: ["INBOX"], unread: true }],
+    )![1]!;
+    expect(leavesMailbox(restored, "PRIMARY")).toBe(true);
+  });
+
   it("gives a reported conversation SPAM and takes INBOX away", () => {
     expect(project({ kind: "reportSpam", threadIds: [1] }, [])).toEqual({
       1: { add: ["SPAM"], remove: ["INBOX"] },
@@ -677,6 +711,7 @@ describe("a block drawn for a create", () => {
           isAllDay: false,
           attendees: [{ name: "Someone", email: "someone@example.test" }],
           recurrence: [],
+          transparency: "transparent",
         },
       },
       id,
@@ -688,6 +723,7 @@ describe("a block drawn for a create", () => {
       title: "Standup",
       start: NOON,
       end: NOON + 900_000,
+      transparency: "transparent",
     });
   });
 

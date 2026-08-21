@@ -137,6 +137,14 @@ pub const SPAM: &str = "SPAM";
 pub const TRASH: &str = "TRASH";
 pub const DRAFT: &str = "DRAFT";
 
+/// Gmail's bulk tabs. Mach's Inbox is INBOX minus these — see `mailboxes.ts`.
+const BULK_CATEGORIES: [&str; 4] = [
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS",
+];
+
 /// The Gmail user label Mach applies to snoozed threads.
 pub const DEFAULT_SNOOZE_LABEL: &str = "Mach/Snoozed";
 
@@ -421,6 +429,23 @@ async fn build_plans(
                 )
             }
 
+            Command::MoveToInbox { restore, .. } => {
+                match restore_state(restore, snap.thread_id) {
+                    Some(state) => (
+                        normalise(state.label_ids.clone()),
+                        state.is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Leave,
+                    ),
+                    None => (
+                        without(&with(&prior, &[INBOX]), &BULK_CATEGORIES),
+                        snap.is_unread,
+                        RemoteOp::Modify,
+                        SnoozeAction::Leave,
+                    ),
+                }
+            }
+
             // Exactly what Gmail's own Report spam sends: SPAM on, INBOX off,
             // in one `batchModify`. Nothing else about the thread is touched —
             // a starred, labelled conversation keeps both — which is what makes
@@ -686,6 +711,13 @@ fn inverse(command: &Command, changed: &[&ThreadPlan]) -> Option<Command> {
             label_id: label_id.clone(),
             add: !add,
         },
+        // Both directions invert to the restore form: putting the bulk tabs
+        // back is only faithful if they were the ones that were there, and
+        // taking INBOX off again is only faithful if the forward added it.
+        Command::MoveToInbox { .. } => Command::MoveToInbox {
+            thread_ids,
+            restore: priors,
+        },
         Command::Trash { .. } | Command::Untrash { .. } => Command::Untrash {
             thread_ids,
             restore: priors,
@@ -754,6 +786,13 @@ fn describe(command: &Command, n: usize) -> String {
         Command::Star { starred: false, .. } => format!("Unstarred {subject}"),
         Command::Label { add: true, .. } => format!("Labelled {subject}"),
         Command::Label { add: false, .. } => format!("Removed the label from {subject}"),
+        Command::MoveToInbox { restore, .. } => {
+            if restore.is_empty() {
+                format!("Moved {subject} to Inbox")
+            } else {
+                format!("Moved {subject} back")
+            }
+        }
         Command::ReportSpam { .. } => format!("Reported {subject} as spam"),
         Command::NotSpam { .. } => format!("Marked {subject} not spam"),
         Command::Trash { .. } => format!("Trashed {subject}"),

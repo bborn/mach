@@ -80,6 +80,7 @@ import type { MergedEvent } from "@/lib/calendar-merge";
 import {
   REMINDER_CHOICES,
   RECURRENCE_CHOICES,
+  SHOW_AS_CHOICES,
   describeReminders,
   describeRules,
   emptyForm,
@@ -496,6 +497,10 @@ export function EventModal({
         ? [{ value: "series", label: "Repeats (rule kept in Google)" }, ...repeatChoices]
         : repeatChoices;
 
+  const showAsItems = SHOW_AS_CHOICES.map((choice) => ({
+    value: choice.id,
+    label: choice.label,
+  }));
   const alertChoices = REMINDER_CHOICES.map((choice) => ({
     value: choice.id,
     label: choice.label,
@@ -527,7 +532,7 @@ export function EventModal({
         {/* Two words that change what the event means rather than how it looks:
             whether it defends the time, and whether anyone sharing this calendar
             can read it. Shown only when they are not the default. */}
-        {event?.transparency === "transparent" && (
+        {form.transparency === "transparent" && (
           <span className="text-micro text-faint-foreground">free</span>
         )}
         {(event?.visibility === "private" || event?.visibility === "confidential") && (
@@ -717,6 +722,29 @@ export function EventModal({
             {form.reminderMinutes === null && event !== null && reminderMinutesOf(event) !== null && (
               <FieldDescription>“Calendar default” can only be restored in Google Calendar</FieldDescription>
             )}
+          </Field>
+
+          <Field orientation="row">
+            <FieldLabel htmlFor={ids.showAs}>Show as</FieldLabel>
+            <Select
+              items={showAsItems}
+              value={form.transparency}
+              disabled={!canEdit}
+              onValueChange={(value) => {
+                if (value !== null) set({ transparency: value as EventForm["transparency"] });
+              }}
+            >
+              <SelectTrigger id={ids.showAs} aria-label="Show as">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {showAsItems.map((choice) => (
+                  <SelectItem key={choice.value} value={choice.value}>
+                    {choice.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </Field>
 
           {/* The call comes before the room. A meeting you cannot join from is
@@ -1081,7 +1109,9 @@ export function EventModal({
                     glance. */}
                 {busy && <LoaderCircle size={11} strokeWidth={1.75} className="animate-spin" />}
                 {event ? "Save" : "Create"}
-                <Kbd keys="mod+enter" className="border-none bg-transparent px-0" />
+                {/* Naked glyph, not a chip: Kbd's muted ink is for a raised
+                    surface, and it disappears on accent. Inherit the button. */}
+                <Kbd keys="mod+enter" className="border-none bg-transparent px-0 text-current" />
               </Button>
             )}
           </div>
@@ -1347,6 +1377,7 @@ function useFieldIds() {
     endDate: `${base}-end-date`,
     repeat: `${base}-repeat`,
     alert: `${base}-alert`,
+    showAs: `${base}-show-as`,
     location: `${base}-location`,
     attendees: `${base}-attendees`,
     calendar: `${base}-calendar`,

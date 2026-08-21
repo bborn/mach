@@ -24,7 +24,7 @@ import type {
   CalendarId,
   Participant,
 } from "@/types";
-import type { EventDraft, EventPatch, Notify } from "./data";
+import type { EventDraft, EventPatch, Notify, Transparency } from "./data";
 import { DEFAULT_EVENT_MINUTES } from "./calendar-geometry";
 import { DAY, MINUTE, startOfDay } from "./time";
 
@@ -155,6 +155,18 @@ export function reminderMinutesOf(event: CalendarEvent): number[] | null {
   return reminders.overrides.map((r) => r.minutes);
 }
 
+export type { Transparency } from "./data";
+
+export const SHOW_AS_CHOICES: { id: Transparency; label: string }[] = [
+  { id: "opaque", label: "Busy" },
+  { id: "transparent", label: "Free" },
+];
+
+/** Busy, unless Google (or a previous save) said this one is free. */
+export function transparencyOf(event: { transparency?: string }): Transparency {
+  return event.transparency === "transparent" ? "transparent" : "opaque";
+}
+
 export interface EventForm {
   title: string;
   allDay: boolean;
@@ -180,6 +192,10 @@ export interface EventForm {
   recurrenceRules: string[];
   /** `null` = the calendar's default; `[]` = no alert; otherwise the offsets. */
   reminderMinutes: number[] | null;
+  /**
+   * Whether this event defends the time. See {@link Transparency}.
+   */
+  transparency: Transparency;
   /**
    * Whether the event should have a Google Meet link.
    *
@@ -519,6 +535,7 @@ export function formFromEvent(event: CalendarEvent): EventForm {
     recurrence: choiceForEvent(event),
     recurrenceRules: [...rules],
     reminderMinutes: reminderMinutesOf(event),
+    transparency: transparencyOf(event),
     // A call scraped out of the description or the location is not a Google
     // conference and cannot be removed by taking one off, so only the real
     // thing ticks this box.
@@ -556,6 +573,7 @@ export function emptyForm(options: {
     recurrence: "none",
     recurrenceRules: [],
     reminderMinutes: null,
+    transparency: "opaque",
     meet: false,
     notify: null,
   };
@@ -646,6 +664,8 @@ export function formPatch(event: CalendarEvent, form: EventForm): EventPatch | u
 
   if (form.meet !== hasMeet(event)) patch.conferencing = form.meet ? "meet" : "none";
 
+  if (form.transparency !== transparencyOf(event)) patch.transparency = form.transparency;
+
   // Last, and after the emptiness test below reads its keys: `notify` says what
   // to do about a change, so on its own it is not one.
   if (Object.keys(patch).length === 0) return undefined;
@@ -704,6 +724,7 @@ export function formDraft(form: EventForm): EventDraft | { error: string } {
     recurrence: rulesOf(form, times.start),
     reminderMinutes: form.reminderMinutes ?? undefined,
     conferencing: form.meet ? "meet" : undefined,
+    transparency: form.transparency,
     // A new event invites the people it names, the way it does in Google
     // Calendar. `null` is the form that was never asked, and the answer to a
     // question nobody asked is the safe one.
@@ -731,6 +752,7 @@ export function duplicateDraft(event: CalendarEvent): EventDraft {
     isAllDay: event.allDay,
     attendees: event.attendees,
     recurrence: [],
+    transparency: transparencyOf(event),
     notify: "nobody",
   };
 }
@@ -760,6 +782,7 @@ export function copyDraft(
     isAllDay: event.allDay,
     attendees: event.attendees,
     recurrence: [],
+    transparency: transparencyOf(event),
     notify: "nobody",
   };
 }

@@ -9,7 +9,7 @@
  * Nothing in this file knows about React. The grid renders it, the tests pin it.
  */
 
-import { HOUR, MINUTE } from "./time";
+import { addDays, startOfDay, HOUR, MINUTE } from "./time";
 
 /**
  * 64px/hour makes a 30-minute meeting 32px, which is a thing you can hit.
@@ -420,6 +420,62 @@ export function packRows<T extends RowItem>(items: readonly T[]): (T & { row: nu
     rows[row].push(range);
     return { ...item, row };
   });
+}
+
+/**
+ * The local midnights of the first inclusive day and the exclusive end day an
+ * event occupies on a date grid.
+ *
+ * All-day events are pinned to UTC midnight of each calendar date, so we read
+ * the UTC date and re-express it as local midnight — otherwise a trip that
+ * Google shows as Tue–Thu starts Monday evening here, west of Greenwich.
+ *
+ * Timed events use local start-of-day. An end exactly on midnight does not
+ * occupy that day (the timed equivalent of Google's exclusive all-day end).
+ */
+export function eventGridRange(event: {
+  start: number;
+  end: number;
+  allDay: boolean;
+}): { start: number; end: number } {
+  if (event.allDay) {
+    const start = localMidnightOfUtcDate(event.start);
+    let end = localMidnightOfUtcDate(Math.max(event.end, event.start + 1));
+    if (end <= start) end = addDays(start, 1).getTime();
+    return { start, end };
+  }
+  const start = startOfDay(event.start).getTime();
+  const last = startOfDay(Math.max(event.end, event.start + 1) - 1).getTime();
+  return { start, end: addDays(last, 1).getTime() };
+}
+
+/** Local midnight of the UTC calendar date `ts` falls on. */
+function localMidnightOfUtcDate(ts: number): number {
+  const d = new Date(ts);
+  return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()).getTime();
+}
+
+/**
+ * Where `range` sits on a run of local day columns, or `null` if it misses
+ * them all. `dayStarts` is each column's local midnight, in order.
+ */
+export function clipToDays(
+  range: { start: number; end: number },
+  dayStarts: readonly number[],
+): { startIndex: number; span: number } | null {
+  let startIndex = -1;
+  let endIndex = -1;
+  for (let i = 0; i < dayStarts.length; i++) {
+    const dayStart = dayStarts[i];
+    const dayEnd =
+      i + 1 < dayStarts.length ? dayStarts[i + 1] : addDays(dayStart, 1).getTime();
+    if (range.start < dayEnd && range.end > dayStart) {
+      if (startIndex === -1) startIndex = i;
+      endIndex = i + 1;
+    }
+  }
+  if (startIndex === -1) return null;
+  return { startIndex, span: endIndex - startIndex };
 }
 
 /**

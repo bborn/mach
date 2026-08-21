@@ -23,6 +23,7 @@ describe("the command vocabulary", () => {
       "markRead",
       "star",
       "label",
+      "moveToInbox",
       "reportSpam",
       "notSpam",
       "trash",
@@ -31,7 +32,7 @@ describe("the command vocabulary", () => {
       "unsnooze",
       "rsvp",
     ];
-    expect(kinds).toHaveLength(12);
+    expect(kinds).toHaveLength(13);
   });
 
   it("separates the batched mail half from the single-event rsvp", () => {

@@ -28,7 +28,9 @@ import {
   Z_EVENT_SELECTED,
   Z_NOW,
   blockHeight,
+  clipToDays,
   clusterPlan,
+  eventGridRange,
   nowScrollTop,
   offsetForTime,
   packRows,
@@ -43,10 +45,12 @@ import {
   dragLabel,
   isCopyDrag,
   isDrag,
+  moveByDays,
   moveResult,
   resizeResult,
   type DragOrigin,
   type DragOutcome,
+  type EventMove,
   type ResizeEdge,
 } from "@/lib/calendar-drag";
 import type { MergedEvent } from "@/lib/calendar-merge";
@@ -63,14 +67,7 @@ export interface EventDraft {
   title: string;
 }
 
-/** What a finished drag or resize asks the caller to save. */
-export interface EventMove {
-  eventId: EventId;
-  start: number;
-  end: number;
-  /** Alt was held: leave the original where it is and create a copy here. */
-  copy: boolean;
-}
+export type { EventMove } from "@/lib/calendar-drag";
 
 interface TimeGridProps {
   days: Date[];
@@ -125,6 +122,12 @@ interface DragSession {
   moved: boolean;
   /** Alt is held right now. Recomputed as the drag runs, not fixed at grab. */
   copy: boolean;
+  /** All-day bar: columns only, no hour. */
+  allDay: boolean;
+  /** Days of the bar, for clamping a drag inside the visible week. */
+  span: number;
+  /** Which day of the bar the pointer grabbed, so the bar stays under it. */
+  grabOffset: number;
   outcome: DragOutcome;
 }
 
@@ -174,6 +177,7 @@ export function TimeGrid({
 }: TimeGridProps) {
   const scroller = useRef<HTMLDivElement>(null);
   const body = useRef<HTMLDivElement>(null);
+  const allDayTrack = useRef<HTMLDivElement>(null);
   const ghost = useRef<HTMLDivElement>(null);
   const ghostLabel = useRef<HTMLSpanElement>(null);
   const session = useRef<DragSession | null>(null);
@@ -325,26 +329,16 @@ export function TimeGrid({
   const timed = useMemo(() => events.filter((m) => !m.event.allDay), [events]);
   const allDay = useMemo(() => events.filter((m) => m.event.allDay), [events]);
 
-  const rangeStart = startOfDay(days[0]).getTime();
-  const rangeEnd = startOfDay(days[days.length - 1]).getTime() + DAY;
-
   // All-day bars span their days rather than repeating once per day.
   const bars = useMemo(() => {
-    const rows = allDay
-      .filter((m) => m.event.start < rangeEnd && m.event.end > rangeStart)
-      .map((m) => {
-        const startIndex = Math.max(
-          0,
-          Math.round((startOfDay(m.event.start).getTime() - rangeStart) / DAY),
-        );
-        const endIndex = Math.min(
-          days.length,
-          Math.max(startIndex + 1, Math.round((m.event.end - rangeStart) / DAY)),
-        );
-        return { merged: m, startIndex, span: endIndex - startIndex };
-      });
+    const dayStarts = days.map((day) => startOfDay(day).getTime());
+    const rows = [];
+    for (const m of allDay) {
+      const clipped = clipToDays(eventGridRange(m.event), dayStarts);
+      if (clipped) rows.push({ merged: m, ...clipped });
+    }
     return packRows(rows);
-  }, [allDay, rangeStart, rangeEnd, days.length]);
+  }, [allDay, days]);
 
   const rowCount = bars.reduce((max, bar) => Math.max(max, bar.row + 1), 0);
   const shownRows = allDayExpanded ? rowCount : Math.min(rowCount, ALL_DAY_MAX_ROWS);
@@ -375,10 +369,10 @@ export function TimeGrid({
     const node = ghost.current;
     if (!live || !node) return;
 
+    const colW = live.contentWidth / days.length;
     const dayShift =
-      (columnIndexFor(live.outcome.start, days) - live.originDayIndex) *
-      (live.contentWidth / days.length);
-    const dy = gridTop(live.outcome.start) - gridTop(live.origin.start);
+      (columnIndexFor(live.outcome.start, days, live.allDay) - live.originDayIndex) * colW;
+    const dy = live.allDay ? 0 : gridTop(live.outcome.start) - gridTop(live.origin.start);
 
     node.style.transform = `translate3d(${dayShift}px, ${dy}px, 0)`;
     if (live.kind === "resize") {
@@ -418,6 +412,7 @@ export function TimeGrid({
           start: live.outcome.start,
           end: live.outcome.end,
           copy: live.copy,
+          allDay: live.allDay,
         });
       }
     },
@@ -451,6 +446,21 @@ export function TimeGrid({
 
       if (live.kind === "resize") {
         live.outcome = resizeResult(live.origin, live.edge, dy);
+      } else if (live.allDay) {
+        const column = dayIndexAt(
+          event.clientX,
+          live.contentLeft,
+          live.contentWidth,
+          days.length,
+        );
+        const startIndex = Math.min(
+          Math.max(column - live.grabOffset, 0),
+          Math.max(days.length - live.span, 0),
+        );
+        live.outcome = moveByDays(
+          { start: live.origin.start, end: live.origin.end, allDay: true },
+          startIndex - live.originDayIndex,
+        );
       } else {
         const column = dayIndexAt(
           event.clientX,
@@ -505,12 +515,21 @@ export function TimeGrid({
       merged: MergedEvent,
       kind: "move" | "resize",
       edge: ResizeEdge,
+      allDay = false,
+      span = 1,
     ) => {
       if (event.button !== 0) return;
-      const rect = body.current?.getBoundingClientRect();
+      const track = allDay ? allDayTrack.current : body.current;
+      const rect = track?.getBoundingClientRect();
       if (!rect) return;
       const target = merged.event;
-      const dayStart = startOfDay(target.start).getTime();
+      const dayStart = allDay
+        ? eventGridRange(target).start
+        : startOfDay(target.start).getTime();
+      const originDayIndex = columnIndexFor(target.start, days, allDay);
+      const contentLeft = allDay ? rect.left : rect.left + TIME_GUTTER;
+      const contentWidth = allDay ? rect.width : rect.width - TIME_GUTTER;
+      const pointerDay = dayIndexAt(event.clientX, contentLeft, contentWidth, days.length);
 
       const next: DragSession = {
         kind,
@@ -518,16 +537,19 @@ export function TimeGrid({
         eventId: target.id,
         origin: { start: target.start, end: target.end, dayStart },
         color: colorFor(target.calendarId),
-        tone: toneFor(target.rsvp),
+        tone: toneFor(target.rsvp, target.transparency),
         title: target.title,
         pointerId: event.pointerId,
         startX: event.clientX,
         startY: event.clientY,
-        originDayIndex: columnIndexFor(target.start, days),
-        contentLeft: rect.left + TIME_GUTTER,
-        contentWidth: rect.width - TIME_GUTTER,
+        originDayIndex,
+        contentLeft,
+        contentWidth,
         moved: false,
         copy: isCopyDrag(kind, event.altKey),
+        allDay,
+        span,
+        grabOffset: Math.min(Math.max(pointerDay - originDayIndex, 0), Math.max(span - 1, 0)),
         outcome: { start: target.start, end: target.end },
       };
       session.current = next;
@@ -538,6 +560,16 @@ export function TimeGrid({
     },
     [days, colorFor, onSelect],
   );
+
+  useEffect(() => {
+    if (!dragging) return;
+    const root = document.documentElement;
+    const previous = root.style.cursor;
+    root.style.cursor = copying ? "copy" : "grabbing";
+    return () => {
+      root.style.cursor = previous;
+    };
+  }, [dragging, copying]);
 
   const ghostPaint = dragging ? paintFor(dragging.color, dragging.tone, { dark }) : null;
   const ghostColumnWidth = dragging ? dragging.contentWidth / days.length : 0;
@@ -624,6 +656,7 @@ export function TimeGrid({
               still sit in a percentage overlay, which is how a bar can span
               Thursday into Friday without being two cells. */}
           <div
+            ref={allDayTrack}
             className="relative min-w-0"
             style={{
               gridColumn: `2 / span ${days.length}`,
@@ -651,12 +684,16 @@ export function TimeGrid({
                     event={event}
                     color={colorFor(event.calendarId)}
                     dark={dark}
-                    tone={toneFor(event.rsvp)}
+                    tone={toneFor(event.rsvp, event.transparency)}
                     past={event.end < now}
                     selected={event.id === selectedId}
-                    dimmed={dimIds?.has(event.id) ?? false}
+                    dimmed={
+                      (dimIds?.has(event.id) ?? false) ||
+                      Boolean(dragging && !copying && dragging.eventId === event.id)
+                    }
                     copies={bar.merged.copies.length}
                     onSelect={() => onOpen(event.id)}
+                    onGrab={(pointer) => grab(pointer, bar.merged, "move", "end", true, bar.span)}
                     blockRef={(node) => registerBlock(event.id, node)}
                     style={{
                       position: "absolute",
@@ -668,6 +705,52 @@ export function TimeGrid({
                   />
                 );
               })}
+            {dragging?.allDay && ghostPaint && (
+              <div
+                ref={ghost}
+                data-calendar-drag
+                className="pointer-events-none absolute overflow-hidden px-2"
+                style={{
+                  left: dragging.originDayIndex * (ghostColumnWidth || 0) + 2,
+                  width: Math.max(
+                    dragging.span * (ghostColumnWidth || 0) - 4,
+                    24,
+                  ),
+                  top: 2,
+                  height: ALL_DAY_CHIP_HEIGHT,
+                  borderRadius: BLOCK_RADIUS,
+                  background: ghostPaint.background,
+                  color: ghostPaint.color,
+                  boxShadow: [
+                    ghostPaint.border ? `inset 0 0 0 1px ${ghostPaint.border}` : undefined,
+                    "0 4px 16px -4px color-mix(in oklab, var(--foreground) 45%, transparent)",
+                  ]
+                    .filter((layer): layer is string => layer !== undefined)
+                    .join(", "),
+                  zIndex: Z_NOW + 1,
+                  willChange: "transform",
+                  fontSize: 12,
+                  lineHeight: `${ALL_DAY_CHIP_HEIGHT}px`,
+                  fontWeight: 600,
+                }}
+              >
+                {copying && (
+                  <span
+                    aria-hidden
+                    className="absolute right-[3px] top-[2px] flex h-[14px] w-[14px] items-center justify-center rounded-full font-semibold"
+                    style={{
+                      fontSize: 11,
+                      lineHeight: "14px",
+                      background: ghostPaint.color,
+                      color: ghostPaint.background,
+                    }}
+                  >
+                    +
+                  </span>
+                )}
+                <span className="block truncate">{dragging.title}</span>
+              </div>
+            )}
             {hiddenBars > 0 && !allDayExpanded && (
               <button
                 type="button"
@@ -752,7 +835,7 @@ export function TimeGrid({
         {/* The drag ghost. One absolutely-positioned rectangle, moved by
             transform, sitting above everything and taking no pointer events —
             so moving it costs a composite, not a layout of the week. */}
-        {dragging && ghostPaint && (
+        {dragging && !dragging.allDay && ghostPaint && (
           <div
             ref={ghost}
             // Marks a live drag for anything that has to stand out of its way.
@@ -826,8 +909,10 @@ export function TimeGrid({
 }
 
 /** Which rendered column an instant belongs to. `-1` when it is off-screen. */
-function columnIndexFor(ts: number, days: Date[]): number {
-  const target = startOfDay(ts).getTime();
+function columnIndexFor(ts: number, days: Date[], allDay = false): number {
+  const target = allDay
+    ? eventGridRange({ start: ts, end: Math.max(ts + 1, ts), allDay: true }).start
+    : startOfDay(ts).getTime();
   const index = days.findIndex((day) => startOfDay(day).getTime() === target);
   return index === -1 ? 0 : index;
 }
@@ -1105,7 +1190,7 @@ function DayColumn({
                 event={event}
                 color={colorFor(event.calendarId)}
                 dark={dark}
-                tone={toneFor(event.rsvp)}
+                tone={toneFor(event.rsvp, event.transparency)}
                 past={event.end < now}
                 // While you are dragging it, the cursor lives on the ghost —
                 // the ghost is the event now, and two accent halos on screen

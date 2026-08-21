@@ -98,6 +98,12 @@ export type Notify = "guests" | "externalGuests" | "nobody";
  */
 export type Conferencing = "meet" | "none";
 
+/**
+ * Whether the event defends the time. Google's `transparency`: `opaque` is
+ * busy (the default), `transparent` is free.
+ */
+export type Transparency = "opaque" | "transparent";
+
 /** Everything needed to bring an event into being. Times are epoch millis. */
 export interface EventDraft {
   title: string;
@@ -113,6 +119,8 @@ export interface EventDraft {
   reminderMinutes?: number[];
   /** `meet` asks Google for a Meet link. */
   conferencing?: Conferencing;
+  /** Busy or free. Omit to leave Google's default, which is busy. */
+  transparency?: Transparency;
   /**
    * Who hears about it. Omitted invites the guests — see {@link Notify}.
    *
@@ -142,6 +150,8 @@ export interface EventPatch {
   recurrence?: string[];
   reminderMinutes?: number[];
   conferencing?: Conferencing;
+  /** Busy or free. */
+  transparency?: Transparency;
   /**
    * Who hears about it. Omitted tells the guests — see {@link Notify}.
    *
@@ -157,6 +167,17 @@ export type Command =
   | { kind: "markRead"; threadIds: ThreadId[]; read: boolean }
   | { kind: "star"; threadIds: ThreadId[]; starred: boolean }
   | { kind: "label"; threadIds: ThreadId[]; labelId: LabelId; add: boolean }
+  /**
+   * Gmail's "Move to Primary": INBOX on, bulk tabs off.
+   *
+   * `Label` moves one id. Getting a conversation into Mach's Inbox is two
+   * things — keep `INBOX`, strip Promotions / Social / Updates / Forums — and
+   * composing that from two commands would be two remote calls and two undo
+   * entries for one keystroke. The inverse carries the prior label set, the
+   * way `notSpam` does, because putting the bulk categories back is only
+   * faithful if they were the ones that were there.
+   */
+  | { kind: "moveToInbox"; threadIds: ThreadId[]; restore?: ThreadLabelState[] }
   | { kind: "reportSpam"; threadIds: ThreadId[] }
   | { kind: "notSpam"; threadIds: ThreadId[]; restore?: ThreadLabelState[] }
   | { kind: "trash"; threadIds: ThreadId[] }
@@ -380,6 +401,7 @@ export function inverseOf(command: Command): Command | undefined {
     // These need state only the command layer holds: the prior labels, the
     // prior RSVP, the row id a create is about to mint, the calendar an event
     // came from. Nothing local can honestly claim an inverse.
+    case "moveToInbox":
     case "unsnooze":
     case "rsvp":
     case "createEvent":
@@ -754,6 +776,13 @@ export const fixtureSource: MachDataSource = {
         return fixtureResult(command, command.starred ? "Starred" : "Unstarred");
       case "label":
         return fixtureResult(command, command.add ? "Label added" : "Label removed");
+      case "moveToInbox":
+        return fixtureResult(
+          command,
+          command.restore?.length
+            ? "Moved back"
+            : `Moved ${pluralize(command.threadIds.length, "conversation")} to Inbox`,
+        );
       case "reportSpam":
         return fixtureResult(
           command,

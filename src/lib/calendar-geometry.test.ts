@@ -9,15 +9,18 @@ import {
   blockPlan,
   blockTier,
   clamp,
+  clipToDays,
   clusterPlan,
+  eventGridRange,
   nowScrollTop,
   offsetForTime,
+  packRows,
   snapTime,
   snapTimeDown,
   timeForOffset,
   visibleColumns,
 } from "./calendar-geometry";
-import { HOUR, MINUTE } from "./time";
+import { HOUR, MINUTE, startOfDay } from "./time";
 
 const DAY_START = new Date(2026, 7, 3, 0, 0, 0, 0).getTime();
 
@@ -308,3 +311,108 @@ describe("clusterPlan", () => {
     }
   });
 });
+
+describe("eventGridRange", () => {
+  it("reads an all-day event as its UTC calendar dates, not the previous evening", () => {
+    // UTC midnight 22 Sep is still the 21st on a US clock. The grid column is
+    // the date Google named, not the wall clock of the stored instant.
+    const range = eventGridRange({
+      start: Date.UTC(2026, 8, 22),
+      end: Date.UTC(2026, 8, 25),
+      allDay: true,
+    });
+    expect(new Date(range.start).getDate()).toBe(22);
+    expect(new Date(range.start).getMonth()).toBe(8);
+    expect(new Date(range.end).getDate()).toBe(25);
+    expect(new Date(range.end).getMonth()).toBe(8);
+  });
+
+  it("keeps a one-day all-day event on that one day", () => {
+    const range = eventGridRange({
+      start: Date.UTC(2026, 8, 22),
+      end: Date.UTC(2026, 8, 23),
+      allDay: true,
+    });
+    expect(new Date(range.start).getDate()).toBe(22);
+    expect(new Date(range.end).getDate()).toBe(23);
+  });
+
+  it("puts a timed event on the local days its start and end actually cover", () => {
+    const start = new Date(2026, 8, 22, 9, 0).getTime();
+    const end = new Date(2026, 8, 22, 10, 0).getTime();
+    const range = eventGridRange({ start, end, allDay: false });
+    expect(range.start).toBe(new Date(2026, 8, 22).getTime());
+    expect(range.end).toBe(new Date(2026, 8, 23).getTime());
+  });
+
+  it("lets an overnight timed event occupy both days", () => {
+    const start = new Date(2026, 8, 22, 22, 0).getTime();
+    const end = new Date(2026, 8, 23, 2, 0).getTime();
+    const range = eventGridRange({ start, end, allDay: false });
+    expect(range.start).toBe(new Date(2026, 8, 22).getTime());
+    expect(range.end).toBe(new Date(2026, 8, 24).getTime());
+  });
+
+  it("does not give a midnight-ending timed event the next day", () => {
+    const start = new Date(2026, 8, 22, 21, 0).getTime();
+    const end = new Date(2026, 8, 23, 0, 0).getTime();
+    const range = eventGridRange({ start, end, allDay: false });
+    expect(range.end).toBe(new Date(2026, 8, 23).getTime());
+  });
+});
+
+describe("clipToDays", () => {
+  const week = Array.from({ length: 7 }, (_, i) =>
+    startOfDay(new Date(2026, 8, 21 + i)).getTime(),
+  );
+
+  it("clips a mid-week trip to the columns it covers", () => {
+    const range = eventGridRange({
+      start: Date.UTC(2026, 8, 22),
+      end: Date.UTC(2026, 8, 25),
+      allDay: true,
+    });
+    expect(clipToDays(range, week)).toEqual({ startIndex: 1, span: 3 });
+  });
+
+  it("clips at the week edge rather than wrapping", () => {
+    // Thu 24 – Mon 28, this week is Mon 21 – Sun 27.
+    const range = eventGridRange({
+      start: Date.UTC(2026, 8, 24),
+      end: Date.UTC(2026, 8, 29),
+      allDay: true,
+    });
+    expect(clipToDays(range, week)).toEqual({ startIndex: 3, span: 4 });
+  });
+
+  it("returns null when the event misses the week", () => {
+    const range = eventGridRange({
+      start: Date.UTC(2026, 9, 8),
+      end: Date.UTC(2026, 9, 12),
+      allDay: true,
+    });
+    expect(clipToDays(range, week)).toBeNull();
+  });
+});
+
+describe("packRows", () => {
+  it("puts a Monday timed event beside a Tuesday–Thursday trip on the same row", () => {
+    const packed = packRows([
+      { startIndex: 0, span: 1, id: "standup" },
+      { startIndex: 1, span: 3, id: "trip" },
+    ]);
+    const standup = packed.find((row) => row.id === "standup")!;
+    const trip = packed.find((row) => row.id === "trip")!;
+    expect(standup.row).toBe(0);
+    expect(trip.row).toBe(0);
+  });
+
+  it("stacks two overlapping trips", () => {
+    const packed = packRows([
+      { startIndex: 1, span: 3, id: "a" },
+      { startIndex: 1, span: 3, id: "b" },
+    ]);
+    expect(packed.map((row) => row.row).sort()).toEqual([0, 1]);
+  });
+});
+

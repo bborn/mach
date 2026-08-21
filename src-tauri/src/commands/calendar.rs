@@ -237,10 +237,14 @@ pub(crate) async fn execute_create(
         status: "confirmed".into(),
         html_link: None,
         updated_at: now_ms(),
-        // Everything migration 7 keeps is Google's to say: a conference it has
-        // not minted yet, the answers nobody has given yet, the creator block it
-        // stamps on the insert. Defaulted here and filled in by the first sync
-        // that reads the created event back.
+        // Written now rather than waited for: the grid paints free events as
+        // outlined, and a create that said "free" should look free before the
+        // first sync that would otherwise be the only source of the fact.
+        transparency: draft.transparency.clone().filter(|t| !t.is_empty()),
+        // Everything else migration 7 keeps is Google's to say: a conference it
+        // has not minted yet, the answers nobody has given yet, the creator
+        // block it stamps on the insert. Defaulted here and filled in by the
+        // first sync that reads the created event back.
         ..Default::default()
     };
 
@@ -900,6 +904,7 @@ fn google_event_for(draft: &EventDraft, nonce: i64) -> GoogleEvent {
             Some(Conferencing::Meet) => Some(meet_request(nonce)),
             _ => None,
         },
+        transparency: draft.transparency.clone().filter(|t| !t.is_empty()),
         ..Default::default()
     }
 }
@@ -1003,6 +1008,9 @@ fn patch_body(patch: &EventPatch, nonce: i64) -> Value {
     if let Some(minutes) = &patch.reminder_minutes {
         body.insert("reminders".into(), json!(reminders_for(minutes)));
     }
+    if let Some(transparency) = &patch.transparency {
+        body.insert("transparency".into(), json!(transparency));
+    }
     // Start and end move together even when only one was named: switching
     // between timed and all-day changes the *shape* of both keys, and Google
     // rejects a body whose start is a `date` and whose end is a `dateTime`.
@@ -1060,6 +1068,7 @@ fn stored_fields(patch: &EventPatch) -> EventFields {
         // rule looked, on reload, like an edit that had not happened.
         recurrence: patch.recurrence.clone(),
         reminders: patch.reminder_minutes.as_deref().map(stored_reminders),
+        transparency: patch.transparency.clone(),
     }
 }
 
@@ -1131,6 +1140,10 @@ fn inverse_patch(patch: &EventPatch, event: &Event) -> Option<EventPatch> {
         recurrence: patch.recurrence.as_ref().map(|_| event.recurrence.clone()),
         reminder_minutes: prior_reminders.flatten(),
         conferencing: prior_conferencing,
+        transparency: patch
+            .transparency
+            .as_ref()
+            .map(|_| event.transparency.clone().unwrap_or_else(|| "opaque".into())),
         notify: patch.notify,
     };
     (!prior.is_empty()).then_some(prior)
@@ -1158,6 +1171,7 @@ fn draft_from(event: &Event) -> EventDraft {
         // and putting a link on the copy that half the room will not be at is
         // worse than putting none — the caller sets this when it means it.
         conferencing: None,
+        transparency: event.transparency.clone(),
         // Left to the caller. A delete's undo wants the choice the delete made;
         // a move wants the choice the move made. Neither is a property of the
         // row this was read from.

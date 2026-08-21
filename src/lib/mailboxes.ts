@@ -58,6 +58,11 @@ export function isBulk(labelIds: readonly string[]): boolean {
   return labelIds.some((id) => (BULK_CATEGORIES as readonly string[]).includes(id));
 }
 
+/** True when moving this conversation to Inbox would change its labels. */
+export function needsInbox(labelIds: readonly string[]): boolean {
+  return !labelIds.includes("INBOX") || isBulk(labelIds);
+}
+
 export function hasBulkTabs(labels: readonly Label[]): boolean {
   return labels.some((label) => (BULK_CATEGORIES as readonly string[]).includes(label.id));
 }
@@ -123,7 +128,7 @@ export function withVirtualMailboxes(labels: readonly Label[]): Label[] {
  * `humanize`.
  */
 const DISPLAY_NAMES: Record<string, string> = {
-  INBOX: "Inbox",
+  INBOX: "All",
   STARRED: "Starred",
   SNOOZED: "Snoozed",
   DRAFT: "Drafts",

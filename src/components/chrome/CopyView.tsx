@@ -53,7 +53,7 @@ export function CopyView() {
       labelId: now.ui.labelId,
       // `mailboxName` and not `label.name`: Gmail's system labels are named
       // INBOX and CATEGORY_PROMOTIONS on the wire, and the rail has always
-      // drawn them as Inbox and Promotions. The copy says what he can see.
+      // drawn them as All and Promotions. The copy says what he can see.
       mailboxName: label ? mailboxName(label) : undefined,
       threadId: now.ui.threadId,
       eventId: now.ui.eventId,

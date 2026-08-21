@@ -184,6 +184,14 @@ pub(crate) const CATALOGUE: &[CommandSpec] = &[
         batch: true,
     },
     CommandSpec {
+        kind: "moveToInbox",
+        summary: "Move conversations to Inbox: they keep INBOX and leave Promotions, \
+                  Social, Updates and Forums.",
+        params: &[THREAD_IDS, RESTORE],
+        undoable: true,
+        batch: true,
+    },
+    CommandSpec {
         kind: "reportSpam",
         summary: "Report conversations as spam: they leave the inbox and go to Spam, and \
                   Google learns from it.",

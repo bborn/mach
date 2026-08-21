@@ -493,6 +493,9 @@ pub struct EventFields {
     /// rather than leaving what was there.
     pub recurrence: Option<Vec<String>>,
     pub reminders: Option<EventReminders>,
+    /// `opaque` or `transparent`. Always a value when named — there is no
+    /// "clear it" because Google has no third state.
+    pub transparency: Option<String>,
 }
 
 impl EventFields {
@@ -569,6 +572,14 @@ pub fn update_event_fields(conn: &Connection, event_id: i64, fields: &EventField
     if let Some(reminders) = &fields.reminders {
         let json = serde_json::to_string(reminders).unwrap_or_else(|_| "null".into());
         push("reminders", Value::Text(json), &mut sets, &mut args);
+    }
+    if let Some(transparency) = &fields.transparency {
+        push(
+            "transparency",
+            Value::Text(transparency.clone()),
+            &mut sets,
+            &mut args,
+        );
     }
 
     args.push(Value::Integer(event_id));

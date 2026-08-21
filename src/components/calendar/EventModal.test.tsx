@@ -254,6 +254,35 @@ describe("telling the guests", () => {
   });
 });
 
+describe("show as", () => {
+  it("offers Busy on an ordinary event", () => {
+    mount();
+    const trigger = document.querySelector('[aria-label="Show as"]');
+    expect(trigger).toBeTruthy();
+    expect(trigger!.textContent).toContain("Busy");
+    expect(text()).not.toMatch(/\bfree\b/);
+  });
+
+  it("reads a free event as free", () => {
+    mount({
+      target: { mode: "view", event: { ...MEETING, transparency: "transparent" } },
+    });
+    const trigger = document.querySelector('[aria-label="Show as"]');
+    expect(trigger!.textContent).toContain("Free");
+  });
+});
+
+describe("Save", () => {
+  it("paints the ⌘⏎ hint in the button's own ink", () => {
+    mount();
+    const save = buttons("Save")[0];
+    expect(save).toBeTruthy();
+    const hint = save.querySelector("kbd");
+    expect(hint).toBeTruthy();
+    expect(hint!.className).toContain("text-current");
+  });
+});
+
 describe("the call", () => {
   it("offers a Meet request as a real, labelled control", () => {
     mount();

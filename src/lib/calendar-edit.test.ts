@@ -28,6 +28,7 @@ import {
   rulesFor,
   timeField,
   timestampFrom,
+  transparencyOf,
   utcDateField,
   utcMidnightFrom,
   wouldNotifyGuests,
@@ -157,6 +158,14 @@ describe("formFromEvent", () => {
     expect(formFromEvent({ ...event, title: "(no title)" }).title).toBe("");
   });
 
+  it("treats a missing transparency as busy", () => {
+    expect(formFromEvent(event).transparency).toBe("opaque");
+    expect(transparencyOf(event)).toBe("opaque");
+    expect(formFromEvent({ ...event, transparency: "transparent" }).transparency).toBe(
+      "transparent",
+    );
+  });
+
   it("shows an all-day event's last covered day, not its exclusive end", () => {
     const allDay: CalendarEvent = {
       ...event,
@@ -279,6 +288,17 @@ describe("formPatch — only what changed", () => {
     expect(formPatch(event, { ...base, reminderMinutes: [] })?.reminderMinutes).toEqual([]);
   });
 
+  it("names busy-versus-free only when it moved", () => {
+    expect(formPatch(event, { ...base, transparency: "opaque" })).toBeUndefined();
+    expect(formPatch(event, { ...base, transparency: "transparent" })?.transparency).toBe(
+      "transparent",
+    );
+    const free = { ...event, transparency: "transparent" as const };
+    expect(
+      formPatch(free, { ...formFromEvent(free), transparency: "opaque" })?.transparency,
+    ).toBe("opaque");
+  });
+
   it("refuses to build a patch from a form that does not describe a time", () => {
     expect(formPatch(event, { ...base, startDate: "" })).toBeUndefined();
   });
@@ -316,6 +336,23 @@ describe("drafts", () => {
     expect(draft.startTs).toBe(NINE);
     expect(draft.attendees).toHaveLength(1);
     expect(draft.recurrence).toEqual([]);
+    expect(draft.transparency).toBe("opaque");
+  });
+
+  it("carries free onto a create and a copy", () => {
+    const draft = formDraft({
+      ...emptyForm({ calendarId: "primary" }),
+      transparency: "transparent",
+    });
+    if ("error" in draft) throw new Error(draft.error);
+    expect(draft.transparency).toBe("transparent");
+    expect(duplicateDraft({ ...event, transparency: "transparent" }).transparency).toBe(
+      "transparent",
+    );
+    expect(
+      copyDraft({ ...event, transparency: "transparent" }, { start: event.start, end: event.end })
+        .transparency,
+    ).toBe("transparent");
   });
 
   it("reports the reason rather than a half-built draft", () => {
@@ -723,6 +760,11 @@ describe("who hears about a write", () => {
     const patch = formPatch(meeting, { ...base, reminderMinutes: [15] });
     expect(patch).toBeDefined();
     expect(wouldNotifyGuests(meeting, patch!)).toBe(false);
+
+    // Busy-versus-free is the same: it changes how *your* calendar reads.
+    const free = formPatch(meeting, { ...base, transparency: "transparent" });
+    expect(free).toBeDefined();
+    expect(wouldNotifyGuests(meeting, free!)).toBe(false);
   });
 
   it("does not ask when there is nobody to tell", () => {

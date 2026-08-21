@@ -489,7 +489,7 @@ export function CalendarMode() {
         void create(copyDraft(source, { start: move.start, end: move.end }), source.calendarId);
         return;
       }
-      applyMove(move.eventId, { start: move.start, end: move.end }, false);
+      applyMove(move.eventId, { start: move.start, end: move.end }, move.allDay);
     },
     [applyMove, allEvents, create],
   );
@@ -1625,6 +1625,7 @@ export function CalendarMode() {
                 selectedId={ui.eventId}
                 dimIds={dimIds}
                 onSelect={openEvent}
+                onMove={onGridMove}
               />
             ) : (
               <TimeGrid

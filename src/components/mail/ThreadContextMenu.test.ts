@@ -129,6 +129,38 @@ describe("buildItems", () => {
     ).toContain("Star");
   });
 
+  it("offers Move to Inbox only when the conversation is not already there", () => {
+    const bulk = thread({ labelIds: ["INBOX", "CATEGORY_UPDATES"] });
+    const primary = thread({ id: 2, labelIds: ["INBOX"] });
+    const handlers = { moveToInbox: vi.fn() };
+
+    expect(labels(buildItems(registry(), [bulk.id], bulk.id, map(bulk), handlers))).toContain(
+      "Move to Inbox",
+    );
+    expect(
+      labels(buildItems(registry(), [primary.id], primary.id, map(primary), handlers)),
+    ).not.toContain("Move to Inbox");
+
+    buildItems(registry(), [bulk.id], bulk.id, map(bulk), handlers)
+      .filter((i): i is Extract<Item, { kind: "item" }> => i.kind === "item")
+      .find((i) => i.label === "Move to Inbox")
+      ?.run();
+    expect(handlers.moveToInbox).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers Always Inbox from this sender for one named sender", () => {
+    const t = thread();
+    const handlers = { alwaysInbox: vi.fn() };
+    const items = buildItems(registry(), [t.id], t.id, map(t), handlers);
+    expect(labels(items)).toContain("Always Inbox from this sender");
+
+    const a = thread({ id: 1 });
+    const b = thread({ id: 2 });
+    expect(
+      labels(buildItems(registry(), [a.id, b.id], a.id, map(a, b), handlers)),
+    ).not.toContain("Always Inbox from this sender");
+  });
+
   it("searches by the sender of the one conversation it can name", () => {
     const t = thread();
     const items = buildItems(registry(), [t.id], t.id, map(t));

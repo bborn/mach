@@ -5,6 +5,7 @@ import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import type { KeyBinding } from "@/lib/keymap";
 import { keyEventFromToken } from "@/lib/menu";
 import { selectOnly, type Selection } from "@/lib/selection";
+import { needsInbox } from "@/lib/mailboxes";
 import { openSearch } from "@/components/search/palette";
 import { replyTarget } from "./thread-cursor";
 import {
@@ -85,7 +86,7 @@ interface OpenMenu {
 }
 
 export function ThreadContextMenu({ children }: { children: ReactNode }) {
-  const { ui, dispatch, visibleThreads } = useMach();
+  const { ui, dispatch, visibleThreads, actions } = useMach();
   const keymap = useKeymap();
   const [menu, setMenu] = useState<OpenMenu | null>(null);
   const chosen = useRef(false);
@@ -110,7 +111,10 @@ export function ThreadContextMenu({ children }: { children: ReactNode }) {
       if (!byId.has(id)) return;
       const selected = ui.selection.ids.includes(id);
       const targets = selected ? [...ui.selection.ids] : [id];
-      const items = buildItems(keymap.active(), targets, ui.threadId, byId);
+      const items = buildItems(keymap.active(), targets, ui.threadId, byId, {
+        moveToInbox: actions.moveToInboxSelected,
+        alwaysInbox: actions.alwaysInboxFromSender,
+      });
       // An empty menu is not a menu. Bail before anything is dispatched, so a
       // right-click that has nothing to offer also has no side effect.
       if (items.length === 0) return;
@@ -134,7 +138,7 @@ export function ThreadContextMenu({ children }: { children: ReactNode }) {
       chosen.current = false;
       setMenu({ anchor, items, count: targets.length, restore });
     },
-    [byId, dispatch, keymap, ui.focus, ui.selection, ui.threadId, visibleThreads],
+    [actions, byId, dispatch, keymap, ui.focus, ui.selection, ui.threadId, visibleThreads],
   );
 
   const onContextMenu = useCallback(
@@ -272,12 +276,18 @@ function find(
   return bindings.find((b) => b.group === group && b.description === description);
 }
 
+export interface ThreadMenuHandlers {
+  moveToInbox?: () => void;
+  alwaysInbox?: () => void;
+}
+
 export function buildItems(
   bindings: readonly KeyBinding[],
   targets: readonly ThreadId[],
   /** The open conversation — what the composer's keys answer, if anything. */
   cursor: ThreadId | null,
   byId: Map<ThreadId, Thread>,
+  on: ThreadMenuHandlers = {},
 ): Item[] {
   const threads = targets.map((id) => byId.get(id)).filter((t): t is Thread => t !== undefined);
   const single = threads.length === 1 ? threads[0] : undefined;
@@ -333,6 +343,17 @@ export function buildItems(
 
   separate();
   push("Actions", "Archive", "Archive");
+  // No Gmail key for this — `v` is Move to, a picker this menu is not. ⌘K
+  // and the right-click are the way in. Shown only when it would change
+  // something: already-Primary mail stays put.
+  if (on.moveToInbox && threads.some((t) => needsInbox(t.labelIds))) {
+    items.push({
+      kind: "item",
+      key: "actions/move-to-inbox",
+      label: "Move to Inbox",
+      run: on.moveToInbox,
+    });
+  }
   // Above Report spam, because it is the gentler of the two answers to the same
   // complaint. It is offered on every row: the binding decides what it can
   // honestly do when there is no offer, and `find` is what keeps the item from
@@ -356,6 +377,14 @@ export function buildItems(
       label: "Search by sender",
       run: () => openSearch(`from:${sender}`),
     });
+    if (on.alwaysInbox) {
+      items.push({
+        kind: "item",
+        key: "filter/always-inbox",
+        label: "Always Inbox from this sender",
+        run: on.alwaysInbox,
+      });
+    }
   }
 
   // A leading or trailing rule is a rule around nothing.

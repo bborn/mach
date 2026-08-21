@@ -100,7 +100,7 @@ import {
   toggleAll,
   type Selection,
 } from "@/lib/selection";
-import { mailboxName, PRIMARY_LABEL, withVirtualMailboxes } from "@/lib/mailboxes";
+import { BULK_CATEGORIES, mailboxName, PRIMARY_LABEL, withVirtualMailboxes } from "@/lib/mailboxes";
 import type { Contact } from "@/lib/contacts";
 import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
@@ -741,6 +741,19 @@ export interface MachActions {
   clearSelection: () => void;
   archiveSelected: () => void;
   trashSelected: () => void;
+  /**
+   * Move the selection to Inbox: keep INBOX, strip Gmail's bulk tabs.
+   *
+   * Gmail's "Move to Primary". Mach's Inbox *is* Primary, so that is the name
+   * the menu and ⌘K use. Inverse restores the exact prior labels.
+   */
+  moveToInboxSelected: () => void;
+  /**
+   * Move this conversation to Inbox and create a Gmail filter so future mail
+   * from the same sender lands there too. Filters do not apply retroactively;
+   * the move is the half that covers the thread on screen.
+   */
+  alwaysInboxFromSender: () => void;
   /**
    * `!` — Gmail's Report spam, over the same selection every other triage verb
    * acts on. No confirmation, for the same reason trash has none: the inverse
@@ -2207,6 +2220,41 @@ export function MachProvider({ children }: { children: ReactNode }) {
 
       archiveSelected: () => bulk({ kind: "archive", threadIds: commandTargetIds }),
       trashSelected: () => bulk({ kind: "trash", threadIds: commandTargetIds }),
+      moveToInboxSelected: () =>
+        bulk({ kind: "moveToInbox", threadIds: commandTargetIds }),
+      alwaysInboxFromSender: () => {
+        const id = commandTargetIds[0];
+        const thread =
+          id !== undefined
+            ? (visibleThreads.find((row) => row.id === id) ?? null)
+            : null;
+        const sender = thread?.participants[0]?.email;
+        if (!thread || !sender) {
+          dispatch({
+            type: "status",
+            status: { message: "No sender to filter on", tone: "info" },
+          });
+          return;
+        }
+        bulk({ kind: "moveToInbox", threadIds: [thread.id] });
+        void getDataSource()
+          .createFilter(thread.accountId, { from: sender }, { removeLabelIds: [...BULK_CATEGORIES] })
+          .then(() => {
+            dispatch({
+              type: "status",
+              status: { message: `Inbox from ${sender}`, tone: "info" },
+            });
+          })
+          .catch((caught) => {
+            dispatch({
+              type: "status",
+              status: {
+                message: `Moved to Inbox · could not create the filter — ${toMailboxError(caught).message}`,
+                tone: "error",
+              },
+            });
+          });
+      },
       reportSpamSelected: () =>
         bulk({ kind: "reportSpam", threadIds: commandTargetIds }),
       unsubscribe: () => {

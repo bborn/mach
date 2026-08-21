@@ -212,6 +212,18 @@ describe("keymap dispatcher", () => {
       expect(inbox).not.toHaveBeenCalled();
     });
 
+    it("does not treat G then ⇧I as G then I", () => {
+      const inbox = vi.fn();
+      const all = vi.fn();
+      keymap.register({ keys: "g i", handler: inbox });
+      keymap.register({ keys: "g shift+i", handler: all });
+
+      keymap.handle(press("g"), 0);
+      keymap.handle(press("i", { shift: true }), 50);
+      expect(all).toHaveBeenCalledTimes(1);
+      expect(inbox).not.toHaveBeenCalled();
+    });
+
     it("times the prefix out", () => {
       const goInbox = vi.fn();
       const jump = vi.fn();
@@ -312,6 +324,7 @@ describe("formatBinding", () => {
 
   it("renders sequences readably", () => {
     expect(formatBinding("g i", "meta")).toBe("G then I");
+    expect(formatBinding("g shift+i", "meta")).toBe("G then ⇧I");
   });
 
   it("renders named keys as their glyph", () => {

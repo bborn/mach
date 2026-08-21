@@ -52,6 +52,7 @@ const SYSTEM_ICONS: Record<string, LucideIcon> = {
 
 /** The Gmail jump keys, on the rows they land on. */
 const MAILBOX_SHORTCUTS: Record<string, string> = {
+  INBOX: "g shift+i",
   STARRED: "g s",
   SNOOZED: "g b",
   DRAFT: "g d",
