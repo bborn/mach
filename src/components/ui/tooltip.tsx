@@ -1,5 +1,6 @@
 import { type ReactElement } from "react";
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
+import { type ModKey } from "@/lib/keymap";
 import { cn } from "@/lib/utils";
 import { Kbd } from "./kbd";
 import { POPUP_MARKER } from "./popup";
@@ -73,22 +74,25 @@ export function TooltipContent({
 export function ShortcutHint({
   label,
   keys,
+  mod,
 }: {
   label: string;
   keys?: string | readonly string[];
+  /** Passed through to {@link Kbd}; only a test has reason to set it. */
+  mod?: ModKey;
 }) {
   const bindings = keys === undefined ? [] : typeof keys === "string" ? [keys] : [...keys];
   return (
     <span className="inline-flex items-center gap-1.5">
       <span>{label}</span>
       {bindings.map((binding) => (
-        <ShortcutKeys key={binding} keys={binding} />
+        <ShortcutKeys key={binding} keys={binding} mod={mod} />
       ))}
     </span>
   );
 }
 
-function ShortcutKeys({ keys }: { keys: string }) {
+function ShortcutKeys({ keys, mod }: { keys: string; mod?: ModKey }) {
   const tokens = keys.trim().split(/\s+/).filter(Boolean);
   return (
     <span className="inline-flex items-center gap-0.5">
@@ -97,6 +101,7 @@ function ShortcutKeys({ keys }: { keys: string }) {
           {i > 0 && <span className="px-0.5 opacity-70">then</span>}
           <Kbd
             keys={token}
+            mod={mod}
             className="h-4 min-w-4 border-background/30 bg-background/15 px-1 text-background"
           />
         </span>
