@@ -297,19 +297,127 @@ pub fn link_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
                 return true;
             }
             use tauri::Manager;
-            let app = webview.app_handle();
-            if let Err(message) = open_in_system_browser(app, url.as_str()) {
-                // Invariant: a click that cannot open a link says so. This is
-                // the only place that knows, so it is the only place that can.
-                use tauri::Emitter;
-                let _ = app.emit(
-                    LINK_FAILED_EVENT,
-                    LinkFailure {
-                        message: format!("Could not open that link: {message}"),
-                    },
-                );
-            }
+            hand_to_browser(webview.app_handle(), url.as_str());
             false
         })
         .build()
 }
+
+/// Open a message's link, and say so on screen if it cannot be opened.
+///
+/// Invariant: a click that cannot open a link says so. Rust is the only layer
+/// that knows — the frame that was clicked cannot run a line of script — so it
+/// is the only one that can report it.
+fn hand_to_browser<R: tauri::Runtime>(app: &tauri::AppHandle<R>, url: &str) {
+    if let Err(message) = open_in_system_browser(app, url) {
+        use tauri::Emitter;
+        let _ = app.emit(
+            LINK_FAILED_EVENT,
+            LinkFailure {
+                message: format!("Could not open that link: {message}"),
+            },
+        );
+    }
+}
+
+/// The other half of [`link_guard`], for WebKitGTK.
+///
+/// # Why there is a second half at all
+///
+/// Every anchor the sanitizer emits carries `target="_blank"`, because that is
+/// what [`crate::render`] needs in order for the click to reach a policy hook
+/// at all — see `FRAME_SANDBOX` in `src/lib/message-body.ts` for the three ways
+/// a link in a sandboxed frame can die inside the engine.
+///
+/// A `_blank` navigation is not the same event as an ordinary one, and the two
+/// engines do not agree on that. WKWebView asks
+/// `decidePolicyForNavigationAction` about both, which is why one hook covered
+/// everything on macOS. WebKitGTK splits them: an ordinary navigation is
+/// `WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION` and a `_blank` one is
+/// `WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION`, two values of the same
+/// `decide-policy` signal — and wry's navigation handler answers only the
+/// first, returning "not mine" for every other decision type
+/// (`wry::webkitgtk`, the `connect_decide_policy` block). So
+/// `Builder::on_navigation` is never consulted, `link_guard` never runs, and
+/// WebKit's default for an unanswered decision is to allow it and then ask
+/// something to provide a window. Nothing in this app answers that either.
+///
+/// The result is the dead click this unit already has a long comment about,
+/// arrived at by a fourth route: the listener attaches, the guard is
+/// registered, every log is empty, and clicking a link in a message does
+/// nothing at all. It is not `xdg-open`, and it is not the browser opening the
+/// page somewhere the reader cannot see it — the URL never leaves the process.
+///
+/// # Why it is a signal handler and not a builder option
+///
+/// Tauri does expose the new-window case as `WebviewWindowBuilder::on_new_window`,
+/// and it is no use here for the reason `link_guard` is a plugin: the window is
+/// declared in `tauri.conf.json`, so there is no builder to hang it on, and a
+/// plugin has `on_navigation` but no `on_new_window`. `with_webview` reaches
+/// the same `decide-policy` signal wry is already on. Ours is connected second
+/// and only ever answers the decision wry declined, so the two do not race.
+///
+/// Cancelling here keeps the property the macOS path has: `ignore()` happens
+/// *before* the engine asks anything to provide a window, so a message's page
+/// is never rendered inside Mach even for an instant.
+#[cfg(target_os = "linux")]
+pub fn route_new_windows(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    // The main window only. `crate::browser`'s window is somewhere on the
+    // internet on purpose and has its own navigation guard; message frames,
+    // which are what this exists for, only ever live here.
+    let Some(window) = app.get_webview_window(crate::shell::MAIN_WINDOW) else {
+        eprintln!("links: no main window to route new-window navigations from");
+        return;
+    };
+
+    let app = app.clone();
+    let attached = window.with_webview(move |platform| {
+        use webkit2gtk::glib::prelude::Cast;
+        use webkit2gtk::{
+            NavigationPolicyDecision, NavigationPolicyDecisionExt, PolicyDecisionExt,
+            PolicyDecisionType, URIRequestExt, WebViewExt,
+        };
+
+        platform
+            .inner()
+            .connect_decide_policy(move |_webview, decision, kind| {
+                if kind != PolicyDecisionType::NewWindowAction {
+                    return false;
+                }
+                let Some(uri) = decision
+                    .dynamic_cast_ref::<NavigationPolicyDecision>()
+                    .and_then(|d| d.navigation_action())
+                    .and_then(|action| action.request())
+                    .and_then(|request| request.uri())
+                else {
+                    return false;
+                };
+                // The same question `link_guard` asks, of the same function: a
+                // new window for one of the app's own origins is not a link in
+                // a message, and is left to whatever asked for it.
+                let Ok(url) = url::Url::parse(uri.as_str()) else {
+                    return false;
+                };
+                if !is_external_link(&url) {
+                    return false;
+                }
+                decision.ignore();
+                hand_to_browser(&app, url.as_str());
+                true
+            });
+    });
+
+    if let Err(e) = attached {
+        // Said out loud rather than swallowed: without this handler every link
+        // in every message is a dead click, and a dead click is silent by
+        // definition.
+        eprintln!("links: could not watch for new-window navigations: {e}");
+    }
+}
+
+/// Nothing to do: WKWebView asks [`link_guard`] about a `_blank` navigation
+/// like any other, so there is no second case to answer.
+#[cfg(not(target_os = "linux"))]
+pub fn route_new_windows(_app: &tauri::AppHandle) {}
