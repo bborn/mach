@@ -342,7 +342,10 @@ describe("a rail row", () => {
     const html = row(account);
     expect(html).toContain("truncate");
     expect(account.title).toBe("alex@northwind.example");
-    expect(account.shortcut).toBe("ctrl+1");
+    // The alias, not a key: `mod2` is ⌃ on macOS and Alt everywhere else, and
+    // the row is read on both. Pinning `ctrl` here is what let the rail go on
+    // promising ⌃1 after the binding had moved off it on Linux.
+    expect(account.shortcut).toBe("mod2+1");
     // The address is the row's label and the tooltip's, so a truncated paint
     // still has the whole string to hover.
     expect(html).toContain("alex@northwind.example");
