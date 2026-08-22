@@ -133,6 +133,12 @@ pub fn run() {
             // macOS — see `shell::fit_to_monitor`.
             shell::fit_to_monitor(app.handle());
 
+            // The half of the link guard that only WebKitGTK needs, and it
+            // needs a live webview rather than a builder, so it is here rather
+            // than in the plugin chain. Another no-op on macOS — see
+            // `ipc::render::route_new_windows`.
+            ipc::render::route_new_windows(app.handle());
+
             // …and if the window came up on the wait page, keep trying until
             // the dev server is there and then load it. Returns immediately
             // when it was never needed.

@@ -2423,6 +2423,7 @@ dependencies = [
  "tiny_http",
  "tokio",
  "url",
+ "webkit2gtk",
 ]
 
 [[package]]

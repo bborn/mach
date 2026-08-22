@@ -286,6 +286,40 @@ export type FrameTokens = Partial<Record<(typeof FRAME_TOKENS)[number], string>>
 export type FrameGround = "light" | "theme";
 
 /**
+ * The scheme a `theme` ground declares: the app's, resolved.
+ *
+ * # Why not `light dark`
+ *
+ * It was, and the pair reads like the right answer — "follow whatever is in
+ * force" — but inside a frame `light dark` does not mean "follow the app". It
+ * means "follow the *system*", because that is the only input `color-scheme`
+ * has when a document names both: the engine picks between them from
+ * `prefers-color-scheme`, which is the desktop's preference and nothing else.
+ *
+ * The app is not obliged to agree with the desktop. `useMach` resolves the
+ * theme preference — `light`, `dark`, or `system` — and pins the result on the
+ * root element as an explicit `color-scheme`, so "light while the desktop is
+ * dark" is a setting, not an accident. On macOS the two rarely diverged and
+ * nobody noticed. On this Linux desktop they diverge by default: the theme
+ * preference was `light` and GNOME's `color-scheme` was `prefer-dark`, so
+ * WebKitGTK resolved the frame to *dark* while the tokens written into it were
+ * the app's *light* ones. Near-black ink on a canvas the engine painted
+ * near-black: a plain-text message that was there, laid out, and unreadable.
+ *
+ * The transparent background is what made it unreadable rather than merely
+ * mismatched. A `theme` ground has no background of its own — it shows the
+ * reading pane through — so the canvas colour comes from the frame's resolved
+ * scheme while every visible colour comes from the app's tokens, and the two
+ * have to be the same scheme or nothing lines up.
+ *
+ * So the frame is told the answer instead of being asked to work it out.
+ * [`readFrameScheme`] reads it off the same root element [`readFrameTokens`]
+ * reads the tokens off, which is what keeps a token block and the scheme it was
+ * chosen for from ever describing different themes.
+ */
+export type FrameScheme = "light" | "dark";
+
+/**
  * Remote HTML is not ours to re-theme.
  *
  * A sender writes their mail against a white page: they set `color` on the
@@ -455,7 +489,7 @@ function tokenBlock(tokens: FrameTokens): string {
  * that URL. Where it leaves a table genuinely too wide, [`containWideContent`]
  * gives that table its own scroller, which is the behaviour we want anyway.
  */
-function frameStyles(tokens: FrameTokens, format: BodyFormat): string {
+function frameStyles(tokens: FrameTokens, format: BodyFormat, scheme: FrameScheme): string {
   const ground = frameGround(format);
   /*
    * One stylesheet, two palettes. Everything below reads its colours through a
@@ -465,11 +499,11 @@ function frameStyles(tokens: FrameTokens, format: BodyFormat): string {
    * `color-scheme: light` on a sender's document is the other half of it: it
    * fixes the engine's own colours — form controls, scrollbars, and the initial
    * `color` for anything a missing token would fall through to — to the page
-   * the mail was written for. The plain-text ground keeps `light dark`, because
-   * there the tokens are the app's and the app is what it should follow.
+   * the mail was written for. The plain-text ground names a scheme too, and
+   * names the app's: see [FrameScheme] for why it cannot be `light dark`.
    */
   const light = ground === "light";
-  return `:root{${tokenBlock(light ? LIGHT_GROUND : tokens)};color-scheme:${light ? "light" : "light dark"}}
+  return `:root{${tokenBlock(light ? LIGHT_GROUND : tokens)};color-scheme:${light ? "light" : scheme}}
 html,body{margin:0;padding:0;background:${light ? "var(--background,#fff)" : "transparent"}}
 /* Nothing nests. A message grows to its natural height and the reading pane is
    the only thing that scrolls, so the frame's own viewport must never have
@@ -544,6 +578,14 @@ export interface FrameDocumentOptions {
   format: BodyFormat;
   /** Only consulted for a `theme` ground; see [`frameGround`]. */
   tokens?: FrameTokens;
+  /**
+   * The app's resolved scheme, for a `theme` ground; see [`FrameScheme`].
+   *
+   * Defaults to `light` for the same reason [`tokens`] defaults to nothing: a
+   * caller that has no app to read is rendering against the stylesheet's own
+   * `:root`, and that block is the light one.
+   */
+  scheme?: FrameScheme;
 }
 
 /**
@@ -578,11 +620,12 @@ export function frameDocument({
   allowRemoteImages,
   format,
   tokens = {},
+  scheme = "light",
 }: FrameDocumentOptions): string {
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${frameCsp(allowRemoteImages)}">
 <meta name="referrer" content="no-referrer">
-<style>${frameStyles(tokens, format)}</style>
+<style>${frameStyles(tokens, format, scheme)}</style>
 </head><body>${html}</body></html>`;
 }
 
@@ -596,6 +639,25 @@ export function readFrameTokens(root: Element | null | undefined): FrameTokens {
     if (value && value.trim()) tokens[name] = value.trim();
   }
   return tokens;
+}
+
+/**
+ * Read the app's resolved scheme off the same element, for the same reason.
+ *
+ * `useMach` writes `color-scheme` on the root as a single keyword, so the
+ * computed value is already the answer and no `matchMedia` call is involved —
+ * which is the whole point, since the media query is the thing that disagreed.
+ *
+ * Anything that is not exactly `dark` is read as light: the property's initial
+ * value is `normal`, which is what this sees for the frame or two before the
+ * theme effect first runs, and light is what the stylesheet's `:root` block
+ * holds until `.dark` replaces it.
+ */
+export function readFrameScheme(root: Element | null | undefined): FrameScheme {
+  if (!root || typeof getComputedStyle !== "function") return "light";
+  return getComputedStyle(root).getPropertyValue("color-scheme").trim() === "dark"
+    ? "dark"
+    : "light";
 }
 
 /* -------------------------------------------------------------------------- */

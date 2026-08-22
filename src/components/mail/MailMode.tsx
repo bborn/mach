@@ -191,27 +191,56 @@ export function MailMode() {
 
     /* --------------------------------------------------------- Accounts --- */
     /*
-     * ⌃1–5 filters to an account, ⌃0 clears the filter.
+     * `mod2`1–5 filters to an account, `mod2`0 clears the filter — ⌃ on macOS,
+     * Alt everywhere else.
      *
-     * ⌘ picks the surface (⌘1 mail, ⌘2 calendar) and ⌃ picks the account —
-     * one modifier per axis, which is the only version of this anyone can
-     * remember. Not ⌥: Option is the text-entry modifier, and ⌥e in the
-     * composer is the start of an accented character, not a shortcut. (It was
-     * also silently broken until `tokenFromEvent` learned to read `event.code`,
-     * because macOS turns ⌥1 into `¡` before the app ever sees it.)
+     * `mod` picks the surface (⌘1 mail, ⌘2 calendar) and `mod2` picks the
+     * account — one modifier per axis, which is the only version of this anyone
+     * can remember. The axes are the same on both platforms; which key carries
+     * the second one is not, and cannot be.
+     *
+     * # macOS: ⌃, and not ⌥
+     *
+     * Option is the text-entry modifier there, and ⌥e in the composer is the
+     * start of an accented character, not a shortcut. (⌥ was also silently
+     * broken until `tokenFromEvent` learned to read `event.code`, because macOS
+     * turns ⌥1 into `¡` before the app ever sees it.) ⌘ and ⌃ are unrelated
+     * chords, so ⌃ costs nothing.
+     *
+     * # Linux: ⌥, because ⌃ is already `mod`
+     *
+     * `detectModKey` answers `ctrl` off a Mac, so there ⌃1 is `mod+1` — the two
+     * axes collapse onto one chord. They did: both bindings registered, the
+     * account one registered later, ties go to the last registration, and ⌃1
+     * filtered to the first account instead of showing Mail. ⌘1 and ⌃1 being
+     * different keys is a fact about Macs, not about this app.
+     *
+     * Alt is free of the reason it was refused above. It is not a compose
+     * modifier under a default xkb layout — Alt+1 on `us` produces no character
+     * at all, where ⌥1 on a Mac produces `¡` — so nothing in the composer is
+     * spent by taking it. It is also free of the compositor: Hyprland's own
+     * bindings are Super's, and its only bare-Alt chord is Alt+Tab.
+     *
+     * What Alt+1–5 does cost on Linux is the composer's tab strip, which binds
+     * the same digits at priority 110 while two or more drafts are open. That
+     * precedence stands and is the same one the calendar's solo keys already
+     * accept: while you are writing a message the number row is about
+     * composers. See `ComposerDock`, and `CalendarMode`'s ⌥ block for the other
+     * half of it — the calendar's are gated on calendar mode and these on mail,
+     * so those two never meet.
      *
      * Gmail has no equivalent — it has no second account — so nothing here is
      * a divergence, it is a whole axis Gmail does not have.
      */
     {
-      keys: "ctrl+0",
+      keys: "mod2+0",
       group: "Accounts",
       description: "All accounts",
       when: () => mail,
       handler: () => dispatch({ type: "account", accountId: null }),
     },
     ...accounts.map((account, index) => ({
-      keys: `ctrl+${index + 1}`,
+      keys: `mod2+${index + 1}`,
       group: "Accounts",
       description: account.name,
       when: () => mail,

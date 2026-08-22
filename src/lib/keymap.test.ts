@@ -71,6 +71,35 @@ describe("normalizeToken", () => {
     expect(normalizeToken("Cmd+Enter", "meta")).toBe("meta+enter");
     expect(normalizeToken("esc", "meta")).toBe("escape");
   });
+
+  it("resolves mod2 to a different key from mod, on both platforms", () => {
+    expect(normalizeToken("mod2+1", "meta")).toBe("ctrl+1");
+    expect(normalizeToken("mod2+1", "ctrl")).toBe("alt+1");
+  });
+
+  /*
+   * The invariant behind `mod2`, and the one whose absence was the bug.
+   *
+   * ⌘1 is Mail and the account filter is on the other axis, so the two must be
+   * different chords wherever the app runs. Written `ctrl` outright, the
+   * account binding held that only on a Mac: off one, `mod` *is* ctrl, both
+   * bindings normalised to `ctrl+1`, and the account one — registered later, so
+   * the winner of a tie — took the key. ⌃1 filtered to the first account and
+   * Mail had no shortcut.
+   *
+   * A digit is checked for each axis rather than one, because the collision was
+   * per-key: `mod+2` and the second account collided the same way, and that is
+   * the pair that was reported (⌃2 filtered instead of opening the calendar).
+   */
+  it("keeps the surface axis and the account axis on different chords", () => {
+    for (const mod of ["meta", "ctrl"] as const) {
+      for (const digit of ["1", "2"]) {
+        expect(normalizeToken(`mod+${digit}`, mod)).not.toBe(
+          normalizeToken(`mod2+${digit}`, mod),
+        );
+      }
+    }
+  });
 });
 
 describe("isTypingTarget", () => {
@@ -320,6 +349,16 @@ describe("formatBinding", () => {
   it("renders modifiers as glyphs", () => {
     expect(formatBinding("mod+k", "meta")).toBe("⌘K");
     expect(formatBinding("mod+k", "ctrl")).toBe("⌃K");
+  });
+
+  /*
+   * The rail and the shortcut sheet print the binding rather than a key the
+   * component chose, so this is what stops either from promising a Mac's ⌃1 to
+   * somebody whose account filter is on Alt.
+   */
+  it("prints mod2 as the key the reader actually has", () => {
+    expect(formatBinding("mod2+1", "meta")).toBe("⌃1");
+    expect(formatBinding("mod2+1", "ctrl")).toBe("⌥1");
   });
 
   it("renders sequences readably", () => {

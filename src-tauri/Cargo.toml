@@ -90,6 +90,14 @@ objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSEvent"] }
 block2 = "0.6.2"
 
+# Reaching the `decide-policy` signal on the app's own WebKitGTK view, which is
+# the only place a `target="_blank"` link in a message can be caught on this
+# platform — see `ipc::render::route_new_windows`. Pinned to the exact version
+# wry resolves, because a second copy of the crate would be a second, unrelated
+# `WebView` type and `PlatformWebview::inner()` would not hand one back.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+
 # Every touch of one file rebuilds and relinks this crate, and that wait is the
 # whole cost of a change he can see. Measured at 27s before this block.
 #
