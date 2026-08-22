@@ -130,8 +130,8 @@ export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
     key: `account:${account.id}`,
     level: 2,
     // Picking an account under Inbox means that account's inbox, which is what
-    // the nesting says it means. ⌃1–5 is the other reading — keep this mailbox,
-    // change the account — and both are worth having.
+    // the nesting says it means. `mod2`1–5 is the other reading — keep this
+    // mailbox, change the account — and both are worth having.
     active: atInbox && accountId === account.id,
     activate: () => on.open(account.id, inboxId),
     leading: null,
@@ -142,7 +142,11 @@ export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
     count: unread.byAccount.get(account.id) ?? 0,
     countSuffix: unread.capped ? "+" : undefined,
     title: account.email,
-    shortcut: index < 5 ? `ctrl+${index + 1}` : undefined,
+    // Left unresolved on purpose: the row hands the binding to `Kbd`, which
+    // formats it for the platform it is being read on. Writing `ctrl` here is
+    // what made the rail promise a Mac's key on a Linux desktop, where the
+    // binding is Alt's — see the Accounts block in `MailMode`.
+    shortcut: index < 5 ? `mod2+${index + 1}` : undefined,
   }));
 
   const mailboxRows: RailItem[] = mailboxes.map((label) => {

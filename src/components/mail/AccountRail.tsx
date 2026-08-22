@@ -22,7 +22,8 @@ import { useInboxUnread } from "./use-inbox-unread";
  * the rail, `j`/`k` walk it, `←`/`→` fold and unfold the sections and step
  * between a heading and its children, Enter picks a mailbox and hands the
  * keyboard back to the list, Escape hands it back without changing anything.
- * ⌘K still jumps to any mailbox by name, and ⌃1–5 still filters to an account
+ * ⌘K still jumps to any mailbox by name, and ⌃1–5 (Alt+1–5 off a Mac; see the
+ * Accounts block in `MailMode`) still filters to an account
  * without leaving the mailbox you are in — the rail's account rows are the
  * other gesture, "that account's inbox", which is what nesting them promises.
  *

@@ -182,6 +182,30 @@ export function detectModKey(): ModKey {
   return /mac|iphone|ipad/i.test(ua) ? "meta" : "ctrl";
 }
 
+/**
+ * The app's *second* modifier axis, written `mod2` in a binding.
+ *
+ * The app has two things a number key can mean — which surface (⌘1 mail, ⌘2
+ * calendar) and which account — so it needs two modifiers, one per axis. `mod`
+ * is the first. This is the other, and unlike `mod` it cannot be the same key
+ * on both platforms.
+ *
+ * On macOS ⌘ and ⌃ are unrelated chords, so the second axis is ⌃ and the two
+ * never meet. Everywhere else `mod` *is* ⌃, so ⌃1 would be both axes at once —
+ * and it was: on Linux the account binding registered later, won the tie, and
+ * ⌃1 filtered to the first account instead of showing Mail. Alt is the next
+ * modifier that is free of the compositor and free of the layout, so that is
+ * what the axis moves to.
+ *
+ * Why Alt is available *here* and refused on macOS is the whole of the split;
+ * `MailMode`'s Accounts block has it.
+ */
+export type Mod2Key = "ctrl" | "alt";
+
+export function mod2For(mod: ModKey): Mod2Key {
+  return mod === "meta" ? "ctrl" : "alt";
+}
+
 function baseKey(key: string): string {
   const lower = key.toLowerCase();
   return NAMED_KEYS[lower] ?? lower;
@@ -218,14 +242,35 @@ export function tokenFromEvent(event: KeyEventLike): string | null {
   return parts.join("+");
 }
 
+/**
+ * One modifier as written, resolved to the key this platform actually holds.
+ *
+ * The two aliases are the two axes — see [`ModKey`] and [`Mod2Key`]. Everything
+ * else is a literal and passes through, so a binding may still name `alt` or
+ * `ctrl` outright when it means that key on every platform.
+ */
+function resolveModifier(name: string, mod: ModKey): string {
+  switch (name) {
+    case "mod":
+    case "cmd":
+    case "command":
+      return mod;
+    case "mod2":
+      return mod2For(mod);
+    case "control":
+      return "ctrl";
+    default:
+      return name;
+  }
+}
+
 /** Canonical token for a binding string, resolving `mod` for this platform. */
 export function normalizeToken(token: string, mod: ModKey): string {
   const pieces = token.split("+").filter(Boolean);
   const key = baseKey(pieces.pop() ?? "");
   const mods = new Set<string>();
   for (const piece of pieces) {
-    const m = piece.toLowerCase();
-    mods.add(m === "mod" || m === "cmd" || m === "command" ? mod : m === "control" ? "ctrl" : m);
+    mods.add(resolveModifier(piece.toLowerCase(), mod));
   }
   const parts: string[] = [];
   if (mods.has("meta")) parts.push("meta");
