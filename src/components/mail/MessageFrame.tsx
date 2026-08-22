@@ -8,6 +8,7 @@ import {
   frameDocument,
   nextFrameSize,
   openExternal,
+  readFrameScheme,
   readFrameTokens,
   reportLinkFailure,
   resetFrameSize,
@@ -19,6 +20,7 @@ import {
   MAX_FRAME_HEIGHT,
   SCROLL_ATTR,
   type BodyFormat,
+  type FrameScheme,
   type FrameTokens,
   type WideCandidate,
 } from "@/lib/message-body";
@@ -63,11 +65,11 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
   // peak in a ref and raising it from inside the updater is what clipped the
   // last line of a message; [`nextFrameSize`] has the measurement.
   const [size, setSize] = useState(INITIAL_FRAME_SIZE);
-  const tokens = useThemeTokens();
+  const { tokens, scheme } = useAppTheme();
 
   const srcDoc = useMemo(
-    () => frameDocument({ html, allowRemoteImages, format, tokens }),
-    [html, allowRemoteImages, format, tokens],
+    () => frameDocument({ html, allowRemoteImages, format, tokens, scheme }),
+    [html, allowRemoteImages, format, tokens, scheme],
   );
 
   const measure = useCallback(() => {
@@ -389,16 +391,28 @@ function preventDefault(event: Event): void {
   event.preventDefault();
 }
 
+interface AppTheme {
+  tokens: FrameTokens;
+  scheme: FrameScheme;
+}
+
 /**
- * The app's tokens, re-read when the theme flips.
+ * The app's theme, re-read when it flips: its tokens and the scheme they belong
+ * to, together.
  *
- * The frame is a separate document, so it inherits nothing: the values are
- * copied in. Watching the `class` attribute is enough because that is exactly
- * how `useMach` applies the theme.
+ * The frame is a separate document, so it inherits nothing — the values are
+ * copied in. Watching `class` and `style` on the root is enough because that is
+ * exactly how `useMach` applies the theme: the class chooses the token block
+ * and the inline `color-scheme` is the resolved answer [`readFrameScheme`]
+ * reads back.
+ *
+ * One piece of state rather than two, so a frame can never be built from this
+ * render's tokens and the last one's scheme. That pairing is the whole point;
+ * see [`FrameScheme`].
  */
-function useThemeTokens(): FrameTokens {
-  const [tokens, setTokens] = useState<FrameTokens>(() =>
-    typeof document === "undefined" ? {} : readFrameTokens(document.documentElement),
+function useAppTheme(): AppTheme {
+  const [theme, setTheme] = useState<AppTheme>(() =>
+    typeof document === "undefined" ? EMPTY_THEME : readAppTheme(document.documentElement),
   );
 
   useEffect(() => {
@@ -406,9 +420,9 @@ function useThemeTokens(): FrameTokens {
     // Compared by value, not identity: a new object every time would change
     // `srcdoc` and reload every frame on the page for nothing.
     const reread = () =>
-      setTokens((current) => {
-        const next = readFrameTokens(root);
-        return sameTokens(current, next) ? current : next;
+      setTheme((current) => {
+        const next = readAppTheme(root);
+        return sameTheme(current, next) ? current : next;
       });
     reread();
     const observer = new MutationObserver(reread);
@@ -416,9 +430,15 @@ function useThemeTokens(): FrameTokens {
     return () => observer.disconnect();
   }, []);
 
-  return tokens;
+  return theme;
 }
 
-function sameTokens(a: FrameTokens, b: FrameTokens): boolean {
-  return FRAME_TOKENS.every((name) => a[name] === b[name]);
+const EMPTY_THEME: AppTheme = { tokens: {}, scheme: "light" };
+
+function readAppTheme(root: Element): AppTheme {
+  return { tokens: readFrameTokens(root), scheme: readFrameScheme(root) };
+}
+
+function sameTheme(a: AppTheme, b: AppTheme): boolean {
+  return a.scheme === b.scheme && FRAME_TOKENS.every((name) => a.tokens[name] === b.tokens[name]);
 }

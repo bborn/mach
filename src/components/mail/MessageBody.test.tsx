@@ -885,6 +885,10 @@ describe("the frame's ground", () => {
     allowRemoteImages: false,
     format: "text",
     tokens: DARK,
+    // The tokens and the scheme they belong to, together, the way
+    // `MessageFrame` reads them off the app root. Passing DARK on its own would
+    // describe a window that does not exist.
+    scheme: "dark",
   });
 
   it("never puts the app's dark ink into a sender's document", () => {
@@ -903,8 +907,11 @@ describe("the frame's ground", () => {
   });
 
   it("fixes a sender's document to the colour scheme the mail was written for", () => {
+    // The app is dark here and the sender's document is still light, scheme
+    // included: the mail was written for a white page and the engine's own
+    // colours have to land on one.
     expect(html).toContain("color-scheme:light}");
-    expect(html).not.toContain("color-scheme:light dark");
+    expect(html).not.toContain("color-scheme:dark");
   });
 
   it("leaves plain text following the app theme", () => {
@@ -912,8 +919,36 @@ describe("the frame's ground", () => {
     // HTML, with no colour of its own to conflict with.
     expect(text).toContain("--foreground:oklch(0.985 0 0)");
     expect(text).toContain("--background:oklch(0.145 0 0)");
-    expect(text).toContain("color-scheme:light dark");
+    expect(text).toContain("color-scheme:dark");
     expect(text).toContain("background:transparent");
+  });
+
+  /*
+   * This is the assertion the old pair got wrong, so it is spelled out on its
+   * own.
+   *
+   * It used to say `color-scheme: light dark`, which reads as "follow whatever
+   * is in force" and is not what it does inside a frame: the engine resolves
+   * the pair from `prefers-color-scheme`, which is the *desktop's* preference.
+   * The app's is a setting of its own, and on a Linux desktop the two diverge
+   * by default — theme `light`, GNOME `prefer-dark` — so the app's light tokens
+   * were painted onto a canvas WebKitGTK had resolved to dark, on a ground
+   * whose background is transparent and therefore has nothing else to say what
+   * colour it is. Plain-text mail was unreadable.
+   *
+   * A `theme` ground names one scheme, always, and it is the app's. See
+   * [`FrameScheme`].
+   */
+  it("never asks a frame to resolve the scheme for itself", () => {
+    expect(text).not.toContain("light dark");
+    const asLight = frameDocument({
+      html: "<div>hi</div>",
+      allowRemoteImages: false,
+      format: "text",
+      scheme: "light",
+    });
+    expect(asLight).toContain("color-scheme:light}");
+    expect(asLight).not.toContain("light dark");
   });
 
   it("treats a snippet as text and an empty body as text", () => {
@@ -923,11 +958,21 @@ describe("the frame's ground", () => {
     expect(frameGround("empty")).toBe("theme");
   });
 
+  /*
+   * Both frames say `light` here and that is the point rather than a weakness:
+   * these tests run with no `document`, so `MessageFrame` has no app root to
+   * read and falls back to the light stylesheet — which is what the two grounds
+   * agree on when the app is light. What separates them is the background, so
+   * that is what this asserts. The scheme itself is pinned above, against a
+   * `frameDocument` told which app it is rendering for.
+   */
   it("reaches the frame the reading pane actually renders", () => {
     const asHtml = attribute(view({ format: "html" }), "srcdoc") ?? "";
     const asText = attribute(view({ format: "text" }), "srcdoc") ?? "";
     expect(asHtml).toContain("color-scheme:light}");
-    expect(asText).toContain("color-scheme:light dark");
+    expect(asHtml).toContain("background:var(--background,#fff)");
+    expect(asText).toContain("color-scheme:light}");
+    expect(asText).toContain("background:transparent");
   });
 
   it("gives the quoted history the same ground as the message it came from", () => {
