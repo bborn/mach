@@ -117,10 +117,21 @@ pub fn run() {
         qa::dev::wait_page(&request)
     });
 
-    builder
+    let builder = builder
         .setup(|app| {
             // Before anything is shown: a QA instance must never take focus.
             shell::apply_qa_policy(app)?;
+
+            // After it, because a QA instance builds its own window and this
+            // has to find whichever one exists. Removes the window frame where
+            // the platform draws one the app was designed not to have; a no-op
+            // on macOS — see `shell::undecorate`.
+            shell::undecorate(app.handle());
+
+            // And made to fit the screen it opened on, which the configured
+            // 1440x900 does not on a 1280x800 logical desktop. Also a no-op on
+            // macOS — see `shell::fit_to_monitor`.
+            shell::fit_to_monitor(app.handle());
 
             // …and if the window came up on the wait page, keep trying until
             // the dev server is there and then load it. Returns immediately
@@ -314,9 +325,40 @@ pub fn run() {
             ipc::plugins::plugin_set_enabled,
             ipc::plugins::plugin_source,
             ipc::plugins::plugin_invoke_result,
-        ])
+        ]);
+
+    // The menu bar, on the only platform that has somewhere to put it.
+    //
+    // On macOS a `Menu` set on the *application* is drawn by the system in the
+    // bar at the top of the screen, and costs the window nothing. Tauri has
+    // nowhere to put it on Linux, so it puts it inside the window: the same
+    // menu becomes a strip drawn across the top of the app's own content,
+    // under the title bar `shell::undecorate` has just removed and above the
+    // chrome the app draws for itself. Three bars where the design has one.
+    //
+    // It also buys nothing there, which is the part that makes this safe.
+    // Every custom item's id *is* a keymap token — `on_menu_event` emits it
+    // and `src/lib/menu.ts` replays it as the keystroke it already was — so
+    // the item and the shortcut are the same thing, and the shortcut is still
+    // registered. What is left is predefined: About, Services, Hide, Hide
+    // Others and Show All are macOS system services with no meaning here, and
+    // minimize, zoom, full screen and close belong to the window manager on a
+    // platform where the window manager is the thing that draws the frame.
+    //
+    // The one item that is not merely a duplicate is Window ▸ Mach (⌘0), and
+    // it is macOS-only for the same reason it exists: it is the way back to a
+    // window that closing *hid*. `shell::hides_on_close` is already
+    // `cfg!(target_os = "macos")`, so closing here destroys and quits, and
+    // there is no hidden window for it to rescue.
+    //
+    // A separate statement rather than more links in the chain, for the same
+    // reason as the wait-page scheme above: so it can be conditional.
+    #[cfg(target_os = "macos")]
+    let builder = builder
         .menu(shell::build_menu)
-        .on_menu_event(|app, event| shell::on_menu_event(app, event.id().as_ref()))
+        .on_menu_event(|app, event| shell::on_menu_event(app, event.id().as_ref()));
+
+    builder
         // Closing hides the window rather than destroying it, so ⌘W stops
         // leaving a live process with no way back to it. See `shell`.
         .on_window_event(|window, event| {
@@ -332,9 +374,17 @@ pub fn run() {
             // A Dock click on an app whose window is hidden. Without this the
             // window that ⌘W hid would be unreachable for the life of the
             // process.
+            //
+            // `Reopen` is a macOS-only variant — it is the app delegate's
+            // `applicationShouldHandleReopen:` and nothing else reports one —
+            // so the `cfg` is on the whole `if let` rather than on its body.
+            #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
                 shell::reopen(app);
             }
+            // Which leaves `app` with no reader anywhere else in here.
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
             /*
              * No handoff session's process outlives the app.
              *

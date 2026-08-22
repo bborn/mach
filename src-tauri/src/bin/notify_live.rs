@@ -19,9 +19,22 @@
 //! anything the app can reach, because the one thing a notification must never
 //! be is something a process other than the owner's own Mach can fire.
 
+// Every item below is gated, which is heavier than gating the two calls that
+// happen not to compile elsewhere — `notify::mac::deliver` and `CFRunLoopRun`
+// — and is the honest shape: the probe *is* macOS. Its whole job is to put an
+// `NSUserNotification` on the screen and block until a hand clicks it, and
+// there is nothing on the other side to port to. The banner Mach posts on
+// Linux is drawn and routed by the desktop's own notification daemon, which
+// reports the activation back through the plugin, so the thing this binary
+// exists to see cannot go unseen there. Without the gate `cargo test` — which
+// builds every target, this one included — fails on Linux before a single test
+// runs.
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "macos")]
 use mach_lib::db::Db;
+#[cfg(target_os = "macos")]
 use mach_lib::notify::{
     self,
     host::{Delivery, Host},
@@ -32,14 +45,17 @@ use mach_lib::notify::{
 /// The identifier in `tauri.conf.json`. Repeated rather than read, because this
 /// binary has no Tauri config loaded and one string is cheaper than a parser.
 /// `scripts/dev-bundle` and `scripts/sign` hold the same one.
+#[cfg(target_os = "macos")]
 const IDENTIFIER: &str = "com.mach.mail";
 
 /// A host that only records, so the click can be printed rather than emitted
 /// into a window this process does not have.
+#[cfg(target_os = "macos")]
 struct Printer {
     opened: Mutex<Vec<PendingOpen>>,
 }
 
+#[cfg(target_os = "macos")]
 impl Host for Printer {
     fn show(&self, _banner: &Banner, _target: &PendingOpen) -> Delivery {
         Delivery::Watched
@@ -68,6 +84,7 @@ impl Host for Printer {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn arrival(id: &str, thread_id: i64, sender: &str, subject: &str, snippet: &str) -> Arrival {
     Arrival {
         gmail_message_id: id.into(),
@@ -82,6 +99,7 @@ fn arrival(id: &str, thread_id: i64, sender: &str, subject: &str, snippet: &str)
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let coalesced = std::env::args().nth(1).as_deref() == Some("digest");
 
@@ -141,7 +159,15 @@ fn main() {
     unsafe { CFRunLoopRun() };
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRunLoopRun();
+}
+
+/// Says so, rather than exiting 0 as if a banner had been shown and clicked.
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("notify_live: macOS only — this probe watches an NSUserNotification");
+    std::process::exit(1);
 }

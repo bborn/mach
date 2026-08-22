@@ -1,4 +1,4 @@
-import { formatBinding } from "@/lib/keymap";
+import { type ModKey, formatBinding } from "@/lib/keymap";
 import { cn } from "@/lib/utils";
 
 /**
@@ -6,7 +6,22 @@ import { cn } from "@/lib/utils";
  * mono face on a surface step, so a row of them reads as a legend rather than
  * a keyboard.
  */
-export function Kbd({ keys, className }: { keys: string; className?: string }) {
+export function Kbd({
+  keys,
+  className,
+  mod,
+}: {
+  keys: string;
+  className?: string;
+  /**
+   * Which key `mod` stands for. Left out it is the platform's, which is the
+   * right answer everywhere except a test: `detectModKey` reads `navigator`,
+   * so an assertion about `⌘` passes on a Mac and fails on Linux, where CI
+   * runs. Pinning it is the same escape hatch `connectMenu` takes for the
+   * same reason — see the note in `menu.test.ts`.
+   */
+  mod?: ModKey;
+}) {
   return (
     <kbd
       className={cn(
@@ -16,7 +31,7 @@ export function Kbd({ keys, className }: { keys: string; className?: string }) {
         className,
       )}
     >
-      {formatBinding(keys)}
+      {formatBinding(keys, mod)}
     </kbd>
   );
 }

@@ -52,8 +52,19 @@ function event(over: Partial<CalendarEvent> & Pick<CalendarEvent, "id" | "title"
   };
 }
 
+// The shape `mergeEvents` produces for an event that merged with nothing —
+// one copy, its own calendar and account, `merged: false`. Spelled out rather
+// than obtained by calling `mergeEvents`, because what is under test here is
+// how `MonthGrid` *packs* blocks into week rows, and a fixture that ran the
+// merge would fail for two different reasons.
 function merged(row: CalendarEvent): MergedEvent {
-  return { event: row, copies: [row] };
+  return {
+    event: row,
+    copies: [row],
+    calendarIds: [row.calendarId],
+    accountIds: [row.accountId],
+    merged: false,
+  };
 }
 
 function mount(events: CalendarEvent[]) {

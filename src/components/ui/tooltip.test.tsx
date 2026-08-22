@@ -4,7 +4,12 @@ import { ShortcutHint } from "./tooltip";
 
 describe("a shortcut hint", () => {
   it("names the action and the key", () => {
-    const html = renderToStaticMarkup(<ShortcutHint label="Mail" keys="mod+1" />);
+    // `mod` is pinned rather than left to the platform. `detectModKey` reads
+    // `navigator` and answers `ctrl` off a Mac, so an assertion about `⌘`
+    // passes locally and fails on CI, which is Linux. Same reasoning, and the
+    // same fix, as the note in `menu.test.ts`. What is under test is that the
+    // hint names the action and renders the binding, not which key `mod` is.
+    const html = renderToStaticMarkup(<ShortcutHint label="Mail" keys="mod+1" mod="meta" />);
     expect(html).toContain("Mail");
     expect(html).toContain("⌘1");
   });
@@ -20,7 +25,10 @@ describe("a shortcut hint", () => {
   });
 
   it("treats two spellings as alternatives, not a sequence", () => {
-    const html = renderToStaticMarkup(<ShortcutHint label="Search" keys={["/", "mod+f"]} />);
+    // Pinned, as above.
+    const html = renderToStaticMarkup(
+      <ShortcutHint label="Search" keys={["/", "mod+f"]} mod="meta" />,
+    );
     expect(html).toContain("Search");
     expect(html).toContain("/");
     expect(html).toContain("⌘F");

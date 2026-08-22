@@ -22,8 +22,10 @@ Not in scope, and not planned:
 
 - **No IMAP or SMTP.** Mach uses the Gmail API.
 - **No other providers.** No Outlook, Fastmail, iCloud, or generic mail.
-- **No mobile, no web, no Windows, no Linux.** macOS desktop only. Refresh
-  tokens live in the macOS Keychain and the UI is WKWebView.
+- **No mobile, no web, no Windows.** macOS and Linux desktop. On macOS refresh
+  tokens live in the Keychain and the window is a WKWebView; on Linux they live
+  in the Secret Service (gnome-keyring, KWallet) and the window is WebKitGTK.
+  Wayland only — X11 is not covered.
 - **No teams and no sharing.** One user, and it's me.
 
 Design records, which explain why the architecture is what it is:

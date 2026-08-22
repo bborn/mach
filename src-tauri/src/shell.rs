@@ -215,6 +215,109 @@ pub fn suppress_configured_window(context: &mut tauri::Context) {
     }
 }
 
+/// Hand the window frame back to the window manager.
+///
+/// `tauri.conf.json` asks for `titleBarStyle: "Overlay"`, `hiddenTitle` and a
+/// `trafficLightPosition`, which together say one thing: this window has no
+/// title bar of its own, the app draws the whole top strip, and the buttons sit
+/// on top of what it drew. All three keys are macOS-only and are ignored in
+/// silence everywhere else — so on Linux the window came up wearing a full
+/// stock title bar *above* the strip the app draws, two bars of chrome in a
+/// design that has none, and the layout lost the height to both.
+///
+/// Done here rather than by adding `"decorations": false` to the window config,
+/// because that key is not platform-scoped: it would take the frame off the
+/// macOS window too, and with it the traffic lights that `trafficLightPosition`
+/// exists to place. That file is JSON and cannot hold a `cfg`, which is the
+/// same reason [`build_menu`]'s comment about `mainBinaryName` lives in
+/// `Cargo.toml`.
+///
+/// Nothing is lost with the frame. Moving, resizing, closing and focusing a
+/// window are the compositor's under Wayland and were never reached through
+/// those buttons.
+#[cfg(target_os = "linux")]
+pub fn undecorate<R: Runtime>(app: &AppHandle<R>) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        return;
+    };
+    if let Err(e) = window.set_decorations(false) {
+        // Said out loud rather than swallowed: the failure mode is a window
+        // that looks wrong, and a wrong-looking window with a silent log is
+        // how the two stacked bars went unnoticed in the first place.
+        eprintln!("shell: could not drop the window decorations: {e}");
+    }
+}
+
+/// Nothing to hand back anywhere else — macOS is already undecorated by
+/// configuration, and this keeps the `setup` call free of a `cfg`, the same way
+/// [`crate::scroll::install`] does.
+#[cfg(not(target_os = "linux"))]
+pub fn undecorate<R: Runtime>(_app: &AppHandle<R>) {}
+
+/// The floor the layout can genuinely meet, in logical pixels.
+///
+/// `tauri.conf.json` says 960×600, which is the width the three-pane mail
+/// layout was drawn for. That number is a promise macOS can keep — windows
+/// float there and the minimum is honoured — and one a tiling compositor
+/// cannot: Hyprland assigns the tile and the client gets no veto, so a declared
+/// 960 does not protect the layout, it only misdescribes it. The real floor is
+/// what the frontend reflows down to.
+#[cfg(target_os = "linux")]
+const MIN_LOGICAL_SIZE: (f64, f64) = (420.0, 520.0);
+
+/// How much of the screen the window may take when it has to shrink.
+#[cfg(target_os = "linux")]
+const SCREEN_FILL: f64 = 0.9;
+
+/// Shrink the window to something the screen can actually hold.
+///
+/// The configured 1440×900 is a Mac number. This machine's panel is 2560×1600
+/// at scale 2 — 1280×800 logical — so the window as configured is *wider than
+/// the desktop it opens on*, and on any window manager that honours the request
+/// it opens half off-screen.
+///
+/// Only ever downwards, and only when it has to: the configured size is read
+/// off the window rather than repeated here, so this stays correct if the
+/// config changes and does nothing at all on a screen with room for it.
+///
+/// Under a tiling compositor the size request is ignored, which is fine —
+/// there the tile is the answer and this is a no-op. It is for the floating
+/// case: another Linux desktop, or Hyprland with the window floated.
+#[cfg(target_os = "linux")]
+pub fn fit_to_monitor<R: Runtime>(app: &AppHandle<R>) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW) else {
+        return;
+    };
+
+    // Lowered before anything else, because a minimum larger than the size set
+    // below would win and undo it.
+    let _ = window.set_min_size(Some(tauri::LogicalSize::new(
+        MIN_LOGICAL_SIZE.0,
+        MIN_LOGICAL_SIZE.1,
+    )));
+
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let screen = monitor.size().to_logical::<f64>(scale);
+    let Ok(current) = window.inner_size() else {
+        return;
+    };
+    let current = current.to_logical::<f64>(scale);
+
+    let width = current.width.min(screen.width * SCREEN_FILL);
+    let height = current.height.min(screen.height * SCREEN_FILL);
+    if width < current.width || height < current.height {
+        let _ = window.set_size(tauri::LogicalSize::new(width, height));
+    }
+}
+
+/// Nowhere else needs it: the configured size is the size that platform was
+/// measured on.
+#[cfg(not(target_os = "linux"))]
+pub fn fit_to_monitor<R: Runtime>(_app: &AppHandle<R>) {}
+
 /// One menu entry that replays `token` through the keymap when chosen.
 struct Replay {
     token: &'static str,

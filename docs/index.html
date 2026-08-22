@@ -3,17 +3,17 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Mach — a fast Gmail and Google Calendar client for macOS</title>
+    <title>Mach — a fast Gmail and Google Calendar client for macOS and Linux</title>
     <meta
       name="description"
-      content="A fast, keyboard-driven Gmail and Google Calendar client for macOS. Everything renders from a local SQLite database, so nothing waits on Google. Google accounts only, MIT, build it from source."
+      content="A fast, keyboard-driven Gmail and Google Calendar client for macOS and Linux. Everything renders from a local SQLite database, so nothing waits on Google. Google accounts only, MIT, build it from source."
     />
     <link rel="canonical" href="https://machmail.dev/" />
     <meta name="color-scheme" content="light dark" />
     <meta property="og:title" content="Mach" />
     <meta
       property="og:description"
-      content="A fast Gmail and Google Calendar client for macOS. I got tired of waiting on Gmail, so I wrote my own."
+      content="A fast Gmail and Google Calendar client for macOS and Linux. I got tired of waiting on Gmail, so I wrote my own."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://machmail.dev/" />
@@ -683,7 +683,7 @@
           <span class="wordmark">Mach</span>
         </div>
         <h1 class="measure" style="margin-top: 0.75rem">
-          A fast Gmail and Google Calendar client for macOS.
+          A fast Gmail and Google Calendar client for macOS and Linux.
         </h1>
         <p class="lede measure">
           I got tired of waiting on Gmail, so I wrote my own. All my accounts in
@@ -692,7 +692,7 @@
           Gmail and Google Calendar only — no IMAP, no other providers.
         </p>
         <div class="meta">
-          <span>macOS only</span>
+          <span>macOS and Linux</span>
           <span class="sep">·</span>
           <span>Build from source</span>
           <span class="sep">·</span>
@@ -1076,9 +1076,10 @@
             iCloud.
           </li>
           <li>
-            <strong>No mobile, no web, no Windows, no Linux.</strong> The tokens
-            live in the macOS Keychain and the window is a WKWebView, so there
-            isn't much to port.
+            <strong>No mobile, no web, no Windows.</strong> macOS and Linux
+            desktop. The tokens live in the macOS Keychain or the Secret Service
+            depending on which you're on, and the window is a WKWebView or
+            WebKitGTK. Wayland only — X11 isn't covered.
           </li>
           <li>
             <strong>No teams and no sharing.</strong> One user, and it's me.
@@ -1097,10 +1098,14 @@
           <li>
             <h3>Prerequisites</h3>
             <ul class="plain" style="margin-top: 0.5rem">
-              <li>macOS, Apple silicon or Intel</li>
               <li>
-                <a href="https://rustup.rs">Rust</a> stable, with the Xcode command
-                line tools
+                macOS, Apple silicon or Intel — or Linux on Wayland, tested on
+                Omarchy (Arch with Hyprland)
+              </li>
+              <li>
+                <a href="https://rustup.rs">Rust</a> stable. On macOS, the Xcode
+                command line tools; on Linux, webkit2gtk-4.1, gtk3, libsoup3 and
+                wl-clipboard
               </li>
               <li><a href="https://bun.sh">Bun</a></li>
               <li>A Google account you can create a Cloud project with</li>

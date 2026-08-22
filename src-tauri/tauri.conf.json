@@ -35,7 +35,10 @@
     "active": true,
     "targets": [
       "app",
-      "dmg"
+      "dmg",
+      "deb",
+      "rpm",
+      "appimage"
     ],
     "category": "Productivity",
     "shortDescription": "A fast Google-only mail and calendar client",

@@ -160,7 +160,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::http::{Response, StatusCode};
 use tauri::webview::{DownloadEvent, NewWindowResponse};
-use tauri::{AppHandle, Emitter, Manager, Runtime, TitleBarStyle, WebviewUrl, WebviewWindowBuilder};
+#[cfg(target_os = "macos")]
+use tauri::TitleBarStyle;
+use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
 
 /// The window's label, and therefore the name no capability may mention.
@@ -360,15 +362,26 @@ pub fn open<R: Runtime>(
     let popup_fixture = fixture.clone();
     let download_app = app.clone();
 
-    WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::External(parsed.clone()))
+    let builder = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::External(parsed.clone()))
         .title(&title)
         .inner_size(900.0, 760.0)
-        .min_inner_size(420.0, 320.0)
-        // The ordinary macOS title bar, because the title *is* the address
-        // readout. The main window hides its own (`Overlay` + `hiddenTitle`);
-        // this one must not.
+        .min_inner_size(420.0, 320.0);
+
+    // The ordinary macOS title bar, because the title *is* the address
+    // readout. The main window hides its own (`Overlay` + `hiddenTitle`);
+    // this one must not.
+    //
+    // The chain breaks here because both of these are macOS-only *methods* on
+    // the builder rather than macOS-only arguments to one: elsewhere the title
+    // bar belongs to the window manager and Tauri does not offer to describe
+    // it. Nothing is lost by their absence — a plain decorated window with the
+    // address as its title is exactly what they ask for.
+    #[cfg(target_os = "macos")]
+    let builder = builder
         .title_bar_style(TitleBarStyle::Visible)
-        .hidden_title(false)
+        .hidden_title(false);
+
+    builder
         // A fresh non-persistent `WKWebsiteDataStore`: no cookies, no
         // localStorage, no cache shared with anything, and nothing left on disk
         // when it closes. The cost is real and is the right cost — a page that

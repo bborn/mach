@@ -376,6 +376,15 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             // back that would let us. Focus the window either way; open the
             // conversation only if we said something about one recently enough
             // for this to plausibly be the answer to it.
+            //
+            // The arm itself is macOS-only because the variant is: no other
+            // platform has an event for "the app was asked for again". The
+            // pending-open handoff below it is therefore also macOS-only, which
+            // is correct — it exists to compensate for a banner click that
+            // arrives with nothing attached to say what was clicked, and the
+            // XDG notification the plugin posts elsewhere reports its own
+            // activation.
+            #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => {
                 if let Some(host) = current() {
                     host.reopen();

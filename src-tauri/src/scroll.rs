@@ -94,11 +94,17 @@
 //! wheels down a separate path keyed on delta shape) and a trap later, so it is
 //! published as its own state and the frontend leaves the wheel path alone.
 
+// The monitor is the only reader of these three, and the monitor only exists on
+// macOS — see `install`. Ungated they are three warnings on every other build.
+#[cfg(target_os = "macos")]
 use std::cell::Cell;
+#[cfg(target_os = "macos")]
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Runtime};
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
+use tauri::{AppHandle, Runtime};
 
 /// The event the frontend listens for. See `src/lib/scroll-phase.ts`.
 pub const SCROLL_PHASE_EVENT: &str = "scroll-phase";
