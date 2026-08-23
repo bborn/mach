@@ -152,8 +152,30 @@ else
 # so concurrent builds wait rather than corrupt each other.
 [build]
 target-dir = "$PARENT_DIR/src-tauri/target"
+
+# No incremental cache from a worktree build.
+#
+# This is the line that stops the disk filling. Measured on a clean target
+# directory, one one-line rebuild of \`lib.rs\`:
+#
+#     as configured           +203MB   7.2s
+#     CARGO_INCREMENTAL=0      +17MB  15.6s
+#
+# Twelve times the growth for eight seconds, and the eight seconds are the
+# part nobody here is waiting on — an agent build is one-shot and unattended.
+#
+# The cache is also nearly useless in this arrangement. Every worktree shares
+# the one target directory above, so fifteen checkouts at fifteen different
+# commits each write their own ~190MB session into it, and the next build in
+# that directory is somebody else's code at somebody else's commit. Full price,
+# almost no hits. \`src-tauri/target\` was created on 2026-08-07 and reached
+# **106GB** by 2026-08-22 — about 7GB a day — until it filled a 926GB disk.
+#
+# The main checkout is deliberately left alone: that is where a person edits
+# and rebuilds in a loop, and 7s against 16s is worth 190MB there.
+incremental = false
 EOF
-  echo "==> Sharing the parent's cargo target dir (skips a full rebuild)"
+  echo "==> Sharing the parent's cargo target dir (skips a full rebuild, no incremental cache)"
 fi
 
 echo "==> Warming the Rust build"

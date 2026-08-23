@@ -24,7 +24,13 @@ default-run = "mach"
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "mach_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# No `staticlib`. It is the iOS artifact — Tauri's template carries all three
+# because it targets mobile, and this app is macOS and Linux desktop; there is
+# no `gen/apple` or `gen/android` to link it. What it *was* doing is producing
+# `libmach_lib.a` at 196MB, twice (here and in `deps/`), on every single build:
+# a full debug build went 2260MB → 1858MB without it, and nothing else changed.
+# `rlib` is what `src/main.rs` links against; `cdylib` is 1MB and stays.
+crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

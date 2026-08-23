@@ -22,8 +22,7 @@ Forking is a completely reasonable outcome, and MIT is there for that.
 ## What is not in scope
 
 Named in the README, and none of it is a gap I'm waiting for help with: IMAP or
-SMTP, any provider that isn't Google, Windows, Linux, mobile, web, teams,
-sharing.
+SMTP, any provider that isn't Google, Windows, mobile, web, teams, sharing.
 
 ## Before you open a pull request
 

@@ -631,7 +631,72 @@ if now.st_ino != was.get("inode"):
 PY
 }
 
+# ---------------------------------------------------------------------------
+# Nobody wants to be the garbage collector
+# ---------------------------------------------------------------------------
+#
+# `.qa/` is gitignored, so it never appears in `git status` and nothing ever
+# prompted anybody to look at it. Ten dead instances had accumulated by the time
+# anyone did, holding 1.5GB — almost all of it seeded stores, because `qa seed`
+# copies the owner's whole mailbox per instance (1.3GB apiece) and `qa down`
+# never took one back.
+#
+# So `up` sweeps before it starts anything. By age, not on `down`: CLAUDE.md
+# tells an agent to run `qa down && qa up` after every frontend change in a
+# worktree, and deleting the store on the way down would make each of those
+# cycles re-copy 1.3GB.
+#
+# Three things it will not touch, in order of how badly it would end:
+#
+#   * `main`, which is the owner's real app and his real mailbox;
+#   * anything with a live process, checked by pid rather than by guessing;
+#   * anything outside `$REPO/.qa`, which is why the path is rebuilt here from
+#     `$REPO` rather than taken from a variable somebody might later reassign.
+#
+# It says what it removed. A sweep nobody can see is how the next surprise gets
+# built.
+QA_KEEP_DAYS="${MACH_QA_KEEP_DAYS:-7}"
+
+prune_dead_instances() {
+  local root="$REPO/.qa"
+  [ -d "$root" ] || return 0
+
+  local dir name pidfile pid removed=0 freed=0 size
+  for dir in "$root"/*/; do
+    [ -d "$dir" ] || continue
+    name="$(basename "$dir")"
+
+    # The owner's. Never.
+    [ "$name" = "main" ] && continue
+    # Not an instance — `qa` keeps a few working directories of its own here.
+    [ -d "$dir/data" ] || [ -f "$dir/mach.pid" ] || continue
+
+    pidfile="$dir/mach.pid"
+    if [ -f "$pidfile" ]; then
+      pid="$(cat "$pidfile" 2>/dev/null || true)"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then continue; fi
+    fi
+
+    # Touched recently enough to still be somebody's work in progress. `-mtime`
+    # on the directory alone would miss a store written inside it, so the test
+    # is whether *anything* under it has been modified in the window.
+    if [ -n "$(find "$dir" -newermt "-${QA_KEEP_DAYS} days" -print -quit 2>/dev/null)" ]; then
+      continue
+    fi
+
+    size="$(du -sm "$dir" 2>/dev/null | cut -f1)"
+    rm -rf "$dir"
+    removed=$((removed + 1))
+    freed=$((freed + ${size:-0}))
+  done
+
+  [ "$removed" -gt 0 ] &&
+    echo "qa: swept $removed instance(s) idle over ${QA_KEEP_DAYS}d, freed ${freed}MB"
+  return 0
+}
+
 cmd_up() {
+  prune_dead_instances
   if pid="$(instance_pid)"; then echo "already running (pid $pid)"; return 0; fi
   [ -x "$BIN" ] || die "no binary at $BIN — run: cd src-tauri && cargo build"
   [ -f "$REPO/.env.local" ] || die "no .env.local — the app would boot 'not configured'"
