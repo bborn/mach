@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { KeymapProvider, useKeyBindings, useKeymap } from "@/hooks/useKeymap";
 import type { KeyBinding } from "@/lib/keymap";
 import { connectQaBridge } from "@/lib/qa-bridge";
+import { connectFrameKeys } from "@/lib/frame-keyboard";
 import type { LabelId } from "@/types";
 import { hasBulkTabs, inboxLabelId } from "@/lib/mailboxes";
 import { MachProvider, useMach } from "@/hooks/useMach";
@@ -116,6 +117,21 @@ function Shell() {
     if (!import.meta.env.DEV) return;
     return connectQaBridge({ keymap, ui: () => uiRef.current });
   }, [keymap]);
+
+  /*
+   * The keyboard, while the reader's focus is inside a message body.
+   *
+   * A message is a sandboxed iframe, and WebKit will not invoke a listener on a
+   * document with scripting disabled — so the keydown forwarding `MessageFrame`
+   * attaches is dead in the app however well it works in a browser tab. The key
+   * is read off the `NSEvent` instead and arrives here. See `lib/frame-keyboard.ts`
+   * and `src-tauri/src/frame_keyboard.rs`.
+   *
+   * Here rather than in `MessageFrame` because it is one listener for the
+   * application, not one per open message, and because the fact it turns on —
+   * "is the active element an iframe" — is a property of the document.
+   */
+  useEffect(() => connectFrameKeys({ keymap }), [keymap]);
 
   useKeyBindings([
     {

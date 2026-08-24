@@ -54,6 +54,7 @@ pub mod qa;
 pub mod render;
 /// Whether the fingers are still on the trackpad — the one thing WebKit
 /// declines to forward, read off the `NSEvent` instead of guessed at.
+pub mod frame_keyboard;
 pub mod scroll;
 pub mod shell;
 /// The clock that brings a snoozed conversation back.
@@ -150,6 +151,14 @@ pub fn run() {
             // back. It steers nothing and swallows nothing — see `scroll`.
             // Here on the main thread, which is where AppKit dispatches.
             scroll::install(app.handle());
+
+            // A third block in that stream, and the quietest: while the
+            // reader's focus is inside a message body — and only then — it
+            // publishes each key so the frontend can run it through the keymap.
+            // Nothing in that frame can, because WebKit will not invoke a
+            // listener on a document with scripting disabled. It swallows
+            // nothing; see `frame_keyboard`.
+            frame_keyboard::install(app.handle());
 
             // The other block in that stream, and the only one that ever
             // swallows an event: Escape closes the page window. It has to be
@@ -287,6 +296,7 @@ pub fn run() {
             ipc::commands::begin_add_account,
             ipc::commands::complete_add_account,
             ipc::commands::remove_account,
+            frame_keyboard::set_frame_focus,
             ipc::prefs::get_preferences,
             ipc::prefs::set_preference,
             ipc::notify::notification_state,

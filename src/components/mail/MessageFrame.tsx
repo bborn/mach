@@ -120,6 +120,21 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
    * the list. Clicking the list revives them, which is why it was reported as
    * "the R shortcut isn't working consistently" rather than as a dead keyboard.
    *
+   * # This does not run in the app
+   *
+   * The same measurement `FRAME_SANDBOX` records for the click listener below
+   * applies here word for word: WebKit refuses to invoke a listener whose
+   * target document has scripting disabled, and the sandbox disables scripting
+   * in this document by design. It attaches, it never fires, and nothing says
+   * so. Believing otherwise cost a third round of the same bug report — "after
+   * I click a link in an email, the E archive keycut doesn't register" — and a
+   * test that dispatched a keydown into the frame passed the whole time,
+   * because Blink runs it.
+   *
+   * What answers it in the app is `frame_keyboard`, which reads the key off the
+   * `NSEvent` below the engine and hands it to the same keymap. This stays for
+   * `bun run dev` and the headless harness, where it is the only path there is.
+   *
    * Straight into the one registry rather than re-dispatching a synthetic event
    * upward: `keymap.handle` is what decides what a key means everywhere else,
    * and a second path to it would be a second thing to keep in step. It only
