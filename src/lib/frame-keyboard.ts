@@ -124,8 +124,17 @@ export function asKeyEvent(payload: FrameKeyPayload): KeyEventLike {
  * message, rather than per keystroke.
  */
 async function reportFrameFocus(inside: boolean): Promise<void> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("set_frame_focus", { inside });
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("set_frame_focus", { inside });
+  } catch (error) {
+    // Said out loud rather than swallowed — a monitor nobody is talking to
+    // means the shortcuts are dead in a message body again, which is the whole
+    // bug. Not a status line, though: the reader has no action to take, and an
+    // unhandled rejection would be filed as a boot failure by the watchdog in
+    // `index.html`.
+    console.error("frame-keyboard: could not report focus to the key monitor", error);
+  }
 }
 
 /**
