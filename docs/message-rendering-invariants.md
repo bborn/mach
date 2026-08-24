@@ -77,6 +77,29 @@ five mailboxes. Assume the sender knows exactly how the sanitizer works.
    frontend in a browser tab where it does run and is the only thing there. It
    is not what makes links work in the app.
 
+   **The same is true of every other listener on that document, and forgetting
+   it cost a third bug report.** A `keydown` listener was attached four lines
+   below the click one, to hand the app back its shortcuts once focus entered a
+   message — and for the same reason it has never fired in Mach. Click anywhere
+   in a message body and the whole keyboard went dead: archive, star, snooze,
+   the way back to the list. It was filed as "the R shortcut isn't working
+   consistently", fixed, measured clean in Blink, and filed again as "after I
+   click a link in an email, the E archive keycut doesn't register".
+
+   Keys are therefore read below the engine too, in `frame_keyboard` — an
+   `NSEvent` monitor in the app's own event stream, the same mechanism `scroll`
+   and `browser` already use. It publishes a key while the frontend says focus
+   is inside a message frame and swallows nothing, so the frame keeps what
+   belongs to it: arrows, space, `⌘A` and `⌘C`.
+
+   Moving focus out of the frame instead would have been smaller and was
+   rejected: a drag-select *is* focus in the frame, so blurring it makes WebKit
+   discard the selection and leaves `⌘C` nothing to copy.
+
+   The rule to carry forward: **a listener the parent attaches to the frame's
+   document is a browser-only convenience.** Anything the app must actually do
+   belongs below the engine.
+
 4. **`data-mach-blocked-src` must be consumed as a DOM property**
    (`img.src = img.dataset.machBlockedSrc`), never concatenated into an HTML
    string. The stored value is percent-encoded so even that would be inert —

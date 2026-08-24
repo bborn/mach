@@ -42,7 +42,10 @@ Working, and what I read my mail in every day:
   that does not expire.
 - Search in Gmail's operator syntax, parsed as you type and compiled to SQL
   against the FTS5 index, plus a `⌘K` palette for everything else.
-- Composer with signatures, a send delay you can cancel, and scheduled send.
+- Composer with signatures, a send delay you can cancel, and scheduled send. A
+  new message has a `From` row when there is more than one account to pick from;
+  a reply goes from the account that holds the conversation, which Gmail gives
+  no way around.
 - Attachments both ways: drag a file onto a composer or press `⇧⌘A` to send
   one; fetch, cache, open, save, and inline `cid:` images on the way in.
 - Day, week and month calendar with drag-to-create and drag-to-move, and an
@@ -69,7 +72,9 @@ Working, and what I read my mail in every day:
   spam report instead.
 - `⌥⌘C` copies what is on screen as plain text — the thread with quotes
   stripped, or the week, or a search and its results — for pasting into a chat
-  window somewhere else.
+  window somewhere else. `⇧⌥⌘C` takes only the message you are reading. Both are
+  in the message's context menu, and both render through the same code the agent
+  reads its context with, so what you paste and what it sees cannot drift.
 - A sandboxed plugin runtime. See [`PLUGINS.md`](PLUGINS.md).
 
 Expect rough edges: nothing packaged, nothing that updates itself, no onboarding
