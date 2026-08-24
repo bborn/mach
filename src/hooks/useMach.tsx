@@ -101,6 +101,7 @@ import {
   type Selection,
 } from "@/lib/selection";
 import { BULK_CATEGORIES, mailboxName, PRIMARY_LABEL, withVirtualMailboxes } from "@/lib/mailboxes";
+import { eventsArrived, NO_EVENT_COUNTS, type EventCounts } from "@/lib/events-arrived";
 import type { Contact } from "@/lib/contacts";
 import type { Artifact } from "@/lib/agent";
 import { connectNotificationOpen } from "@/lib/notification-open";
@@ -965,6 +966,13 @@ export function MachProvider({ children }: { children: ReactNode }) {
   /** Bumped by anything that writes an event — see `reloadEvents`. */
   const [eventsKey, setEventsKey] = useState(0);
   /**
+   * How many events each account had written when we last heard, so a sync
+   * pass that brought some can be told from one that brought none. A ref
+   * rather than state: nothing renders from it, and it must not re-run the
+   * effect that maintains it.
+   */
+  const eventCounts = useRef<EventCounts>(NO_EVENT_COUNTS);
+  /**
    * Bumped when a background write may have changed the open conversation.
    *
    * Separate from `reloadKey` because it costs one local `get_thread` rather
@@ -1186,7 +1194,25 @@ export function MachProvider({ children }: { children: ReactNode }) {
       else off();
     };
 
-    void source.onSyncStatus(setSync).then(keep);
+    /*
+     * The calendar's push channel, which it did not have.
+     *
+     * Mail gets `onThreadsChanged`; events had nothing, so a calendar pass
+     * wrote rows into SQLite that the grid never re-read — it refetches on
+     * `windowKey` (navigating out of the loaded 30 days) and on `eventsKey`
+     * (a *local* write), and a sync moves neither. An event made on a phone
+     * therefore sat in the database until something else happened to make the
+     * view refetch. See `eventsArrived` for why the counter has to be read as
+     * a rise rather than a total.
+     */
+    void source
+      .onSyncStatus((next) => {
+        setSync(next);
+        const { arrived, counts } = eventsArrived(next, eventCounts.current);
+        eventCounts.current = counts;
+        if (arrived) setEventsKey((key) => key + 1);
+      })
+      .then(keep);
     void source.onThreadsChanged(scheduleRefresh).then(keep);
 
     /*
