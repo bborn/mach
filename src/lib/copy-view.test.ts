@@ -8,6 +8,7 @@ import {
   copyScore,
   copyViewResolver,
   copyableContext,
+  copyableMessage,
   describeCopy,
   publishSearch,
 } from "./copy-view";
@@ -106,13 +107,32 @@ describe("what ⌘⌥C copies, per surface", () => {
     expect(items.some((i) => i.id === "listing")).toBe(false);
   });
 
-  it("a list with nothing open copies the row under the cursor and the rows in view", () => {
+  /*
+   * It used to copy the row *and* the index beside it, on the grounds that the
+   * list is context. Reported as "copy for llm seems to copy the entire
+   * messages index too though which is stupid": a numbered list of thirty-four
+   * unrelated subject lines was most of the payload, and none of it was the
+   * conversation he pointed at. A conversation under the cursor is as named as
+   * one in the reading pane.
+   */
+  it("a list with a row under the cursor copies that conversation and not the index", () => {
     const items = copyableContext({
       ...mailbox,
       selectedThread: thread,
       visibleThreads: [thread, other],
     });
     expect(items[0]).toMatchObject({ kind: "thread", threadId: 11 });
+    expect(items.some((i) => i.id === "listing")).toBe(false);
+  });
+
+  /*
+   * And the index is still the answer when there is no conversation to name —
+   * which is what keeps "what am I looking at" answerable in a mailbox nobody
+   * has moved the cursor in.
+   */
+  it("a list with nothing under the cursor copies the rows in view", () => {
+    const items = copyableContext({ ...mailbox, visibleThreads: [thread, other] });
+    expect(items.some((i) => i.kind === "thread")).toBe(false);
     const listing = items.find((i) => i.id === "listing");
     expect(listing?.detail).toContain("Invoice 4471");
   });
@@ -178,15 +198,24 @@ describe("what the toast says", () => {
     expect(describeCopy(items, false)).toBe("Copied “Series A data room”");
   });
 
+  /*
+   * The rows come along only when no conversation was named — see the surface
+   * table. A cursor on a row used to bring them too, and the index was most of
+   * what landed on the clipboard.
+   */
   it("counts the rows when they came along too", () => {
-    const items = copyableContext({
-      ...mailbox,
-      selectedThread: thread,
-      visibleThreads: [thread, other],
+    const items = copyableContext({ ...mailbox, visibleThreads: [thread, other] });
+    expect(describeCopy(items, false)).toBe("Copied “Inbox” and 2 conversations in view");
+  });
+
+  it("names one message when that is what was copied", () => {
+    const items = copyableMessage({
+      threadId: 11,
+      messageId: 91,
+      subject: "Series A data room",
+      from: "Tawny Chen",
     });
-    expect(describeCopy(items, false)).toBe(
-      "Copied “Series A data room” and 2 conversations in view",
-    );
+    expect(describeCopy(items, false)).toBe("Copied “Tawny Chen — Series A data room”");
   });
 
   it("says so when the cap bit, rather than trimming quietly", () => {

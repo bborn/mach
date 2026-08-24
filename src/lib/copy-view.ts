@@ -77,20 +77,21 @@ export interface CopyableView extends ShellView {
  * | on screen | what lands on the clipboard |
  * |---|---|
  * | a conversation open | every message in it: sender, date, body |
- * | a mailbox, cursor on a row | that conversation, *and* the rows in view |
+ * | a mailbox, cursor on a row | that conversation |
  * | a mailbox, nothing selected | the mailbox and the rows in view |
  * | a search | the query and its results |
  * | a search with a result open | that conversation, and the query |
  * | an event selected | the event and the range on screen |
  * | the calendar, nothing selected | the range on screen and the events in it |
  *
- * Two rules hold the table together. **Open beats beside**: a conversation in
- * the reading pane is what he is looking at, and the list next to it is where
- * he came from — attaching both put forty unrelated subject lines around the
- * one thing he pointed at, and they were most of the payload. And **a copy
- * never refuses**: the thinnest surface in the app, an empty mailbox, still
- * copies the line naming it, which is a true answer to "what am I looking at"
- * even if it is a short one.
+ * Two rules hold the table together. **A named conversation beats the list**:
+ * whether it is open or merely under the cursor, it is the thing he pointed at,
+ * and the list beside it is where he came from — attaching both put a numbered
+ * index of thirty-four unrelated subject lines around the one conversation he
+ * meant, and it was most of the payload. And **a copy never refuses**: the
+ * thinnest surface in the app, an empty mailbox, still copies the line naming
+ * it, which is a true answer to "what am I looking at" even if it is a short
+ * one.
  */
 export function copyableContext(view: CopyableView): ContextItem[] {
   const snapshot = currentSearch();
@@ -99,6 +100,43 @@ export function copyableContext(view: CopyableView): ContextItem[] {
       ? { ...view, search: snapshot.query, visibleThreads: snapshot.results }
       : view;
   return contextFor(withSearch, { listing: true });
+}
+
+/**
+ * The one message somebody pointed at, rather than the conversation round it.
+ *
+ * `copyableContext` above answers "what am I looking at", and in a thread that
+ * is every message in it. This answers a narrower question the reading pane can
+ * ask and the shell cannot: *this* message, the one under the pointer or the
+ * cursor.
+ *
+ * It is the same item shape and it goes to the same renderer — `messageId`
+ * narrows the expansion `threadId` already does, so the rows, the scrubbing and
+ * the fence are all the ones a conversation gets. See
+ * `agent::context::ContextItem`.
+ *
+ * The label carries the sender as well as the subject because a block headed
+ * `[message] Invoice` says nothing a paste-reader could not have guessed, and
+ * whose message it was is the first thing they need.
+ */
+export function copyableMessage(message: {
+  threadId: number;
+  messageId: number;
+  subject: string;
+  from?: string;
+}): ContextItem[] {
+  const subject = message.subject.trim();
+  const from = message.from?.trim();
+  const label = [from, subject].filter(Boolean).join(" — ") || "Message";
+  return [
+    {
+      id: `message:${message.messageId}`,
+      kind: "message",
+      label,
+      threadId: message.threadId,
+      messageId: message.messageId,
+    },
+  ];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -158,6 +196,7 @@ export async function copyContextText(context: ContextItem[]): Promise<CopyRecei
  */
 export function describeCopy(items: readonly ContextItem[], truncated: boolean): string {
   const named =
+    items.find((item) => item.kind === "message") ??
     items.find((item) => item.kind === "thread") ??
     items.find((item) => item.kind === "event") ??
     items.find((item) => item.kind === "search") ??

@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Archive, Bookmark, Clock, CornerUpLeft, MailX, PencilLine, ShieldAlert } from "lucide-react";
 import { overlayOwnsKeyboard, useMach } from "@/hooks/useMach";
 import { useKeyBindings } from "@/hooks/useKeymap";
 import { ACCOUNT_BG } from "@/lib/colors";
 import { COMPOSER_KEYS, keyboardInComposer, loadDraftForMessage } from "@/lib/compose";
 import { MESSAGE_COLUMN_MAX } from "@/lib/message-body";
+import { copyContextText, copyableMessage, describeCopy, requestCopyView } from "@/lib/copy-view";
+import { errorMessage } from "@/lib/ipc";
 import { fullDate } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import type { MessageId, ThreadId } from "@/types";
-import { ContextMenu, ContextMenuItem } from "@/components/ui/context-menu";
+import { Button } from "@/components/ui/button";
+import { ContextMenu, ContextMenuItem, ContextMenuSeparator } from "@/components/ui/context-menu";
 import { Hint } from "@/components/ui/kbd";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ThreadMessage } from "./ThreadMessage";
@@ -18,8 +22,22 @@ import {
   moveMessageCursor,
   replyTarget,
 } from "./thread-cursor";
+import { unsubscribeAction } from "./unsubscribe-offer";
 import { PluginViews } from "@/components/plugins/PluginView";
 import { openableLatestId } from "./opening-message";
+
+/**
+ * The key for "copy this message", named once so the binding and the menu row
+ * that prints it cannot drift.
+ *
+ * ⌥⌘C is the conversation and stays that. ⇧⌘C is not free — it is
+ * `composeAnother`, live across the whole of mail mode — so this is the fourth
+ * shape of copy rather than the third: ⇧⌥⌘C, which reads as "the other one of
+ * those" and which nothing else claims. It is a mouthful, and the context menu
+ * is why that is affordable: the menu is how anybody finds this, and the key is
+ * for the second time.
+ */
+const COPY_MESSAGE_KEY = "shift+mod+alt+c";
 
 /**
  * The conversation.
@@ -71,6 +89,51 @@ export function ReadingPane() {
       new CustomEvent("mach:compose", { detail: { kind, replyToId: messageId } }),
     );
   }, []);
+
+  /* ----------------------------------------------------- copying for a model */
+
+  /**
+   * One message, as text, on the clipboard.
+   *
+   * The sibling of ⌥⌘C rather than a second implementation of it: the item goes
+   * to the same renderer, which narrows the expansion a conversation gets — see
+   * `copyableMessage` and `agent::context::ContextItem`. What differs is only
+   * how much of the thread comes along.
+   *
+   * `detailRef` because the handler is registered once and a conversation
+   * finishing its load must not have to re-register a key.
+   */
+  const detailRef = useRef(detail);
+  detailRef.current = detail;
+
+  const copyMessage = useCallback(
+    (messageId: MessageId) => {
+      const thread = detailRef.current;
+      const message = thread?.messages.find((entry) => entry.id === messageId);
+      if (!thread || !message) {
+        actions.setStatus("That message is no longer here");
+        return;
+      }
+      const items = copyableMessage({
+        threadId: thread.thread.id,
+        messageId,
+        // A message carries no subject of its own here; the conversation's is
+        // the one a reader of the paste needs anyway.
+        subject: thread.thread.subject,
+        from: message.from.name || message.from.email,
+      });
+      // A copy that silently succeeds and one that silently failed look the
+      // same, so both outcomes say which happened. `CopyView` does likewise.
+      void copyContextText(items)
+        .then(({ chars, truncated }) =>
+          actions.setStatus(
+            chars === 0 ? "There was nothing in that message to copy" : describeCopy(items, truncated),
+          ),
+        )
+        .catch((error: unknown) => actions.setStatus(errorMessage(error), "error"));
+    },
+    [actions],
+  );
 
   const openMenu = useCallback((messageId: MessageId, anchor: Element) => {
     returnTo.current =
@@ -125,6 +188,22 @@ export function ReadingPane() {
       passthrough: true,
       when: () => inThread() && focusedMessageId() !== null,
       handler: () => {},
+    },
+    {
+      keys: COPY_MESSAGE_KEY,
+      group: "Mail",
+      description: "Copy this message as text",
+      priority: 20,
+      // On the message the keyboard is on, which is the same message ⇧F10
+      // would open the menu for. `allowInInput` for the reason ⌥⌘C has it: the
+      // moment you most want a message on your clipboard is half-way through
+      // replying to it.
+      allowInInput: true,
+      when: () => inThread() && replyTarget() !== null,
+      handler: () => {
+        const id = replyTarget();
+        if (id !== null) copyMessage(id);
+      },
     },
     {
       // The same menu the ⋮ opens, on the row the keyboard is on.
@@ -344,6 +423,23 @@ export function ReadingPane() {
               onClick={() => menu && answer("forward", menu.messageId)}
             >
               Forward
+            </ContextMenuItem>
+            {/*
+              Both copies, because they answer different questions and only one
+              of them was reachable. "This message" is the one the pointer is
+              on; "conversation" is ⌥⌘C, which already existed and which nobody
+              could find — its own resolver keywords say `llm chatgpt claude`
+              and the app never used the word anywhere a reader could see it.
+            */}
+            <ContextMenuSeparator />
+            <ContextMenuItem
+              shortcut={COPY_MESSAGE_KEY}
+              onClick={() => menu && copyMessage(menu.messageId)}
+            >
+              Copy this message
+            </ContextMenuItem>
+            <ContextMenuItem shortcut="mod+alt+c" onClick={() => requestCopyView()}>
+              Copy conversation
             </ContextMenuItem>
           </ContextMenu>
 

@@ -37,10 +37,20 @@ export type ToolState = "running" | "ok" | "error" | "denied";
 /** One thing the owner was looking at when they asked. */
 export interface ContextItem {
   id: string;
-  kind: "thread" | "event" | "day" | "search" | "mailbox" | "selection";
+  kind: "thread" | "message" | "event" | "day" | "search" | "mailbox" | "selection";
   /** What the removable line says. */
   label: string;
   threadId?: number;
+  /**
+   * One message of that conversation, rather than the tail of it.
+   *
+   * Set by "Copy this message", which points at what somebody is reading
+   * rather than at the twelve messages around it. It narrows the expansion
+   * `threadId` already does — same rows, same scrubbing, same fence — because
+   * a second way to turn mail into text is what `agent::context` exists to not
+   * have. Meaningless without `threadId`.
+   */
+  messageId?: number;
   eventId?: number;
   detail?: string;
 }
@@ -379,11 +389,21 @@ export function contextFor(view: ShellView, options: ContextOptions = {}): Conte
       });
     }
 
-    // Only when nothing is open. A conversation in the reading pane *is* the
-    // thing on screen; the list beside it is where he came from. Copying both
-    // put forty unrelated subject lines around the one conversation he meant,
-    // and they were most of the payload.
-    const listing = options.listing && view.threadId == null ? threadListing(view) : null;
+    /*
+     * Only when no conversation is attached at all.
+     *
+     * It used to be "only when nothing is *open*", which left the cursor case
+     * attaching both: one conversation and, underneath it, a numbered index of
+     * the thirty-four rows beside it. Reported as "copy for llm seems to copy
+     * the entire messages index too though which is stupid", and it is — the
+     * index was most of the payload and none of it was what he pointed at.
+     *
+     * Open or selected, a named conversation is the answer. The list is only
+     * the answer when there is nothing named, which is the empty-mailbox case
+     * the rule below still serves.
+     */
+    const named = items.some((item) => item.kind === "thread");
+    const listing = options.listing && !named ? threadListing(view) : null;
     if (listing) items.push(listing);
     return items;
   }
