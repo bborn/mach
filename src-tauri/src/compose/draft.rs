@@ -858,6 +858,46 @@ pub fn save_draft(db: &Db, draft: &Draft, now_ms: i64) -> Result<Draft> {
     Ok(load_draft(db, &saved.id)?.unwrap_or(saved))
 }
 
+/// Move a draft to a different account, keeping every word of it.
+///
+/// Everything Gmail knows about this draft belongs to the account it is
+/// leaving. The draft id `drafts.update` addresses was minted by that account
+/// and means nothing under another one's token — the update would 404 — and the
+/// mirror is filed under message and thread ids of the same provenance. The
+/// synthetic thread a new message was given to live in belongs there too. So
+/// all of it is cleared, and the next push creates the draft where it now is.
+///
+/// This writes the row and no more: taking the mirror out on the way from one
+/// account and putting it back on the way into the other is the caller's, and
+/// so is deleting the Gmail draft left behind. See the `moveDraftAccount` arm
+/// in `ipc::compose`, which is the only door to this.
+pub fn move_account(db: &Db, draft_id: &str, account_id: i64, now_ms: i64) -> Result<Option<Draft>> {
+    ensure_compose_schema(db)?;
+    // A draft that has been sent or thrown away stays that way. `save_draft`
+    // refuses the same resurrection for the same reason.
+    if is_retired(db, draft_id)? {
+        return Ok(None);
+    }
+    db.write(|conn| {
+        conn.execute(
+            "UPDATE compose_drafts
+                SET account_id       = ?2,
+                    thread_id        = NULL,
+                    updated_at       = ?3,
+                    gmail_draft_id   = NULL,
+                    gmail_message_id = NULL,
+                    gmail_thread_id  = NULL,
+                    remote_state     = 'pending',
+                    remote_error     = NULL,
+                    remote_synced_at = 0
+              WHERE id = ?1",
+            rusqlite::params![draft_id, account_id, now_ms],
+        )?;
+        Ok(())
+    })?;
+    load_draft(db, draft_id)
+}
+
 /// Record what Gmail said about a draft. Never touches the text.
 pub fn set_remote(db: &Db, draft_id: &str, remote: &DraftRemote) -> Result<()> {
     ensure_compose_schema(db)?;

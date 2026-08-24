@@ -565,3 +565,22 @@ export function withoutSignature(body: string): string {
   const at = body.indexOf(SIGNATURE_MARKER);
   return at === -1 ? body : body.slice(0, at);
 }
+
+/**
+ * Put a different signature where the last one was.
+ *
+ * The account a draft goes from decides the block under it, so changing the
+ * account has to change the block. Doing that as
+ * `withHtmlSignature(withoutSignature(body), next)` leaves behind the blank
+ * line the first signature arrived with — switch accounts four times and the
+ * message ends on four empty paragraphs — so the separator goes with it.
+ *
+ * A body with no signature in it keeps none. Deleting the block is a decision,
+ * and changing account is not a reason to overrule it; the exception is a body
+ * that is empty, which is a draft nobody has written in yet.
+ */
+export function swapHtmlSignature(body: string, signature: string): string {
+  const at = body.indexOf(SIGNATURE_MARKER);
+  if (at === -1) return body.trim() === "" ? withHtmlSignature(body, signature) : body;
+  return withHtmlSignature(body.slice(0, at).replace(/<div><br><\/div>$/, ""), signature);
+}

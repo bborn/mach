@@ -12,6 +12,7 @@ import {
   htmlToPlainText,
   isBlankHtml,
   isSafeStyleValue,
+  swapHtmlSignature,
   withHtmlSignature,
   withoutSignature,
 } from "./email-html";
@@ -207,5 +208,41 @@ describe("signatures", () => {
 
   it("escapes text on its way into HTML", () => {
     expect(htmlFromPlainText("a < b & c")).toBe("<div>a &lt; b &amp; c</div>");
+  });
+
+  it("swaps one signature for another without moving the message", () => {
+    const first = withHtmlSignature("<div>Morning</div>", "Bruno\nMach");
+    const second = swapHtmlSignature(first, "Bruno\nNorthwind");
+    expect(htmlToPlainText(second)).toContain("Morning");
+    expect(htmlToPlainText(second)).toContain("-- \nBruno\nNorthwind");
+    expect(htmlToPlainText(second)).not.toContain("Mach");
+  });
+
+  /*
+   * The whole reason this is not `withHtmlSignature(withoutSignature(…))`.
+   * That pair leaves the blank line the departing signature arrived with, so
+   * the message grows an empty paragraph on every switch — four accounts tried
+   * and the reply ends four lines below where it started.
+   */
+  it("leaves nothing behind, however many accounts are tried", () => {
+    let body = withHtmlSignature("<div>Morning</div>", "One");
+    for (const name of ["Two", "Three", "Four", "One"]) {
+      body = swapHtmlSignature(body, name);
+    }
+    expect(body).toBe(withHtmlSignature("<div>Morning</div>", "One"));
+  });
+
+  it("puts one under a draft nobody has written in yet", () => {
+    expect(htmlToPlainText(swapHtmlSignature("", "Bruno"))).toContain("-- \nBruno");
+  });
+
+  /*
+   * "I deleted my signature on this one" is a decision, and changing account is
+   * not a reason to overrule it. Only an empty body gets one back.
+   */
+  it("puts none back where the writer took it off", () => {
+    expect(swapHtmlSignature("<div>No sign-off, thanks</div>", "Bruno")).toBe(
+      "<div>No sign-off, thanks</div>",
+    );
   });
 });

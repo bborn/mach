@@ -14,6 +14,7 @@
 //! | `loadDraft` | `draftId`, `messageId` or `threadId` | `{ draft \| null }` |
 //! | `saveDraft` | `draft` | `{ draft }` |
 //! | `discardDraft` | `draftId` | `{ ok, remote }` |
+//! | `moveDraftAccount` | `draftId`, `accountId` | `{ draft, remote }` |
 //! | `attachChoose` | `draftId`, `inline?` | `{ attachments, added, refused }` |
 //! | `attachAdd` | `draftId`, `paths`, `inline?` | `{ attachments, added, refused }` |
 //! | `attachRemove` | `attachmentId` | `{ ok, attachments }` |
@@ -297,6 +298,98 @@ pub async fn dispatch(
                     "error": error.to_string(),
                 })),
             }
+        }
+
+        // Send this draft from a different account.
+        //
+        // Ordered like `discardDraft` above and for the same reason: the local
+        // rows move first so the composer repaints without waiting on Google,
+        // and the `drafts.delete` that clears the copy left behind is then
+        // awaited. If it fails there is a draft of this message sitting in a
+        // mailbox the owner has just stopped writing from, and the next sync
+        // pass will hand it back to him as a second draft — worth a sentence on
+        // screen rather than silence.
+        //
+        // The move itself is total: see `draft::move_account` for why none of
+        // the Gmail identity can come along.
+        "moveDraftAccount" => {
+            let id = required_str(&payload, "draftId")?;
+            let account_id = required_i64(&payload, "accountId")?;
+            // A composer that has not been written in yet has no row: autosave
+            // declines to save an empty draft, so `c` then `From` — which is
+            // the order somebody who noticed the wrong address uses — arrives
+            // here with nothing to move. That is not a failure. There is no
+            // Gmail draft, no mirror and no conversation, so the account is
+            // the composer's own business until the first save carries it in.
+            let Some(existing) = draft::load_draft(db, &id)? else {
+                return Ok(json!({ "draft": Value::Null, "remote": "none" }));
+            };
+            if existing.account_id == account_id {
+                return Ok(json!({ "draft": existing, "remote": "none" }));
+            }
+            // A reply is answering a conversation that one account holds.
+            // `reply_to_id`, the `References` chain built from it and the thread
+            // it is mirrored into are all rows of that account, and Gmail has no
+            // call that answers one account's thread as another. The composer
+            // does not offer the control here; this is the other end of that.
+            if existing.kind != DraftKind::New {
+                return Err(ComposeError::invalid(
+                    "a reply goes from the account that holds the conversation",
+                ));
+            }
+            let remote_id = existing
+                .remote
+                .draft_id
+                .clone()
+                .filter(|remote| !remote.is_empty());
+            engine::mirror::unmirror(db, &existing)?;
+            let Some(moved) = draft::move_account(db, &id, account_id, now)? else {
+                // Retired between the load above and here: `⌘⏎` and discard
+                // both take the row out, and neither waits for this.
+                return Ok(json!({ "draft": Value::Null, "remote": "none" }));
+            };
+            // A new message lives in a synthetic conversation of its own, and
+            // the one it had belonged to the account it just left. This is the
+            // same two-step `saveDraft` does: mirror, then tell the row where
+            // it landed.
+            let thread_id = engine::mirror::mirror(db, &moved, now)?;
+            let moved = draft::save_draft(
+                db,
+                &Draft {
+                    thread_id: Some(thread_id),
+                    ..moved
+                },
+                now,
+            )?;
+            let outcome = match remote_id {
+                Some(remote_id) => {
+                    match engine::remote::DraftRemoteSync::new(db.clone(), outbox.clients())
+                        .delete(&remote_id, existing.account_id)
+                        .await
+                    {
+                        Ok(()) => json!("deleted"),
+                        Err(error) => {
+                            engine::remote::spawn_push(
+                                db.clone(),
+                                outbox.clients(),
+                                moved.id.clone(),
+                                now,
+                            );
+                            return Ok(json!({
+                                "draft": moved,
+                                "remote": "failed",
+                                "error": error.to_string(),
+                            }));
+                        }
+                    }
+                }
+                None => json!("none"),
+            };
+            // Only now: the draft the owner is looking at belongs to the new
+            // account, and pushing it is what puts it on his phone under the
+            // address he chose.
+            engine::remote::spawn_push(db.clone(), outbox.clients(), moved.id.clone(), now);
+            Ok(json!({ "draft": moved, "remote": outcome }))
         }
 
         // Attach files already on disk. The panel route goes through

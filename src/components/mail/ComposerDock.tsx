@@ -10,7 +10,7 @@ import {
   sendDelayMs,
   signatureFor,
 } from "@/lib/prefs";
-import { withHtmlSignature } from "@/lib/email-html";
+import { swapHtmlSignature, withHtmlSignature } from "@/lib/email-html";
 import { Kbd } from "@/components/ui/kbd";
 import { Overlay } from "@/components/ui/dialog";
 import { RESIZE_STEP, Resizer } from "@/components/ui/split";
@@ -65,6 +65,7 @@ import {
   isDraftEmpty,
   loadDraft,
   loadDraftForThread,
+  moveDraftAccount,
   newDraft,
   prepareDraft,
   removeAttachment,
@@ -314,6 +315,49 @@ export function ComposerDock() {
       autosaveFor(next.id).queue(next);
     },
     [autosaveFor],
+  );
+
+  /**
+   * Send this draft from a different account.
+   *
+   * Two halves, and only one of them is a field edit. The signature under the
+   * message belongs to the account, so it is swapped here — see
+   * `swapHtmlSignature` for what "swapped" has to mean to survive being done
+   * four times. Everything else is Rust's: the Gmail draft, the mirror and the
+   * conversation a new message was given all belong to the account being left,
+   * and none of them can come along.
+   *
+   * Rust first, then the local state, because the pending autosave would
+   * otherwise write `account_id` on its own and skip all of that. A refusal —
+   * which is what a reply gets — leaves the composer exactly as it was.
+   */
+  const moveAccount = useCallback(
+    async (draft: Draft, accountId: number) => {
+      if (accountId === draft.accountId) return;
+      // Whatever is queued was written against the old account, and it must not
+      // land on top of the move.
+      autosaves.current.get(draft.id)?.cancel();
+      try {
+        const moved = await moveDraftAccount(draft.id, accountId);
+        const body = swapHtmlSignature(bodyAsHtml(draft), signatureFor(prefs, accountId));
+        // `moved.draft` is null for a composer nobody has written in yet: there
+        // was no row to move, and the account rides along on the first save.
+        change({ ...draft, ...(moved.draft ?? {}), accountId, body, bodyFormat: "html" });
+        // The draft is here, under the account he chose, *and* still sitting in
+        // the account it left — where the next sync pass will hand it back to
+        // him as a second draft. Silence would be the wrong answer.
+        if (moved.remote === "failed") {
+          const left = accounts.find((account) => account.id === draft.accountId);
+          actions.setStatus(
+            `A copy of this draft is still in ${left?.email ?? "the other account"}`,
+            "error",
+          );
+        }
+      } catch (error) {
+        actions.setStatus(errorMessage(error), "error");
+      }
+    },
+    [accounts, actions, prefs, change],
   );
 
   /**
@@ -1701,6 +1745,16 @@ export function ComposerDock() {
       onPopOut={canPopOut(visible.kind) ? (at) => popOut(visible.id, at) : undefined}
       onChange={change}
       onBodyChange={changeBody}
+      /*
+       * Offered only where there is a choice to make. A reply goes from the
+       * account that holds the conversation — `reply_to_id`, the `References`
+       * chain and the thread it is mirrored into are all rows of that account,
+       * and Gmail has no call that answers one account's thread as another.
+       */
+      fromAccounts={visible.kind === "new" ? accounts : undefined}
+      onChangeAccount={
+        visible.kind === "new" ? (accountId) => void moveAccount(visible, accountId) : undefined
+      }
       onSend={send}
       onClose={dismiss}
       onDiscard={() => discard(visible.id)}

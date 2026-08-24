@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -14,6 +15,15 @@ import { useKeyBindings, useKeymap } from "@/hooks/useKeymap";
 import { OVERLAY_KEY_FLOOR } from "@/lib/keymap";
 import { useGhostText } from "@/hooks/useGhostText";
 import { Kbd } from "@/components/ui/kbd";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { ACCOUNT_BG } from "@/lib/colors";
+import type { Account } from "@/types";
 import { GhostHint, GhostText } from "@/components/ui/ghost";
 import {
   AddressSuggestions,
@@ -182,6 +192,23 @@ interface ComposerProps {
    * own "first field in the panel" fallback cannot find it.
    */
   bodyRef?: RefObject<HTMLElement | null>;
+  /**
+   * The accounts this message could go from.
+   *
+   * Fewer than two and the row is not drawn — there is no choice to offer. It
+   * is also absent on a reply, which has none to make: the conversation belongs
+   * to one account, and Gmail has no call that answers it as another. See the
+   * `moveDraftAccount` arm in `ipc::compose` for the other end of that.
+   */
+  fromAccounts?: readonly Account[];
+  /**
+   * Send it from this account instead.
+   *
+   * Not an ordinary field edit handed to `onChange`: the move takes the draft
+   * away from everything Gmail knows about it, and the copy in the account it
+   * leaves has to be deleted rather than abandoned. Rust does it in one piece.
+   */
+  onChangeAccount?: (accountId: number) => void;
   /** Everyone the app has seen, for the address fields. */
   contacts?: readonly Contact[];
   /** Lines describing what is being answered, for the ghost completions. */
@@ -254,6 +281,8 @@ export function Composer({
   onKeepDraft,
   confirmingSubject = false,
   onConfirmSubject,
+  fromAccounts,
+  onChangeAccount,
   onSendAnyway,
   onKeepWriting,
   onAttach,
@@ -844,6 +873,14 @@ export function Composer({
         </div>
 
         <div className={cn(COMPOSER_FIXED_ROW, "mt-2 space-y-1 border-b border-border pb-2")}>
+          {fromAccounts && fromAccounts.length > 1 && onChangeAccount && (
+            <FromField
+              accounts={fromAccounts}
+              accountId={draft.accountId}
+              onChange={onChangeAccount}
+              disabled={busy}
+            />
+          )}
           <AddressField label="To" typeahead={to} value={raw.to} disabled={busy} inputRef={toField} />
           {showCc && (
             <>
@@ -1389,6 +1426,92 @@ function CompletedAddressField({
       disabled={disabled}
       inputRef={inputRef}
     />
+  );
+}
+
+/**
+ * Which account the message goes from.
+ *
+ * Drawn as a row of the same block as To, because that is what it is — the
+ * other end of the same address. The trigger drops the box `SelectTrigger`
+ * normally wears and takes it back on hover: at rest this has to read as the
+ * line of text it sits beside, not as the one control in the header with a
+ * border around it.
+ */
+function FromField({
+  accounts,
+  accountId,
+  onChange,
+  disabled,
+}: {
+  accounts: readonly Account[];
+  accountId: number;
+  onChange: (accountId: number) => void;
+  disabled?: boolean;
+}) {
+  const items = accounts.map((account) => ({
+    value: String(account.id),
+    label: account.email,
+  }));
+  // Named by the word beside it *and* by its own contents, so the control is
+  // announced as "From bruno@example.com". An `aria-label` would have replaced
+  // the address rather than introduced it, which is the half that matters.
+  const labelId = useId();
+  const fieldId = useId();
+  return (
+    <div className="flex min-w-0 items-baseline gap-2">
+      <span id={labelId} className="w-7 shrink-0 text-micro text-faint-foreground">
+        From
+      </span>
+      <Select
+        items={items}
+        value={String(accountId)}
+        onValueChange={(value) => {
+          if (value === null) return;
+          const next = Number(value);
+          if (next !== accountId) onChange(next);
+        }}
+      >
+        <SelectTrigger
+          id={fieldId}
+          aria-labelledby={`${labelId} ${fieldId}`}
+          disabled={disabled}
+          className={cn(
+            "-ml-1 h-6 w-auto max-w-full border-transparent bg-transparent px-1",
+            "hover:border-border data-[popup-open]:border-accent",
+          )}
+        >
+          <SelectValue>
+            {(value: string | null) => {
+              const account = accounts.find((entry) => String(entry.id) === value);
+              return <AccountName account={account} />;
+            }}
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {accounts.map((account) => (
+            <SelectItem key={account.id} value={String(account.id)}>
+              <AccountName account={account} />
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+/** An account as the swatch the rail colours it with, and its address. */
+function AccountName({ account }: { account?: Account }) {
+  return (
+    <span className="flex min-w-0 items-center gap-1.5">
+      <span
+        className={cn(
+          "h-2 w-2 shrink-0 rounded-[2px]",
+          account ? ACCOUNT_BG[account.colorIndex] : "bg-border",
+        )}
+      />
+      <span className="min-w-0 truncate">{account?.email ?? ""}</span>
+    </span>
   );
 }
 

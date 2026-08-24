@@ -339,6 +339,57 @@ export async function discardDraft(draftId: string): Promise<DiscardResult> {
   return { ok: result.ok ?? true, remote: result.remote ?? "none", error: result.error };
 }
 
+/**
+ * What became of the Gmail copy when a draft changed hands.
+ *
+ * `failed` is the one worth saying out loud, and it says something different
+ * from the discard case: the draft is here, under the account that was picked,
+ * and there is *also* a copy of it in the account it left. That one will come
+ * back down the next sync as a draft of a message he is about to send from
+ * somewhere else.
+ */
+export interface MoveAccountResult {
+  /**
+   * The row as it now stands, or `null` when there was never a row.
+   *
+   * A composer nobody has written in yet has not been saved — autosave
+   * declines an empty draft — so `c` then `From`, which is the order somebody
+   * who noticed the wrong address uses, has nothing for Rust to move. The
+   * account is the composer's own until the first save carries it in.
+   */
+  draft: Draft | null;
+  remote: "none" | "deleted" | "failed";
+  error?: string | null;
+}
+
+/**
+ * Send this draft from a different account.
+ *
+ * Not an ordinary save. Nothing Gmail knows about a draft survives the move —
+ * see `draft::move_account` — and the copy in the old account has to be deleted
+ * rather than left, so this is Rust's to do in one piece rather than something
+ * the editor can express by writing a different `accountId` on the next
+ * autosave.
+ */
+export async function moveDraftAccount(
+  draftId: string,
+  accountId: number,
+): Promise<MoveAccountResult> {
+  if (!isTauri()) {
+    const existing = localDrafts.get(draftId);
+    return {
+      draft: existing ? localSave({ ...existing, accountId }) : null,
+      remote: "none",
+    };
+  }
+  const result = await call<Partial<MoveAccountResult>>({
+    op: "moveDraftAccount",
+    draftId,
+    accountId,
+  });
+  return { draft: result.draft ?? null, remote: result.remote ?? "none", error: result.error };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Attachments                                                                 */
 /* -------------------------------------------------------------------------- */

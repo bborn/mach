@@ -700,6 +700,12 @@ try {
         Escape: { code: "Escape", vk: 27 },
         ArrowLeft: { code: "ArrowLeft", vk: 37 },
         ArrowRight: { code: "ArrowRight", vk: 39 },
+        // Up and down are how a menu is walked, and their absence read as
+        // silence rather than as an error: `press` throws for a key it does not
+        // know, and a harness call that pipes stderr away then looks exactly
+        // like a keystroke the page ignored.
+        ArrowUp: { code: "ArrowUp", vk: 38 },
+        ArrowDown: { code: "ArrowDown", vk: 40 },
       };
       const spec = known[name];
       if (!spec) throw new Error(`press does not know ${name}`);

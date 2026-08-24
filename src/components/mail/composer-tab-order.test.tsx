@@ -86,6 +86,15 @@ const TABBABLE = [
 
 /** What a stop is called, preferring the name a screen reader would read. */
 function name(element: Element): string {
+  // `From` is named by the word beside it rather than by an `aria-label`, so
+  // that the address is announced *after* the word rather than instead of it.
+  // The first id is the label; the rest is the value.
+  const labelledBy = element.getAttribute("aria-labelledby")?.split(" ")[0];
+  if (labelledBy) {
+    const root = element.getRootNode() as ParentNode;
+    const labelled = root.querySelector(`#${labelledBy}`)?.textContent?.trim();
+    if (labelled) return labelled;
+  }
   const aria = element.getAttribute("aria-label");
   if (aria) return aria;
   const labelled = element.closest("label")?.querySelector("span")?.textContent;
@@ -152,6 +161,33 @@ describe("the composer's tab order", () => {
       "Message",
       ...FOOTER,
     ]);
+  });
+
+  /*
+   * `From` is the first of the addresses and therefore the first of their
+   * stops. It exists only where there is a choice to make — one account, or a
+   * reply, and the row is not drawn at all — which is why every other case in
+   * this file passes no accounts and asserts a sequence without it.
+   */
+  it("puts From at the head of the addresses when there is a choice", () => {
+    expect(
+      stops(
+        {},
+        {
+          fromAccounts: [
+            { id: 1, email: "bruno@example.com", name: "Personal", colorIndex: 1, kind: "personal" },
+            {
+              id: 2,
+              email: "bruno@northwind.example",
+              name: "Northwind",
+              colorIndex: 3,
+              kind: "workspace",
+            },
+          ],
+          onChangeAccount: () => {},
+        },
+      ),
+    ).toEqual(["Subject", "cc / bcc", "From", "To", "Message", ...FOOTER]);
   });
 
   it("drops the subject field for a reply, whose subject is derived", () => {

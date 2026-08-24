@@ -5201,3 +5201,218 @@ async fn a_file_that_is_refused_is_named_and_the_rest_still_land() {
         "a refusal has to say which file: {refused:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sending a new message from a different account
+// ---------------------------------------------------------------------------
+//
+// The composer's `From` row. What makes this more than an `account_id` update
+// is everything that *cannot* come with it: the Gmail draft id belongs to the
+// account that minted it, the mirror is filed under message and thread ids of
+// the same provenance, and a new message's conversation is a synthetic thread
+// of that account's. A move that carried any of them forward would put a
+// `drafts.update` for one account's draft on another account's token — a 404,
+// with the real draft still sitting where it was.
+
+/// The whole move, end to end: the draft, the mirror and the conversation.
+#[tokio::test]
+async fn a_new_message_can_be_sent_from_a_different_account() {
+    let db = Db::open_in_memory().unwrap();
+    let from = seed_account(&db, "bruno@example.com", Some("Bruno"));
+    let to = seed_account(&db, "bruno@northwind.example", Some("Bruno at Northwind"));
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let saved = dispatch(
+        &db,
+        &out,
+        json!({
+            "op": "saveDraft",
+            "draft": {
+                "id": "d-move",
+                "accountId": from,
+                "kind": "new",
+                "to": [{ "email": "tawny@partner.com" }],
+                "subject": "Coffee?",
+                "body": "Thursday?",
+            },
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap()["draft"]
+        .clone();
+    assert!(saved["threadId"].as_i64().is_some(), "it has one to leave");
+
+    let moved = dispatch(
+        &db,
+        &out,
+        json!({ "op": "moveDraftAccount", "draftId": "d-move", "accountId": to, "now": NOW + 1 }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(moved["draft"]["accountId"].as_i64(), Some(to));
+    assert_eq!(moved["remote"], json!("none"), "it was never pushed");
+    assert_eq!(
+        moved["draft"]["subject"].as_str(),
+        Some("Coffee?"),
+        "the words are the one thing that does come with it"
+    );
+
+    // One draft in the mailbox, not two, and it is the other account's now.
+    //
+    // Not asserted on the thread *id*: `threads` has no AUTOINCREMENT, so the
+    // row deleted on the way out gives its rowid straight back to the row
+    // created on the way in. What the move has to be true of is the owner.
+    let rows = drafts_mailbox(&db);
+    assert_eq!(rows.len(), 1, "the old mirror went with the old account");
+    let now_at = moved["draft"]["threadId"].as_i64().unwrap();
+    let (owner, count): (i64, i64) = db
+        .read(|c| {
+            let owner = c.query_row(
+                "SELECT account_id FROM threads WHERE id = ?1",
+                [now_at],
+                |row| row.get(0),
+            )?;
+            let count =
+                c.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+            Ok((owner, count))
+        })
+        .unwrap();
+    assert_eq!(owner, to, "a new message's conversation is its account's");
+    assert_eq!(count, 1, "and the one it left is not still standing");
+}
+
+/// The half that costs a request: the copy left behind in the old account is
+/// deleted, and the draft arrives at the new one with nothing Gmail can be told
+/// to update — so the next push creates rather than 404s.
+#[tokio::test]
+async fn moving_a_pushed_draft_deletes_the_copy_it_leaves_behind() {
+    let db = Db::open_in_memory().unwrap();
+    let from = seed_account(&db, "bruno@example.com", Some("Bruno"));
+    let to = seed_account(&db, "bruno@northwind.example", Some("Bruno at Northwind"));
+    let transport = FakeTransport::scripted(vec![
+        Ok(HttpResponse::json(
+            200,
+            r#"{"id":"r-draft-move","message":{"id":"gmsg-1","threadId":"gthread-9"}}"#,
+        )),
+        Ok(HttpResponse::json(200, "{}")),
+    ]);
+    let out = outbox(&db, Arc::clone(&transport));
+    let sync = compose::remote::DraftRemoteSync::new(db.clone(), clients(Arc::clone(&transport)));
+
+    dispatch(
+        &db,
+        &out,
+        json!({
+            "op": "saveDraft",
+            "draft": {
+                "id": "d-pushed",
+                "accountId": from,
+                "kind": "new",
+                "to": [{ "email": "tawny@partner.com" }],
+                "subject": "Coffee?",
+                "body": "Thursday?",
+            },
+            "now": NOW,
+        }),
+    )
+    .await
+    .unwrap();
+    sync.push("d-pushed", NOW).await.unwrap();
+    assert_eq!(
+        draft::load_draft(&db, "d-pushed")
+            .unwrap()
+            .unwrap()
+            .remote
+            .draft_id
+            .as_deref(),
+        Some("r-draft-move"),
+        "the account it is leaving holds a real Gmail draft"
+    );
+
+    let moved = dispatch(
+        &db,
+        &out,
+        json!({ "op": "moveDraftAccount", "draftId": "d-pushed", "accountId": to, "now": NOW + 1 }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(moved["remote"], json!("deleted"));
+    let deletes: Vec<String> = transport
+        .requests()
+        .into_iter()
+        .filter(|request| matches!(request.method, mach_lib::google::HttpMethod::Delete))
+        .map(|request| request.url)
+        .collect();
+    assert_eq!(deletes.len(), 1, "one delete, for the draft left behind");
+    assert!(
+        deletes[0].contains("r-draft-move"),
+        "and it names that draft: {}",
+        deletes[0]
+    );
+
+    let after = draft::load_draft(&db, "d-pushed").unwrap().unwrap();
+    assert_eq!(after.account_id, to);
+    assert_eq!(
+        after.remote.draft_id, None,
+        "nothing left for a `drafts.update` to address under the new token"
+    );
+    assert_eq!(after.remote.message_id, None);
+    assert_eq!(after.remote.thread_id, None);
+}
+
+/// A reply answers a conversation one account holds: `reply_to_id`, the
+/// `References` chain built from it and the thread it is mirrored into are all
+/// that account's rows, and Gmail has no call that answers one account's thread
+/// as another. The composer does not draw the control here; this is the other
+/// end of the same rule, so a caller that has not read it cannot do it anyway.
+#[tokio::test]
+async fn a_reply_cannot_be_moved_to_another_account() {
+    let (db, _a, thread, _m) = seeded();
+    let other = seed_account(&db, "bruno@northwind.example", Some("Bruno at Northwind"));
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let saved = save_body(&db, &out, thread, "on it", NOW).await;
+    let id = saved["id"].as_str().unwrap().to_string();
+
+    let refused = dispatch(
+        &db,
+        &out,
+        json!({ "op": "moveDraftAccount", "draftId": id, "accountId": other, "now": NOW + 1 }),
+    )
+    .await;
+
+    assert!(refused.is_err(), "and it says so rather than half-doing it");
+    let unchanged = draft::load_draft(&db, &id).unwrap().unwrap();
+    assert_ne!(unchanged.account_id, other, "nothing moved");
+    assert_eq!(drafts_mailbox(&db).len(), 1, "and the mirror is where it was");
+}
+
+/// `c`, then `From`, before a word is typed.
+///
+/// That is the order somebody who noticed the wrong address uses, and there is
+/// no row at that point: autosave declines to save an empty draft, so nothing
+/// has been written, nothing mirrored and nothing pushed. Answering with an
+/// error would make the control appear broken exactly when it is most likely to
+/// be reached for.
+#[tokio::test]
+async fn moving_a_draft_that_was_never_saved_is_not_a_failure() {
+    let db = Db::open_in_memory().unwrap();
+    let _from = seed_account(&db, "bruno@example.com", Some("Bruno"));
+    let to = seed_account(&db, "bruno@northwind.example", Some("Bruno at Northwind"));
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let moved = dispatch(
+        &db,
+        &out,
+        json!({ "op": "moveDraftAccount", "draftId": "d-never-saved", "accountId": to, "now": NOW }),
+    )
+    .await
+    .unwrap();
+
+    assert!(moved["draft"].is_null(), "there was nothing to hand back");
+    assert_eq!(moved["remote"], json!("none"));
+    assert!(drafts_mailbox(&db).is_empty(), "and nothing was conjured up");
+}
