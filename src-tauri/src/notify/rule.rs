@@ -73,6 +73,11 @@ pub const BULK_CATEGORIES: [&str; 4] = [
     "CATEGORY_FORUMS",
 ];
 
+/// Tabs Gmail splits out of Primary. The badge and the Inbox list use this
+/// cut; banners still use [`BULK_CATEGORIES`] so an Updates digest does not
+/// interrupt just because it now appears in the list.
+pub const PRIMARY_EXCLUDED: [&str; 2] = ["CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL"];
+
 /// One newly stored message, with everything the rule needs about it.
 ///
 /// Built by [`super::hydrate`] from rows that were written moments earlier, so

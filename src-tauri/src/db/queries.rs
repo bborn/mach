@@ -56,15 +56,9 @@ pub const SNOOZED_MAILBOX: &str = "SNOOZED";
 /// check below, for the reason spelled out in `list_threads`.
 const FILED_ELSEWHERE: [&str; 5] = ["INBOX", "SENT", DRAFT_LABEL, "SPAM", "TRASH"];
 
-/// Gmail's bulk tabs. Primary is the inbox minus these — the same cut
-/// notifications already use. `CATEGORY_PERSONAL` is not the inverse: most
-/// mail has no category at all.
-const BULK_CATEGORIES: [&str; 4] = [
-    "CATEGORY_PROMOTIONS",
-    "CATEGORY_SOCIAL",
-    "CATEGORY_UPDATES",
-    "CATEGORY_FORUMS",
-];
+/// Tabs Gmail parks outside Primary. Updates and Forums stay in that list
+/// even when the API still stamps the category.
+const PRIMARY_EXCLUDED: [&str; 2] = ["CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL"];
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -373,15 +367,17 @@ fn mailbox_clause(conn: &Connection, label: &str, args: &mut Vec<Value>) -> Stri
         ),
         SNOOZED_MAILBOX => SNOOZED.to_string(),
         DRAFT_LABEL => format!("({} OR {LOCAL_DRAFT})", carries(conn, label, args)),
-        // Primary tab: in the inbox, and not bulk. The id is `PRIMARY`, not
-        // Gmail's `CATEGORY_PERSONAL` — that label is on thousands of
-        // archived conversations (login codes, product insights) and asking
-        // for it is how the inbox filled with mail that was not in the inbox.
+        // Primary tab: in the inbox, minus Promotions and Social. The id is
+        // `PRIMARY`, not Gmail's `CATEGORY_PERSONAL` — that label is on
+        // thousands of archived conversations (login codes, product insights)
+        // and asking for it is how the inbox filled with mail that was not in
+        // the inbox. Updates and Forums stay: Gmail's Primary tab shows them
+        // even when the API still stamps the category.
         "PRIMARY" => format!(
             "{} AND NOT EXISTS (SELECT 1 FROM thread_labels tl \
                WHERE tl.thread_id = t.id AND tl.gmail_label_id IN ({}))",
             carries(conn, "INBOX", args),
-            placeholders(&BULK_CATEGORIES, args)
+            placeholders(&PRIMARY_EXCLUDED, args)
         ),
         // Promotions tab: still in the inbox. Archive takes INBOX off and
         // leaves the category, so asking only for the category would keep

@@ -263,11 +263,8 @@ export function MessageBody({ message, live }: MessageBodyProps) {
   }, [rendered, inlineImages]);
 
   if (!withImages) {
-    return (
-      <div ref={box} className="mt-3 text-list text-faint-foreground">
-        Rendering…
-      </div>
-    );
+    // Empty, not a status line. The iframe is a frame or two away.
+    return <div ref={box} className="mt-3" />;
   }
 
   // The box the anchor is measured from. It has to be the whole body, including

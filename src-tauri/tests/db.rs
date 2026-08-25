@@ -1877,6 +1877,44 @@ fn a_dense_mailbox_still_streams_from_the_thread_index() {
     );
 }
 
+/// Inbox is Gmail's Primary tab: Promotions and Social out, Updates in.
+///
+/// The API stamps Honeybadger and GitHub `CATEGORY_UPDATES` while the web
+/// client's Primary tab still shows them. Subtracting every bulk category
+/// left sixteen conversations in a mailbox Gmail drew as a hundred and sixty.
+#[test]
+fn primary_keeps_updates_and_drops_promotions() {
+    let t = TempDb::new("primary-cut");
+    let a = account(&t.db, "owner@example.com", 0);
+    let personal = thread(&t.db, a, "g-personal", "lunch", 1);
+    let updates = thread(&t.db, a, "g-updates", "honeybadger", 2);
+    let promo = thread(&t.db, a, "g-promo", "sale", 3);
+    let social = thread(&t.db, a, "g-social", "invite", 4);
+    let conn = t.db.writer();
+    q::set_thread_labels(&conn, personal, &["INBOX".into()]).unwrap();
+    q::set_thread_labels(&conn, updates, &["INBOX".into(), "CATEGORY_UPDATES".into()]).unwrap();
+    q::set_thread_labels(&conn, promo, &["INBOX".into(), "CATEGORY_PROMOTIONS".into()]).unwrap();
+    q::set_thread_labels(&conn, social, &["INBOX".into(), "CATEGORY_SOCIAL".into()]).unwrap();
+
+    let rows = t
+        .db
+        .read(|conn| {
+            q::list_threads(
+                conn,
+                &ThreadQuery {
+                    label_id: Some("PRIMARY".into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("list");
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    assert!(ids.contains(&personal), "bare INBOX belongs in Primary");
+    assert!(ids.contains(&updates), "Updates-stamped mail belongs in Primary");
+    assert!(!ids.contains(&promo), "Promotions does not");
+    assert!(!ids.contains(&social), "Social does not");
+}
+
 // ---------------------------------------------------------------------------
 // the address book, and the index it was supposed to be reading
 // ---------------------------------------------------------------------------

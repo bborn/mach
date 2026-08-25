@@ -45,8 +45,9 @@ describe("mailboxName", () => {
 describe("needsInbox", () => {
   it("says whether moving to Inbox would change anything", () => {
     expect(needsInbox(["INBOX"])).toBe(false);
-    expect(needsInbox(["INBOX", "CATEGORY_UPDATES"])).toBe(true);
-    expect(needsInbox(["INBOX", "CATEGORY_FORUMS", "UNREAD"])).toBe(true);
+    expect(needsInbox(["INBOX", "CATEGORY_UPDATES"])).toBe(false);
+    expect(needsInbox(["INBOX", "CATEGORY_FORUMS", "UNREAD"])).toBe(false);
+    expect(needsInbox(["INBOX", "CATEGORY_PROMOTIONS"])).toBe(true);
     expect(needsInbox(["STARRED"])).toBe(true);
   });
 });

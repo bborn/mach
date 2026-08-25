@@ -76,6 +76,10 @@
   --border: oklch(0.90 0.004 250);
   --border-strong: oklch(0.84 0.006 250);
 
+  /* Classic scrollbar track. Styled below; the reading pane always shows it
+     so a tall message cannot take 10px off the iframe and rewrap the body. */
+  --scrollbar-size: 10px;
+
   /* The one accent. Selection, focus, unread. */
   --accent: oklch(0.55 0.18 255);
   --accent-foreground: oklch(0.985 0 0);
@@ -355,8 +359,8 @@
   }
 
   ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: var(--scrollbar-size);
+    height: var(--scrollbar-size);
   }
 
   ::-webkit-scrollbar-track {

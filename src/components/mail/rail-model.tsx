@@ -102,8 +102,9 @@ export interface RailInput {
   accountId: AccountId | null;
   labelId: LabelId;
   /**
-   * What "Inbox" means for this mailbox. `PRIMARY` — inbox minus bulk —
-   * once labels have loaded. Account rows and the heading both open this.
+   * What "Inbox" means for this mailbox. `PRIMARY` — inbox minus Promotions
+   * and Social — once labels have loaded. Account rows and the heading both
+   * open this.
    */
   inboxId?: LabelId;
   threadId: ThreadId | null;

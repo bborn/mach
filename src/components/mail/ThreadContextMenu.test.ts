@@ -129,19 +129,30 @@ describe("buildItems", () => {
     ).toContain("Star");
   });
 
+  /*
+   * "Not already there" means not already in the list Inbox draws, and that
+   * list is INBOX minus Promotions and Social — Gmail's Primary shows
+   * Updates- and Forums-stamped mail, and so does this one. So an Updates
+   * conversation in the inbox is already where the item would move it, and
+   * offering it would be a menu entry that does nothing.
+   */
   it("offers Move to Inbox only when the conversation is not already there", () => {
-    const bulk = thread({ labelIds: ["INBOX", "CATEGORY_UPDATES"] });
-    const primary = thread({ id: 2, labelIds: ["INBOX"] });
+    const parked = thread({ labelIds: ["INBOX", "CATEGORY_PROMOTIONS"] });
+    const updates = thread({ id: 2, labelIds: ["INBOX", "CATEGORY_UPDATES"] });
+    const primary = thread({ id: 3, labelIds: ["INBOX"] });
     const handlers = { moveToInbox: vi.fn() };
 
-    expect(labels(buildItems(registry(), [bulk.id], bulk.id, map(bulk), handlers))).toContain(
+    expect(labels(buildItems(registry(), [parked.id], parked.id, map(parked), handlers))).toContain(
       "Move to Inbox",
     );
+    expect(
+      labels(buildItems(registry(), [updates.id], updates.id, map(updates), handlers)),
+    ).not.toContain("Move to Inbox");
     expect(
       labels(buildItems(registry(), [primary.id], primary.id, map(primary), handlers)),
     ).not.toContain("Move to Inbox");
 
-    buildItems(registry(), [bulk.id], bulk.id, map(bulk), handlers)
+    buildItems(registry(), [parked.id], parked.id, map(parked), handlers)
       .filter((i): i is Extract<Item, { kind: "item" }> => i.kind === "item")
       .find((i) => i.label === "Move to Inbox")
       ?.run();

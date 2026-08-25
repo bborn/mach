@@ -2044,13 +2044,41 @@ export function MachProvider({ children }: { children: ReactNode }) {
     [undoHost],
   );
 
-  // Opening an unread conversation marks it read — once, and quietly.
+  /*
+   * Opening an unread conversation marks it read — once, quietly, and only for
+   * as long as that stays true.
+   *
+   * The set used to record the *attempt*, which made a mark that did not land
+   * permanent. Nothing retried it: the id was in the set, so re-opening the
+   * conversation did nothing, and the only thing that cleared the set was
+   * relaunching the app. Meanwhile the optimistic guess had already drawn the
+   * row as read and taken it out of the rail's count.
+   *
+   * The store and the window then disagreed for ever, and the Dock badge —
+   * which counts rows in SQLite rather than what is drawn — was the only thing
+   * still telling the truth. Reported as "mach doc icon says 1 unread but not
+   * true", against a conversation that really was unread and really was drawn
+   * as read.
+   *
+   * So the id goes in before the call, which is what stops a storm while it is
+   * in flight, and comes back out only when the command *never ran* — a throw,
+   * which is the transport dying or the window going away mid-flight. The next
+   * `detail` — a re-open, or the refetch a sync pass causes — tries again.
+   *
+   * A command that ran and was refused keeps its id. Google refusing to modify
+   * a thread will refuse again in thirty seconds, and `run` has already put the
+   * reason on the status line: retrying would be an error toast every sync pass
+   * for as long as the conversation stayed open.
+   */
   const markedRead = useRef(new Set<ThreadId>());
   useEffect(() => {
     const thread = detail?.thread;
     if (!thread || !thread.unread || markedRead.current.has(thread.id)) return;
-    markedRead.current.add(thread.id);
-    void run({ kind: "markRead", threadIds: [thread.id], read: true }, { quiet: true });
+    const id = thread.id;
+    markedRead.current.add(id);
+    void run({ kind: "markRead", threadIds: [id], read: true }, { quiet: true }).catch(() =>
+      markedRead.current.delete(id),
+    );
   }, [detail, run]);
 
   const state = useMemo(

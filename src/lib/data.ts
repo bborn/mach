@@ -42,7 +42,7 @@ import type {
 } from "@/types";
 import type { Contact } from "./contacts";
 import * as fixtures from "./fixtures";
-import { isBulk, PRIMARY_LABEL, PROMOTIONS_LABEL } from "./mailboxes";
+import { isOutsidePrimary, PRIMARY_LABEL, PROMOTIONS_LABEL } from "./mailboxes";
 import { matchesSearchNode, type SearchNode } from "./search-query";
 
 /* -------------------------------------------------------------------------- */
@@ -672,7 +672,7 @@ function inMailbox(thread: Thread, labelId: LabelId): boolean {
   }
   if (labelId === "SNOOZED") return fixtures.SNOOZED_THREAD_IDS.includes(thread.id);
   if (labelId === PRIMARY_LABEL) {
-    return thread.labelIds.includes("INBOX") && !isBulk(thread.labelIds);
+    return thread.labelIds.includes("INBOX") && !isOutsidePrimary(thread.labelIds);
   }
   if (labelId === PROMOTIONS_LABEL) {
     return thread.labelIds.includes(labelId) && thread.labelIds.includes("INBOX");

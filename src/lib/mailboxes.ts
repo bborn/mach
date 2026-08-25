@@ -42,10 +42,10 @@ export const RAIL_ORDER: readonly LabelId[] = [
 ];
 
 /**
- * Gmail's bulk tabs. Primary is the inbox minus these — not mail tagged
- * `CATEGORY_PERSONAL`. Most real mail has no category at all; Promotions /
- * Social / Updates / Forums are the ones Google actually stamps, and that is
- * the same cut notifications already use.
+ * Gmail's bulk tabs. "Move to Inbox" strips these. They are not the same cut
+ * as Inbox itself: Gmail's Primary tab still shows Updates- and Forums-stamped
+ * mail (Honeybadger, GitHub, the lot) while parking Promotions and Social in
+ * their own tabs.
  */
 export const BULK_CATEGORIES: readonly LabelId[] = [
   "CATEGORY_PROMOTIONS",
@@ -54,13 +54,28 @@ export const BULK_CATEGORIES: readonly LabelId[] = [
   "CATEGORY_FORUMS",
 ];
 
+/**
+ * What Inbox subtracts. Promotions and Social are the tabs Gmail actually
+ * splits off Primary; Updates and Forums stay in that list even when the API
+ * still stamps the category.
+ */
+export const PRIMARY_EXCLUDED: readonly LabelId[] = [
+  "CATEGORY_PROMOTIONS",
+  "CATEGORY_SOCIAL",
+];
+
 export function isBulk(labelIds: readonly string[]): boolean {
   return labelIds.some((id) => (BULK_CATEGORIES as readonly string[]).includes(id));
 }
 
+/** True when the conversation would not appear in Inbox. */
+export function isOutsidePrimary(labelIds: readonly string[]): boolean {
+  return labelIds.some((id) => (PRIMARY_EXCLUDED as readonly string[]).includes(id));
+}
+
 /** True when moving this conversation to Inbox would change its labels. */
 export function needsInbox(labelIds: readonly string[]): boolean {
-  return !labelIds.includes("INBOX") || isBulk(labelIds);
+  return !labelIds.includes("INBOX") || isOutsidePrimary(labelIds);
 }
 
 export function hasBulkTabs(labels: readonly Label[]): boolean {
@@ -75,7 +90,7 @@ export function inboxLabelId(): LabelId {
 /**
  * Gmail's category tabs: still in the inbox.
  *
- * Primary is inbox minus bulk. Promotions is inbox ∩ promotions. Archive
+ * Primary is inbox minus Promotions and Social. Promotions is inbox ∩ promotions. Archive
  * takes `INBOX` off and leaves the category, so a query that only asked for
  * the category would keep showing mail you had filed away.
  */

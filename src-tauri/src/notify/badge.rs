@@ -32,17 +32,17 @@ use rusqlite::Connection;
 
 use crate::db::Result as DbResult;
 
-use super::{badge_enabled, host::Host, rule::BULK_CATEGORIES, rule::INBOX};
+use super::{badge_enabled, host::Host, rule::INBOX, rule::PRIMARY_EXCLUDED};
 
-/// Unread conversations still in the inbox the window shows: not Promotions,
-/// Social, Updates or Forums.
+/// Unread conversations still in the inbox the window shows: not Promotions
+/// or Social. Updates and Forums stay, matching Gmail's Primary tab.
 ///
 /// Deliberately not filtered by the per-account notification setting: muting an
 /// account means "do not interrupt me for it", not "pretend its mail is not
 /// there". The badge is a count, and a count that silently omitted a mailbox
 /// would be the app lying rather than being quiet.
 pub fn unread_in_inbox(conn: &Connection) -> DbResult<i64> {
-    let bulk = BULK_CATEGORIES
+    let bulk = PRIMARY_EXCLUDED
         .iter()
         .map(|c| format!("'{c}'"))
         .collect::<Vec<_>>()
@@ -87,18 +87,25 @@ mod tests {
     use super::*;
     use crate::db::Db;
 
-    /// Unread in the inbox, unread but archived, read in the inbox, and an
-    /// unread Update still sitting in the inbox — the last is waiting, just
-    /// not in the view the badge is for.
+    /// Unread in the inbox, unread but archived, read in the inbox, an unread
+    /// Update in the inbox, and an unread Promotion in the inbox.
+    ///
+    /// The Update is the interesting one. It used to be excluded, on the
+    /// reading that the badge should count what the Primary tab counts — but
+    /// Gmail's Primary *shows* Updates- and Forums-stamped mail, and so does
+    /// this window. Only Promotions and Social are parked elsewhere, so only
+    /// they are subtracted. See `rule::PRIMARY_EXCLUDED`.
     fn seed(db: &Db) {
         db.write(|conn| {
             conn.execute_batch(
                 "INSERT INTO accounts (id, email) VALUES (1, 'alex@example.com');
                  INSERT INTO threads (id, account_id, gmail_thread_id, is_unread)
-                      VALUES (1, 1, 't1', 1), (2, 1, 't2', 1), (3, 1, 't3', 0), (4, 1, 't4', 1);
+                      VALUES (1, 1, 't1', 1), (2, 1, 't2', 1), (3, 1, 't3', 0),
+                             (4, 1, 't4', 1), (5, 1, 't5', 1);
                  INSERT INTO thread_labels (thread_id, gmail_label_id)
                       VALUES (1, 'INBOX'), (3, 'INBOX'), (2, 'Receipts'),
-                             (4, 'INBOX'), (4, 'CATEGORY_UPDATES');",
+                             (4, 'INBOX'), (4, 'CATEGORY_UPDATES'),
+                             (5, 'INBOX'), (5, 'CATEGORY_PROMOTIONS');",
             )?;
             Ok(())
         })
@@ -111,9 +118,20 @@ mod tests {
         seed(&db);
         assert_eq!(
             db.read(unread_in_inbox).unwrap(),
-            1,
-            "archived unread and inbox Updates do not badge"
+            2,
+            "archived unread and inbox Promotions do not badge; an inbox Update does"
         );
+    }
+
+    /// The badge counts what the list shows, or it is a number about nothing.
+    ///
+    /// This is the pair `queries::mailbox_clause` maintains for `PRIMARY`, and
+    /// the two have to subtract the same set. They were briefly out of step —
+    /// the badge subtracted four categories and the list two — and the symptom
+    /// was a Dock badge reading 1 over a window showing nothing unread.
+    #[test]
+    fn the_badge_subtracts_what_the_inbox_subtracts() {
+        assert_eq!(PRIMARY_EXCLUDED, ["CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL"]);
     }
 
     #[test]

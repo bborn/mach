@@ -71,6 +71,10 @@ commands.allow = [
   # Preferences.
   "get_preferences",
   "set_preference",
+  # Where the keyboard is, so the NSEvent monitor knows whether to speak. The
+  # window is the only thing that can read `document.activeElement`; see
+  # `frame_keyboard`.
+  "set_frame_focus",
   # Notifications.
   "notification_state",
   "notification_request_permission",

@@ -82,9 +82,9 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
     // new layout and the heights measured in the old one say nothing about it —
     // `nextFrameSize` resets the peak on exactly that.
     //
-    // It is not a rare event: a message tall enough to make the reading pane
-    // scroll takes a scrollbar's width off the frame partway through settling,
-    // and the body rewraps a line or two taller in the narrower box.
+    // The pane now keeps its 10px track even for a short message (`lockGutter`),
+    // so this used to fire on every tall open and no longer does. A splitter
+    // drag is still a real width change.
     const width = frame.clientWidth;
 
     /*
@@ -111,7 +111,7 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
   }, []);
 
   /*
-   * Hand the app back its keyboard.
+   * Hand the app back its keyboard — in a browser tab, and only there.
    *
    * This is a real iframe, so the instant anything inside it has focus — one
    * click to select a word or to scroll — its keydowns fire in *its* document
@@ -142,7 +142,9 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
    * unbound key is left to the document exactly as it was.
    *
    * `frameKeepsKey` holds back what belongs to the document being read — see
-   * there for which, and why ⌘A is the one that would hurt.
+   * there for which, and why ⌘A is the one that would hurt. `lib/frame-keyboard.ts`
+   * applies the same rule to what arrives from Rust, so the two paths cannot
+   * drift into disagreeing about which keys are the frame's.
    */
   const keymap = useKeymap();
   const forwardKey = useCallback(
@@ -167,95 +169,125 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
     [keymap],
   );
 
-  // Torn down and rebuilt on every load, because changing `srcdoc` replaces the
-  // document these listeners are attached to.
+  // Torn down and rebuilt on every document, because changing `srcdoc` replaces
+  // the document these listeners are attached to.
   const teardown = useRef<(() => void) | null>(null);
+  const boundDoc = useRef<Document | null>(null);
   useEffect(() => () => teardown.current?.(), []);
 
-  const onLoad = useCallback(() => {
-    teardown.current?.();
-    const doc = frameRef.current?.contentDocument;
-    if (!doc) return;
-
-    // A new document is new content, so the old heights say nothing about it.
-    setSize(resetFrameSize);
-
-    // Belt and braces: the authoritative reveal is the re-render with
-    // `allowRemoteImages: true`, which also widens the frame CSP. This catches
-    // anything a stale render left behind, as a property assignment.
-    if (allowRemoteImages) {
-      revealBlockedImages({
-        querySelectorAll: (selector) => doc.querySelectorAll<HTMLImageElement>(selector),
-      });
+  /*
+   * Size the frame when the HTML has parsed, not when every remote image has
+   * loaded. `iframe.onload` waits for those pictures; Linear and a Honeybadger
+   * digest sat at 28px for the better part of a second while they did.
+   *
+   * Images still grow the frame afterwards: `ResizeObserver` and the 250ms
+   * follow-up in `bindDocument` catch them. What this must not do is call
+   * `resetFrameSize` on load — that would collapse a parse-time height back
+   * toward the floor the moment the PNG landed.
+   */
+  const settle = useCallback(() => {
+    const frame = frameRef.current;
+    const inner = frame?.contentDocument;
+    const root = inner?.documentElement;
+    if (!frame || !inner || !root || frame.clientWidth === 0) return;
+    // One property read decides whether the pass is worth running at all.
+    // Ordinary mail does not overflow, and the pass costs a forced layout per
+    // table; this runs on every resize, so "nothing to do" has to be cheap.
+    if (root.scrollWidth > root.clientWidth) {
+      containWideContent(wideCandidates(inner), frame.clientWidth);
     }
+    measure();
+    root.classList.toggle("mach-capped", root.scrollHeight > MAX_FRAME_HEIGHT);
+  }, [measure]);
 
-    // Before anything is measured: a disclosure is an inline box and changes
-    // what fits. Once per document rather than per resize, since the answer
-    // does not depend on the layout.
-    discloseLinkTargets(anchorCandidates(doc));
-
-    doc.addEventListener("click", interceptNavigation, true);
-    doc.addEventListener("auxclick", interceptNavigation, true);
-    doc.addEventListener("submit", preventDefault, true);
-    doc.addEventListener("dragstart", preventDefault, true);
-    doc.addEventListener("keydown", forwardKey, true);
-
-    /*
-     * Let the frame scroll itself once it is clamped.
-     *
-     * Below the cap the frame is exactly as tall as its content and has nothing
-     * to scroll. At the cap the height has stopped tracking the content, so
-     * without a scrollbar everything past it would be unreachable — which is a
-     * bug this code has already had once.
-     */
-    const syncCapped = () => {
-      const root = frameRef.current?.contentDocument?.documentElement;
-      if (!root) return;
-      root.classList.toggle("mach-capped", root.scrollHeight > MAX_FRAME_HEIGHT);
-    };
-
-    // Contain, then measure, then decide about the cap — in that order, because
-    // each answer depends on the one before it.
-    const settle = () => {
-      const frame = frameRef.current;
-      const inner = frame?.contentDocument;
-      const root = inner?.documentElement;
-      // One property read decides whether the pass is worth running at all.
-      // Ordinary mail does not overflow, and the pass costs a forced layout per
-      // table; this runs on every resize, so "nothing to do" has to be cheap.
-      if (frame && inner && root && root.scrollWidth > root.clientWidth) {
-        containWideContent(wideCandidates(inner), frame.clientWidth);
+  const bindDocument = useCallback(
+    (doc: Document) => {
+      if (boundDoc.current === doc) {
+        settle();
+        return;
       }
-      measure();
-      syncCapped();
+      teardown.current?.();
+      boundDoc.current = doc;
+
+      // Belt and braces: the authoritative reveal is the re-render with
+      // `allowRemoteImages: true`, which also widens the frame CSP. This catches
+      // anything a stale render left behind, as a property assignment.
+      if (allowRemoteImages) {
+        revealBlockedImages({
+          querySelectorAll: (selector) => doc.querySelectorAll<HTMLImageElement>(selector),
+        });
+      }
+
+      // Before anything is measured: a disclosure is an inline box and changes
+      // what fits. Once per document rather than per resize, since the answer
+      // does not depend on the layout.
+      discloseLinkTargets(anchorCandidates(doc));
+
+      doc.addEventListener("click", interceptNavigation, true);
+      doc.addEventListener("auxclick", interceptNavigation, true);
+      doc.addEventListener("submit", preventDefault, true);
+      doc.addEventListener("dragstart", preventDefault, true);
+      doc.addEventListener("keydown", forwardKey, true);
+
+      const observer =
+        typeof ResizeObserver === "function" ? new ResizeObserver(() => settle()) : null;
+      // The body again, for the same reason, and because observing the root would
+      // re-fire on every height we set and risk a resize loop.
+      const observed = doc.body ?? doc.documentElement;
+      if (observer && observed) observer.observe(observed);
+
+      // Inline `data:` images and web fonts settle a frame or two after load, and
+      // an image is exactly the thing that turns a table that fitted into one
+      // that does not.
+      const frameId = requestAnimationFrame(settle);
+      const timer = window.setTimeout(settle, 250);
+      settle();
+
+      teardown.current = () => {
+        if (boundDoc.current === doc) boundDoc.current = null;
+        doc.removeEventListener("click", interceptNavigation, true);
+        doc.removeEventListener("auxclick", interceptNavigation, true);
+        doc.removeEventListener("submit", preventDefault, true);
+        doc.removeEventListener("dragstart", preventDefault, true);
+        doc.removeEventListener("keydown", forwardKey, true);
+        observer?.disconnect();
+        cancelAnimationFrame(frameId);
+        window.clearTimeout(timer);
+        teardown.current = null;
+      };
+    },
+    [allowRemoteImages, settle, forwardKey],
+  );
+
+  const onLoad = useCallback(() => {
+    const doc = frameRef.current?.contentDocument;
+    if (doc) bindDocument(doc);
+  }, [bindDocument]);
+
+  const bindRef = useRef(bindDocument);
+  bindRef.current = bindDocument;
+
+  useEffect(() => {
+    teardown.current?.();
+    boundDoc.current = null;
+    setSize(resetFrameSize);
+    const frame = frameRef.current;
+    if (!frame) return;
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      const doc = frame.contentDocument;
+      if (doc?.body && doc.readyState !== "loading" && frame.clientWidth > 0) {
+        bindRef.current(doc);
+        return;
+      }
+      requestAnimationFrame(tick);
     };
-
-    const observer =
-      typeof ResizeObserver === "function" ? new ResizeObserver(() => settle()) : null;
-    // The body again, for the same reason, and because observing the root would
-    // re-fire on every height we set and risk a resize loop.
-    const observed = doc.body ?? doc.documentElement;
-    if (observer && observed) observer.observe(observed);
-
-    // Inline `data:` images and web fonts settle a frame or two after load, and
-    // an image is exactly the thing that turns a table that fitted into one
-    // that does not.
-    const frameId = requestAnimationFrame(settle);
-    const timer = window.setTimeout(settle, 250);
-    settle();
-
-    teardown.current = () => {
-      doc.removeEventListener("click", interceptNavigation, true);
-      doc.removeEventListener("auxclick", interceptNavigation, true);
-      doc.removeEventListener("submit", preventDefault, true);
-      doc.removeEventListener("dragstart", preventDefault, true);
-      doc.removeEventListener("keydown", forwardKey, true);
-      observer?.disconnect();
-      cancelAnimationFrame(frameId);
-      window.clearTimeout(timer);
-      teardown.current = null;
+    requestAnimationFrame(tick);
+    return () => {
+      cancelled = true;
     };
-  }, [allowRemoteImages, measure, forwardKey]);
+  }, [srcDoc]);
 
   return (
     <iframe

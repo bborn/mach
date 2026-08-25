@@ -115,6 +115,13 @@ async function settle() {
   });
 }
 
+it("does not narrate the wait for a first render", async () => {
+  setRenderInvoker(() => new Promise(() => {}));
+  mount();
+  expect(container.textContent).not.toMatch(/render/i);
+  expect(container.querySelector("iframe")).toBeNull();
+});
+
 it("renders the text before the fetch resolves, and upgrades when it lands", async () => {
   const asked: string[] = [];
   let release: (value: unknown) => void = () => {};

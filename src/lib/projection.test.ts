@@ -148,7 +148,7 @@ describe("what a command is known to do", () => {
       },
       [{ id: 1, labelIds: ["INBOX"], unread: true }],
     )![1]!;
-    expect(leavesMailbox(restored, "PRIMARY")).toBe(true);
+    expect(leavesMailbox(restored, "PRIMARY")).toBe(false);
   });
 
   it("gives a reported conversation SPAM and takes INBOX away", () => {
@@ -259,6 +259,7 @@ describe("what a command is known to do", () => {
     expect(entersMailbox(restored, "INBOX")).toBe(true);
     expect(entersMailbox(restored, "PRIMARY", ["INBOX"])).toBe(true);
     expect(entersMailbox(restored, "PRIMARY", ["INBOX", "CATEGORY_PROMOTIONS"])).toBe(false);
+    expect(entersMailbox(restored, "PRIMARY", ["INBOX", "CATEGORY_UPDATES"])).toBe(true);
     expect(entersMailbox(restored, "CATEGORY_PROMOTIONS", ["INBOX"])).toBe(false);
   });
 
