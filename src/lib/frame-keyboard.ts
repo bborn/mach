@@ -36,6 +36,16 @@ import { frameKeepsKey } from "@/lib/message-body";
 import { isTauri } from "@/lib/ipc";
 import type { KeyEventLike } from "@/lib/keymap";
 
+/**
+ * How often the poll below asks where the keyboard is.
+ *
+ * Short enough that a click into a message and a reach for `r` cannot fall
+ * between two checks — that gap is the whole failure it guards against — and
+ * long enough that it is a property read a handful of times a second and
+ * nothing else. It sends no IPC unless the answer changed.
+ */
+const FOCUS_POLL_MS = 150;
+
 /** The event Rust emits. Mirrors `frame_keyboard::FRAME_KEY_EVENT`. */
 export const FRAME_KEY_EVENT = "frame-key";
 
@@ -159,21 +169,37 @@ export function connectFrameKeys(env: {
   let inside = keyboardInFrame();
   void reportFrameFocus(inside);
 
-  // One listener for both directions: `focusout` is followed by `focusin` when
-  // focus lands somewhere else, and by nothing at all when it lands nowhere —
-  // so the answer is read from `document.activeElement` rather than from which
-  // event arrived. A microtask, because during `focusout` the active element is
-  // still the old one.
-  const onFocusChange = () => {
-    queueMicrotask(() => {
-      const next = keyboardInFrame();
-      if (next === inside) return;
-      inside = next;
-      void reportFrameFocus(next);
-    });
+  /*
+   * Two ways of noticing, because one of them cannot be trusted here.
+   *
+   * `focusin`/`focusout` on the app's own document are the cheap, instant
+   * answer, and they are why this is not a busy loop. But the transition that
+   * matters — focus crossing *into* a subframe — is exactly the kind of thing
+   * this file has already been caught assuming about WebKit twice, and there is
+   * deliberately no way to run script in the real window (see `src-tauri/src/qa/`)
+   * to find out whether the parent hears it. An event that never fires would
+   * leave the flag down, the monitor silent, and every shortcut dead the moment
+   * somebody clicked a message — which is the bug this whole mechanism exists
+   * to fix, returning by a different door.
+   *
+   * So the events are a fast path and the poll is the authority.
+   * `document.activeElement` is a property read and cannot be wrong; comparing
+   * it costs nothing and reports only on a change, so a window nobody is
+   * touching sends no IPC at all. The interval is short enough that reaching
+   * for `r` after a click never loses the keystroke.
+   */
+  const check = () => {
+    const next = keyboardInFrame();
+    if (next === inside) return;
+    inside = next;
+    void reportFrameFocus(next);
   };
+  // A microtask, because during `focusout` the active element is still the old
+  // one and the answer would be a frame stale.
+  const onFocusChange = () => queueMicrotask(check);
   document.addEventListener("focusin", onFocusChange, true);
   document.addEventListener("focusout", onFocusChange, true);
+  const poll = window.setInterval(check, FOCUS_POLL_MS);
 
   let stopped = false;
   let off: (() => void) | null = null;
@@ -189,6 +215,7 @@ export function connectFrameKeys(env: {
 
   return () => {
     stopped = true;
+    window.clearInterval(poll);
     document.removeEventListener("focusin", onFocusChange, true);
     document.removeEventListener("focusout", onFocusChange, true);
     void reportFrameFocus(false);

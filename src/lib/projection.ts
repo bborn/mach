@@ -558,6 +558,27 @@ export function suppressedIds(guesses: Guesses, labelId: LabelId): Set<ThreadId>
  * and `guessedAt` is the count each guess was made at. Equal means nothing has
  * arrived since, so there is nothing to decide on yet.
  */
+/**
+ * How many decidable lists a guess may be contradicted by before it is retired
+ * anyway.
+ *
+ * A guess is a prediction, and the refetch that follows a command routinely
+ * lands before Gmail's change is in it — measured at "back at 3168ms, retired
+ * at 3270ms" — so the first disagreeing list is not evidence of anything and
+ * retiring on it puts the star out and lights it again.
+ *
+ * A prediction that is *still* wrong several lists later is simply wrong. It
+ * used to be kept regardless, which made a guess nothing ever agreed with
+ * permanent: the row went on drawing the state that was predicted while the
+ * store said otherwise, and only a relaunch cleared it. That is what put a `1`
+ * on the Dock — which counts rows in SQLite — over a window showing nothing
+ * unread, reported as "unread count is fucked again".
+ *
+ * Three, because the command's own refetch and the sync pass behind it are two,
+ * and the third is the one that means it.
+ */
+const GUESS_GRACE_VERSIONS = 3;
+
 export function settledGuesses(
   rows: readonly Pick<Thread, "id" | "labelIds" | "unread">[],
   guesses: Guesses,
@@ -576,6 +597,20 @@ export function settledGuesses(
     if (guessedAt[id] === listVersion) continue;
     const guess = guesses[id]!;
     const row = byId.get(id);
+    /*
+     * Out of grace: the list has moved on several times and still does not say
+     * what this guess predicted. Retire it and let the row draw what the store
+     * actually holds, right or wrong — a visible disagreement is recoverable
+     * and a permanent invisible one is not.
+     */
+    const stale =
+      listVersion >= 0 &&
+      guessedAt[id] !== undefined &&
+      listVersion - guessedAt[id] >= GUESS_GRACE_VERSIONS;
+    if (stale) {
+      settled.push(id);
+      continue;
+    }
     if (row) {
       if (agrees(row, guess)) settled.push(id);
     } else if (leavesMailbox(guess, labelId)) {

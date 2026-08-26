@@ -745,3 +745,63 @@ describe("a block drawn for a create", () => {
     expect(rows.map((e) => e.id)).toEqual([42]);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* A guess that is never agreed with                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Reported as "unread count is fucked again — shows 1 unread badge, but nothing
+ * is unread".
+ *
+ * A guess used to retire only when the list *agreed* with it, so one that
+ * nothing ever agreed with was pinned for the life of the process. The row went
+ * on drawing what was predicted — read — while `threads.is_unread` in SQLite
+ * said otherwise. The Dock badge counts those rows and does not read guesses,
+ * so it was the only surface still telling the truth, and it looked like the
+ * badge was broken.
+ *
+ * The grace is what keeps the old fix intact: the refetch after a command
+ * routinely lands before Gmail's change is in it, and retiring on that first
+ * disagreement is the star-flash this file already argues against at length.
+ */
+describe("a guess the list never agrees with", () => {
+  const guess = { add: [], remove: [], unread: false } as const;
+
+  function rows(unread: boolean) {
+    return [{ id: 1, labelIds: ["INBOX"], unread }];
+  }
+
+  it("survives a list that merely has not caught up yet", () => {
+    // One version on: the command's own refetch, which routinely predates the
+    // change reaching Gmail.
+    expect(settledGuesses(rows(true), { 1: guess }, "INBOX", { 1: 0 }, 1)).toEqual([]);
+    expect(settledGuesses(rows(true), { 1: guess }, "INBOX", { 1: 0 }, 2)).toEqual([]);
+  });
+
+  it("retires once several lists have disagreed with it", () => {
+    expect(settledGuesses(rows(true), { 1: guess }, "INBOX", { 1: 0 }, 3)).toEqual([1]);
+  });
+
+  it("still retires the moment the list agrees, without waiting out the grace", () => {
+    expect(settledGuesses(rows(false), { 1: guess }, "INBOX", { 1: 0 }, 1)).toEqual([1]);
+  });
+
+  /*
+   * The version stamp is what stops a list fetched *before* the command from
+   * deciding anything, and the grace must not smuggle that back in.
+   */
+  it("decides nothing on the list the guess was made against", () => {
+    expect(settledGuesses(rows(true), { 1: guess }, "INBOX", { 1: 5 }, 5)).toEqual([]);
+  });
+
+  /*
+   * Callers that keep no stamps at all — the tests above this block, and any
+   * older call site — keep the pure "agrees" rule rather than retiring
+   * everything on the first list.
+   */
+  it("leaves an unstamped guess to the agreement rule alone", () => {
+    expect(settledGuesses(rows(true), { 1: guess }, "INBOX")).toEqual([]);
+    expect(settledGuesses(rows(true), { 1: guess }, "INBOX", {}, 99)).toEqual([]);
+  });
+});
