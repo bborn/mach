@@ -766,7 +766,7 @@ describe("a block drawn for a create", () => {
  * disagreement is the star-flash this file already argues against at length.
  */
 describe("a guess the list never agrees with", () => {
-  const guess = { add: [], remove: [], unread: false } as const;
+  const guess: ThreadGuess = { add: [], remove: [], unread: false };
 
   function rows(unread: boolean) {
     return [{ id: 1, labelIds: ["INBOX"], unread }];

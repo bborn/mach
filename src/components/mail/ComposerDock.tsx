@@ -67,6 +67,7 @@ import {
   loadDraftForThread,
   moveDraftAccount,
   newDraft,
+  forwardAttachments,
   prepareDraft,
   removeAttachment,
   saveDraft,
@@ -498,7 +499,45 @@ export function ComposerDock() {
         // `prepare` reads the thread — its account, its recipients, its
         // References header — and comes back with an empty body. The signature
         // is the one thing it cannot know, because it is not in the thread.
-        if (prepared) openDraft(signed(prepared));
+        if (!prepared) return;
+        openDraft(signed(prepared));
+
+        /*
+         * A forward's files, after the window is up.
+         *
+         * The text of the original rides along at build time and costs
+         * nothing, but its attachments are metadata here until somebody
+         * fetches them — so this is a request, and it must not sit between `f`
+         * and the composer appearing. The chips land a moment later, which is
+         * the same shape a drag-and-drop already has.
+         *
+         * Forwarding used to send the words and silently leave the files
+         * behind, which is the kind of failure you find out about from the
+         * other end.
+         */
+        if (kind !== "forward" || replyToId == null) return;
+        const brought = await forwardAttachments(prepared.id, replyToId).catch(
+          (error: unknown) => {
+            actions.setStatus(errorMessage(error), "error");
+            return null;
+          },
+        );
+        if (!brought) return;
+        if (brought.attachments.length > 0) {
+          setDrafts((current) =>
+            current.map((entry) =>
+              entry.id === prepared.id
+                ? { ...entry, attachments: brought.attachments }
+                : entry,
+            ),
+          );
+        }
+        // Named rather than counted: "2 files could not be brought" leaves the
+        // owner to work out which, and the answer decides whether the forward
+        // is worth sending at all.
+        if (brought.refused.length > 0) {
+          actions.setStatus(`Not forwarded — ${brought.refused.join("; ")}`, "error");
+        }
       })();
     },
     [threadId, actions, signed, openDraft],
@@ -1751,6 +1790,23 @@ export function ComposerDock() {
        * chain and the thread it is mirrored into are all rows of that account,
        * and Gmail has no call that answers one account's thread as another.
        */
+      /*
+       * What a forward is carrying, named from the message it was prepared
+       * against. The words themselves are Rust's, added at build — see the
+       * strip's own comment for why this is a label and not the text.
+       */
+      forwarding={
+        visible.kind === "forward"
+          ? (() => {
+              const parent = detail?.messages.find((m) => m.id === visible.replyToId);
+              if (!parent) return undefined;
+              return {
+                subject: detail?.thread.subject ?? "",
+                from: parent.from.name || parent.from.email,
+              };
+            })()
+          : undefined
+      }
       fromAccounts={visible.kind === "new" ? accounts : undefined}
       onChangeAccount={
         visible.kind === "new" ? (accountId) => void moveAccount(visible, accountId) : undefined

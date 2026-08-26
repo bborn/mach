@@ -242,6 +242,40 @@ export async function prepareDraft(
   return result.draft;
 }
 
+/** What came across with a forward, and what would not. */
+export interface ForwardedFiles {
+  attachments: DraftAttachment[];
+  /** Named, with Google's reason. Empty on the ordinary path. */
+  refused: string[];
+}
+
+/**
+ * Bring the forwarded message's files onto the draft.
+ *
+ * A separate call from `prepareDraft`, and after it, because the two cost
+ * different things. A forward's *text* is free — Rust reproduces the original
+ * out of rows that are already local, at build time — but a synced message
+ * carries an attachment's name, type and size and not its bytes. Those arrive
+ * only when somebody opens or saves one, so this almost always has to fetch,
+ * and a fetch has no business between `f` and the composer appearing.
+ *
+ * Inline images are deliberately left behind: they are part of the body the
+ * forward already reproduces, and attaching them would put every signature
+ * graphic in the message twice.
+ */
+export async function forwardAttachments(
+  draftId: string,
+  messageId: number,
+): Promise<ForwardedFiles> {
+  if (!isTauri()) return { attachments: [], refused: [] };
+  const { invoke } = await import("@tauri-apps/api/core");
+  const result = await invoke<Partial<ForwardedFiles>>("forward_attachments", {
+    draftId,
+    messageId,
+  });
+  return { attachments: result.attachments ?? [], refused: result.refused ?? [] };
+}
+
 /**
  * A blank draft, addressed to nobody, belonging to no conversation.
  *

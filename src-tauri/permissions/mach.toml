@@ -71,6 +71,8 @@ commands.allow = [
   # Preferences.
   "get_preferences",
   "set_preference",
+  # A forward's files, fetched and copied onto the draft.
+  "forward_attachments",
   # Where the keyboard is, so the NSEvent monitor knows whether to speak. The
   # window is the only thing that can read `document.activeElement`; see
   # `frame_keyboard`.

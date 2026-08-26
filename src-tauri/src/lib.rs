@@ -319,6 +319,7 @@ pub fn run() {
             ipc::render::open_external,
             evict::command::restore_message_body,
             ipc::attachments::attachment_open,
+            ipc::attachments::forward_attachments,
             ipc::attachments::attachment_save,
             ipc::attachments::attachment_inline_image,
             ipc::compose::send_message,

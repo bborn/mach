@@ -23,7 +23,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use mail_parser::MessageParser;
+use mail_parser::{MessageParser, MimeHeaders};
 
 use mach_lib::commands::{AccountClients, GoogleClients};
 use mach_lib::db::models::{
@@ -5415,4 +5415,64 @@ async fn moving_a_draft_that_was_never_saved_is_not_a_failure() {
     assert!(moved["draft"].is_null(), "there was nothing to hand back");
     assert_eq!(moved["remote"], json!("none"));
     assert!(drafts_mailbox(&db).is_empty(), "and nothing was conjured up");
+}
+
+// ---------------------------------------------------------------------------
+// A forward carries the files, not only the words
+// ---------------------------------------------------------------------------
+
+/// Asked as "does forwarding an email also forward the contents of the email?"
+///
+/// The words, yes — `forward_text` reproduces the original whole and there is a
+/// test above for it. The files did not come, and nothing said so: `prepared()`
+/// copies To, Cc and the subject off the parent and stops, so forwarding a
+/// message with a PDF sent the text of it and left the PDF behind. The kind of
+/// failure whose first report comes from the recipient.
+///
+/// The copy itself is `ipc::attachments::forward_attachments`, which needs a
+/// Gmail client to fetch bytes that are metadata until somebody asks for them.
+/// What can be asserted here without one is the half that was wrong: a prepared
+/// forward starts with no attachments of its own, so anything the draft carries
+/// has to have been put there deliberately — and `add_bytes` is what puts it
+/// there, on the same rows `build` reads.
+#[tokio::test]
+async fn a_forward_sends_the_files_it_was_given() {
+    let (db, _account, _thread, ids) = seeded_long_thread();
+    let out = outbox(&db, FakeTransport::always_ok());
+
+    let mut draft =
+        draft::prepare_reply_to(&db, ids[1], DraftKind::Forward, "d-fwd".into()).unwrap();
+    draft.to = vec![Mailbox::new("someone@else.com")];
+    draft.body = "fyi".into();
+    draft::save_draft(&db, &draft, NOW).unwrap();
+
+    // What the bug was: nothing rides along on its own.
+    assert!(
+        compose::attach::list(&db, "d-fwd").unwrap().is_empty(),
+        "a prepared forward starts empty; the files are fetched and copied after"
+    );
+
+    // What `forward_attachments` does, minus the Gmail round trip it makes to
+    // turn an attachment row into bytes.
+    compose::attach::add_bytes(&db, "d-fwd", "diligence.pdf", b"%PDF-1.4 ...", false, NOW)
+        .unwrap();
+
+    let carried = compose::attach::list(&db, "d-fwd").unwrap();
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].filename, "diligence.pdf");
+    assert!(!carried[0].inline, "a forwarded file is a file, not a body part");
+
+    // And it reaches the wire, beside the reproduced original rather than
+    // instead of it.
+    let saved = draft::load_draft(&db, "d-fwd").unwrap().unwrap();
+    let bytes = built_bytes(&db, &saved);
+    let parsed = MessageParser::new().parse(&bytes).unwrap();
+    let plain = parsed.body_text(0).unwrap().into_owned();
+    assert!(plain.contains("---------- Forwarded message ---------"), "{plain}");
+    let names: Vec<String> = parsed
+        .attachments()
+        .filter_map(|p| p.attachment_name().map(str::to_string))
+        .collect();
+    assert!(names.contains(&"diligence.pdf".to_string()), "{names:?}");
+    let _ = out;
 }

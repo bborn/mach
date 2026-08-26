@@ -10,7 +10,7 @@ import {
   type Ref,
   type RefObject,
 } from "react";
-import { Image as ImageIcon, LoaderCircle, Paperclip, X } from "lucide-react";
+import { CornerDownRight, Image as ImageIcon, LoaderCircle, Paperclip, X } from "lucide-react";
 import { useKeyBindings, useKeymap } from "@/hooks/useKeymap";
 import { OVERLAY_KEY_FLOOR } from "@/lib/keymap";
 import { useGhostText } from "@/hooks/useGhostText";
@@ -209,6 +209,15 @@ interface ComposerProps {
    * leaves has to be deleted rather than abandoned. Rust does it in one piece.
    */
   onChangeAccount?: (accountId: number) => void;
+  /**
+   * The message this draft is forwarding, when it is forwarding one.
+   *
+   * Absent for every other kind. A reply's quoted trail is invisible here too,
+   * and deliberately: every mail client quotes on reply and nobody is surprised
+   * by it. A forward that shows an empty body while sending somebody else's
+   * whole message is the one that needed saying.
+   */
+  forwarding?: { subject: string; from: string };
   /** Everyone the app has seen, for the address fields. */
   contacts?: readonly Contact[];
   /** Lines describing what is being answered, for the ghost completions. */
@@ -283,6 +292,7 @@ export function Composer({
   onConfirmSubject,
   fromAccounts,
   onChangeAccount,
+  forwarding,
   onSendAnyway,
   onKeepWriting,
   onAttach,
@@ -937,6 +947,36 @@ export function Composer({
             {dropTarget === "body" && draggingInlinable
               ? "Drop in the message"
               : "Drop to attach"}
+          </div>
+        )}
+
+        {/*
+          What is going with the message that is not in the editor.
+
+          A forward reproduces the original whole — headers and all — at build
+          time, so the composer opens on an empty body and sends a full message.
+          Every other client shows that block; this showed nothing, and the only
+          way to know the forward carried anything was to send it and ask.
+          Reported as "does forwarding an email also forward the contents".
+
+          Not the text itself, and not editable: `forward_html` builds it from
+          the stored message at send, so anything drawn here would be a second
+          copy that could disagree with what actually leaves. One line naming
+          the message is the whole claim — the recipient gets *that*.
+        */}
+        {forwarding && (
+          <div
+            className={cn(
+              COMPOSER_FIXED_ROW,
+              "mt-2 flex min-w-0 items-baseline gap-1.5 text-micro text-faint-foreground",
+            )}
+          >
+            <CornerDownRight size={12} strokeWidth={1.75} className="shrink-0 translate-y-px" />
+            <span className="shrink-0">Forwarding</span>
+            <span className="min-w-0 truncate text-muted-foreground">
+              {forwarding.subject}
+              {forwarding.from ? ` — ${forwarding.from}` : ""}
+            </span>
           </div>
         )}
 

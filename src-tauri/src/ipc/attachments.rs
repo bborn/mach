@@ -656,3 +656,94 @@ fn human_size(bytes: i64) -> String {
         format!("{} KB", (bytes / 1024).max(1))
     }
 }
+
+// ===========================================================================
+// Forwarding
+// ===========================================================================
+
+/// Put the forwarded message's files on the forwarding draft.
+///
+/// # Why this is a second call and not part of `prepare`
+///
+/// A forward's *text* is free: [`compose::draft::forward_text`] reproduces the
+/// original out of rows that are already local, and it happens at build time
+/// with nothing to wait for. Its files are not. A synced message carries an
+/// attachment's name, type and size but not its bytes — those arrive only when
+/// somebody opens or saves one — so forwarding almost always has to fetch, and
+/// a fetch belongs nowhere near the keystroke that opens a composer. `prepare`
+/// stays a local read and the window opens on it; this follows.
+///
+/// # What it does not do
+///
+/// **Inline images are left behind.** They are parts of the body, addressed by
+/// `cid:`, and [`forward_html`] reproduces that body as the sender wrote it —
+/// including those references. Attaching them again would put every logo and
+/// signature graphic in the message a second time, as files, under a chip. A
+/// recipient whose client resolves the `cid:` sees the original; one whose
+/// client does not sees what Gmail's own forward shows them.
+///
+/// [`forward_html`]: crate::ipc::compose::engine::draft::forward_html
+/// [`compose::draft::forward_text`]: crate::ipc::compose::engine::draft::forward_text
+///
+/// # Failure is per file
+///
+/// One attachment Google will not hand back — too large for the cap, a part
+/// that is no longer there — must not cost the other three, and must not cost
+/// the forward itself. Each is tried on its own and the ones that failed come
+/// back named, so the composer can say which files are *not* going and the
+/// owner can decide before sending rather than after.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardedFiles {
+    /// The draft's attachments as they now stand, in the shape the composer
+    /// already draws.
+    pub attachments: Vec<crate::ipc::compose::engine::attach::Attachment>,
+    /// Files that could not be brought across, by name, with Google's reason.
+    pub refused: Vec<String>,
+}
+
+#[tauri::command(async)]
+pub async fn forward_attachments(
+    state: State<'_, AppState>,
+    draft_id: String,
+    message_id: i64,
+) -> Result<ForwardedFiles, IpcError> {
+    use crate::ipc::compose::engine::attach;
+
+    // Metadata only: the ids of every file on the message being forwarded.
+    //
+    // No inline filter, because there is nothing inline in here to filter.
+    // `sync::convert` populates this table from `ExtractedBody::files()`, which
+    // is defined as the parts a person would call attachments — the `cid:`
+    // images the body references are kept out of it and fetched by Content-ID
+    // on their own path. So this is already the file list and nothing else.
+    let ids: Vec<i64> = state.db.read(|conn| {
+        let mut stmt =
+            conn.prepare("SELECT id FROM attachments WHERE message_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([message_id], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })?;
+
+    let now = crate::ipc::compose::now_ms();
+    let mut refused: Vec<String> = Vec::new();
+    for id in ids {
+        match materialise(&state, id).await {
+            Ok(file) => match std::fs::read(&file.path) {
+                Ok(bytes) => {
+                    if let Err(error) =
+                        attach::add_bytes(&state.db, &draft_id, &file.filename, &bytes, false, now)
+                    {
+                        refused.push(format!("{}: {error}", file.filename));
+                    }
+                }
+                Err(error) => refused.push(format!("{}: {error}", file.filename)),
+            },
+            Err(error) => refused.push(error.to_string()),
+        }
+    }
+
+    Ok(ForwardedFiles {
+        attachments: attach::list(&state.db, &draft_id)?,
+        refused,
+    })
+}
