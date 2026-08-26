@@ -255,11 +255,12 @@ in what the owner typed, nor one of his own addresses — computed from the sess
 not asked of the model. A planted draft is still planted; the sentence he reads
 before it leaves says where the address came from.
 
-Two things the finding did not raise are also done: a session may move
+One thing the finding did not raise is also done: a session may move
 `WRITE_BUDGET` (25) conversations before it starts asking, charged per thread id
-so one call with two hundred of them parks on its own; and `suggest/prompt.rs`
-drops a suggested reply whose body repeats ten consecutive words of his past mail,
-or names a link or an address nobody in the conversation wrote.
+so one call with two hundred of them parks on its own. A second — `suggest/`
+refusing to emit a reply that repeated ten consecutive words of his past mail,
+or named a link or an address nobody in the conversation wrote — went with that
+module when reply suggestions were removed.
 
 Still open: mail arriving through **tool results** is unfenced raw JSON. The
 system prompt names `get_thread` and `search_threads` as sources of untrusted
@@ -503,19 +504,21 @@ like a wall of text. Recording it as a known limit rather than proposing a fix.
 
 ---
 
-### R11 — `suggest/` pulls the owner's own Sent mail into a prompt keyed on incoming mail.
+### R11 — `suggest/` pulled the owner's own Sent mail into a prompt keyed on incoming mail. *(closed — the code is gone)*
 
-`voice::examples` (`suggest/voice.rs:60-76`) selects past replies the owner
-wrote, to teach the model his voice, and selects them by full-text relevance to
-the incoming message (`voice.rs:22-24`). An attacker who can guess terms that
-appear in a private sent message can cause that message to be loaded into a
-model's context by sending mail containing those terms.
+`voice::examples` selected past replies the owner wrote, to teach the model his
+voice, and selected them by full-text relevance to the *incoming* message. An
+attacker who could guess terms appearing in a private sent message could cause
+that message to be loaded into a model's context by sending mail containing
+those terms. It was the one place where attacker-chosen text steered what
+private content got read.
 
-This is low severity for this app: the model is the owner's own, the output is
-display-only (`suggest/mod.rs:21-26` — "A suggestion is not a draft"), and
-`suggest/` has no Gmail client and structurally cannot create one. It is listed
-because it is the one place where attacker-chosen text steers what private
-content gets read.
+Closed by removal rather than by mitigation: reply suggestions were dropped
+because they were not useful, and `suggest/` went with them. Nothing now reads
+Sent mail on an incoming message's account. The entry is kept rather than
+deleted because the shape is worth remembering — any future feature that picks
+which of the owner's own mail to read *using text a stranger sent* reintroduces
+exactly this, and should be measured against it before it ships.
 
 ---
 
@@ -661,7 +664,7 @@ origin can reach any command. There is no deep-link plugin and no
 exists for a web page or a message to aim at.
 
 **The agent's outbound surface is closed.** No fetch tool, no HTTP tool, no shell
-tool, no file tool — verified by grep across `agent/`, `handoff/` and `suggest/`.
+tool, no file tool — verified by grep across `agent/` and `handoff/`.
 The API base URL is env-only and never derived from content. The MCP server binds
 `127.0.0.1:0`, uses 32 random bytes as a bearer token compared in constant time,
 writes the token to a `0600` file rather than argv, and 403s any request carrying

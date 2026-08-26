@@ -119,9 +119,6 @@ commands.allow = [
   "agent_status",
   "agent_complete",
   # Reply suggestions.
-  "reply_suggestions",
-  "reply_suggestion_record",
-  "reply_suggestion_stats",
   # The plugin host.
   "plugin_sandbox",
   "plugin_conformance",

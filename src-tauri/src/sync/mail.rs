@@ -146,11 +146,6 @@ pub struct MailSync {
     /// Shared across every account, so five accounts cannot together open fifty
     /// connections to Google.
     pub limiter: Arc<Semaphore>,
-    /// How [`crate::suggest`] reaches a model. `None` — the default everywhere
-    /// except the running app — means this pass writes no reply suggestions,
-    /// which is what a test, a fixture or a tool that only wants a backfill
-    /// should get.
-    pub suggest_brain: Option<crate::suggest::SuggestBrain>,
 }
 
 impl MailSync {
@@ -799,39 +794,13 @@ impl MailSync {
         // could take back, and `announce` opens its own short transaction to
         // record what it said.
         //
-        // `suggest::consider` rides the same gate for the same reason, and it is
-        // the reason that gate is structural rather than a filter: a backfill
-        // stores a year of mail, every message of it an "arrival" as far as the
-        // store is concerned, and only an incremental pass on an account that
-        // already had a watermark reaches either of these. Without that, a new
-        // account's first sync would write tens of thousands of replies nobody
-        // asked for and bill for all of them.
-        //
-        // It returns immediately; the model call happens on a task of its own,
-        // so a slow API cannot hold up a sync pass. The headers come from the
-        // wire response rather than from the row, because `List-Unsubscribe` and
-        // `Precedence` are not columns — nothing else needs them — and they are
-        // still in hand right here.
+        // The gate is structural rather than a filter: a backfill stores a year
+        // of mail, every message of it an "arrival" as far as the store is
+        // concerned, and only an incremental pass on an account that already had
+        // a watermark reaches this. Without that, a new account's first sync
+        // would announce tens of thousands of messages.
         if voice == Voice::Announce {
             crate::notify::announce(&self.db, account_id, &arrived);
-
-            if let Some(brain) = self.suggest_brain.as_ref() {
-                let headers = arrived
-                    .iter()
-                    .filter_map(|id| {
-                        fetched
-                            .get(id)
-                            .map(|m| (id.clone(), crate::suggest::Headers::of(m)))
-                    })
-                    .collect();
-                crate::suggest::consider(
-                    &self.db,
-                    brain.clone(),
-                    account_id,
-                    &arrived,
-                    headers,
-                );
-            }
         }
 
         self.report.add_messages(written as i64);

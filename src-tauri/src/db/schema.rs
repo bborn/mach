@@ -102,7 +102,28 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 21,
         sql: M21_SENDER_INDEX_COVERS_NAME,
     },
+    Migration {
+        version: 22,
+        sql: M22_DROP_REPLY_SUGGESTIONS,
+    },
 ];
+
+/// Migration 22 — the reply suggestions are gone.
+///
+/// The feature wrote two stances per conversation ahead of time and offered
+/// them on a row above the composer. It was removed for the plainest reason
+/// there is: it was not useful. Nothing reads these tables now, and 17 and 19
+/// above stay exactly where they are — a migration list is a ledger of what has
+/// already run on somebody's disk, and editing history would leave every
+/// existing install trying to apply a version it has recorded.
+///
+/// `IF EXISTS` on all three, because an install that never reached 17 has
+/// nothing to drop and must not fail on the way past.
+const M22_DROP_REPLY_SUGGESTIONS: &str = r#"
+DROP INDEX IF EXISTS idx_reply_suggestion_outcomes_kind;
+DROP TABLE IF EXISTS reply_suggestion_outcomes;
+DROP TABLE IF EXISTS reply_suggestions;
+"#;
 
 /// Migration 20 — an index the recipient operators can stand on.
 ///

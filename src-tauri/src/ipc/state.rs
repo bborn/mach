@@ -458,24 +458,7 @@ pub fn bootstrap(config: AppConfig) -> Result<AppState, IpcError> {
     if let Ok(Some(interval)) = db.read(super::prefs::sync_interval) {
         sync_config.poll_interval = interval;
     }
-    // The running app is the one engine allowed to write reply suggestions, and
-    // it says so here rather than inheriting it. See
-    // [`SyncEngine::with_suggest_transport`] for why that is a decision rather
-    // than a default: an engine constructed by a test or a tool has no way to
-    // spend money by accident.
     let sync = Arc::new(SyncEngine::new(db.clone(), sync_clients, sync_config)?);
-    sync.set_suggest_brain(crate::suggest::SuggestBrain {
-        transport: Arc::new(super::agent::engine::wire::ReqwestModelTransport::new()),
-        // The same directory ⌘K's sessions run in, for the same reasons — see
-        // the workspace note in `ipc::agent`. A backend that spawns a process
-        // needs somewhere to be, and neither the owner's home directory nor a
-        // bundled app's `/` is it.
-        workspace: config
-            .database_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("agent"),
-    });
 
     // Deliberately *not* the Keychain read that used to be here. See
     // `restore_accounts_into`: doing it on this thread deadlocks the launch.

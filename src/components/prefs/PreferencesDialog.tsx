@@ -22,14 +22,6 @@ import {
   loadBackendStatus,
   type AgentBackendStatus,
 } from "@/lib/agent";
-import {
-  EMPTY_STATS,
-  WORTH_IT_RATE,
-  capLabel,
-  loadSuggestionStats,
-  spendLabel,
-  type SuggestionStats,
-} from "@/lib/suggestions";
 import { errorMessage } from "@/lib/ipc";
 import { openExternal } from "@/lib/message-body";
 import { Button } from "@/components/ui/button";
@@ -1153,120 +1145,10 @@ function AgentSettings({
         </Field>
       )}
 
-      <Field orientation="row">
-        <FieldLabel htmlFor={ids.replySuggestions}>Replies</FieldLabel>
-        {/*
-          Off means nothing generates — no model call, no row, no cost — which
-          is the only version of this switch worth having. The rule behind it is
-          deliberately not written on screen: any human message addressed to
-          him, minus list mail, no-reply senders and the categories Gmail has
-          already filed as bulk. See `suggest::rule`.
-        */}
-        <Toggle
-          id={ids.replySuggestions}
-          label="Write replies for new mail"
-          checked={prefs.replySuggestions}
-          onChange={(on) => set("replySuggestions", on)}
-        />
-        {/*
-          The one state the "Runs on" line above does not already cover.
-          Written replies use the same backend ⌘K does, so a machine with no
-          brain at all already says so up there, in red, once. A custom command
-          is different: it answers ⌘K perfectly well and cannot write a reply,
-          because the contract in docs/agent-backends.md is a session. Named
-          only while it is true, and never as a status line.
-        */}
-        {prefs.agentBackend === "command" && (
-          <FieldDescription>Not available with a custom command</FieldDescription>
-        )}
-      </Field>
-
-      {prefs.replySuggestions && (
-        <>
-          <Field orientation="row">
-            <FieldLabel htmlFor={ids.replySuggestionModel}>Reply model</FieldLabel>
-            <Input
-              id={ids.replySuggestionModel}
-              spellCheck={false}
-              placeholder="claude-sonnet-5"
-              value={prefs.replySuggestionModel}
-              onChange={(event) => set("replySuggestionModel", event.target.value)}
-            />
-          </Field>
-          <SuggestionUsage />
-        </>
-      )}
     </>
   );
 }
 
-/**
- * What it writes, what he sends, and what it has spent doing it.
- *
- * Two rows, read together. The rate is the one number that decides whether the
- * feature is worth its cost; the budget row is what it cost, and — the reason
- * it is here at all — the only place that says so when the cap has stopped
- * writing replies. A feature that quietly stops is the specific failure this
- * project has paid the most for, and a cap is a way to stop quietly.
- *
- * Both rows are absent until there is something to say. A rate with no
- * denominator and a count of nothing are shapes on screen that say nothing.
- */
-function SuggestionUsage() {
-  const [stats, setStats] = useState<SuggestionStats>(EMPTY_STATS);
-
-  useEffect(() => {
-    let live = true;
-    void loadSuggestionStats().then((next) => {
-      if (live) setStats(next);
-    });
-    return () => {
-      live = false;
-    };
-  }, []);
-
-  const { budget } = stats;
-  const percent = stats.asWrittenRate === null ? null : Math.round(stats.asWrittenRate * 100);
-  const thin = stats.asWrittenRate !== null && stats.asWrittenRate < WORTH_IT_RATE;
-  const capped = capLabel(budget);
-  const spend = spendLabel(budget);
-  const showBudget = budget.dayLimit > 0 && (budget.dayCount > 0 || capped !== null);
-
-  return (
-    <>
-      {percent !== null && (
-        <Field orientation="row">
-          <FieldLabel>Sent as written</FieldLabel>
-          <div className={cn("text-list tabular-nums", thin ? "text-danger" : "text-foreground")}>
-            {percent}%
-          </div>
-          <FieldDescription>
-            {stats.sentAsWritten} of {stats.suggested} written · {stats.picked} opened ·{" "}
-            {stats.sentEdited} rewritten · {stats.dismissed} declined
-          </FieldDescription>
-        </Field>
-      )}
-
-      {showBudget && (
-        <Field orientation="row">
-          <FieldLabel>Last 24 hours</FieldLabel>
-          <div className={cn("text-list tabular-nums", capped ? "text-danger" : "text-foreground")}>
-            {budget.dayCount} of {budget.dayLimit}
-          </div>
-          <FieldDescription>
-            {capped ? (
-              <span className="text-danger">{capped}</span>
-            ) : (
-              [`${budget.hourCount} of ${budget.hourLimit} in the last hour`, spend]
-                .filter(Boolean)
-                .join(" · ")
-            )}
-          </FieldDescription>
-        </Field>
-      )}
-    </>
-  );
-}
 
 /** Stable ids so every label points at its own control. */
 function useIds() {
@@ -1286,7 +1168,5 @@ function useIds() {
     agentBackend: `${prefix}-agent-backend`,
     agentModel: `${prefix}-agent-model`,
     agentCommand: `${prefix}-agent-command`,
-    replySuggestions: `${prefix}-reply-suggestions`,
-    replySuggestionModel: `${prefix}-reply-suggestion-model`,
   };
 }

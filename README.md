@@ -58,11 +58,6 @@ Working, and what I read my mail in every day:
   send delay, week start, working hours and sync interval.
 - An in-app agent that runs on the Claude Code CLI by default and needs no API
   key. See [`docs/agent-backends.md`](docs/agent-backends.md).
-- Suggested replies: on a thread somebody has asked you something in, the reply
-  bar offers two stances with the whole reply already written behind each, drawn
-  from your own sent mail so they sound like you. They stay in local SQLite —
-  nothing reaches Gmail's drafts until you pick one — and the app keeps count of
-  how often you send one roughly as written.
 - Unsubscribe with `⇧⌘U`: archives the conversation and unsubscribes in the
   background — one request where the sender supports one-click, the unsubscribe
   email sent for you where they don't. A sender who offers only a form gets you

@@ -41,8 +41,6 @@
  *   | `notificationsEnabled` | Rust: `notify::plan`, before it decides anything |
  *   | `notificationAccounts` | Rust: `notify::plan`, per account |
  *   | `badgeEnabled` | Rust: `notify::badge`, on every recompute |
- *   | `replySuggestions` | Rust: `suggest::plan`, before it decides anything |
- *   | `replySuggestionModel` | Rust: `suggest::model`, on every generation |
  *   | `agentBackend` | Rust: `agent::backend`, when a session starts |
  *   | `agentModel` | Rust: `agent::backend`, likewise |
  *   | `agentCommand` | Rust: `agent::backend`, likewise |
@@ -145,22 +143,6 @@ export interface Preferences {
   notificationAccounts: Record<string, boolean>;
   /** The unread count on the Dock icon. */
   badgeEnabled: boolean;
-  /**
-   * Whether the agent writes replies for mail as it arrives.
-   *
-   * On by default — he asked for this and should find it working. Off means
-   * *nothing generates*: no model call, no row, no cost. See `suggest` in Rust,
-   * which reads this before it decides anything.
-   */
-  replySuggestions: boolean;
-  /**
-   * A model id, or `""` for the default.
-   *
-   * Free text for the same reason `agentModel` is. The default is a Sonnet and
-   * is never Opus: this runs unattended against every human message addressed to
-   * him.
-   */
-  replySuggestionModel: string;
   agentBackend: AgentBackend;
   /**
    * A model id or alias, or `""` for the backend's own default.
@@ -200,8 +182,6 @@ export const DEFAULT_PREFERENCES: Preferences = {
   notificationsEnabled: true,
   notificationAccounts: {},
   badgeEnabled: true,
-  replySuggestions: true,
-  replySuggestionModel: "",
   agentBackend: "auto",
   agentModel: "",
   agentCommand: "",
@@ -341,8 +321,6 @@ export function parsePreferences(raw: unknown): Preferences {
     notificationsEnabled: flag(source.notificationsEnabled, d.notificationsEnabled),
     notificationAccounts: mutedAccounts(source.notificationAccounts),
     badgeEnabled: flag(source.badgeEnabled, d.badgeEnabled),
-    replySuggestions: flag(source.replySuggestions, d.replySuggestions),
-    replySuggestionModel: text(source.replySuggestionModel),
     agentBackend:
       typeof source.agentBackend === "string" && AGENT_BACKENDS.has(source.agentBackend)
         ? (source.agentBackend as AgentBackend)

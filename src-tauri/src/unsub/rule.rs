@@ -92,7 +92,26 @@
 use crate::unsub::target::{self, Target, Unusable};
 
 /// Gmail labels this rule reads.
-pub use crate::suggest::rule::{BULK_CATEGORIES, DRAFT, SENT, SPAM, TRASH};
+///
+/// Spelled out here rather than imported. They used to be re-exported from the
+/// reply-suggestion rule, which was the only other thing that needed them and
+/// happened to define them first; that module is gone and these are not about
+/// it. `notify::rule` keeps its own copy for the same reason — three callers
+/// naming Gmail's own constants is not duplication worth removing, and a shared
+/// module for five strings would only make each one harder to find.
+pub const SENT: &str = "SENT";
+pub const DRAFT: &str = "DRAFT";
+pub const SPAM: &str = "SPAM";
+pub const TRASH: &str = "TRASH";
+
+/// Gmail's bulk tabs. Mail Google filed in one of these is not a stranger
+/// writing to you, whatever else the rule finds.
+pub const BULK_CATEGORIES: [&str; 4] = [
+    "CATEGORY_PROMOTIONS",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS",
+];
 
 /// How many messages from one address make it a sender rather than a stranger.
 ///
