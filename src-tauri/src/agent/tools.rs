@@ -982,16 +982,70 @@ pub struct ToolOutcome {
     pub artifact: Option<Artifact>,
 }
 
+/// The tools that are answered entirely out of the local store.
+///
+/// # Why this list is a thing and not just "the reads"
+///
+/// `list_filters` is a read too, and it is deliberately *not* here: a Gmail
+/// filter lives at Google and nowhere else, so listing them needs a credential,
+/// a network and the account clients — which is to say, the running app. The
+/// property this list actually names is **answerable from SQLite alone**, and
+/// that is the property [`crate::cli`] needs: these eight are the verbs the
+/// command line can serve with the app closed, and everything else has to knock
+/// on the door.
+///
+/// It is a list rather than a flag on [`Tool`] for the same reason
+/// [`AUTO_COMMANDS`] is: "where does the answer come from" is a fact about the
+/// implementation below, and putting it on the tool definition would let it
+/// drift from the `match` in [`execute_read`] without anything noticing.
+/// `read_tools_and_execute_read_agree` pins the two together.
+pub const READ_TOOLS: &[&str] = &[
+    "list_threads",
+    "search_threads",
+    "get_thread",
+    "list_events",
+    GET_EVENT_TOOL,
+    LIST_CALENDARS_TOOL,
+    "list_labels",
+    "list_accounts",
+];
+
+pub fn is_read_tool(name: &str) -> bool {
+    READ_TOOLS.contains(&name)
+}
+
+/// Run one local-store read against nothing but a database.
+///
+/// `None` when `name` is not one of [`READ_TOOLS`] — the caller decides whether
+/// that is "ask the app" or "no such verb", because the two callers want
+/// different sentences.
+///
+/// This exists so that the command line and the agent run *the same* read. The
+/// alternative was a second set of queries in the CLI, which is how `mach
+/// search` and ⌘K would come to disagree about what a match is, and the
+/// disagreement would show up as a bug report about the app rather than about
+/// the tool that was actually wrong.
+pub fn execute_read(db: &Db, name: &str, input: &Value) -> Option<Result<ToolOutcome, AgentError>> {
+    Some(match name {
+        "list_threads" => list_threads(db, input),
+        "search_threads" => search_threads(db, input),
+        "get_thread" => get_thread(db, input),
+        "list_events" => list_events(db, input),
+        GET_EVENT_TOOL => get_event(db, input),
+        LIST_CALENDARS_TOOL => list_calendars(db, input),
+        "list_labels" => list_labels(db, input),
+        "list_accounts" => list_accounts(db),
+        _ => return None,
+    })
+}
+
 pub async fn execute(ctx: &ToolContext, name: &str, input: &Value) -> Result<ToolOutcome, AgentError> {
     match name {
-        "list_threads" => list_threads(ctx, input),
-        "search_threads" => search_threads(ctx, input),
-        "get_thread" => get_thread(ctx, input),
-        "list_events" => list_events(ctx, input),
-        GET_EVENT_TOOL => get_event(ctx, input),
-        LIST_CALENDARS_TOOL => list_calendars(ctx, input),
-        "list_labels" => list_labels(ctx, input),
-        "list_accounts" => list_accounts(ctx),
+        // The local-store reads, all eight of them, through the one function
+        // that a caller with nothing but a database can also call. See
+        // [`execute_read`].
+        _ if is_read_tool(name) => execute_read(&ctx.db, name, input)
+            .expect("is_read_tool agrees with execute_read"),
         DRAFT_TOOL => draft_reply(ctx, input).await,
         NEW_DRAFT_TOOL => draft_message(ctx, input).await,
         SEND_TOOL => send_draft(ctx, input).await,
@@ -1071,7 +1125,7 @@ async fn run_command(ctx: &ToolContext, name: &str, input: &Value) -> Result<Too
     })
 }
 
-fn list_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+fn list_threads(db: &Db, input: &Value) -> Result<ToolOutcome, AgentError> {
     let query = ThreadQuery {
         account_id: input.get("accountId").and_then(Value::as_i64),
         label_id: Some(
@@ -1088,7 +1142,7 @@ fn list_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentEr
         limit: Some(limit_of(input, 20)),
         cursor: None,
     };
-    let page = reads::list_threads(&ctx.db, &query).map_err(ipc_to_agent)?;
+    let page = reads::list_threads(db, &query).map_err(ipc_to_agent)?;
     let artifact = only_thread(&page.items);
     let items: Vec<Value> = page.items.iter().map(thread_row).collect();
     Ok(ToolOutcome {
@@ -1111,12 +1165,12 @@ fn only_thread(items: &[crate::db::models::ThreadSummary]) -> Option<Artifact> {
     }
 }
 
-fn search_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+fn search_threads(db: &Db, input: &Value) -> Result<ToolOutcome, AgentError> {
     let query = input
         .get("query")
         .and_then(Value::as_str)
         .ok_or_else(|| AgentError::invalid("search_threads needs a query"))?;
-    let page = reads::search_threads(&ctx.db, query, Some(limit_of(input, 20)))
+    let page = reads::search_threads(db, query, Some(limit_of(input, 20)))
         .map_err(ipc_to_agent)?;
     let artifact = only_thread(&page.items);
     let items: Vec<Value> = page.items.iter().map(thread_row).collect();
@@ -1135,9 +1189,9 @@ fn search_threads(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Agent
 /// makes the cap irrelevant.
 const BODY_CHARS: usize = 4_000;
 
-fn get_thread(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+fn get_thread(db: &Db, input: &Value) -> Result<ToolOutcome, AgentError> {
     let thread_id = required_i64(input, "threadId")?;
-    let detail = reads::get_thread(&ctx.db, thread_id).map_err(ipc_to_agent)?;
+    let detail = reads::get_thread(db, thread_id).map_err(ipc_to_agent)?;
 
     let messages: Vec<Value> = detail
         .messages
@@ -1195,10 +1249,10 @@ fn message_text(message: &crate::db::models::Message) -> String {
     format!("{head}\n… [truncated]")
 }
 
-fn list_events(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+fn list_events(db: &Db, input: &Value) -> Result<ToolOutcome, AgentError> {
     let start = required_i64(input, "startMs")?;
     let end = required_i64(input, "endMs")?;
-    let events = reads::list_events(&ctx.db, start, end).map_err(ipc_to_agent)?;
+    let events = reads::list_events(db, start, end).map_err(ipc_to_agent)?;
     // One event in the range is the range answering with an object. Seventeen
     // is a list — see [`Artifact`], and `get_event` for how the model shows one.
     let artifact = match events.as_slice() {
@@ -1234,10 +1288,9 @@ fn list_events(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErr
 /// cannot know which of the seventeen rows the reply is about; this is how the
 /// model says *this one*, and the owner gets something to click instead of a
 /// bulleted transcription of the row.
-fn get_event(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+fn get_event(db: &Db, input: &Value) -> Result<ToolOutcome, AgentError> {
     let event_id = required_i64(input, "eventId")?;
-    let event = ctx
-        .db
+    let event = db
         .read(|conn| crate::db::command_queries::event_by_id(conn, event_id))
         .map_err(|e| AgentError::invalid(e.to_string()))?
         .ok_or_else(|| AgentError::invalid(format!("no event {event_id} in the local store")))?;
@@ -1308,9 +1361,9 @@ fn get_event(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError
 /// all so that "move the Molly events off the old calendar" can name it.
 ///
 /// [`role_writable`]: crate::db::models::role_writable
-fn list_calendars(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
+fn list_calendars(db: &Db, input: &Value) -> Result<ToolOutcome, AgentError> {
     let account_id = input.get("accountId").and_then(Value::as_i64);
-    let calendars = reads::list_calendars(&ctx.db).map_err(ipc_to_agent)?;
+    let calendars = reads::list_calendars(db).map_err(ipc_to_agent)?;
     let items: Vec<Value> = calendars
         .iter()
         .filter(|c| account_id.is_none_or(|id| c.account_id == id))
@@ -1336,8 +1389,8 @@ fn list_calendars(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Agent
     })
 }
 
-fn list_labels(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentError> {
-    let labels = reads::list_labels(&ctx.db, input.get("accountId").and_then(Value::as_i64))
+fn list_labels(db: &Db, input: &Value) -> Result<ToolOutcome, AgentError> {
+    let labels = reads::list_labels(db, input.get("accountId").and_then(Value::as_i64))
         .map_err(ipc_to_agent)?;
     let items: Vec<Value> = labels
         .iter()
@@ -1351,8 +1404,8 @@ fn list_labels(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, AgentErr
     })
 }
 
-fn list_accounts(ctx: &ToolContext) -> Result<ToolOutcome, AgentError> {
-    let accounts = reads::list_accounts(&ctx.db).map_err(ipc_to_agent)?;
+fn list_accounts(db: &Db) -> Result<ToolOutcome, AgentError> {
+    let accounts = reads::list_accounts(db).map_err(ipc_to_agent)?;
     let items: Vec<Value> = accounts
         .iter()
         .map(|a| json!({ "accountId": a.id, "email": a.email }))

@@ -33,6 +33,8 @@ pub mod auth;
 pub mod browser;
 /// The system pasteboard, for ⌘⌥C.
 pub mod clipboard;
+/// The command line: the same tool surface ⌘K has, over a loopback door.
+pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod db;
@@ -222,6 +224,19 @@ pub fn run() {
                 // Tell the UI, so an account needing attention says so without
                 // waiting for the first sync pass to report it.
                 ipc::events::emit_sync_status(&creds, &state.status_payload());
+            });
+
+            // The command line's door: a loopback port, a `0600` token file
+            // beside the store, and `ToolGate::run` behind it. After `manage`
+            // because it dispatches through the state, and inside a task
+            // because it needs a `tokio::runtime::Handle` to drive the gate's
+            // futures on. See `cli::door` for why a port that outlives one
+            // question is acceptable when `agent::mcp` argues that one should
+            // not.
+            let door_app = app.handle().clone();
+            let door_dir = data_dir.clone();
+            tauri::async_runtime::spawn(async move {
+                cli::door::install(&door_app, &door_dir, tokio::runtime::Handle::current());
             });
 
             // The bridge starts the loop and then forwards its progress for the

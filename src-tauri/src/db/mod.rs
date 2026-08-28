@@ -135,6 +135,10 @@ struct Inner {
     interactive_waiting: Mutex<usize>,
     /// Where a background writer sleeps while `interactive_waiting` is non-zero.
     quiet: Condvar,
+    /// Whether this handle was opened by [`Db::open_read_only`]. Read when the
+    /// pool has to open another connection, so a reader minted an hour after
+    /// the open is `query_only` for the same reason the first one was.
+    read_only: bool,
 }
 
 impl Db {
@@ -159,6 +163,64 @@ impl Db {
         let db = Db::from_uri(path.to_string_lossy().into_owned())?;
         restrict_store(path);
         Ok(db)
+    }
+
+    /// Open an existing store for reading only, with no migration and no
+    /// possibility of a write.
+    ///
+    /// # Why this exists, and why it is not [`Db::open`]
+    ///
+    /// The command-line interface (`crate::cli`) answers a search or a thread
+    /// read straight out of SQLite, whether or not the app is running. That is
+    /// free — WAL means a second process reading the store never blocks the app
+    /// and is never blocked by it — but it is only free if the second process
+    /// is genuinely incapable of writing. [`Db::open`] is not: it creates the
+    /// file if it is missing and it runs [`schema::migrate`], which is a write,
+    /// from a process that is not the one holding the writer. Two migrators on
+    /// one store is the sort of thing that works every time until the day the
+    /// schema changes.
+    ///
+    /// So this differs in three ways, each of them a refusal:
+    ///
+    /// * **no `CREATE`** — a path that is not already a store is an error, not
+    ///   a new empty store. A CLI that answered "0 conversations" because it
+    ///   had just invented a database in the wrong directory would be lying in
+    ///   the most convincing possible way;
+    /// * **no migration** — the schema is whatever the app last wrote. An older
+    ///   binary reading a newer store fails on the query it cannot answer,
+    ///   which is a smaller wrong than rewriting the store to suit itself;
+    /// * **`query_only` on every connection, the writer included.** The pool
+    ///   readers already have it. Setting it on the write connection too means
+    ///   that a stray `db.write` anywhere in a read path is an engine error at
+    ///   the point of the write, not a silent second writer.
+    ///
+    /// The file is still opened `READ_WRITE` at the OS level rather than
+    /// `READ_ONLY`, and that is deliberate: a database whose `-wal` has not been
+    /// checkpointed cannot be read at all through a `SQLITE_OPEN_READONLY`
+    /// handle unless the `-shm` already exists, so the one case a read-only
+    /// open would break is the case that matters — the app crashed and the CLI
+    /// is being used to find out what it had. `query_only` is enforced by the
+    /// engine on every statement, which is the guarantee that was wanted.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Db> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(DbError::Other(format!(
+                "no store at {} — nothing has been synced there",
+                path.display()
+            )));
+        }
+        let uri = path.to_string_lossy().into_owned();
+        let writer = open_read_only_connection(&uri)?;
+        Ok(Db {
+            inner: Arc::new(Inner {
+                uri,
+                writer: Mutex::new(writer),
+                idle_readers: Mutex::new(Vec::new()),
+                interactive_waiting: Mutex::new(0),
+                quiet: Condvar::new(),
+                read_only: true,
+            }),
+        })
     }
 
     /// An in-memory database, for tests and throwaway work.
@@ -187,6 +249,7 @@ impl Db {
                 idle_readers: Mutex::new(Vec::new()),
                 interactive_waiting: Mutex::new(0),
                 quiet: Condvar::new(),
+                read_only: false,
             }),
         })
     }
@@ -258,7 +321,11 @@ impl Db {
             Some(conn) => conn,
             // If opening a reader fails we cannot usefully proceed: the file was
             // openable moments ago when the writer was created.
-            None => open_connection(&self.inner.uri, true).expect("open reader connection"),
+            None => match self.inner.read_only {
+                true => open_read_only_connection(&self.inner.uri),
+                false => open_connection(&self.inner.uri, true),
+            }
+            .expect("open reader connection"),
         };
         Reader {
             conn: Some(conn),
@@ -455,6 +522,29 @@ fn open_connection(uri: &str, read_only: bool) -> Result<Connection> {
         | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(uri, flags)?;
     apply_pragmas(&conn, read_only)?;
+    Ok(conn)
+}
+
+/// A connection that cannot write, and does not try to make the file writable
+/// on the way in.
+///
+/// The pragma set is [`apply_pragmas`]'s minus the two that change the file:
+/// `journal_mode`, which writes the header, and `wal_autocheckpoint`, which is
+/// a setting for a process that checkpoints. `query_only` is set **first**, so
+/// there is no window in which this connection could write even if a later
+/// pragma in the batch failed.
+fn open_read_only_connection(uri: &str) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(uri, flags)?;
+    conn.execute_batch(
+        "PRAGMA query_only = ON;
+         PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = -16000;",
+    )?;
     Ok(conn)
 }
 

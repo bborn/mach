@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# scripts/mach — Mach's own tool surface, from a shell.
+#
+#   scripts/mach tools                  every verb, and what each one costs
+#   scripts/mach search invoice         a read: answered from SQLite, no app needed
+#   scripts/mach get_thread 4127        one conversation
+#   scripts/mach archive 4127 --yes     a write: over the app's door, app required
+#   scripts/mach help archive           one verb's parameters
+#   scripts/mach where                  the store, and whether the app is up
+#
+# There is no verb list in this file, and there is none in the CLI either. The
+# verbs are the app's own tool surface — `ToolGate::tools`, which is
+# `Command::catalogue` plus the local reads, the composer and any installed
+# plugins — read at runtime, with each tool's JSON schema becoming that verb's
+# flags. Anything ⌘K can do, this can do.
+#
+# WHY THIS IS A SHIM AND NOT THE BINARY
+#
+# The artifact is `mach-cli`, because `mach` is the GUI application and
+# `mainBinaryName` in tauri.conf.json depends on it staying that way. This
+# script finds the compiled artifact — in a worktree that is the *parent's*
+# target directory, see scripts/cargo-target-dir — builds it if it is missing,
+# and execs it. Put it on your PATH as `mach` if you want the short name.
+#
+# READS DO NOT NEED THE APP; WRITES DO, AND FAIL LOUDLY WITHOUT IT
+#
+# A read opens the store with PRAGMA query_only = ON, which under WAL neither
+# blocks the running app nor is blocked by it. Everything else goes over a
+# loopback door the app opens, and if the app is not running it fails and says
+# so rather than queueing — only that process holds the OAuth tokens, the
+# outbox's recall timer and the undo stack. See src-tauri/src/cli/.
+#
+# MACH_DATA_DIR points this at a QA instance's store and door instead of the
+# owner's, exactly as it does for the app itself.
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET="$("$REPO/scripts/cargo-target-dir" "$REPO")"
+BINARY="$TARGET/debug/mach-cli"
+
+if [ ! -x "$BINARY" ]; then
+  echo "building mach-cli…" >&2
+  (cd "$REPO/src-tauri" && cargo build --bin mach-cli) >&2
+fi
+
+exec "$BINARY" "$@"

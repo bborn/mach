@@ -406,6 +406,9 @@ pub struct ApprovalDesk {
     ui: Arc<SessionUi>,
     waiting: Mutex<HashMap<String, oneshot::Sender<ApprovalOutcome>>>,
     closed: AtomicBool,
+    /// An answer given before the question was asked. See
+    /// [`ApprovalDesk::standing`].
+    standing: Option<ApprovalOutcome>,
 }
 
 impl ApprovalDesk {
@@ -414,6 +417,48 @@ impl ApprovalDesk {
             ui,
             waiting: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            standing: None,
+        }
+    }
+
+    /// A desk that already knows the answer, for a caller with no window to ask
+    /// in.
+    ///
+    /// # Why this is not a hole in the approval model
+    ///
+    /// [`ApprovalDesk::ask`] is the only function in the codebase that can say
+    /// yes to sending mail, and everything about it assumes a human is looking
+    /// at a drawer: it writes a [`PendingApproval`] into a snapshot, emits an
+    /// event, and parks until a click arrives on `agent_send`. The command line
+    /// (`crate::cli`) has none of that. A shell pipeline cannot answer a window,
+    /// and a door that parked waiting for one would hang every CLI invocation
+    /// until somebody noticed a prompt in an app they were not looking at.
+    ///
+    /// So the consent is collected *before* the call instead of during it, on
+    /// the invocation that asked for the action, and this carries that decision
+    /// into the gate unchanged. The decision itself is made by
+    /// [`crate::cli::protocol::decide`] on the app's side of the door — never by
+    /// the CLI's argument parser, which is advice — and a `standing` desk is
+    /// built for exactly one call with exactly that answer. It is not a mode a
+    /// session can be put into: nothing that has a window uses it, and
+    /// [`ApprovalDesk::new`] is unchanged.
+    ///
+    /// The door only ever passes `Approved`, and the reason is worth having
+    /// written down: a refusal cannot be expressed as a `Denied` answer here,
+    /// because most of what the command line can do is [`ToolPolicy::Auto`] and
+    /// never reaches the desk at all — the gate would run an unauthorised
+    /// `archive` without ever asking. So the refusal happens in front of the
+    /// gate, in [`crate::cli::door::decide_and_run`], and what reaches this
+    /// point is only ever a call that was allowed. The outcome stays a
+    /// parameter so that this function holds no opinion about who is asking.
+    ///
+    /// [`ToolPolicy::Auto`]: super::tools::ToolPolicy::Auto
+    pub fn standing(ui: Arc<SessionUi>, outcome: ApprovalOutcome) -> ApprovalDesk {
+        ApprovalDesk {
+            ui,
+            waiting: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            standing: Some(outcome),
         }
     }
 
@@ -425,6 +470,13 @@ impl ApprovalDesk {
     pub async fn ask(&self, pending: PendingApproval) -> ApprovalOutcome {
         if self.closed.load(Ordering::SeqCst) {
             return ApprovalOutcome::Closed;
+        }
+
+        // Answered in advance, by somebody who was told what they were
+        // answering. Nothing is put on screen and nothing parks — there is no
+        // screen and nobody to park for.
+        if let Some(outcome) = self.standing.clone() {
+            return outcome;
         }
 
         let (tx, rx) = oneshot::channel();

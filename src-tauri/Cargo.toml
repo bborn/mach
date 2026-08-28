@@ -17,6 +17,18 @@ repository = "https://github.com/bborn/mach"
 # comment, which is why it is here.
 default-run = "mach"
 
+# The command line. A second binary rather than a subcommand of the app, and
+# `src/cli/mod.rs` carries the argument: a separate executable cannot open a
+# window and cannot take the store's writer, which is the entire safety claim of
+# a CLI that reads locally and writes only through the running app.
+#
+# `mach-cli` rather than `mach` because `mach` is the GUI, and `mainBinaryName`
+# in `tauri.conf.json` depends on it staying that way. `scripts/mach` is the
+# shim during development.
+[[bin]]
+name = "mach-cli"
+path = "src/bin/mach_cli.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
