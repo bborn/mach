@@ -128,6 +128,22 @@
 //! Nothing reads it to change what the reader sees; it exists so the rows this
 //! module invented text for can be found again if the extractor improves.
 //!
+//! # The row's `search_text` goes with the HTML
+//!
+//! Migration 23 added a column holding the readable text of `body_html`, for
+//! `messages_fts` to index and for nothing else, so that a message is findable
+//! by what its markup says as well as by what its sender wrote. The sweep does
+//! not fill that column — sync fills it when the message arrives and
+//! [`crate::db::backfill::derive_search_text`] filled it once for the mail that
+//! predates sync doing so — but it does have to keep one invariant.
+//!
+//! The derived write above clears `search_text` in the same statement. Both
+//! columns would otherwise hold the same text, read out of the same markup by
+//! the same extractor, and `messages_fts` would carry every one of its terms
+//! twice: once against `body_text` and once against `search_text`. The message
+//! is no less findable for the clearing, because the text did not go anywhere.
+//! It moved into the column a reader can also see.
+//!
 //! # Getting the space back
 //!
 //! Setting a column to NULL does not shrink the file. SQLite moves the freed
@@ -332,30 +348,14 @@ pub fn retention_reason(facts: &MessageFacts, now_ms: i64, policy: &EvictionPoli
     plan(facts, now_ms, policy).kept()
 }
 
-/// The largest derived body the sweep will store.
-///
-/// Derived text is written back into the store the sweep is trying to shrink, so
-/// it needs a ceiling that does not depend on the sender's markup being sane. A
-/// quarter of a megabyte is far more prose than any mail body — the owner's
-/// entire `body_text` column is 140 MB across 66 000 messages, about 2 KB each —
-/// and it bounds the pathological case where stripping the tags off a very large
-/// document yields a very large document.
-pub const MAX_DERIVED_BYTES: usize = 256 * 1024;
-
-/// The text this HTML would be indexed and read by, or `None` if there is none.
-///
-/// Sanitizing happens inside [`crate::render::text::from_html`], which is what
-/// keeps a `<style>` block from arriving in the index as three kilobytes of CSS
-/// selectors.
-pub fn derive_text(html: &str) -> Option<String> {
-    let text = crate::render::text::from_html(html);
-    let bounded = crate::render::text::truncate(&text, MAX_DERIVED_BYTES);
-    if bounded.trim().is_empty() {
-        None
-    } else {
-        Some(bounded.into_owned())
-    }
-}
+// Both of these used to live here, because the sweep was the only thing that
+// ever derived text from markup. It is not any more — sync derives at ingest and
+// [`crate::db::backfill`] derives for the rows that predate it — so the
+// derivation and its ceiling sit beside the extractor in
+// [`crate::render::text`], where the judgement about text quality that decides
+// when to use them also is. Re-exported rather than moved out of reach: this is
+// still the module whose name the ceiling is about.
+pub use crate::render::text::{derive_text, MAX_DERIVED_BYTES};
 
 // ---------------------------------------------------------------------------
 // the sweep
@@ -368,7 +368,8 @@ pub struct EvictionReport {
     pub examined: u64,
     /// Rows whose HTML was dropped.
     pub evicted: u64,
-    /// Of those, rows that had no `body_text` until this sweep wrote one.
+    /// Of those, rows whose `body_text` this sweep wrote: the ones that had
+    /// none, and the ones whose own text was not worth indexing.
     pub derived: u64,
     /// Bytes of derived text written back, which is the cost of those rows.
     pub bytes_written: u64,
@@ -615,10 +616,16 @@ pub fn sweep(db: &Db, now_ms: i64, policy: &EvictionPolicy) -> Result<EvictionRe
                       WHERE id = ?1 AND body_html IS NOT NULL",
                 )?;
                 // Text and eviction in one statement. See the function doc.
+                //
+                // `search_text = NULL` because the text being written into
+                // `body_text` is the same text, read out of the same markup by
+                // the same extractor. Leaving both would put every one of its
+                // terms into `messages_fts` twice.
                 let mut derive = conn.prepare(
                     "UPDATE messages
                         SET body_text            = ?3,
                             body_text_derived_at = ?2,
+                            search_text          = NULL,
                             body_html            = NULL,
                             html_evicted_at      = ?2,
                             html_restored_at     = NULL

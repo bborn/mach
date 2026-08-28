@@ -1667,3 +1667,176 @@ fn an_attribute_name_is_matched_at_its_boundary() {
     );
     assert_eq!(derived, "https://real.test/");
 }
+
+// ---------------------------------------------------------------------------
+// text for finding, not for reading
+// ---------------------------------------------------------------------------
+//
+// `messages_fts` indexes `subject`, `body_text` and `search_text`. The third is
+// the readable text of the sender's markup, and it exists because a
+// `text/plain` part is not reliably a rendering of the message: the case that
+// produced it is a hotel confirmation whose generator replaced every anchor's
+// text with the tracking URL behind it, so the hotel's name is in the message
+// only as base64 inside a link.
+//
+// These cover what goes in that column and what is left out of it.
+
+/// The plain part of message 69568 in the owner's store, in shape: a preheader
+/// line, a field of padding, the terms and conditions, and a page of tracking
+/// URLs whose base64 hides the booking.
+fn hotel_plain_part() -> String {
+    let mut body = String::from("MGM Resorts is excited to welcome you");
+    body.push_str(&" ".repeat(9349));
+    body.push_str(&"\n".repeat(553));
+    body.push_str(
+        "Your Reservation Has Been Confirmed We look forward to hosting you as part of \
+         Acknowledgement Number. Cancellation policy: the deposit is forfeited unless \
+         the reservation is cancelled within the period communicated at booking. \
+         Incidental charges are authorized against the credit or debit card provided \
+         on arrival, and the authorization is released by your financial institution \
+         after departure. Guests are responsible for taxes and applicable resort fees. \
+         Play responsibly; problem gambling helpline available to patrons.",
+    );
+    for n in 0..40 {
+        body.push_str(&format!(
+            " http://rlm.passkey.com/Tracking/track.do?token=dHJraWQ9NjIxMDk2NzMwfn5\
+             +bGlua2lkPTQxNjY5MzUxMz{n}V+fn5tZXRob2Q9bGlua35+fnVybD1NYW5kYWxheSBCYXk\
+             &hash=59ABB30F15A977661BACE8676BF058BA"
+        ));
+    }
+    body
+}
+
+/// What that message's markup says, which is where the booking is.
+const HOTEL_HTML: &str = "<html><body>\
+    <h1>Your Reservation Has Been Confirmed</h1>\
+    <p>Mandalay Bay and W Las Vegas</p>\
+    <p>3950 S Las Vegas Blvd, Las Vegas, NV 89119</p>\
+    <table><tr><td>Arrival</td><td>Sunday, 14 September</td></tr>\
+    <tr><td>Departure</td><td>Wednesday, 17 September</td></tr>\
+    <tr><td>Room type</td><td>King Deluxe, resort tower</td></tr>\
+    <tr><td>Acknowledgement number</td><td>N9MO22TS0</td></tr></table>\
+    </body></html>";
+
+#[test]
+fn the_markup_is_kept_when_it_says_something_the_plain_part_does_not() {
+    // The case that produced the column, and the reason no test of the plain
+    // part's quality could have caught it: this plain part is not thin. It runs
+    // to 19 KB and carries the terms and conditions in full. What it does not
+    // carry is the booking.
+    let plain = hotel_plain_part();
+    assert!(plain.len() > 17_000, "fixture is {} bytes", plain.len());
+    assert!(
+        text::distinct_words(&plain) > 40,
+        "the plain part is a real body: {} distinct words",
+        text::distinct_words(&plain)
+    );
+    for missing in ["mandalay", "vegas", "89119"] {
+        assert!(
+            !plain.to_lowercase().contains(&format!(" {missing}")),
+            "{missing} is not in the plain part as a word"
+        );
+    }
+
+    let derived = text::searchable_text(Some(&plain), HOTEL_HTML).expect("kept");
+    for fact in ["Mandalay", "Las Vegas", "89119", "N9MO22TS0", "King Deluxe"] {
+        assert!(derived.contains(fact), "lost {fact:?}: {derived:?}");
+    }
+}
+
+#[test]
+fn markup_that_only_repeats_the_plain_part_is_left_out() {
+    // The disk filter, and the only case where dropping is free: every word of
+    // the derivation is already indexed under `body_text`.
+    let plain = "Your armadillo brush ships Tuesday from the Leeds warehouse, and the \
+                 courier will leave it with a neighbour if nobody answers.";
+    let html = "<html><body><p>Your armadillo brush ships Tuesday from the Leeds \
+                warehouse, and the courier will leave it with a neighbour if nobody \
+                answers.</p></body></html>";
+    assert_eq!(text::searchable_text(Some(plain), html), None);
+}
+
+#[test]
+fn one_new_word_is_enough_to_keep_it() {
+    // The floor is one word rather than a threshold, because the cost of being
+    // wrong is asymmetric: keeping too much costs disk, and dropping something
+    // that adds a word costs a search nobody can run any other way.
+    let plain = "Your order has shipped.";
+    let html = "<html><body><p>Your order has shipped.</p>\
+                <p>Tracking: armadillo</p></body></html>";
+    let derived = text::searchable_text(Some(plain), html).expect("kept");
+    assert!(derived.contains("armadillo"));
+}
+
+#[test]
+fn a_message_with_no_plain_part_keeps_everything_its_markup_says() {
+    // Nothing is already indexed, so every word is a new one. These are the
+    // messages that were findable by their subject alone until the eviction
+    // sweep reached them, which on age alone can be ninety days.
+    let derived = text::searchable_text(None, HOTEL_HTML).expect("kept");
+    assert!(derived.contains("Mandalay"));
+    assert_eq!(text::searchable_text(Some("   \n  "), HOTEL_HTML), Some(derived));
+}
+
+#[test]
+fn markup_with_no_prose_in_it_yields_nothing() {
+    assert_eq!(
+        text::searchable_text(None, "<html><body><img src=\"data:,\"></body></html>"),
+        None
+    );
+}
+
+#[test]
+fn base64_and_hex_fragments_are_not_words() {
+    // Splitting on non-letters leaves fragments that are pure letters of a
+    // plausible length. Counting those would make a page of tracking URLs look
+    // like it says something, and every one of those pages would then be stored
+    // as though it added vocabulary.
+    for token in [
+        "dHJraWQ", "bGlua", "tZXRob", "fnVybD", "eyJhbGciOiJIUzI", "aGVsbG8", "AAAAAAAAAAAAAAAAAAA",
+    ] {
+        assert_eq!(text::distinct_words(token), 0, "{token:?} counted as a word");
+    }
+    for token in ["reservation", "Mandalay", "MGM", "café", "日本語"] {
+        assert_eq!(text::distinct_words(token), 1, "{token:?} did not count");
+    }
+}
+
+#[test]
+fn the_same_word_twice_counts_once() {
+    // A footer repeating six words forty times is findable by six.
+    assert_eq!(text::distinct_words("Unsubscribe. Unsubscribe! UNSUBSCRIBE"), 1);
+}
+
+#[test]
+fn padding_is_not_vocabulary() {
+    // Spaces, newlines and zero-width fillers are how a preheader is stretched
+    // to fill the inbox preview. None of them is a word, so none of them can
+    // make a derivation look as though it adds one.
+    let mut padded = String::from("Your parcel is out for delivery");
+    padded.push_str(&" ".repeat(4000));
+    padded.push_str(&"\u{200b}".repeat(4000));
+    padded.push_str(&"\u{feff}".repeat(1000));
+    assert_eq!(
+        text::distinct_words(&padded),
+        text::distinct_words("Your parcel is out for delivery")
+    );
+
+    let html = "<html><body><p>Your parcel is out for delivery</p></body></html>";
+    assert_eq!(text::searchable_text(Some(&padded), html), None);
+}
+
+#[test]
+fn a_script_without_spaces_between_words_still_compares() {
+    // Japanese, Hebrew and Arabic do not put spaces between words, so a clause
+    // arrives at the counter as one run. Over-counting there can only make Mach
+    // decide a derivation adds nothing and skip storing it, which is the cheap
+    // mistake.
+    let plain = "ご予約ありがとうございます。チェックインは午後四時から。";
+    let same = "<html><body><p>ご予約ありがとうございます。チェックインは午後四時から。</p></body></html>";
+    assert_eq!(text::searchable_text(Some(plain), same), None);
+
+    let more = "<html><body><p>ご予約ありがとうございます。</p><p>Mandalay Bay</p></body></html>";
+    assert!(text::searchable_text(Some(plain), more).is_some());
+}
+

@@ -64,7 +64,7 @@ const PRIMARY_EXCLUDED: [&str; 2] = ["CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL"];
 // small helpers
 // ---------------------------------------------------------------------------
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -837,6 +837,11 @@ pub fn message_by_gmail_id(
 /// The `ON CONFLICT ... DO UPDATE` path fires the `messages_fts_au` trigger, so
 /// re-syncing a message re-indexes it; there is no path that writes a body
 /// without updating the search index.
+///
+/// `search_text` is written like any other column of the body. It is derived
+/// from `body_html` in the same response, so a re-sync that brings the body
+/// brings the derivation with it, and a row is never left with an index entry
+/// for markup it no longer holds.
 pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
     let id = conn.query_row(
         "INSERT INTO messages (thread_id, account_id, gmail_message_id, rfc822_message_id,
@@ -844,9 +849,10 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
                                to_json, cc_json, bcc_json, subject, body_html, body_text,
                                snippet, internal_date, is_unread, is_draft, reply_to,
                                body_text_flowed, body_text_delsp,
-                               list_unsubscribe, list_unsubscribe_post, list_id, precedence)
+                               list_unsubscribe, list_unsubscribe_post, list_id, precedence,
+                               search_text)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?23, ?24, ?25)
+                 ?20, ?21, ?22, ?23, ?24, ?25, ?26)
          ON CONFLICT(account_id, gmail_message_id) DO UPDATE SET
              thread_id         = excluded.thread_id,
              rfc822_message_id = excluded.rfc822_message_id,
@@ -867,6 +873,7 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
              reply_to          = excluded.reply_to,
              body_text_flowed  = excluded.body_text_flowed,
              body_text_delsp   = excluded.body_text_delsp,
+             search_text       = excluded.search_text,
              -- COALESCE, not excluded: a re-sync arriving with a metadata-only
              -- response would otherwise wipe headers a full fetch had already
              -- stored, and we-were-never-told is a worse answer than a
@@ -902,6 +909,7 @@ pub fn upsert_message(conn: &Connection, new: &NewMessage) -> Result<i64> {
             new.list_unsubscribe_post,
             new.list_id,
             new.precedence,
+            new.search_text,
         ],
         |row| row.get(0),
     )?;
@@ -1666,6 +1674,13 @@ pub fn fts_match_expression(input: &str) -> Option<String> {
 /// subject column is weighted 10x the body, because a hit in the subject is
 /// what the user usually means. Lower (more negative) is better, so the sort is
 /// ascending.
+///
+/// `search_text` — the text Mach read out of the sender's markup — is weighted
+/// at half the body. It is the same message said again, so a hit there is worth
+/// less than a hit in what the sender actually wrote; and it is the noisier of
+/// the two, because it carries navigation, footers and `alt` text that no human
+/// composed. Weighted rather than excluded, because for a message whose plain
+/// part omits the booking it is the only place the booking is.
 pub fn search_threads(conn: &Connection, input: &str, limit: u32) -> Result<Vec<ThreadHit>> {
     let Some(expr) = fts_match_expression(input) else {
         return Ok(Vec::new());
@@ -1679,7 +1694,7 @@ pub fn search_threads(conn: &Connection, input: &str, limit: u32) -> Result<Vec<
     // FTS query, then the join is ordinary SQL.
     let mut stmt = conn.prepare(
         "WITH hits AS MATERIALIZED (
-             SELECT rowid AS rid, bm25(messages_fts, 10.0, 1.0) AS score
+             SELECT rowid AS rid, bm25(messages_fts, 10.0, 1.0, 0.5) AS score
              FROM messages_fts
              WHERE messages_fts MATCH ?1
          )

@@ -251,6 +251,11 @@ pub fn mirror(db: &Db, draft: &Draft, now_ms: i64) -> Result<i64> {
                 // and is not flowed. It never claims to be.
                 body_text_flowed: false,
                 body_text_delsp: false,
+                // No `search_text`: that column carries what a stranger's
+                // markup says that their plain part does not. Both halves here
+                // were written from the same draft seconds ago, so the HTML
+                // holds not one word the text beside it is missing.
+                search_text: None,
                 snippet: snippet.clone(),
                 internal_date: now_ms,
                 is_unread: false,

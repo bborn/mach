@@ -199,6 +199,7 @@ pub fn run() {
             let dispatcher = Arc::clone(&state.dispatcher);
             let wake_cancel = state.sync.cancel_token();
             let evict_db = state.db.clone();
+            let repair_db = state.db.clone();
             let evict_cancel = state.sync.cancel_token();
 
             // The agent's bridge needs somewhere to send invoke requests, and
@@ -272,6 +273,40 @@ pub fn run() {
                     )
                 },
             ));
+
+            // Reading `search_text` out of `body_html` for the mail that
+            // arrived before sync started doing it, so that a message is
+            // findable by what its markup says and not only by what its sender
+            // put in the plain part. A one-time repair, and the only one that is
+            // not run from `bootstrap`: the snippet decode there is a few
+            // hundred milliseconds of string work, this is fifteen seconds of
+            // HTML sanitizing, and doing it on the setup thread would hold the
+            // window's first paint behind it.
+            //
+            // `spawn_blocking` rather than `spawn`, because every call in it is
+            // synchronous SQLite and CPU; on the async runtime it would occupy a
+            // worker thread that has mail to fetch. It waits out the same window
+            // the first eviction sweep does, for the same reason — launch is
+            // when the sync loop needs the writer — and its own writes stand
+            // aside for anything a person is waiting on. See
+            // `db::backfill::derive_search_text`.
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(evict::FIRST_SWEEP_DELAY).await;
+                let done = tauri::async_runtime::spawn_blocking(move || {
+                    crate::db::backfill::derive_search_text(&repair_db)
+                })
+                .await;
+                match done {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(n)) => eprintln!("indexed the markup of {n} older messages"),
+                    // Nothing was written that should not have been, and the
+                    // marker is only set on a clean pass, so this retries next
+                    // launch. The symptom is some mail staying findable by its
+                    // subject alone.
+                    Ok(Err(e)) => eprintln!("search-text repair failed, will retry next boot: {e}"),
+                    Err(e) => eprintln!("search-text repair did not run: {e}"),
+                }
+            });
 
             Ok(())
         })

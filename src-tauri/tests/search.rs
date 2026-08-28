@@ -1106,3 +1106,199 @@ fn bench_against_a_real_store() {
     }
     println!();
 }
+
+// ---------------------------------------------------------------------------
+// message 69568
+// ---------------------------------------------------------------------------
+//
+// The message this whole column exists for, as a fixture. It is a hotel booking
+// confirmation from a generator that replaces every anchor's *text* with the
+// tracking URL behind it, so the hotel's name reaches the `text/plain` part
+// only as base64 inside a link. Its plain part is not thin — 19 KB, and the
+// terms and conditions in full — which is why no test of the plain part's
+// quality could ever have found this. Both texts are indexed instead.
+//
+// `mandalay` and `vegas` are the two words the owner searched for and did not
+// find.
+
+/// The `text/plain` part as that generator writes it.
+fn passkey_plain_part() -> String {
+    let mut body = String::from("MGM Resorts is excited to welcome you");
+    body.push_str(&" ".repeat(9349));
+    body.push_str(&"\n".repeat(553));
+    body.push_str(
+        "Your Reservation Has Been Confirmed We look forward to hosting you as part of \
+         Acknowledgement Number. Cancellation policy: the deposit is forfeited unless the \
+         reservation is cancelled within the period communicated at booking. Incidental \
+         charges are authorized against the credit or debit card provided on arrival, and \
+         the authorization is released by your financial institution after departure. \
+         Guests are responsible for taxes and applicable resort fees.",
+    );
+    // The booking, base64 inside the links, which is where `mandalay` was.
+    for n in 0..40 {
+        body.push_str(&format!(
+            " http://rlm.passkey.com/Tracking/track.do?token=dHJraWQ9NjIxMDk2NzMwfn5\
+             +bGlua2lkPTQxNjY5MzUxMz{n}V+fn5tZXRob2Q9bGlua35+fnVybD1NYW5kYWxheSBCYXk\
+             &hash=59ABB30F15A977661BACE8676BF058BA"
+        ));
+    }
+    body
+}
+
+/// The `text/html` part, where the booking is in words.
+fn passkey_html() -> String {
+    format!(
+        "<html><body>\
+         <h1>Your Reservation Has Been Confirmed</h1>\
+         <p>Mandalay Bay and W Las Vegas</p>\
+         <p>3950 S Las Vegas Blvd, Las Vegas, NV 89119</p>\
+         <table><tr><td>Arrival</td><td>Sunday, 14 September</td></tr>\
+         <tr><td>Departure</td><td>Wednesday, 17 September</td></tr>\
+         <tr><td>Room type</td><td>King Deluxe, resort tower</td></tr>\
+         <tr><td>Acknowledgement number</td><td>N9MO22TS0</td></tr></table>{}\
+         </body></html>",
+        "<div style=\"padding:0\">&nbsp;</div>".repeat(80)
+    )
+}
+
+/// Stores it the way sync does, through `prepare_message` and `upsert_message`,
+/// so the test covers the path the mail actually takes.
+fn seed_booking_confirmation(db: &Db, account_id: i64) -> i64 {
+    use mach_lib::google::types as g;
+    use mach_lib::sync::convert;
+
+    let plain = passkey_plain_part();
+    let html = passkey_html();
+    let payload: g::Message = serde_json::from_value(serde_json::json!({
+        "id": "69568",
+        "threadId": "t69568",
+        "labelIds": ["INBOX"],
+        "internalDate": "1700000000000",
+        "snippet": "MGM Resorts is excited to welcome you",
+        "payload": {
+            "mimeType": "multipart/alternative",
+            "headers": [
+                {"name": "Subject", "value": "Your Reservation Confirmation with MGM Resorts"},
+                {"name": "From", "value": "MGM Resorts <info@cvent.com>"},
+            ],
+            "parts": [
+                {
+                    "mimeType": "text/plain",
+                    "body": {
+                        "data": mach_lib::google::types::encode_base64url(plain.as_bytes()),
+                        "size": plain.len(),
+                    },
+                },
+                {
+                    "mimeType": "text/html",
+                    "body": {
+                        "data": mach_lib::google::types::encode_base64url(html.as_bytes()),
+                        "size": html.len(),
+                    },
+                },
+            ],
+        },
+    }))
+    .expect("a Gmail payload");
+
+    let mut prepared = convert::prepare_message(account_id, &payload);
+    let conn = db.writer();
+    let thread_id = q::upsert_thread(
+        &conn,
+        &NewThread {
+            account_id,
+            gmail_thread_id: "t69568".into(),
+            participants: vec![Participant {
+                name: Some("MGM Resorts".into()),
+                email: "info@cvent.com".into(),
+            }],
+            subject: "Your Reservation Confirmation with MGM Resorts".into(),
+            snippet: "MGM Resorts is excited to welcome you".into(),
+            last_message_at: 1_700_000_000_000,
+            is_unread: false,
+            message_count: 1,
+            has_attachments: false,
+            label_ids: vec!["INBOX".into()],
+        },
+    )
+    .expect("thread");
+    prepared.message.thread_id = thread_id;
+    q::upsert_message(&conn, &prepared.message).expect("message")
+}
+
+#[test]
+fn a_booking_confirmation_is_findable_by_the_hotel_its_markup_names() {
+    let db = TempDb::new("booking");
+    let account_id = account(&db, "alex@example.com");
+    let message_id = seed_booking_confirmation(&db, account_id);
+
+    // The premise, checked rather than assumed: the words are not in the text
+    // the sender sent, and the plain part is a real body rather than a stub.
+    let (body_text, search_text): (String, Option<String>) = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT body_text, search_text FROM messages WHERE id = ?1",
+                [message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .expect("row");
+    let plain = body_text.to_lowercase();
+    assert!(!plain.contains(" mandalay"), "mandalay is not a word in the plain part");
+    assert!(!plain.contains(" vegas"), "vegas is not a word in the plain part");
+    assert!(
+        mach_lib::render::text::distinct_words(&body_text) > 40,
+        "the plain part is a real body, not a stub"
+    );
+    assert!(search_text.is_some(), "the markup is stored for the index");
+
+    // The acceptance test.
+    for term in ["mandalay", "vegas"] {
+        let found = db
+            .read(|conn| q::search_thread_summaries(conn, term, 10))
+            .expect("search");
+        assert_eq!(found.len(), 1, "searching {term:?} finds the confirmation");
+    }
+
+    // And nothing was traded away for it: the sender's own words still find it,
+    // and so does the subject.
+    for term in ["forfeited", "resorts"] {
+        let found = db
+            .read(|conn| q::search_thread_summaries(conn, term, 10))
+            .expect("search");
+        assert_eq!(found.len(), 1, "searching {term:?} still finds it");
+    }
+}
+
+#[test]
+fn the_derivation_adds_the_booking_and_not_the_tracking_noise() {
+    // `search_text` is the extractor's output rather than the raw markup, which
+    // is what keeps a `<style>` block and a page of link targets out of the
+    // index. The base64 in this message is findable either way — it is in the
+    // `text/plain` part the sender sent, verbatim, and FTS5 tokenises it — so
+    // what this pins is the column Mach controls: the second copy of the message
+    // carries the booking and none of the noise.
+    let db = TempDb::new("booking-noise");
+    let account_id = account(&db, "alex@example.com");
+    let message_id = seed_booking_confirmation(&db, account_id);
+
+    let search_text: String = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT search_text FROM messages WHERE id = ?1",
+                [message_id],
+                |r| r.get(0),
+            )?)
+        })
+        .expect("row");
+
+    for fact in ["Mandalay", "Las Vegas", "89119", "N9MO22TS0", "King Deluxe"] {
+        assert!(search_text.contains(fact), "derivation lost {fact:?}");
+    }
+    for noise in ["dHJraWQ", "passkey.com", "padding:0"] {
+        assert!(
+            !search_text.contains(noise),
+            "derivation carried {noise:?} into the index"
+        );
+    }
+}

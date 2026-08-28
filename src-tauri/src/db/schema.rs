@@ -106,7 +106,114 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 22,
         sql: M22_DROP_REPLY_SUGGESTIONS,
     },
+    Migration {
+        version: 23,
+        sql: M23_SEARCH_TEXT,
+    },
 ];
+
+/// Migration 23 — a message can be found by what its markup says.
+///
+/// # The bug
+///
+/// `messages_fts` indexed `subject` and `body_text`, so a message was findable
+/// by what the sender wrote in their `text/plain` part and by nothing else. That
+/// is a good index right up until the plain part is not a rendering of the
+/// message.
+///
+/// Message 69568 on the owner's store is a hotel booking confirmation. Its
+/// plain part is 19 KB and carries 278 distinct English words, the terms and
+/// conditions in full, so nothing about it looks thin. What is missing is the
+/// booking — the generator replaced every anchor's text with the tracking URL
+/// behind it, so `Mandalay Bay and W Las Vegas` is in the message as
+/// `…&token=dHJraWQ9…TWFuZGFsYXkgQmF5…`. Searching `mandalay` found nothing;
+/// searching `vegas` found nothing.
+///
+/// The first attempt at this was a test of whether a plain part was worth
+/// indexing, which would then be *replaced* by text read out of the markup.
+/// That was the wrong shape. It cannot help 69568, whose plain part is not
+/// starved; and choosing between the two texts means losing whichever one is
+/// not chosen. There is no threshold that makes choosing safe, because both
+/// texts carry words the other does not.
+///
+/// # The column
+///
+/// So both are indexed. `search_text` holds the readable text of `body_html`,
+/// written by [`crate::render::text::searchable_text`], and `messages_fts`
+/// gains a third column over it. Nothing renders `search_text` and nothing
+/// reads it back — it exists to be tokenised. That is the whole difference
+/// between it and `body_text`, which is a body a person reads when the HTML is
+/// gone, and which this migration does not touch.
+///
+/// It is only written where it says something new. The test is not a judgement
+/// about quality, it is arithmetic: store the derivation when it carries a word
+/// the message is not already findable by. On the owner's store that is 12 689
+/// of 14 349 resident bodies, 87 MB of text.
+///
+/// No timestamp beside it, unlike `body_text_derived_at` in migration 13. That
+/// column exists because derived text and a sender's text are indistinguishable
+/// once both are in `body_text`; `search_text` is only ever derived, so
+/// `search_text IS NOT NULL` already names every row a better extractor would
+/// want to redo.
+///
+/// # What the rebuild costs, and why it is paid here
+///
+/// FTS5 has no way to add a column, so the table is dropped and rebuilt. On the
+/// owner's store — 69 519 messages, 337 MB of subject and body text — that
+/// measured **5.8 seconds**, and it is CPU rather than disk (3.5 s user, 0.9 s
+/// sys), so a cold page cache does not multiply it.
+///
+/// Six seconds is a long time to hold the boot. It is paid here anyway, because
+/// the alternative is an online index swap: a second FTS table, triggers
+/// writing to both, a batched population, and a rename, with a partially built
+/// index as the failure mode. That is a great deal of machinery pointed at the
+/// one structure that makes his mail findable, to save six seconds once. A
+/// migration cannot leave the store half-done; that swap can.
+///
+/// The rebuild also collects what the old index had accumulated. It came out at
+/// 146 MB against the 192 MB it replaced, so after
+/// [`crate::db::backfill::derive_search_text`] fills the new column and the
+/// index settles at 178 MB, the owner is 14 MB ahead of where he started.
+///
+/// [`M1_INITIAL`] is deliberately not edited. It is a record of what has already
+/// run on somebody's disk. A fresh install creates the two-column table and then
+/// runs this, which rebuilds an empty index and costs nothing.
+const M23_SEARCH_TEXT: &str = r#"
+ALTER TABLE messages ADD COLUMN search_text TEXT;
+
+DROP TRIGGER IF EXISTS messages_fts_ai;
+DROP TRIGGER IF EXISTS messages_fts_ad;
+DROP TRIGGER IF EXISTS messages_fts_au;
+DROP TABLE IF EXISTS messages_fts;
+
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    subject,
+    body_text,
+    search_text,
+    content = 'messages',
+    content_rowid = 'id',
+    tokenize = "unicode61 remove_diacritics 2"
+);
+
+INSERT INTO messages_fts (messages_fts) VALUES ('rebuild');
+
+CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts (rowid, subject, body_text, search_text)
+    VALUES (new.id, new.subject, new.body_text, new.search_text);
+END;
+
+CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts (messages_fts, rowid, subject, body_text, search_text)
+    VALUES ('delete', old.id, old.subject, old.body_text, old.search_text);
+END;
+
+CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts (messages_fts, rowid, subject, body_text, search_text)
+    VALUES ('delete', old.id, old.subject, old.body_text, old.search_text);
+    INSERT INTO messages_fts (rowid, subject, body_text, search_text)
+    VALUES (new.id, new.subject, new.body_text, new.search_text);
+END;
+"#;
 
 /// Migration 22 — the reply suggestions are gone.
 ///
@@ -445,11 +552,24 @@ CREATE INDEX IF NOT EXISTS idx_messages_sender
 ///    without this the query for "text Mach invented" does not exist.
 ///  * `html_evicted_at` does not answer it. A message can have derived text and
 ///    a resident body — sync's upsert writes `body_html` back without touching
-///    either date — and a message can be evicted with the sender's own text.
+///    it — and a message can be evicted with the sender's own text.
 ///
 /// Nothing reads it to change what the reader sees. Derived text is rendered
 /// exactly like any other plain-text body, because it is the same claim: this is
 /// what the message says.
+///
+/// # It is still only the sweep that writes this
+///
+/// Migration 23 added `search_text`, which is also read out of `body_html` by
+/// the same extractor, and it does *not* set this column. The two answer
+/// different questions. This one is about `body_text`, which a person reads, and
+/// where a derivation and a sender's own words are otherwise indistinguishable.
+/// `search_text` is only ever derived, so it needs no flag to say so.
+///
+/// The invariant between them is that they are never both true of the same
+/// text: when the sweep writes a derived `body_text`, it clears `search_text` in
+/// the same statement, because that text is now indexed by the column beside it
+/// and storing it twice would put every one of its terms in the index twice.
 const M13_DERIVED_TEXT: &str = r#"
 ALTER TABLE messages ADD COLUMN body_text_derived_at INTEGER;
 "#;
@@ -463,7 +583,10 @@ ALTER TABLE messages ADD COLUMN body_text_derived_at INTEGER;
 /// message. `body_text` is not that — it is small, it is what `messages_fts`
 /// indexes, and it is what an evicted message renders from while the request is
 /// in flight. The sweep writes it only into a row that has none, and only in the
-/// statement that drops the HTML; see migration 13 and [`crate::evict`].
+/// statement that drops the HTML; see migration 13 and [`crate::evict`]. A
+/// sender's own text is never replaced by a machine's reading of their markup —
+/// when Mach wants that reading indexed as well, it goes in `search_text`
+/// (migration 23), which nobody reads.
 ///
 /// Both columns are about the *cache*, not the message, which is why neither is
 /// on `NewMessage` and neither is written by sync's upsert:
@@ -982,6 +1105,10 @@ CREATE INDEX idx_events_account_window   ON events (account_id, start_ts, end_ts
 -- External-content FTS5 over `messages`: the index stores only the inverted
 -- terms, the text itself is never duplicated. That halves the on-disk cost of
 -- a 12-month backfill.
+--
+-- Two columns here, three from migration 23 on, which drops this table and
+-- rebuilds it. This is left as it was written: the list is a record of what has
+-- already run on somebody's disk.
 CREATE VIRTUAL TABLE messages_fts USING fts5(
     subject,
     body_text,

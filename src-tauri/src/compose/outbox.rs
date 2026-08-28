@@ -298,9 +298,11 @@ impl Outbox {
             body_html: Some(out.html.clone()),
             body_text: Some(out.text.clone()),
             // See the mirror: our own text alternative is not flowed, and the
-            // MIME we send does not say it is.
+            // MIME we send does not say it is. No `search_text` either; that
+            // column is about what a stranger's markup adds.
             body_text_flowed: false,
             body_text_delsp: false,
+            search_text: None,
             snippet: snippet(&out.text),
             internal_date: now_ms,
             is_unread: false,

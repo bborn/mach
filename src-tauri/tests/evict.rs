@@ -659,12 +659,12 @@ fn the_sweep_leaves_everything_unrecoverable_where_it_is() {
 
 #[test]
 fn a_sweep_never_rewrites_a_body_the_sender_wrote() {
-    // `body_text` and `subject` are the whole of `messages_fts`. The sweep
-    // writes `body_text` now, and only ever into a row that has none — a
+    // The sweep writes `body_text`, and only ever into a row that has none — a
     // sender's own text is never replaced by a machine's reading of their
-    // markup. Asserted as a property of the whole store rather than of one row,
-    // so a future clause that "fixes up" a body while it is there has to fail
-    // this.
+    // markup. When Mach wants that reading indexed as well it goes in
+    // `search_text`, which is a different column and is nobody's body. Asserted
+    // as a property of the whole store rather than of one row, so a future
+    // clause that "fixes up" a body while it is there has to fail this.
     let db = TempDb::new("columns");
     let account_id = account(&db);
     for n in 0..5 {
@@ -1365,4 +1365,152 @@ fn a_vacuum_does_not_lose_a_message_or_the_index() {
         .read(|conn| q::search_thread_summaries(conn, "pangolin", 10))
         .expect("search");
     assert_eq!(found.len(), 1, "the index survived the rewrite");
+}
+
+// ===========================================================================
+// The markup's text, and where it goes when the markup does not
+// ===========================================================================
+//
+// `messages_fts` indexes `subject`, `body_text` and `search_text` (migration
+// 23). The sweep does not fill that third column — sync does, when a message
+// arrives — but it owns the one invariant between them: the two columns never
+// hold the same text, because `messages_fts` would then carry every one of its
+// terms twice.
+
+fn search_text_of(db: &Db, message_id: i64) -> Option<String> {
+    db.read(|conn| {
+        Ok(conn
+            .query_row(
+                "SELECT search_text FROM messages WHERE id = ?1",
+                [message_id],
+                |r| r.get(0),
+            )
+            .expect("row"))
+    })
+    .expect("read")
+}
+
+fn set_search_text(db: &Db, message_id: i64, text: &str) {
+    db.write(|conn| {
+        conn.execute(
+            "UPDATE messages SET search_text = ?2 WHERE id = ?1",
+            rusqlite::params![message_id, text],
+        )?;
+        Ok(())
+    })
+    .expect("set search_text");
+}
+
+#[test]
+fn deriving_a_body_moves_the_markups_text_out_of_search_text() {
+    // An HTML-only message arrives, so sync puts the markup's text in
+    // `search_text`. Ninety days later the sweep writes that same text into
+    // `body_text` — a body to render while the re-fetch is in flight — and the
+    // column it came from is cleared in the same statement.
+    let db = TempDb::new("search-text-moves");
+    let account_id = account(&db);
+    let id = store(&db, account_id, &html_only("Quarterly pangolin numbers attached."));
+    set_search_text(&db, id, "Quarterly pangolin numbers attached.");
+
+    let before = db
+        .read(|conn| q::search_thread_summaries(conn, "pangolin", 10))
+        .expect("search");
+    assert_eq!(before.len(), 1, "findable before the sweep");
+
+    evict::sweep(&db, NOW, &policy()).expect("sweep");
+
+    assert!(text_of(&db, id).expect("text").contains("pangolin"));
+    assert_eq!(search_text_of(&db, id), None, "not stored twice");
+    assert_eq!(derived_at_of(&db, id), Some(NOW));
+
+    let after = db
+        .read(|conn| q::search_thread_summaries(conn, "pangolin", 10))
+        .expect("search");
+    assert_eq!(after.len(), 1, "and still findable after it");
+}
+
+#[test]
+fn an_ordinary_eviction_leaves_search_text_where_it_is() {
+    // The row has a body of its own, so the sweep only drops the markup. The
+    // markup's text is still the only place some of its words are.
+    let db = TempDb::new("search-text-stays");
+    let account_id = account(&db);
+    let id = store(&db, account_id, &Sample::default());
+    set_search_text(&db, id, "Pangolin conservation update, from the footer.");
+
+    evict::sweep(&db, NOW, &policy()).expect("sweep");
+
+    assert_eq!(html_of(&db, id), None);
+    assert_eq!(
+        search_text_of(&db, id).as_deref(),
+        Some("Pangolin conservation update, from the footer.")
+    );
+    assert_eq!(
+        db.read(|conn| q::search_thread_summaries(conn, "pangolin", 10))
+            .expect("search")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_refetch_fills_the_search_text_nothing_else_could_reach() {
+    // A message evicted before any of this shipped: its markup was gone, so
+    // neither sync nor the backfill could read it. Opening it brings the markup
+    // back, and the derivation runs on the way past.
+    let db = TempDb::new("refetch-search-text");
+    let account_id = account(&db);
+    let sample = Sample::default();
+    let id = store(&db, account_id, &sample);
+    evict::sweep(&db, NOW, &policy()).expect("sweep");
+    assert_eq!(search_text_of(&db, id), None);
+    assert!(db
+        .read(|conn| q::search_thread_summaries(conn, "armadillo", 10))
+        .expect("search")
+        .is_empty());
+
+    let transport = StubGmail::new(vec![ok_json(message_with_html(
+        &sample.gmail_message_id,
+        "<p>The armadillo brush ships Tuesday from the Leeds warehouse.</p>",
+    ))]);
+    let clients = clients(&transport);
+
+    block_on(restore_html(&db, &clients, id)).expect("restore");
+
+    assert!(search_text_of(&db, id).expect("filled").contains("armadillo"));
+    assert_eq!(
+        db.read(|conn| q::search_thread_summaries(conn, "armadillo", 10))
+            .expect("search")
+            .len(),
+        1,
+        "and now it is findable by what its markup said"
+    );
+    // The sender's own body is untouched, and the HTML it went for landed.
+    assert_eq!(
+        text_of(&db, id).as_deref(),
+        Some("The quarterly numbers are attached.")
+    );
+    assert!(html_of(&db, id).expect("html is back").contains("armadillo"));
+}
+
+#[test]
+fn a_refetch_adds_nothing_to_a_body_the_sweep_already_derived() {
+    // The row's `body_text` *is* this markup's text. Storing it again in
+    // `search_text` would put every one of its terms in the index twice.
+    let db = TempDb::new("refetch-already-derived");
+    let account_id = account(&db);
+    let sample = html_only("Quarterly pangolin numbers attached.");
+    let id = store(&db, account_id, &sample);
+    evict::sweep(&db, NOW, &policy()).expect("sweep");
+    assert!(derived_at_of(&db, id).is_some());
+
+    let transport = StubGmail::new(vec![ok_json(message_with_html(
+        &sample.gmail_message_id,
+        "<p>Quarterly pangolin numbers attached.</p>",
+    ))]);
+    let clients = clients(&transport);
+
+    block_on(restore_html(&db, &clients, id)).expect("restore");
+
+    assert_eq!(search_text_of(&db, id), None);
 }

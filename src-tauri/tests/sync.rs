@@ -3167,3 +3167,209 @@ async fn a_forced_pass_refetches_the_calendar_list_the_loop_would_have_cached() 
         .unwrap();
     assert_eq!(stored.len(), 2, "the new calendar is here without a restart");
 }
+
+// ===========================================================================
+// What a message is findable by
+// ===========================================================================
+//
+// `messages_fts` indexes `subject`, `body_text` and `search_text`. The first
+// two are what the sender sent; the third is the readable text of their markup,
+// written here, at the one moment both are in hand for free. See
+// `render::text::searchable_text`.
+
+/// What the markup says and the plain part does not.
+const SHIPPING_PROSE: &str = "Your armadillo brush ships Tuesday from the Leeds \
+     warehouse, and the courier will leave it with a neighbour if nobody answers \
+     the door.";
+
+/// A `text/plain` part padded out to a plausible size with tracking URLs, which
+/// is what a great deal of marketing mail sends.
+fn preheader_stub() -> String {
+    let mut text = String::from("Your order is on its way");
+    text.push_str(&" ".repeat(6000));
+    for n in 0..40 {
+        text.push_str(&format!(
+            " https://click.example.test/t?token=dHJraWQ9NjIxMDk2NzMwfn{n}\
+             5+bGlua2lkPTQxNjY5MzUxMzV+fn5tZXRob2Q9bGlua35&hash=59ABB30F15A97766"
+        ));
+    }
+    text
+}
+
+/// Markup padded past the 2 KB floor, the way real mail is.
+fn markup(prose: &str) -> String {
+    format!(
+        "<html><body><table><tr><td><p>{prose}</p></td></tr></table>{}</body></html>",
+        "<div style=\"padding:0\">&nbsp;</div>".repeat(80)
+    )
+}
+
+fn message_with_parts(text: Option<&str>, html: Option<&str>) -> Value {
+    let mut parts = Vec::new();
+    if let Some(text) = text {
+        parts.push(json!({
+            "mimeType": "text/plain",
+            "body": {"data": encode_base64url(text.as_bytes()), "size": text.len()},
+        }));
+    }
+    if let Some(html) = html {
+        parts.push(json!({
+            "mimeType": "text/html",
+            "body": {"data": encode_base64url(html.as_bytes()), "size": html.len()},
+        }));
+    }
+    json!({
+        "id": "m-indexed",
+        "threadId": "t-indexed",
+        "labelIds": ["INBOX"],
+        "internalDate": "1700000000000",
+        "snippet": "Your order is on its way",
+        "payload": {
+            "mimeType": "multipart/alternative",
+            "headers": [
+                {"name": "Subject", "value": "Your order has shipped"},
+                {"name": "From", "value": "Shop <shop@example.com>"},
+            ],
+            "parts": parts,
+        },
+    })
+}
+
+fn prepared(text: Option<&str>, html: Option<&str>) -> (Option<String>, Option<String>) {
+    use mach_lib::google::types as g;
+    use mach_lib::sync::convert;
+
+    let payload: g::Message =
+        serde_json::from_value(message_with_parts(text, html)).expect("a Gmail payload");
+    let message = convert::prepare_message(1, &payload).message;
+    (message.body_text, message.search_text)
+}
+
+#[test]
+fn the_markup_is_indexed_beside_the_text_the_sender_sent() {
+    let stub = preheader_stub();
+    let (body_text, search_text) = prepared(Some(&stub), Some(&markup(SHIPPING_PROSE)));
+
+    // The sender's text is stored exactly as it arrived. It is what the reader
+    // falls back to when the markup is evicted, and nothing here rewrites it.
+    assert_eq!(body_text.as_deref(), Some(stub.as_str()));
+
+    let search_text = search_text.expect("the markup says something new");
+    assert!(search_text.contains("armadillo"));
+    assert!(
+        !search_text.contains("dHJraWQ"),
+        "the tracking URLs did not come with it"
+    );
+}
+
+#[test]
+fn markup_that_repeats_the_plain_part_is_not_stored_twice() {
+    let prose = format!("{SHIPPING_PROSE} Delivery takes two working days once scanned.");
+    let (body_text, search_text) = prepared(Some(&prose), Some(&markup(&prose)));
+
+    assert_eq!(body_text.as_deref(), Some(prose.as_str()));
+    assert_eq!(search_text, None);
+}
+
+#[test]
+fn html_only_mail_is_findable_when_it_is_stored() {
+    // It used to wait for the eviction sweep to write a `body_text`, which goes
+    // on age alone and can be ninety days away. Until then it was findable by
+    // its subject.
+    let (body_text, search_text) = prepared(None, Some(&markup(SHIPPING_PROSE)));
+
+    assert_eq!(body_text, None, "there was no plain part and none is invented");
+    assert!(search_text.expect("markup text").contains("armadillo"));
+}
+
+#[test]
+fn small_markup_is_below_the_floor() {
+    // Under 2 KB there is not enough markup to be saying anything the plain
+    // part is not, and the derivation would cost more stored than it returns.
+    let (_, search_text) = prepared(Some("hi"), Some("<p>Ship date: Tuesday</p>"));
+    assert_eq!(search_text, None);
+}
+
+#[test]
+fn a_message_with_no_markup_is_left_entirely_alone() {
+    let plain = "Meeting moved to Thursday.";
+    assert_eq!(prepared(Some(plain), None), (Some(plain.into()), None));
+    assert_eq!(prepared(None, None), (None, None));
+}
+
+#[test]
+fn the_senders_flowed_declaration_is_still_only_about_their_own_text() {
+    // `format=flowed` says the line breaks in the *plain* part belong to the
+    // sender's generator. Deriving text for the index changes nothing about it.
+    use mach_lib::google::types as g;
+    use mach_lib::sync::convert;
+
+    let mut payload = message_with_parts(Some("Sounds good.\n"), Some(&markup(SHIPPING_PROSE)));
+    payload["payload"]["parts"][0]["mimeType"] = json!("text/plain; charset=UTF-8; format=flowed");
+    let payload: g::Message = serde_json::from_value(payload).expect("a Gmail payload");
+
+    let message = convert::prepare_message(1, &payload).message;
+    assert!(message.body_text_flowed);
+    assert!(message.search_text.is_some());
+}
+
+#[test]
+fn a_search_finds_a_message_by_what_its_markup_says() {
+    // The whole point, through the index rather than the column: `armadillo` is
+    // in the markup and nowhere else, and the row is found by it.
+    let db = Db::open_in_memory().expect("db");
+    let account_id = db
+        .write(|conn| {
+            let id = queries::upsert_account(
+                conn,
+                &NewAccount {
+                    email: "alex@example.com".into(),
+                    display_name: None,
+                    token_ref: "com.mach.mail.oauth".into(),
+                    colour_index: 0,
+                },
+            )?;
+            Ok(id)
+        })
+        .expect("account");
+
+    let stub = preheader_stub();
+    let html = markup(SHIPPING_PROSE);
+    let payload: mach_lib::google::types::Message =
+        serde_json::from_value(message_with_parts(Some(&stub), Some(&html))).expect("payload");
+    let mut prepared = mach_lib::sync::convert::prepare_message(account_id, &payload);
+
+    db.write(|conn| {
+        let thread_id = queries::upsert_thread(
+            conn,
+            &mach_lib::db::models::NewThread {
+                account_id,
+                gmail_thread_id: "t-indexed".into(),
+                participants: Vec::new(),
+                subject: "Your order has shipped".into(),
+                snippet: "…".into(),
+                last_message_at: 1_700_000_000_000,
+                is_unread: false,
+                message_count: 1,
+                has_attachments: false,
+                label_ids: vec!["INBOX".into()],
+            },
+        )?;
+        prepared.message.thread_id = thread_id;
+        queries::upsert_message(conn, &prepared.message)?;
+        Ok(())
+    })
+    .expect("store");
+
+    let found = db
+        .read(|conn| queries::search_thread_summaries(conn, "armadillo", 10))
+        .expect("search");
+    assert_eq!(found.len(), 1, "found by a word only its markup carries");
+
+    // And the sender's own words still find it, because both columns are
+    // indexed rather than one of them chosen.
+    let found = db
+        .read(|conn| queries::search_thread_summaries(conn, "order", 10))
+        .expect("search");
+    assert_eq!(found.len(), 1);
+}

@@ -81,6 +81,15 @@ struct Target {
     gmail_message_id: String,
     evicted: bool,
     resident: bool,
+    /// What the row is currently rendered by, so the restore can tell whether
+    /// the markup it is about to store says anything not already findable.
+    body_text: Option<String>,
+    /// Whether that `body_text` is itself a reading of this message's markup,
+    /// written by the sweep on the way out. If it is, the markup is already
+    /// indexed and there is nothing here to add.
+    body_text_derived: bool,
+    /// Whether the row already carries the markup's text for the index.
+    has_search_text: bool,
 }
 
 fn target(db: &Db, message_id: i64) -> Result<Target, RestoreError> {
@@ -90,7 +99,10 @@ fn target(db: &Db, message_id: i64) -> Result<Target, RestoreError> {
                 "SELECT account_id,
                         gmail_message_id,
                         html_evicted_at IS NOT NULL,
-                        body_html IS NOT NULL
+                        body_html IS NOT NULL,
+                        body_text,
+                        body_text_derived_at IS NOT NULL,
+                        search_text IS NOT NULL
                    FROM messages WHERE id = ?1",
                 [message_id],
                 |row| {
@@ -99,6 +111,9 @@ fn target(db: &Db, message_id: i64) -> Result<Target, RestoreError> {
                         gmail_message_id: row.get(1)?,
                         evicted: row.get(2)?,
                         resident: row.get(3)?,
+                        body_text: row.get(4)?,
+                        body_text_derived: row.get(5)?,
+                        has_search_text: row.get(6)?,
                     })
                 },
             )
@@ -116,6 +131,9 @@ fn target(db: &Db, message_id: i64) -> Result<Target, RestoreError> {
 /// The write is `WHERE html_evicted_at IS NOT NULL`, so a sync pass that
 /// restored the body first is not overwritten by a slower request carrying the
 /// same bytes.
+///
+/// It also fills the row's `search_text` while the markup is in hand, for the
+/// rows nothing else can reach — see the comment on the write.
 pub async fn restore_html(
     db: &Db,
     clients: &Arc<dyn GoogleClients>,
@@ -158,12 +176,41 @@ pub async fn restore_html(
 
     let bytes = html.len();
     let now = super::now_ms();
+
+    /*
+     * The last rows this can reach.
+     *
+     * `search_text` — the readable text of the markup, for `messages_fts` and
+     * for nothing else — is written by sync when a message arrives, and was
+     * written once by `db::backfill::derive_search_text` for the mail that
+     * arrived before sync did that. Neither can reach a message whose HTML had
+     * already been evicted, because there was no markup here to read. On the
+     * owner's store that is 34 752 messages: evicted, and carrying only what
+     * their sender wrote.
+     *
+     * There is markup here now, because somebody opened the message and this
+     * function went and got it. So the same derivation runs on the way past, at
+     * the cost of one sanitize on a request that has already taken a round trip.
+     *
+     * A row whose `body_text` the sweep derived is skipped before that: its
+     * markup is already indexed, under `body_text`, and storing the same text
+     * again would put every one of its terms in twice.
+     *
+     * The write fills `search_text` only where it is NULL, so a sync that got
+     * there first keeps what it wrote. The restore itself is unconditional on
+     * that — the reader waited for this body and must get it either way.
+     */
+    let derived = (!target.has_search_text && !target.body_text_derived)
+        .then(|| crate::render::text::searchable_text(target.body_text.as_deref(), &html))
+        .flatten();
     db.write(|conn| {
         conn.execute(
             "UPDATE messages
-                SET body_html = ?2, html_restored_at = ?3
+                SET body_html        = ?2,
+                    html_restored_at = ?3,
+                    search_text      = coalesce(search_text, ?4)
               WHERE id = ?1 AND html_evicted_at IS NOT NULL",
-            rusqlite::params![message_id, html, now],
+            rusqlite::params![message_id, html, now, derived],
         )?;
         Ok(())
     })?;

@@ -423,6 +423,26 @@ pub struct NewMessage {
     /// rows, the outbox — stores "not flowed", which is what they are.
     pub body_text_flowed: bool,
     pub body_text_delsp: bool,
+    /// The readable text of `body_html`, for the search index only (migration
+    /// 23). Never rendered, never read back.
+    ///
+    /// `messages_fts` indexes `subject`, `body_text` and this, so a message is
+    /// findable by what its sender wrote *and* by what their markup says. The
+    /// two are not the same text often enough to matter: see
+    /// [`crate::render::text::searchable_text`], which is what fills this and
+    /// which leaves it `None` when the markup adds no word the message is
+    /// already findable by.
+    ///
+    /// Unlike `html_evicted_at` and `html_restored_at`, which are facts about
+    /// the *cache* and are therefore not on this struct at all (see migration
+    /// 12), this is derived from the body in the same response and is written
+    /// by the same upsert.
+    ///
+    /// Every writer that is not sync leaves it `None`. The composer's mirror
+    /// and the outbox have HTML, but it is HTML Mach wrote from the draft a
+    /// moment earlier; there is nothing in it that is not already in the plain
+    /// part beside it.
+    pub search_text: Option<String>,
     pub snippet: String,
     pub internal_date: i64,
     pub is_unread: bool,
