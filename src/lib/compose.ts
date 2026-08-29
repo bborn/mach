@@ -714,6 +714,70 @@ export async function listOutbox(): Promise<OutboxEntry[]> {
   return result.pending;
 }
 
+
+/**
+ * One message that did not go, and is not going to without a decision.
+ *
+ * Mirrors `compose::outbox::FailedSend`. The recipients and the body are parsed
+ * out of the queued RFC822 rather than read from columns, which is why they are
+ * here and not on `OutboxEntry`: two of the failures in the owner's store have
+ * no subject, so who it was for is the only thing that names the message, and a
+ * message Google refuses on its address cannot be retried into working — the
+ * words are then the only part worth recovering.
+ */
+export interface FailedSend {
+  id: string;
+  accountId: number;
+  threadId?: number | null;
+  subject: string;
+  to: Mailbox[];
+  cc: Mailbox[];
+  bcc: Mailbox[];
+  /** Google's reason, verbatim. */
+  error: string;
+  /** When the message was written. */
+  createdAt: number;
+  attempts: number;
+  /** The plain-text alternative, as it would have been sent. */
+  body: string;
+  /** Names only — the bytes stay in the queue. */
+  attachments: string[];
+}
+
+/** Everything that stopped trying, newest first. */
+export async function listFailedSends(): Promise<FailedSend[]> {
+  if (!isTauri()) return localFailedSends();
+  const result = await call<{ failed?: FailedSend[] }>({ op: "unsent" });
+  return result.failed ?? [];
+}
+
+/**
+ * Put a failed message back in the queue.
+ *
+ * The owner asks for this; nothing retries on its own. A message that reached
+ * `failed` did so because Google gave an answer no amount of waiting changes —
+ * a dead grant, a refused address — so the thing that has to happen first is a
+ * person fixing whatever it was.
+ */
+export async function retrySend(outboxId: string): Promise<boolean> {
+  if (!isTauri()) {
+    localFailed = localFailed.filter((row) => row.id !== outboxId);
+    return true;
+  }
+  const result = await call<{ ok?: boolean }>({ op: "retry", outboxId });
+  return result.ok === true;
+}
+
+/** Throw a failed message away, bytes and all. */
+export async function discardSend(outboxId: string): Promise<boolean> {
+  if (!isTauri()) {
+    localFailed = localFailed.filter((row) => row.id !== outboxId);
+    return true;
+  }
+  const result = await call<{ ok?: boolean }>({ op: "discard", outboxId });
+  return result.ok === true;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Recipients                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -1181,6 +1245,46 @@ export function escapeHtml(text: string): string {
  */
 const localDrafts = new Map<string, Draft>();
 let localOutbox: OutboxEntry[] = [];
+
+/**
+ * Two failed sends in the fixture browser, so the surface that reports them can
+ * be worked on there at all. Modelled on the real rows: one with no subject
+ * whose only identity is who it was for, one refused on its address.
+ */
+let localFailed: FailedSend[] = [
+  {
+    id: "ob-local-failed-1",
+    accountId: 1,
+    threadId: null,
+    subject: "Re: Checking in",
+    to: [{ name: "Briana Alberghini", email: "briana@freshcommunications.example" }],
+    cc: [],
+    bcc: [{ email: "bcc@sdr.example" }],
+    error: "google resource not found: Requested entity was not found.",
+    createdAt: Date.now() - 36 * 3_600_000,
+    attempts: 1,
+    body: "Briana — following up on the reporting we talked about last week. Are the September numbers something you can pull, or should I ask Dana?",
+    attachments: [],
+  },
+  {
+    id: "ob-local-failed-2",
+    accountId: 1,
+    threadId: null,
+    subject: "",
+    to: [{ email: "hi there" }],
+    cc: [],
+    bcc: [],
+    error: "google api error 400: Invalid To header",
+    createdAt: Date.now() - 19 * 86_400_000,
+    attempts: 1,
+    body: "Sounds good, thanks.",
+    attachments: [],
+  },
+];
+
+function localFailedSends(): FailedSend[] {
+  return localFailed;
+}
 
 /**
  * Seeded on first use rather than at module load: this file and `fixtures` sit

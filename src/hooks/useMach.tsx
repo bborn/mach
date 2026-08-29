@@ -27,6 +27,7 @@ import type {
 } from "@/types";
 import {
   describeResult,
+  describeSendFailure,
   describeWakeFailure,
   failedIds,
   getDataSource,
@@ -283,6 +284,14 @@ interface UiState {
    * looking at when they pressed `b`.
    */
   snoozeOpen: boolean;
+  /**
+   * Whether the list of messages that did not send is up.
+   *
+   * Up here rather than inside the panel because three things open it — the
+   * rail row, `g u`, and ⌘K — and none of them can reach into another
+   * component's `useState`. The same argument as `snoozeOpen`.
+   */
+  unsentOpen: boolean;
   listWidth: number;
   hiddenCalendars: CalendarId[];
   theme: Theme;
@@ -376,6 +385,7 @@ type UiAction =
   | { type: "palette"; open: boolean }
   | { type: "addAccount"; open: boolean; email?: string | null }
   | { type: "snooze"; open: boolean }
+  | { type: "unsent"; open: boolean }
   | { type: "listWidth"; width: number }
   | { type: "toggleCalendar"; calendarId: CalendarId }
   | { type: "theme"; theme: Theme }
@@ -437,6 +447,7 @@ export const initialUi: UiState = {
   addAccountOpen: false,
   addAccountEmail: null,
   snoozeOpen: false,
+  unsentOpen: false,
   listWidth: 520,
   hiddenCalendars: [],
   theme: "system",
@@ -577,6 +588,8 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
     // overlays stacked on each other is a surface nobody asked for.
     case "snooze":
       return { ...state, snoozeOpen: action.open, paletteOpen: false };
+    case "unsent":
+      return { ...state, unsentOpen: action.open, paletteOpen: false };
     case "listWidth":
       return { ...state, listWidth: clamp(action.width, 280, 640) };
     case "toggleCalendar":
@@ -844,6 +857,8 @@ export interface MachActions {
   setAddAccount: (open: boolean, email?: string | null) => void;
   /** Open or shut the snooze picker. `b`, the clock button and ⌘K all call it. */
   setSnooze: (open: boolean) => void;
+  /** Open or shut the list of messages that did not send. */
+  setUnsent: (open: boolean) => void;
   setStatus: (message: string, tone?: StatusMessage["tone"]) => void;
   /** Pin or unpin the mailbox being looked at, account scope included. */
   toggleFavoriteView: () => void;
@@ -1232,6 +1247,23 @@ export function MachProvider({ children }: { children: ReactNode }) {
           status: { message: describeWakeFailure(failure), tone: "error" },
         }),
       )
+      .then(keep);
+
+    /*
+     * A queued message that stopped trying.
+     *
+     * The composer's strip only covers the ten seconds it is on screen, and a
+     * flush runs long after that — on the next launch, from the command line,
+     * from an agent. This is the moment it happens, said out loud wherever the
+     * owner is; the rail's Unsent row is what is still there tomorrow.
+     */
+    void source
+      .onSendFailed((failure) => {
+        dispatchUi({
+          type: "status",
+          status: { message: describeSendFailure(failure), tone: "error" },
+        });
+      })
       .then(keep);
 
     /*
@@ -2542,6 +2574,7 @@ export function MachProvider({ children }: { children: ReactNode }) {
       setPalette: (open) => dispatch({ type: "palette", open }),
       setAddAccount: (open, email) => dispatch({ type: "addAccount", open, email }),
       setSnooze: (open) => dispatch({ type: "snooze", open }),
+      setUnsent: (open) => dispatch({ type: "unsent", open }),
       setStatus: (message, tone = "info") =>
         dispatch({ type: "status", status: { message, tone } }),
       toggleFavoriteView: () => pin(viewFavorite),

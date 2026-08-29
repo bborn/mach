@@ -530,7 +530,12 @@ fn outbox<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<Outbox>, String> {
     let state = app.state::<AppState>();
     let built = Arc::new(
         Outbox::new(state.db.clone(), Arc::clone(&state.dispatcher.clients))
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| e.to_string())?
+            // A send from the command line that Google refuses still has to
+            // reach the person at the window, and this is the only path by
+            // which it can: the CLI process has already exited by the time the
+            // undo window lapses and the flush runs in here.
+            .reporting_to(Arc::new(crate::ipc::events::SendFailures::new(app.clone()))),
     );
     Ok(Arc::clone(OUTBOX.get_or_init(|| built)))
 }

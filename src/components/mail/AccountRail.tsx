@@ -14,6 +14,7 @@ import { RESIZE_STEP, Resizer } from "@/components/ui/split";
 import { DEFAULT_RAIL_WIDTH, clampRailWidth } from "./rail-layout";
 import { railItems, railStep, type RailItem, type RailSection } from "./rail-model";
 import { useInboxUnread } from "./use-inbox-unread";
+import { useUnsent } from "./use-unsent";
 
 /**
  * The rail is a tree, and trees are navigable.
@@ -115,6 +116,7 @@ export function AccountRail() {
   );
   const inboxId = inboxLabelId();
   const unread = useInboxUnread(suppressed, inboxId);
+  const { failed } = useUnsent();
 
   // The rail carries the mailboxes you navigate to, not every label Gmail has.
   // Labels live in ⌘K, and the ones worth a permanent row you favorite. Inbox
@@ -137,6 +139,7 @@ export function AccountRail() {
           inboxId,
           threadId: ui.threadId,
           unread,
+          unsent: failed.length,
           collapsed,
         },
         {
@@ -148,6 +151,7 @@ export function AccountRail() {
           openFavorite: (favorite) => actions.openFavorite(favorite),
           unfavorite: (key) => actions.unfavorite(key),
           toggle: toggleSection,
+          openUnsent: () => actions.setUnsent(true),
         },
       ),
     // `toggleSection` is rebuilt every render but closes over nothing except
@@ -158,6 +162,7 @@ export function AccountRail() {
       mailboxes,
       favorites,
       unread,
+      failed.length,
       collapsed,
       ui.accountId,
       ui.labelId,
@@ -374,6 +379,7 @@ export function RailRow({
   const { active, label, count, countSuffix, title, shortcut, leading, onRemove, removeTitle } =
     item;
   const surface = item.surface === true;
+  const warning = item.tone === "warning";
   const rowButton = (
       <button
         type="button"
@@ -404,7 +410,13 @@ export function RailRow({
         <span
           className={cn(
             "flex w-3.5 shrink-0 items-center justify-center",
-            active ? "text-accent" : surface ? "text-muted-foreground" : undefined,
+            warning
+              ? "text-warning"
+              : active
+                ? "text-accent"
+                : surface
+                  ? "text-muted-foreground"
+                  : undefined,
           )}
         >
           {leading}
@@ -414,7 +426,7 @@ export function RailRow({
           <span
             className={cn(
               "shrink-0 font-mono text-micro tabular-nums",
-              active ? "text-foreground" : "text-muted-foreground",
+              warning ? "text-warning" : active ? "text-foreground" : "text-muted-foreground",
             )}
           >
             {count}

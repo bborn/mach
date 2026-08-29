@@ -26,6 +26,7 @@
 //! | `undo` | `outboxId` | `{ cancelled }` |
 //! | `flush` | `now?` | `{ outcomes, pending }` |
 //! | `outbox` | — | `{ pending }` |
+//! | `unsent` | — | `{ failed }` |
 //! | `retry` / `discard` | `outboxId` | `{ ok }` |
 //!
 //! Collapsing these into one command is a constraint, not a design. When the
@@ -68,11 +69,15 @@ pub async fn send_message(
     state: tauri::State<'_, AppState>,
     draft: Value,
 ) -> Result<Value, IpcError> {
+    // A send that fails from this window still has to say so when the flush was
+    // a background one — the mount drain, a scheduled send landing an hour
+    // later — so the queue is given the ear before it is given any work.
     let outbox = Outbox::new(
         state.db.clone(),
         Arc::clone(&state.dispatcher.clients),
     )
-    .map_err(IpcError::from)?;
+    .map_err(IpcError::from)?
+    .reporting_to(Arc::new(super::events::SendFailures::new(app.clone())));
     // One operation needs the application itself: choosing files is a system
     // panel, and a panel needs a window to be modal to. Everything else runs
     // through `dispatch`, which is a plain function so the tests can drive it.
@@ -589,6 +594,12 @@ pub async fn dispatch(
         }
 
         "outbox" => Ok(json!({ "pending": outbox.pending()?, "all": outbox.list()? })),
+
+        // What did not go, and is not going to without somebody deciding
+        // something. Its own op rather than a filter over `outbox` because it
+        // answers a different question and costs more to answer: the recipients
+        // and the words come out of the stored bytes, which is a parse per row.
+        "unsent" => Ok(json!({ "failed": outbox.failed()? })),
 
         "retry" => {
             let id = required_str(&payload, "outboxId")?;

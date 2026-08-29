@@ -2,7 +2,7 @@
 //!
 //! The UI must never sit on a timer asking whether anything changed — that is
 //! the same "wait for an answer" the whole design exists to avoid, just aimed at
-//! the backend instead of at Google. Two events carry everything the shell
+//! the backend instead of at Google. Four events carry everything the shell
 //! needs:
 //!
 //! | event | when | payload |
@@ -10,6 +10,7 @@
 //! | `sync-status` | the engine's watch channel changed | [`SyncStatusPayload`] |
 //! | `threads-changed` | a pass or a command wrote threads | `null` |
 //! | `wake-failed` | Google refused a snooze wake | [`WakeFailedPayload`] |
+//! | `send-failed` | a queued message stopped trying | [`SendFailedPayload`] |
 //!
 //! `wake-failed` exists because a wake has no gesture behind it. Every other
 //! write in the app was asked for a moment ago and its refusal lands on the
@@ -17,6 +18,15 @@
 //! with nowhere to go would be exactly the silent failure this project has paid
 //! for before. The conversation stays snoozed and the next tick retries it, and
 //! this says so once.
+//!
+//! `send-failed` is the same argument about a different tick. A message leaves
+//! the outbox when its undo window lapses, which can be ten seconds after `⌘⏎`
+//! or the following morning, and the flush that carries it runs from the CLI
+//! and from the agent as well as from the window. A refusal on any of those
+//! paths had nowhere to land: four of them accumulated in the owner's store
+//! over eighteen days, the newest a business reply, and nothing on screen ever
+//! mentioned one. This is how the window hears. The durable half is the queue
+//! itself — see [`FailedSend`](crate::ipc::compose::engine::FailedSend).
 //!
 //! `threads-changed` deliberately carries nothing. The list is keyset-paginated
 //! and the reading pane is a point read, so "something changed, re-read what you
@@ -45,6 +55,7 @@ use super::types::SyncStatusPayload;
 pub const SYNC_STATUS_EVENT: &str = "sync-status";
 pub const THREADS_CHANGED_EVENT: &str = "threads-changed";
 pub const WAKE_FAILED_EVENT: &str = "wake-failed";
+pub const SEND_FAILED_EVENT: &str = "send-failed";
 
 /// One refused wake, as the frontend reads it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +67,52 @@ pub struct WakeFailedPayload {
     pub message: String,
     /// Whether the sweep that follows could plausibly succeed.
     pub retriable: bool,
+}
+
+/// One message that stopped trying, as the frontend reads it.
+///
+/// Deliberately thin. The window's own copy of the queue is the durable list —
+/// it re-reads `compose_outbox` and gets the recipients and the words with it —
+/// so this carries only enough to name the message in a status line, and to
+/// stop the surface having to guess whether it needs to re-read at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendFailedPayload {
+    /// The `compose_outbox` row. What a "show me" gesture would address.
+    pub id: String,
+    pub subject: String,
+    /// Google's reason, verbatim.
+    pub message: String,
+}
+
+/// The window's ear on the outbox. See
+/// [`FailedSends`](crate::ipc::compose::engine::FailedSends).
+///
+/// Generic over the runtime so the CLI door, which is generic, can build one —
+/// and so a mock-runtime test can drive it without a real webview.
+pub struct SendFailures<R: Runtime> {
+    app: AppHandle<R>,
+}
+
+impl<R: Runtime> SendFailures<R> {
+    pub fn new(app: AppHandle<R>) -> Self {
+        SendFailures { app }
+    }
+}
+
+impl<R: Runtime> crate::ipc::compose::engine::FailedSends for SendFailures<R> {
+    fn send_failed(&self, entry: &crate::ipc::compose::engine::OutboxEntry, error: &str) {
+        // Best-effort, like every other emit here: no window is not a reason to
+        // fail a send that has already failed.
+        let _ = self.app.emit(
+            SEND_FAILED_EVENT,
+            SendFailedPayload {
+                id: entry.id.clone(),
+                subject: entry.subject.clone(),
+                message: error.to_string(),
+            },
+        );
+    }
 }
 
 /// Tell the UI the thread list is stale. Best-effort: a failed emit means the

@@ -127,7 +127,11 @@ pub(crate) fn engine(app: &AppHandle, state: &AppState) -> Result<Arc<AgentEngin
             state.db.clone(),
             Arc::clone(&state.dispatcher.clients),
         )
-        .map_err(IpcError::from)?,
+        .map_err(IpcError::from)?
+        // A reply the agent sent and Google refused is the worst version of
+        // this: nobody was watching the send at all. It reports through the
+        // same channel a composer send does.
+        .reporting_to(Arc::new(events::SendFailures::new(app.clone()))),
     );
 
     let workspace = state

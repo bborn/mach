@@ -1403,6 +1403,195 @@ async fn a_permanent_failure_keeps_the_bytes_and_takes_the_reply_out_of_the_thre
     assert_eq!(out.get(&entry.id).unwrap().unwrap().state, OutboxState::Holding);
 }
 
+
+// ------------------------------------------------- what did not go, and why
+
+/// A sink that records rather than emitting, standing in for the window.
+struct RecordingSink {
+    reports: Mutex<Vec<(String, String)>>,
+}
+
+impl RecordingSink {
+    fn new() -> Arc<Self> {
+        Arc::new(RecordingSink {
+            reports: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn reports(&self) -> Vec<(String, String)> {
+        self.reports.lock().unwrap().clone()
+    }
+}
+
+impl compose::outbox::FailedSends for RecordingSink {
+    fn send_failed(&self, entry: &compose::outbox::OutboxEntry, error: &str) {
+        self.reports
+            .lock()
+            .unwrap()
+            .push((entry.id.clone(), error.to_string()));
+    }
+}
+
+#[tokio::test]
+async fn a_failed_send_says_so_at_the_moment_it_fails() {
+    // The half that reaches somebody who is not looking at the composer. The
+    // flush that carries a message can run from a timer, from the CLI or from
+    // the agent, and until this existed none of the three had anywhere to
+    // report a refusal.
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_failing(403, r#"{"error":{"message":"no scope"}}"#);
+    let sink = RecordingSink::new();
+    let out = Outbox::new(db.clone(), clients(Arc::clone(&transport)))
+        .unwrap()
+        .reporting_to(Arc::clone(&sink) as Arc<dyn compose::outbox::FailedSends>);
+
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    let entry = out.queue(&built, NOW, NOW).unwrap();
+    out.flush_due(NOW).await.unwrap();
+
+    let reports = sink.reports();
+    assert_eq!(reports.len(), 1, "one report for one failure");
+    assert_eq!(reports[0].0, entry.id);
+    assert!(reports[0].1.contains("no scope"), "Google's reason, verbatim");
+}
+
+#[tokio::test]
+async fn a_retriable_failure_says_nothing_because_it_has_not_failed_yet() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::scripted(vec![Ok(HttpResponse::json(
+        429,
+        r#"{"error":{"message":"slow down"}}"#,
+    ))]);
+    let sink = RecordingSink::new();
+    let out = Outbox::new(db.clone(), clients(Arc::clone(&transport)))
+        .unwrap()
+        .reporting_to(Arc::clone(&sink) as Arc<dyn compose::outbox::FailedSends>);
+
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    out.queue(&built, NOW, NOW).unwrap();
+    out.flush_due(NOW).await.unwrap();
+
+    assert!(
+        sink.reports().is_empty(),
+        "a message going back into the queue is not news"
+    );
+}
+
+#[tokio::test]
+async fn the_unsent_list_names_the_message_and_google_s_reason() {
+    // The durable half. Two of the four failures in the owner's real store have
+    // no subject at all, so the recipients are the only thing that identifies
+    // them — and they live in the RFC822 bytes, not in a column.
+    let (db, _a, thread, _m) = seeded();
+    let transport =
+        FakeTransport::always_failing(400, r#"{"error":{"message":"Invalid To header"}}"#);
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let built = draft::build(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>The words I wrote.</div>"),
+        NOW,
+        1,
+    )
+    .unwrap();
+    let entry = out.queue(&built, NOW, NOW).unwrap();
+    out.flush_due(NOW).await.unwrap();
+
+    let failed = out.failed().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id, entry.id);
+    assert!(
+        failed[0].error.contains("Invalid To header"),
+        "Google's reason survives to the surface: {}",
+        failed[0].error
+    );
+    assert!(
+        !failed[0].to.is_empty(),
+        "the recipients come back out of the stored message"
+    );
+    assert!(
+        failed[0].body.contains("The words I wrote"),
+        "and so do the words, which is all that is left of a message that cannot be retried"
+    );
+}
+
+#[tokio::test]
+async fn only_failed_messages_are_unsent() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    out.queue(&built, NOW, NOW + UNDO_WINDOW_MS).unwrap();
+
+    assert!(
+        out.failed().unwrap().is_empty(),
+        "a message still inside its undo window has not failed"
+    );
+
+    out.flush_due(NOW + UNDO_WINDOW_MS).await.unwrap();
+    assert!(out.failed().unwrap().is_empty(), "nor has one that went");
+}
+
+#[tokio::test]
+async fn the_unsent_list_is_newest_first() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_failing(400, r#"{"error":{"message":"nope"}}"#);
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let older = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "one"), NOW, 1).unwrap();
+    let first = out.queue(&older, NOW, NOW).unwrap();
+    out.flush_due(NOW).await.unwrap();
+
+    let newer = draft::build(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "two"),
+        NOW + 60_000,
+        1,
+    )
+    .unwrap();
+    let second = out.queue(&newer, NOW + 60_000, NOW + 60_000).unwrap();
+    out.flush_due(NOW + 60_000).await.unwrap();
+
+    let failed = out.failed().unwrap();
+    assert_eq!(
+        failed.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
+        vec![second.id, first.id],
+        "the one he has not noticed yet is the one from today"
+    );
+}
+
+#[tokio::test]
+async fn discarding_an_unsent_message_empties_the_list() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_failing(400, r#"{"error":{"message":"nope"}}"#);
+    let out = outbox(&db, Arc::clone(&transport));
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    let entry = out.queue(&built, NOW, NOW).unwrap();
+    out.flush_due(NOW).await.unwrap();
+    assert_eq!(out.failed().unwrap().len(), 1);
+
+    assert!(out.discard(&entry.id).unwrap());
+    assert!(out.failed().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_unsent_op_answers_over_ipc() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_failing(400, r#"{"error":{"message":"Invalid To header"}}"#);
+    let out = outbox(&db, Arc::clone(&transport));
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    out.queue(&built, NOW, NOW).unwrap();
+    out.flush_due(NOW).await.unwrap();
+
+    let answer = dispatch(&db, &out, json!({ "op": "unsent" })).await.unwrap();
+    let failed = answer["failed"].as_array().expect("a list");
+    assert_eq!(failed.len(), 1);
+    assert!(failed[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid To header"));
+    assert!(failed[0]["to"].as_array().is_some_and(|to| !to.is_empty()));
+}
+
 #[tokio::test]
 async fn the_local_copy_lands_before_the_request_goes_out() {
     // The speed thesis, for sending: the thread repaints from SQLite, then the

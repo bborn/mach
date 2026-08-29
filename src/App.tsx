@@ -15,6 +15,7 @@ import { TitleBar } from "@/components/chrome/TitleBar";
 import { CalendarMode } from "@/components/calendar/CalendarMode";
 import { LinkFailures } from "@/components/mail/LinkFailures";
 import { MailMode } from "@/components/mail/MailMode";
+import { UnsentPanel } from "@/components/mail/UnsentPanel";
 import { CommandPalette } from "@/components/palette/CommandPalette";
 import { ShortcutSheet } from "@/components/chrome/ShortcutSheet";
 import { AddAccountDialog } from "@/components/accounts/AddAccountDialog";
@@ -387,6 +388,10 @@ function Shell() {
         bindings={shortcuts ?? []}
         onClose={() => setShortcuts(null)}
       />
+      {/* Renders nothing while the queue is clean. `g u` and its rail row are
+          the two ways in; both are dead when there is nothing that did not
+          send. */}
+      <UnsentPanel />
       <AddAccountDialog />
       <FeedbackDialog />
       {/* Renders nothing for a handoff to a target that has run before — it

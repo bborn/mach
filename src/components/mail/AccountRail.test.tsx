@@ -76,6 +76,7 @@ const HANDLERS: RailHandlers = {
   openFavorite: () => CALLS.push("favorite"),
   unfavorite: (key) => CALLS.push(`unfavorite:${key}`),
   toggle: (section) => CALLS.push(`toggle:${section}`),
+  openUnsent: () => CALLS.push("unsent"),
 };
 
 function build(over: Partial<Parameters<typeof railItems>[0]> = {}): RailItem[] {
@@ -88,6 +89,7 @@ function build(over: Partial<Parameters<typeof railItems>[0]> = {}): RailItem[] 
       labelId: "INBOX",
       threadId: null,
       unread: unread(),
+      unsent: 0,
       collapsed: [],
       ...over,
     },

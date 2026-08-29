@@ -24,6 +24,7 @@ import { ghostEnabled, setGhostEnabled } from "@/lib/ghost";
 import { forcedSyncInFlight, subscribeForcedSync } from "@/lib/force-sync";
 import { listTime, monthShort, shortTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
+import { useUnsent } from "@/components/mail/use-unsent";
 import { Overlay } from "@/components/ui/dialog";
 import { BareInput } from "@/components/ui/input";
 import { Kbd } from "@/components/ui/kbd";
@@ -58,6 +59,12 @@ const COMMANDS: PaletteCommand[] = [
     keywords: "filter inbox always forever sender github updates forums",
   },
   { id: "snooze", title: "Snooze conversation", hint: "B", keywords: "snooze later" },
+  {
+    id: "unsent",
+    title: "Unsent messages",
+    hint: "G U",
+    keywords: "unsent outbox failed send stuck not sent queue",
+  },
   {
     id: "report-spam",
     title: "Report spam",
@@ -114,7 +121,7 @@ const COMMANDS: PaletteCommand[] = [
 ];
 
 /**
- * The commands, with the one that has a live state folded in.
+ * The commands, with the two that depend on the world folded in.
  *
  * "Sync now" is the only entry here that talks to Google, so it is the only one
  * that can be *in progress* when you open the palette. Its shortcut column
@@ -122,10 +129,17 @@ const COMMANDS: PaletteCommand[] = [
  * a pass is running. Pressing it again is already harmless — the action refuses
  * and the engine refuses behind it — and this is what stops it looking like
  * nothing happened.
+ *
+ * "Unsent messages" is the other, and it is removed rather than dimmed. Most
+ * commands here are worth offering with nothing to act on — "Snooze" answers
+ * "open a conversation first", which teaches the key — but a surface that
+ * exists only to report failures has nothing to teach when there are none, and
+ * offering it would make an empty outbox look like a place to check.
  */
-export function commandsWith(syncing: boolean): PaletteCommand[] {
-  if (!syncing) return COMMANDS;
-  return COMMANDS.map((command) =>
+export function commandsWith(syncing: boolean, unsent = 0): PaletteCommand[] {
+  const listed = unsent > 0 ? COMMANDS : COMMANDS.filter((c) => c.id !== "unsent");
+  if (!syncing) return listed;
+  return listed.map((command) =>
     command.id === "sync-now" ? { ...command, hint: "Syncing" } : command,
   );
 }
@@ -138,7 +152,8 @@ export function CommandPalette() {
     () => forcedSyncInFlight("all"),
     () => false,
   );
-  const commands = useMemo(() => commandsWith(syncing), [syncing]);
+  const { failed } = useUnsent();
+  const commands = useMemo(() => commandsWith(syncing, failed.length), [syncing, failed.length]);
 
   // Every label is reachable here, which is why the rail does not list them.
   const mailboxes = useMemo(
@@ -249,6 +264,8 @@ export function CommandPalette() {
           return actions.unsubscribe();
         case "unsubscribe-in-browser":
           return actions.unsubscribePageInBrowser();
+        case "unsent":
+          return actions.setUnsent(true);
         case "snooze":
           // Hands over to the picker rather than committing a time of its own.
           // The reducer's `snooze` case shuts this palette on the way out, so

@@ -25,6 +25,7 @@ import {
   Folder,
   Inbox,
   Mail,
+  MailWarning,
   Megaphone,
   Send,
   Star,
@@ -85,6 +86,14 @@ export interface RailItem {
   count?: number;
   /** `"+"` when the count is a floor rather than a total. */
   countSuffix?: string;
+  /**
+   * Something is wrong here. Colours the icon and the count.
+   *
+   * The only row that carries it is Unsent, and it carries it always: the row
+   * does not exist unless a message failed to send, so the tone is not a state
+   * of the row, it is what the row is for.
+   */
+  tone?: "warning";
   title?: string;
   /** Keymap binding this row opens, shown on a hover-hold. */
   shortcut?: string;
@@ -109,6 +118,8 @@ export interface RailInput {
   inboxId?: LabelId;
   threadId: ThreadId | null;
   unread: InboxUnread;
+  /** How many messages did not send. Zero means the row is not there. */
+  unsent: number;
   collapsed: readonly string[];
 }
 
@@ -119,6 +130,8 @@ export interface RailHandlers {
   openFavorite: (favorite: Favorite) => void;
   unfavorite: (key: string) => void;
   toggle: (section: RailSection) => void;
+  /** Show what did not send. */
+  openUnsent: () => void;
 }
 
 export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
@@ -198,6 +211,33 @@ export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
     !open(section) && rows.some((row) => row.active);
 
   return [
+    /*
+     * What did not send, above everything else, and only when there is any.
+     *
+     * The rail is otherwise a list of places, and this is not one — it is the
+     * one thing in the window that says a message the owner believes he sent is
+     * still sitting here. It goes first because the requirement is that he
+     * finds out without going looking, and the top-left of the mailbox is where
+     * the eye already lands. It costs nothing the rest of the time: the row
+     * does not exist while the queue is clean.
+     */
+    ...(input.unsent > 0
+      ? [
+          {
+            key: "unsent",
+            level: 1 as const,
+            surface: true,
+            spaced: false,
+            active: false,
+            activate: () => on.openUnsent(),
+            leading: <MailWarning size={13} strokeWidth={1.75} />,
+            label: "Unsent",
+            count: input.unsent,
+            tone: "warning" as const,
+            shortcut: "g u",
+          },
+        ]
+      : []),
     {
       key: "section:inbox",
       level: 1,

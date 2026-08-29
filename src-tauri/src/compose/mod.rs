@@ -65,7 +65,7 @@ pub use draft::{
 };
 pub use remote::DraftRemoteSync;
 pub use mime::{build_rfc822, Mailbox, Outgoing, OutgoingAttachment};
-pub use outbox::{Outbox, OutboxEntry, OutboxState, UNDO_WINDOW_MS};
+pub use outbox::{FailedSend, FailedSends, Outbox, OutboxEntry, OutboxState, UNDO_WINDOW_MS};
 
 // ---------------------------------------------------------------------------
 // schema

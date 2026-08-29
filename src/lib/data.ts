@@ -596,6 +596,15 @@ export interface MachDataSource {
    * that is happening.
    */
   onWakeFailed(handler: (failure: WakeFailure) => void): Promise<Unsubscribe>;
+  /**
+   * A queued message that stopped trying.
+   *
+   * The flush that sends a message runs on a timer, from the command line and
+   * from the agent, so a refusal can land with nobody watching — and did, four
+   * times, over eighteen days. This is the moment-of-failure half; the durable
+   * half is the queue, which `listFailedSends` reads.
+   */
+  onSendFailed(handler: (failure: SendFailure) => void): Promise<Unsubscribe>;
 }
 
 /** One refused wake, as `ipc::events::WakeFailedPayload` sends it. */
@@ -603,6 +612,22 @@ export interface WakeFailure {
   threadIds: ThreadId[];
   message: string;
   retriable: boolean;
+}
+
+/** One message that stopped trying, as `ipc::events::SendFailedPayload` sends it. */
+export interface SendFailure {
+  /** The `compose_outbox` row. */
+  id: string;
+  subject: string;
+  /** Google's reason, verbatim. */
+  message: string;
+}
+
+/** `Not sent: "Re: Checking in" — Invalid To header`. */
+export function describeSendFailure(failure: SendFailure): string {
+  const subject = failure.subject.trim();
+  const named = subject === "" ? "Not sent" : `Not sent: “${subject}”`;
+  return `${named} — ${failure.message}`;
 }
 
 /** "Could not wake 2 conversations — Google had an error". */
@@ -914,6 +939,9 @@ export const fixtureSource: MachDataSource = {
     return () => {};
   },
   async onWakeFailed() {
+    return () => {};
+  },
+  async onSendFailed() {
     return () => {};
   },
 };

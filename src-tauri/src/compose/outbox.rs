@@ -32,6 +32,18 @@
 //! can retry it after re-authorizing, which is only possible because the queue
 //! stores the finished message rather than a reference to a draft that may have
 //! been edited since.
+//!
+//! Keeping the bytes is not the same as telling anybody. For eighteen months a
+//! `failed` row was a row nothing read: four of them sat in the owner's store,
+//! the newest a real business reply, and he found out when somebody ran a
+//! `SELECT` for him. Two things close that. [`Outbox::failed`] is the durable
+//! half — it reads the rows back with the recipients and the words parsed out
+//! of the stored message, so a surface can show what did not go without the
+//! draft it was written as still existing. [`FailedSends`] is the immediate
+//! half: a sink the send path tells the moment a message stops trying, so the
+//! window hears about a flush it did not ask for. Both are needed. A flush runs
+//! from the command line and from the agent as well as from `⌘⏎`, and the app
+//! can be shut when it happens.
 
 use std::sync::Arc;
 
@@ -151,12 +163,65 @@ pub struct FlushOutcome {
     pub will_retry: bool,
 }
 
+/// One message that did not go, with enough of itself to be recognised.
+///
+/// The row alone is not enough. Two of the failures in the owner's store have
+/// no subject at all, so "which message is this" can only be answered by who it
+/// was addressed to — and that lives in the RFC822 bytes, not in a column. The
+/// body comes along for the same reason: a message whose address Google refuses
+/// outright cannot be retried into working, and the words are then the only
+/// thing worth recovering. Both are parsed on read rather than denormalised
+/// into columns, because the rows already in the store predate any column we
+/// could add and the bytes are already there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedSend {
+    pub id: String,
+    pub account_id: i64,
+    #[serde(default)]
+    pub thread_id: Option<i64>,
+    pub subject: String,
+    #[serde(default)]
+    pub to: Vec<super::mime::Mailbox>,
+    #[serde(default)]
+    pub cc: Vec<super::mime::Mailbox>,
+    #[serde(default)]
+    pub bcc: Vec<super::mime::Mailbox>,
+    /// Google's reason, verbatim. "Invalid To header" and "resource not found"
+    /// call for different next moves, so the string is not summarised.
+    pub error: String,
+    /// When the message was written. Not when it failed — a permanent failure
+    /// happens within seconds of the send, and this is the number the owner can
+    /// place against what he was doing.
+    pub created_at: i64,
+    pub attempts: i64,
+    /// The plain-text alternative, as it would have been sent.
+    pub body: String,
+    /// Names only. The bytes stay in the queue; this says what would go with it.
+    #[serde(default)]
+    pub attachments: Vec<String>,
+}
+
+/// Told when a message stops trying.
+///
+/// The same shape as the sync engine's session emitter, and for the same
+/// reason: `Outbox` is an engine type the tests drive directly and it must not
+/// need a window to exist. The IPC layer supplies one of these that emits
+/// `send-failed`; the CLI door and the agent supply the same one, which is what
+/// makes a send from `mach` or from a tool reach the window the owner is
+/// actually looking at.
+pub trait FailedSends: Send + Sync {
+    fn send_failed(&self, entry: &OutboxEntry, error: &str);
+}
+
 /// The queue. Holds the store and the per-account client factory, nothing else —
 /// no timer, no task, no channel, because the schedule lives in `send_after`.
 pub struct Outbox {
     db: Db,
     clients: Arc<dyn GoogleClients>,
     user_id: String,
+    /// Absent in tests and in every path that has no window to talk to.
+    sink: Option<Arc<dyn FailedSends>>,
 }
 
 impl Outbox {
@@ -166,11 +231,18 @@ impl Outbox {
             db,
             clients,
             user_id: "me".to_string(),
+            sink: None,
         })
     }
 
     pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = user_id.into();
+        self
+    }
+
+    /// Say it out loud when a message stops trying. See [`FailedSends`].
+    pub fn reporting_to(mut self, sink: Arc<dyn FailedSends>) -> Self {
+        self.sink = Some(sink);
         self
     }
 
@@ -416,6 +488,48 @@ impl Outbox {
             .into_iter()
             .filter(|e| !matches!(e.state, OutboxState::Sent))
             .collect())
+    }
+
+    /// Everything that stopped trying, newest first.
+    ///
+    /// Newest first because the one that matters is almost always the last one:
+    /// a failure the owner has not noticed yet is a failure from today, and a
+    /// list that buries it under three from a fortnight ago has answered the
+    /// wrong question.
+    pub fn failed(&self) -> Result<Vec<FailedSend>> {
+        Ok(self.db.read(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, account_id, thread_id, subject, last_error, created_at, \
+                        attempts, rfc822 \
+                   FROM compose_outbox WHERE state = 'failed' \
+                  ORDER BY created_at DESC, id DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let rfc822: Vec<u8> = row.get(7)?;
+                let parsed = ParsedMessage::of(&rfc822);
+                Ok(FailedSend {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    thread_id: row.get(2)?,
+                    subject: row.get(3)?,
+                    to: parsed.to,
+                    cc: parsed.cc,
+                    bcc: parsed.bcc,
+                    // A row written by a build that predates `last_error` — or
+                    // by one of the paths that fails before Google is reached —
+                    // still has to say something a person can act on.
+                    error: row
+                        .get::<_, Option<String>>(4)?
+                        .filter(|text| !text.trim().is_empty())
+                        .unwrap_or_else(|| "Google refused the message".to_string()),
+                    created_at: row.get(5)?,
+                    attempts: row.get(6)?,
+                    body: parsed.body,
+                    attachments: parsed.attachments,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })?)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<OutboxEntry>> {
@@ -735,6 +849,14 @@ impl Outbox {
             }
             Ok(())
         })?;
+        // After the write, not before: what the sink reports has to be a state
+        // that is already committed, or a window that reacts by re-reading the
+        // queue reads it before the row says `failed`.
+        if !retry {
+            if let Some(sink) = self.sink.as_ref() {
+                sink.send_failed(entry, &error.to_string());
+            }
+        }
         Ok(())
     }
 
@@ -855,6 +977,74 @@ pub fn holds_draft_message(
         )
         .optional()?
         .is_some())
+}
+
+/// The parts of a queued message a person needs to recognise it.
+///
+/// Reading these back out of the bytes we built is a small indignity and the
+/// right trade: it is the only way a row written by last year's build — which
+/// is what all four of the owner's failures are — can show who it was for.
+struct ParsedMessage {
+    to: Vec<super::mime::Mailbox>,
+    cc: Vec<super::mime::Mailbox>,
+    bcc: Vec<super::mime::Mailbox>,
+    body: String,
+    attachments: Vec<String>,
+}
+
+impl ParsedMessage {
+    fn of(rfc822: &[u8]) -> Self {
+        use mail_parser::{HeaderName, MessageParser, MimeHeaders};
+
+        let Some(message) = MessageParser::default().parse(rfc822) else {
+            return ParsedMessage {
+                to: Vec::new(),
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                body: String::new(),
+                attachments: Vec::new(),
+            };
+        };
+        let addresses = |name: HeaderName<'_>| -> Vec<super::mime::Mailbox> {
+            message
+                .header(name)
+                .and_then(|value| value.as_address())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|address| {
+                            let email = address.address()?.trim().to_string();
+                            if email.is_empty() {
+                                return None;
+                            }
+                            Some(match address.name() {
+                                Some(name) => super::mime::Mailbox::named(name, email),
+                                None => super::mime::Mailbox::new(email),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // The text alternative, which `build_rfc822` always writes beside the
+        // HTML one. Reading that rather than the markup is what makes the body
+        // something the owner can select and paste into a new message.
+        let body = message
+            .body_text(0)
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        let attachments = message
+            .attachments()
+            .filter_map(|part| part.attachment_name().map(str::to_string))
+            .collect();
+
+        ParsedMessage {
+            to: addresses(HeaderName::To),
+            cc: addresses(HeaderName::Cc),
+            bcc: addresses(HeaderName::Bcc),
+            body,
+            attachments,
+        }
+    }
 }
 
 fn participants(list: &[super::mime::Mailbox]) -> Vec<Participant> {
