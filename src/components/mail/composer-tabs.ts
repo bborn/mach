@@ -26,6 +26,15 @@
  * A draft with nobody in it yet leads with its subject instead, and a draft
  * with neither is named for its kind, so a composer opened a second ago is
  * "New message" rather than an empty chip.
+ *
+ * # Except when the recipient is a machine
+ *
+ * Replying to a Delta receipt produced `⌥1 Transactional Email Reply Inbox ·
+ * Your…`. That name is boilerplate an email service printed, it identifies
+ * nothing, and it ate the line the subject would have used. So a recipient
+ * that is not a person steps aside and the subject leads instead — see
+ * `automatedAddress`, which decides that from the address and never from the
+ * name.
  */
 
 import { subjectStem, type Draft, type Mailbox } from "@/lib/compose";
@@ -58,8 +67,15 @@ export function composerTabs(drafts: readonly Draft[]): ComposerTab[] {
   return drafts.map((draft, index) => {
     const who = recipient(draft);
     const about = subjectStem(draft.subject) || null;
-    const lead = who ?? about ?? kindName(draft);
-    const trail = who === null ? null : about;
+    /*
+     * The one case where the recipient does not lead: it is a machine, and
+     * there is a subject to lead in its place. The name still follows — it
+     * says which service, which is worth the characters left over — and it is
+     * now what truncation eats, which it has earned.
+     */
+    const stepAside = who !== null && who.automated && about !== null;
+    const lead = stepAside ? about : (who?.text ?? about ?? kindName(draft));
+    const trail = stepAside ? who.text : who === null ? null : about;
     const chord = index < KEYED_COMPOSERS ? index + 1 : null;
     return {
       id: draft.id,
@@ -87,13 +103,96 @@ export function composerTabs(drafts: readonly Draft[]): ComposerTab[] {
  * `cc` stands in for an empty `to` so that a draft addressed only in copy is
  * still named after a person.
  */
-function recipient(draft: Draft): string | null {
+function recipient(draft: Draft): { text: string; automated: boolean } | null {
   const people: Mailbox[] = draft.to.length > 0 ? draft.to : draft.cc;
   const first = people[0];
   if (!first) return null;
   const name = first.name?.trim() || first.email.trim();
   if (name === "") return null;
-  return people.length > 1 ? `${name} +${people.length - 1}` : name;
+  return {
+    text: people.length > 1 ? `${name} +${people.length - 1}` : name,
+    automated: automatedAddress(first.email),
+  };
+}
+
+/**
+ * Whether an address belongs to a machine rather than to somebody.
+ *
+ * # The address decides this, and the display name never does
+ *
+ * "Transactional Email Reply Inbox" is boilerplate and "Delta Air Lines" is a
+ * company the owner really does write to, and nothing about their shape
+ * separates them: both are capitalised multi-word noun phrases, both are
+ * descriptions rather than given names. A test written against display names
+ * either misses the first or demotes the second, and demoting the second is
+ * much the worse error — it fires on the mail that matters instead of on
+ * receipts. So display names are not consulted.
+ *
+ * The address is a different kind of evidence, because the sending system wrote
+ * it about itself. `no-reply@` and `notifications@` are declarations that
+ * nobody is reading the mailbox, and
+ * `reply-H3DFZJSV4PQEFIHGBKJDBP6IAA.10202@t.delta.com` carries a routing token
+ * no person would be given. Both live in the local part; the domain says
+ * nothing, since a machine and a colleague can share one.
+ *
+ * It errs towards under-firing. A staffed `support@` or `info@` is left alone,
+ * and so is a routing token shorter than the bar in `isRoutingToken`. The one
+ * way it fires wrongly is a person who really does read `notifications@` at
+ * their own domain, and even then their name survives in the trail.
+ */
+function automatedAddress(email: string): boolean {
+  const at = email.lastIndexOf("@");
+  const local = (at === -1 ? email : email.slice(0, at)).trim().toLowerCase();
+  const segments = local.split(/[.\-_+]+/).filter((part) => part !== "");
+  if (segments.length === 0) return false;
+  /*
+   * The declaration runs at the front, and the separators inside it are the
+   * sender's taste: `noreply`, `no-reply` and `do.not.reply` are one mailbox
+   * spelled three ways. Joining the leading segments back up reads all three,
+   * and reads them through whatever the sender appended after — `noreply-orders@`.
+   */
+  for (let take = 1; take <= Math.min(3, segments.length); take += 1) {
+    if (NOBODY_READS_IT.has(segments.slice(0, take).join(""))) return true;
+  }
+  return segments.some(isRoutingToken);
+}
+
+/**
+ * Local parts that say, in the sender's own words, that nobody is there.
+ *
+ * Role addresses a human answers — `support`, `info`, `sales`, `billing`,
+ * `hello` — are absent from this list. Writing to a company's support desk is
+ * writing to the company, and the company's name is the useful half of that
+ * label.
+ */
+const NOBODY_READS_IT = new Set([
+  "noreply",
+  "noreplies",
+  "noresponse",
+  "donotreply",
+  "dontreply",
+  "nomail",
+  "notify",
+  "notification",
+  "notifications",
+  "autoreply",
+  "automated",
+  "mailerdaemon",
+  "postmaster",
+  "bounce",
+  "bounces",
+]);
+
+/**
+ * A segment that is an identifier a machine minted, not a name a person picked.
+ *
+ * Sixteen characters, and digits among the letters. The bar is set high on
+ * purpose: `johnsmith1985` is thirteen, and catching one more ESP token is not
+ * worth demoting somebody who put their birth year in their address.
+ */
+function isRoutingToken(segment: string): boolean {
+  if (segment.length < 16 || !/^[a-z0-9]+$/.test(segment)) return false;
+  return /^[0-9]+$/.test(segment) || (/[a-z]/.test(segment) && /[0-9]/.test(segment));
 }
 
 /** The last resort: a draft with no recipient and no subject is what it is. */

@@ -136,4 +136,58 @@ describe("TabStrip", () => {
     press("ArrowRight");
     expect(document.activeElement).not.toBe(tabs()[1]);
   });
+
+  /*
+   * The edge fade. jsdom has no layout, so the row's widths are given to it
+   * here — which is the whole of what the component reads to decide, and the
+   * reason the decision is a plain comparison rather than anything measured
+   * off a rendered box.
+   */
+  describe("when the row is wider than the strip", () => {
+    function scrollTo(left: number, { width = 300, content = 900 } = {}) {
+      const list = host.querySelector<HTMLDivElement>('[role="tablist"]')!;
+      Object.defineProperty(list, "clientWidth", { value: width, configurable: true });
+      Object.defineProperty(list, "scrollWidth", { value: content, configurable: true });
+      list.scrollLeft = left;
+      act(() => list.dispatchEvent(new Event("scroll", { bubbles: true })));
+      return list;
+    }
+
+    // One gradient layer per end that has tabs beyond it: `to left` fades the
+    // right-hand end, `to right` the left-hand one.
+    it("fades only the far end while the row is at its start", () => {
+      mount("a");
+      const mask = scrollTo(0).style.maskImage;
+      expect(mask).toContain("to left");
+      expect(mask).not.toContain("to right");
+    });
+
+    it("fades both ends in the middle of the row", () => {
+      mount("a");
+      const mask = scrollTo(300).style.maskImage;
+      expect(mask).toContain("to right");
+      expect(mask).toContain("to left");
+    });
+
+    it("fades only the near end once the row is at its far end", () => {
+      mount("a");
+      const mask = scrollTo(600).style.maskImage;
+      expect(mask).toContain("to right");
+      expect(mask).not.toContain("to left");
+    });
+
+    it("draws no fade at all when every tab fits", () => {
+      mount("a");
+      expect(scrollTo(0, { content: 300 }).style.maskImage).toBe("");
+    });
+
+    // The cue is paint. It must not become something ⇥ can land on, or a
+    // second stop appears in a strip whose whole point is having one.
+    it("adds no tab stop", () => {
+      mount("b");
+      scrollTo(300);
+      expect(tabs().map((tab) => tab.tabIndex)).toEqual([-1, 0, -1]);
+      expect(host.querySelectorAll("button")).toHaveLength(3);
+    });
+  });
 });

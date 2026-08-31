@@ -112,6 +112,118 @@ describe("what a composer's tab says", () => {
   });
 });
 
+/**
+ * The recipient leads until it turns out not to be anybody.
+ *
+ * The reported label is the first case: `⌥1 Transactional Email Reply Inbox ·
+ * Your…`, where the name is what Delta's mail service prints on every receipt
+ * and the subject — the half that would have told this draft from another —
+ * was the half that fell off the end.
+ *
+ * The rest of these are the cases the rule must *not* fire on, and they are why
+ * it reads the address rather than the display name. "Transactional Email Reply
+ * Inbox" and "Delta Air Lines" are the same shape as each other; their
+ * addresses are not.
+ */
+describe("a recipient that identifies nobody", () => {
+  it("steps aside for the subject when its address carries a routing token", () => {
+    const one = tab({
+      to: [
+        {
+          name: "Transactional Email Reply Inbox",
+          email: "reply-H3DFZJSV4PQEFIHGBKJDBP6IAA.10202@t.delta.com",
+        },
+      ],
+      subject: "Re: Your Delta flight receipt",
+    });
+    expect(one.lead).toBe("Your Delta flight receipt");
+    expect(one.trail).toBe("Transactional Email Reply Inbox");
+  });
+
+  it("steps aside for a mailbox that says nobody reads it", () => {
+    for (const email of [
+      "no-reply@members.example",
+      "noreply@members.example",
+      "do.not.reply@members.example",
+      "noreply-orders@shop.example",
+      "notifications@social.example",
+      "bounces@lists.example",
+      "mailer-daemon@mx.example",
+    ]) {
+      expect(tab({ to: [{ name: "Some Service", email }], subject: "Order 4471" }).lead).toBe(
+        "Order 4471",
+      );
+    }
+  });
+
+  it("leaves a person alone, however corporate their name reads", () => {
+    const one = tab({
+      to: [{ name: "Delta Air Lines", email: "customer.care@delta.com" }],
+      subject: "Refund for flight DL219",
+    });
+    expect(one.lead).toBe("Delta Air Lines");
+    expect(one.trail).toBe("Refund for flight DL219");
+  });
+
+  // A desk somebody sits at. Writing to it is writing to the company, and the
+  // company is the useful half of the label.
+  it("leaves a staffed role address alone", () => {
+    for (const email of [
+      "support@stripe.example",
+      "info@paperbark.example",
+      "sales@northloop.example",
+      "billing@northloop.example",
+    ]) {
+      expect(tab({ to: [{ name: "Paperbark", email }], subject: "Invoice 12" }).lead).toBe(
+        "Paperbark",
+      );
+    }
+  });
+
+  // Thirteen characters with a birth year in them is a person. The bar for a
+  // routing token is sixteen, so this one is nowhere near it.
+  it("leaves an address with digits in it alone", () => {
+    expect(
+      tab({ to: [{ email: "johnsmith1985@example.com" }], subject: "Saturday" }).lead,
+    ).toBe("johnsmith1985@example.com");
+    expect(
+      tab({ to: [{ name: "Ada Lovelace", email: "ada.lovelace2@example.com" }], subject: "Notes" })
+        .lead,
+    ).toBe("Ada Lovelace");
+  });
+
+  // A long name is not a token; a token has digits in it. `bartholomewsinclair`
+  // is nineteen characters of somebody.
+  it("leaves a long all-letters local part alone", () => {
+    expect(
+      tab({ to: [{ email: "bartholomewsinclair@example.com" }], subject: "Lunch" }).lead,
+    ).toBe("bartholomewsinclair@example.com");
+  });
+
+  // Nothing to step aside *for*. A generic "Reply" would be worse than the
+  // boilerplate, which at least says which service.
+  it("keeps the machine name when there is no subject to lead instead", () => {
+    const one = tab({
+      kind: "reply",
+      to: [{ name: "Transactional Email Reply Inbox", email: "no-reply@t.delta.com" }],
+    });
+    expect(one.lead).toBe("Transactional Email Reply Inbox");
+    expect(one.trail).toBeNull();
+  });
+
+  it("still counts the other recipients when the first one steps aside", () => {
+    const one = tab({
+      to: [
+        { name: "Notifications", email: "noreply@social.example" },
+        { name: "Deb Feldman", email: "deb@feldmanlegal.example" },
+      ],
+      subject: "Escalation",
+    });
+    expect(one.lead).toBe("Escalation");
+    expect(one.trail).toBe("Notifications +1");
+  });
+});
+
 describe("the strip and the keyboard, from one list", () => {
   const drafts = Array.from({ length: 11 }, (_, index) =>
     draft({ id: `d${index + 1}`, subject: `Draft ${index + 1}` }),

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useKeyBindings } from "@/hooks/useKeymap";
 
 export interface TabItem {
@@ -53,7 +53,38 @@ interface TabStripProps {
  * a local handler would never see an arrow the mail list had already claimed —
  * nor ⏎, which opens a thread. They are live only while focus is inside the
  * strip, and carry no description, so the `?` sheet is unchanged.
+ *
+ * # The edges say when there is more
+ *
+ * Once the row scrolls, the tabs off either end leave no trace: ⌥1 is still
+ * ⌥1, and nothing on screen says it is there. The strip fades out over the
+ * last few pixels on whichever side has more, which is the only cue available
+ * here — a scrollbar is the grey band the composer strip was rewritten to get
+ * rid of, and a pair of arrow buttons would be two more tab stops and two more
+ * things to draw. The fade is a `mask-image`, so it carries no colour of its
+ * own and needs nothing from either theme.
  */
+/**
+ * How far in the row fades at an end it can still be scrolled towards.
+ *
+ * Matched to the `scroll-px-5` its consumers set, for the reason given where
+ * the mask is built.
+ */
+const EDGE_FADE = "1.25rem";
+
+/**
+ * One gradient per end, intersected, rather than one gradient with a
+ * `calc(100% - …)` stop in the middle of it. Two layers say the same thing and
+ * a strip that fades at one end only is then a single layer with nothing to
+ * compose, which is the common case.
+ */
+function edgeMask(edges: { before: boolean; after: boolean }): string {
+  const layers: string[] = [];
+  if (edges.before) layers.push(`linear-gradient(to right, transparent 0px, #000 ${EDGE_FADE})`);
+  if (edges.after) layers.push(`linear-gradient(to left, transparent 0px, #000 ${EDGE_FADE})`);
+  return layers.join(", ");
+}
+
 export function TabStrip({
   items,
   activeId,
@@ -64,6 +95,44 @@ export function TabStrip({
 }: TabStripProps) {
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const nodes = useRef(new Map<string, HTMLButtonElement>());
+  const strip = useRef<HTMLDivElement | null>(null);
+  const [edges, setEdges] = useState({ before: false, after: false });
+
+  /*
+   * A pixel of slack at each end. A scroll container that has been sent to its
+   * own end can sit a fraction short of it on a fractional-DPI display, and a
+   * fade that never quite goes away is a fade that stops meaning anything.
+   */
+  const measure = useCallback(() => {
+    const node = strip.current;
+    if (!node) return;
+    const left = node.scrollLeft;
+    const overflow = node.scrollWidth - node.clientWidth;
+    setEdges((was) => {
+      const before = left > 1;
+      const after = left < overflow - 1;
+      return was.before === before && was.after === after ? was : { before, after };
+    });
+  }, []);
+
+  useEffect(() => {
+    measure();
+    const node = strip.current;
+    if (!node || typeof ResizeObserver === "undefined") return;
+    // The row is re-measured when the window changes width and when a tab's own
+    // width changes, neither of which produces a scroll event.
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    for (const tab of nodes.current.values()) observer.observe(tab);
+    return () => observer.disconnect();
+    /*
+     * Keyed by which tabs there are, not by the array: a consumer that builds
+     * `items` inline hands over a new one on every render, and re-attaching the
+     * observer on every keystroke in the composer below is not what this is
+     * for. A tab that changes size without the list changing is still caught —
+     * that is what the observer is watching for.
+     */
+  }, [measure, items.map((item) => item.id).join("\u0000")]);
 
   /**
    * Put focus on the tab `delta` away from wherever it is now.
@@ -123,8 +192,26 @@ export function TabStrip({
    */
   const stopId = items.some((item) => item.id === activeId) ? activeId : (items[0]?.id ?? null);
 
+  /*
+   * The fade is exactly the strip's own scroll padding wide, so a tab the chord
+   * or an arrow key brings back lands clear of it and keeps its focus ring.
+   */
+  const fade = edges.before || edges.after ? edgeMask(edges) : undefined;
+
   return (
-    <div role="tablist" aria-label={label} aria-orientation="horizontal" className={className}>
+    <div
+      role="tablist"
+      aria-label={label}
+      aria-orientation="horizontal"
+      className={className}
+      ref={strip}
+      onScroll={measure}
+      style={
+        fade === undefined
+          ? undefined
+          : { maskImage: fade, WebkitMaskImage: fade, maskComposite: "intersect" }
+      }
+    >
       {items.map((item) => {
         const selected = item.id === activeId;
         return (
