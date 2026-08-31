@@ -35,7 +35,19 @@ set -euo pipefail
 # MACH_DATA_DIR points this at a QA instance's store and door instead of the
 # owner's, exactly as it does for the app itself.
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolved through symlinks, because the header above tells you to put this on
+# your PATH as `mach` and the obvious way to do that is a symlink into
+# ~/.local/bin. `BASH_SOURCE[0]` is then the *symlink*, so the naive dirname
+# lands in ~/.local and the repo is nowhere to be found. Each hop is resolved
+# relative to the directory the link sits in, since a link's target may itself
+# be relative.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  LINK_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [ "${SOURCE:0:1}" = "/" ] || SOURCE="$LINK_DIR/$SOURCE"
+done
+REPO="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 TARGET="$("$REPO/scripts/cargo-target-dir" "$REPO")"
 BINARY="$TARGET/debug/mach-cli"
 
