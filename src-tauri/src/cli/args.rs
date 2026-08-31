@@ -257,10 +257,25 @@ pub fn build_input(tokens: &[String], schema: &Value) -> Result<Value, CliError>
         let raw = match inline {
             Some(value) => value,
             None => match type_of(&property) {
-                // `--unreadOnly` on its own means yes. Anything else needs a
-                // value, and taking the next token as one is only safe when it
-                // is not itself a flag.
-                "boolean" => String::new(),
+                // `--unreadOnly` on its own means yes, and that is the common
+                // spelling. But a boolean schema means false is a real answer —
+                // `star` documents "true stars, false unstars" — and `--starred
+                // false` is how a person writes it. So the next token is taken
+                // only when it is literally `true` or `false`.
+                //
+                // Only those two words, and pointedly not the aliases `1`, `0`,
+                // `yes` and `no` that `coerce` accepts after an `=`. Thread ids
+                // are integers, so `--starred 0` would be a genuine ambiguity
+                // between a value and the first positional, and guessing wrong
+                // there stars the wrong conversation. `--starred=0` stays
+                // unambiguous and still works.
+                "boolean" => match tokens.get(i + 1).map(String::as_str) {
+                    Some(word @ ("true" | "false")) => {
+                        i += 1;
+                        word.to_string()
+                    }
+                    _ => String::new(),
+                },
                 _ => {
                     let next = tokens.get(i + 1).filter(|t| !t.starts_with("--"));
                     let value = next
@@ -310,10 +325,23 @@ pub fn build_input(tokens: &[String], schema: &Value) -> Result<Value, CliError>
     }
     let leftover: Vec<String> = waiting.collect();
     if !leftover.is_empty() {
+        // A stray `yes`/`no`/`1`/`0` is almost always somebody answering a
+        // boolean the long way round, since those are the aliases `coerce`
+        // takes after an `=` but the parser will not read off the next token
+        // (see the boolean arm above). "nothing takes yes" reads as though the
+        // value were wrong rather than the spelling, which is the report that
+        // brought this here.
+        let boolish = leftover
+            .iter()
+            .find(|word| matches!(word.to_ascii_lowercase().as_str(), "yes" | "no" | "1" | "0"));
+        let hint = match boolish {
+            Some(word) => format!(" If it is a yes-or-no answer, write it as --flag={word}."),
+            None => String::new(),
+        };
         return Err(CliError::new(
             "usage",
             format!(
-                "nothing takes {}. Name it with a flag, or drop it.",
+                "nothing takes {}. Name it with a flag, or drop it.{hint}",
                 leftover.join(" ")
             ),
         ));
@@ -373,6 +401,76 @@ mod tests {
         });
         let tokens = vec!["4127".to_string()];
         assert_eq!(build_input(&tokens, &schema).unwrap(), json!({ "threadId": 4127 }));
+    }
+
+    /// `star` documents "true stars, false unstars", so false has to be
+    /// sayable. It was not: the boolean arm never read the next token, so
+    /// `--starred false` left `false` as a positional and the verb was told
+    /// `true`, which is the opposite of the request.
+    #[test]
+    fn a_boolean_takes_the_word_after_it() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "starred": { "type": "boolean" },
+                "threadIds": { "type": "array", "items": { "type": "integer" } },
+            },
+            "required": ["starred", "threadIds"],
+        });
+        let call = |args: &[&str]| {
+            build_input(
+                &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &schema,
+            )
+        };
+        for (args, starred) in [
+            (vec!["29682", "--starred", "false"], false),
+            (vec!["29682", "--starred", "true"], true),
+            (vec!["29682", "--starred=false"], false),
+            // The bare flag still means yes, which is the common spelling.
+            (vec!["29682", "--starred"], true),
+        ] {
+            assert_eq!(
+                call(&args).unwrap(),
+                json!({ "starred": starred, "threadIds": [29682] }),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Thread ids are integers, so reading `0` or `1` off as a value would be a
+    /// coin flip between the answer and the first positional — and calling it
+    /// wrong acts on the wrong conversation. Only the two unambiguous words are
+    /// taken; the other spellings `coerce` accepts after an `=` are left where
+    /// they fall, and the error names the form that works.
+    #[test]
+    fn a_boolean_leaves_its_other_spellings_alone_and_says_how_to_write_them() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "starred": { "type": "boolean" },
+                "threadIds": { "type": "array", "items": { "type": "integer" } },
+            },
+            "required": ["starred", "threadIds"],
+        });
+        let args: Vec<String> = ["29682", "--starred", "yes"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let error = build_input(&args, &schema).unwrap_err();
+        assert!(
+            error.message.contains("--flag=yes"),
+            "names the spelling it wants: {}",
+            error.message
+        );
+        let fixed: Vec<String> = ["29682", "--starred=yes"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            build_input(&fixed, &schema).unwrap(),
+            json!({ "starred": true, "threadIds": [29682] })
+        );
     }
 
     #[test]
