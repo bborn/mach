@@ -122,6 +122,25 @@ impl FakeTransport {
         self.requests.lock().unwrap().clone()
     }
 
+    /// Replace the queued responses partway through a test.
+    ///
+    /// The draft-backed tests have to push a draft before they can fail one, and
+    /// the push spends responses. This is how a script gets installed after the
+    /// setup rather than before it.
+    fn script(&self, responses: Vec<Result<HttpResponse, TransportError>>) {
+        let mut queue = self.responses.lock().unwrap();
+        queue.clear();
+        queue.extend(responses);
+    }
+
+    fn urls_ending(&self, suffix: &str) -> Vec<String> {
+        self.requests()
+            .into_iter()
+            .map(|r| r.url)
+            .filter(|url| url.split('?').next().unwrap_or(url).ends_with(suffix))
+            .collect()
+    }
+
     /// The RFC822 bytes Gmail was actually handed, decoded back out of `raw`.
     fn sent_rfc822(&self) -> Vec<Vec<u8>> {
         self.requests()
@@ -5664,4 +5683,364 @@ async fn a_forward_sends_the_files_it_was_given() {
         .collect();
     assert!(names.contains(&"diligence.pdf".to_string()), "{names:?}");
     let _ = out;
+}
+
+// ============================================ the draft that is no longer there
+
+const NOT_FOUND: &str = r#"{"error":{"message":"Requested entity was not found."}}"#;
+const NOTHING_FOUND: &str = r#"{"messages":[]}"#;
+
+/// Queue a draft-backed reply and leave it waiting to flush.
+async fn queued_draft_backed_reply(
+    db: &Db,
+    out: &Outbox,
+    transport: &Arc<FakeTransport>,
+    thread: i64,
+    body: &str,
+) -> String {
+    let saved = pushed_draft(db, out, transport, thread, body).await;
+    dispatch(db, out, json!({ "op": "send", "draft": saved, "now": NOW + 1 }))
+        .await
+        .unwrap();
+    out.pending().unwrap().first().expect("a queued row").id.clone()
+}
+
+/// Three of the four failures in his store, fixed.
+///
+/// A since-fixed bug deleted the Gmail draft the outbox was about to send, so
+/// `drafts.send` addressed a draft that was not there. The bytes were never in
+/// question — they are in the row — so a 404 that provably predates any send
+/// request should go out as an ordinary message rather than sit in the outbox
+/// forever.
+#[tokio::test]
+async fn a_draft_that_was_deleted_under_us_still_sends_the_message() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let id = queued_draft_backed_reply(&db, &out, &transport, thread, "Both items are handled.")
+        .await;
+
+    transport.script(vec![
+        Ok(HttpResponse::json(404, NOT_FOUND.to_string())),
+        Ok(HttpResponse::json(200, NOTHING_FOUND.to_string())),
+        Ok(HttpResponse::json(
+            200,
+            r#"{"id":"sent-without-the-draft","threadId":"gthread-1"}"#.to_string(),
+        )),
+    ]);
+    let outcomes = out.flush_due(NOW + UNDO_WINDOW_MS + 2).await.unwrap();
+
+    assert!(outcomes[0].sent, "{outcomes:?}");
+    let stored = out.get(&id).unwrap().unwrap();
+    assert_eq!(stored.state, OutboxState::Sent);
+    assert_eq!(stored.sent_message_id.as_deref(), Some("sent-without-the-draft"));
+
+    assert_eq!(transport.urls_ending("/drafts/send").len(), 1, "the draft was tried first");
+    assert_eq!(
+        transport.urls_ending("/messages/send").len(),
+        1,
+        "and the bytes went exactly once after it 404'd"
+    );
+}
+
+/// The guard, pinned.
+///
+/// `attempts == 1` looks like the right test for "nothing can have been
+/// delivered yet" and is not, because `Outbox::retry` sets `attempts` back to
+/// zero. A row whose `drafts.send` went out last week is `attempts == 1` again
+/// the moment the owner presses Retry in the Unsent panel — and if that send
+/// had succeeded and only its answer was lost, falling back would put a second
+/// copy in the recipient's inbox. The durable flag is what says no.
+#[tokio::test]
+async fn a_retry_by_hand_does_not_re_open_the_fallback() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let id = queued_draft_backed_reply(&db, &out, &transport, thread, "Sent, possibly.").await;
+
+    // The first attempt goes out and comes back permanently refused.
+    transport.script(vec![Ok(HttpResponse::json(
+        403,
+        r#"{"error":{"message":"no scope"}}"#.to_string(),
+    ))]);
+    out.flush_due(NOW + UNDO_WINDOW_MS + 2).await.unwrap();
+    assert_eq!(out.get(&id).unwrap().unwrap().state, OutboxState::Failed);
+
+    // He presses Retry, which resets the attempt count — and this time the
+    // draft is gone.
+    assert!(out.retry(&id, NOW + 60_000).unwrap());
+    assert_eq!(out.get(&id).unwrap().unwrap().attempts, 0, "attempts really is back to zero");
+    let before = transport.urls_ending("/messages/send").len();
+    transport.script(vec![Ok(HttpResponse::json(404, NOT_FOUND.to_string()))]);
+    out.flush_due(NOW + 60_001).await.unwrap();
+
+    assert_eq!(
+        transport.urls_ending("/messages/send").len(),
+        before,
+        "a send request had already left for this row; the bytes must not go again"
+    );
+    assert_eq!(
+        transport.urls_ending("/messages").len(),
+        0,
+        "and there is nothing to look up, because the answer would not be acted on"
+    );
+    let stored = out.get(&id).unwrap().unwrap();
+    assert_eq!(stored.state, OutboxState::Failed);
+    assert!(stored.last_error.unwrap().contains("not found"));
+}
+
+/// The dangerous case: the draft is gone because somebody sent it.
+///
+/// He can open gmail.com and send the same draft while it is waiting out its
+/// undo window. Counting attempts cannot see that, so the fallback asks Gmail
+/// whether the message is already in the mailbox before it sends anything.
+#[tokio::test]
+async fn a_draft_somebody_else_sent_is_recognised_rather_than_sent_again() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let id = queued_draft_backed_reply(&db, &out, &transport, thread, "Already gone.").await;
+
+    transport.script(vec![
+        Ok(HttpResponse::json(404, NOT_FOUND.to_string())),
+        Ok(HttpResponse::json(
+            200,
+            r#"{"messages":[{"id":"already-there","threadId":"gthread-1"}]}"#.to_string(),
+        )),
+    ]);
+    out.flush_due(NOW + UNDO_WINDOW_MS + 2).await.unwrap();
+
+    assert_eq!(
+        transport.urls_ending("/messages/send").len(),
+        0,
+        "it is in his mailbox; sending it again is the bug this guard exists for"
+    );
+    let stored = out.get(&id).unwrap().unwrap();
+    assert_eq!(stored.state, OutboxState::Sent, "and the row stops claiming it failed");
+    assert_eq!(stored.sent_message_id.as_deref(), Some("already-there"));
+
+    // The lookup was the message's own `Message-ID`, not a guess.
+    let lookup = transport
+        .requests()
+        .into_iter()
+        .find(|r| r.url.contains("rfc822msgid"))
+        .expect("the probe");
+    assert!(lookup.url.contains("q=rfc822msgid"), "{}", lookup.url);
+}
+
+/// A lookup that fails tells us nothing, so nothing is what we do with it.
+#[tokio::test]
+async fn a_lookup_that_fails_leaves_the_message_where_it_was() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let id = queued_draft_backed_reply(&db, &out, &transport, thread, "Unknowable.").await;
+
+    transport.script(vec![
+        Ok(HttpResponse::json(404, NOT_FOUND.to_string())),
+        Ok(HttpResponse::json(500, r#"{"error":{"message":"backend"}}"#.to_string())),
+    ]);
+    out.flush_due(NOW + UNDO_WINDOW_MS + 2).await.unwrap();
+
+    assert_eq!(transport.urls_ending("/messages/send").len(), 0);
+    let stored = out.get(&id).unwrap().unwrap();
+    assert_eq!(stored.state, OutboxState::Failed);
+    assert!(
+        stored.last_error.unwrap().contains("not found"),
+        "the reason shown is the one that actually stopped it"
+    );
+}
+
+// ================================================ picking it back up on its own
+
+/// An upper bound on the burst, so the loop below terminates. The real ceiling
+/// is `MAX_ATTEMPTS`, which the outbox keeps to itself.
+const MAX_OUTBOX_ATTEMPTS: usize = 8;
+
+/// Wind a message all the way to `failed` through a retriable error.
+async fn exhausted(out: &Outbox, db: &Db, thread: i64, at: i64) -> String {
+    let built = draft::build(
+        db,
+        &reply_draft(db, thread, DraftKind::Reply, "<div>Still trying.</div>"),
+        at,
+        1,
+    )
+    .unwrap();
+    let entry = out.queue(&built, at, at).unwrap();
+    let mut now = at;
+    for _ in 0..MAX_OUTBOX_ATTEMPTS {
+        out.flush_due(now).await.unwrap();
+        if out.get(&entry.id).unwrap().unwrap().state == OutboxState::Failed {
+            break;
+        }
+        now += 30_000;
+    }
+    assert_eq!(out.get(&entry.id).unwrap().unwrap().state, OutboxState::Failed);
+    entry.id
+}
+
+/// Gmail being unreachable for the length of a meeting used to cost a message
+/// permanently: a burst of attempts two minutes wide, then nothing until a
+/// person noticed. It now waits five minutes and asks again.
+#[tokio::test]
+async fn a_message_that_ran_out_of_attempts_on_a_retriable_error_is_picked_back_up() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_failing(503, r#"{"error":{"message":"unavailable"}}"#);
+    let out = outbox(&db, Arc::clone(&transport));
+    let id = exhausted(&out, &db, thread, NOW).await;
+
+    let failed_at = out.get(&id).unwrap().unwrap().send_after;
+    let sends = transport.send_count();
+
+    // Four and a half minutes later, still nothing.
+    out.flush_due(failed_at + 4 * 60_000 + 30_000).await.unwrap();
+    assert_eq!(transport.send_count(), sends, "the backoff is a backoff");
+    assert_eq!(out.get(&id).unwrap().unwrap().state, OutboxState::Failed);
+
+    // Five minutes: one more attempt, and one only.
+    out.flush_due(failed_at + 5 * 60_000).await.unwrap();
+    assert_eq!(transport.send_count(), sends + 1, "exactly one attempt per revival");
+    let stored = out.get(&id).unwrap().unwrap();
+    assert_eq!(stored.state, OutboxState::Failed, "it failed again, and says so");
+    assert_eq!(stored.revivals, 1);
+    assert!(stored.last_error.unwrap().contains("503"));
+
+    // And it is in the Unsent panel throughout, with its latest reason.
+    let unsent = out.failed().unwrap();
+    assert_eq!(unsent.len(), 1);
+    assert!(unsent[0].error.contains("503"));
+}
+
+/// It stops. Three revivals, an hour and five minutes, and then the message
+/// waits for a person.
+#[tokio::test]
+async fn the_automatic_retries_run_out() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_failing(503, r#"{"error":{"message":"unavailable"}}"#);
+    let out = outbox(&db, Arc::clone(&transport));
+    let id = exhausted(&out, &db, thread, NOW).await;
+
+    let mut now = out.get(&id).unwrap().unwrap().send_after;
+    for wait in [5, 15, 45] {
+        now += wait * 60_000;
+        out.flush_due(now).await.unwrap();
+    }
+    assert_eq!(out.get(&id).unwrap().unwrap().revivals, 3);
+
+    let sends = transport.send_count();
+    // A day of flushes, and nothing more leaves.
+    for hour in 1..=24 {
+        out.flush_due(now + hour * 60 * 60_000).await.unwrap();
+    }
+    assert_eq!(transport.send_count(), sends, "a message must not retry forever");
+    assert_eq!(out.get(&id).unwrap().unwrap().state, OutboxState::Failed);
+}
+
+/// The other half, and the one that matters more: a message Google refused for
+/// a reason another attempt cannot change must never be sent again on its own.
+#[tokio::test]
+async fn a_permanent_failure_is_never_retried_automatically() {
+    let (db, _a, thread, _m) = seeded();
+    let transport =
+        FakeTransport::always_failing(400, r#"{"error":{"message":"Invalid To header"}}"#);
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let built = draft::build(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>To nobody.</div>"),
+        NOW,
+        1,
+    )
+    .unwrap();
+    let entry = out.queue(&built, NOW, NOW).unwrap();
+    out.flush_due(NOW).await.unwrap();
+
+    let stored = out.get(&entry.id).unwrap().unwrap();
+    assert_eq!(stored.state, OutboxState::Failed);
+    let sends = transport.send_count();
+    assert_eq!(sends, 1, "one attempt, because 400 is not retriable");
+
+    // A week of flushes, at every interval the revival schedule knows about.
+    for minutes in [5, 15, 45, 60, 24 * 60, 7 * 24 * 60] {
+        out.flush_due(NOW + minutes * 60_000).await.unwrap();
+    }
+    assert_eq!(transport.send_count(), sends, "nothing may put this back in the queue");
+    let stored = out.get(&entry.id).unwrap().unwrap();
+    assert_eq!(stored.state, OutboxState::Failed);
+    assert_eq!(stored.revivals, 0);
+}
+
+/// The rows already in his store were written before any of this existed, so
+/// they carry the column defaults. The defaults have to be the timid ones.
+#[tokio::test]
+async fn a_row_from_an_older_build_is_never_revived() {
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+
+    let built = draft::build(
+        &db,
+        &reply_draft(&db, thread, DraftKind::Reply, "<div>From last year.</div>"),
+        NOW,
+        1,
+    )
+    .unwrap();
+    let entry = out.queue(&built, NOW, NOW + UNDO_WINDOW_MS).unwrap();
+    // Exactly the shape of the four in the owner's store: failed, one attempt,
+    // and none of the bookkeeping this feature added.
+    db.write(|conn| {
+        conn.execute(
+            "UPDATE compose_outbox
+                SET state = 'failed', attempts = 1, retriable = 0, failed_at = 0,
+                    revivals = 0, send_issued = 0,
+                    last_error = 'google resource not found: Requested entity was not found.'
+              WHERE id = ?1",
+            [&entry.id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    out.flush_due(NOW + 30 * 24 * 60 * 60_000).await.unwrap();
+    assert_eq!(transport.send_count(), 0);
+    assert_eq!(out.get(&entry.id).unwrap().unwrap().state, OutboxState::Failed);
+}
+
+/// The store on his Mac already has every table this module makes, so the only
+/// thing that can go wrong with a new column is never being added.
+///
+/// `compose_schema_is_current` used to answer "yes" on the strength of an index
+/// created before these columns existed, and a `yes` there skips the whole
+/// `ALTER TABLE` pass. Dropping the newest column and asking again is the only
+/// way to test the upgrade a fresh store never performs.
+#[test]
+fn a_store_written_by_yesterdays_build_gets_the_new_columns() {
+    let (db, _a, _thread, _m) = seeded();
+    compose::ensure_compose_schema(&db).unwrap();
+
+    let columns = |db: &Db| -> Vec<String> {
+        db.read(|conn| {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('compose_outbox')")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap()
+    };
+    assert!(columns(&db).iter().any(|c| c == "revivals"));
+
+    // Back to the shape the upgrade has to cope with.
+    db.write(|conn| {
+        for column in ["send_issued", "retriable", "failed_at", "revivals"] {
+            conn.execute_batch(&format!("ALTER TABLE compose_outbox DROP COLUMN {column}"))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(!columns(&db).iter().any(|c| c == "revivals"));
+
+    compose::ensure_compose_schema(&db).unwrap();
+    let after = columns(&db);
+    for column in ["send_issued", "retriable", "failed_at", "revivals"] {
+        assert!(after.iter().any(|c| c == column), "{column} was not added back");
+    }
 }

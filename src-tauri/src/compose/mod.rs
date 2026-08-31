@@ -228,6 +228,36 @@ const OUTBOX_DRAFT_COLUMNS: &[(&str, &str)] = &[
     ("gmail_draft_message_id", "TEXT"),
 ];
 
+/// What the queue remembers about giving up, and about having tried.
+///
+/// Added the same way as the lists above, and every default is the shape a row
+/// written before them had — which matters more here than usual, because two of
+/// these four decide whether a message may be sent again.
+///
+///  * `send_issued` — **has a send request for this row ever left this
+///    machine?** Set inside the same statement that claims the row, so it is
+///    committed before any bytes go out and survives a crash between the two.
+///    Nothing clears it, not even the user pressing Retry, because the question
+///    it answers is about history and not about intent. It is what makes the
+///    `drafts.send` 404 fallback safe; see [`outbox::Outbox::send_one`].
+///    Defaulting to `0` is deliberate and is discussed there.
+///  * `retriable` — whether the failure that stopped this message was one
+///    another attempt could plausibly get past. Recorded rather than re-derived,
+///    because [`GoogleError::is_retriable`](crate::google::GoogleError::is_retriable)
+///    takes an error and all the row keeps is a sentence. `0` for every row
+///    written before this column, which is the conservative answer: a message
+///    that failed under an older build is never revived behind the owner's back.
+///  * `failed_at` — when it stopped trying, which `send_after` does not say.
+///    The revival schedule counts from here.
+///  * `revivals` — how many times the queue has picked it back up on its own.
+///    The ceiling that stops a message retrying forever.
+const OUTBOX_RETRY_COLUMNS: &[(&str, &str)] = &[
+    ("send_issued", "INTEGER NOT NULL DEFAULT 0"),
+    ("retriable", "INTEGER NOT NULL DEFAULT 0"),
+    ("failed_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("revivals", "INTEGER NOT NULL DEFAULT 0"),
+];
+
 /// What tells a file in the body from a file beside it.
 ///
 /// Added the same way as the two lists above. Both default to the shape every
@@ -293,7 +323,23 @@ fn compose_schema_is_current(conn: &Connection) -> DbResult<bool> {
             |row| row.get(0),
         )
         .optional()?;
-    Ok(indexed.is_some())
+    if indexed.is_none() {
+        return Ok(false);
+    }
+    // The index above was the whole marker once, and that was a trap: it is
+    // created last, so it says "everything that existed when this store was
+    // upgraded has run" — and a column added *afterwards* is then never added
+    // at all, because the check short-circuits before reaching it. The newest
+    // column has to be part of the marker, and this is the line to move when
+    // the next one arrives.
+    let column: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('compose_outbox') WHERE name = 'revivals'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(column.is_some())
 }
 
 /// The schema itself, against a connection inside a write transaction.
@@ -305,6 +351,7 @@ pub fn create_compose_schema(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(COMPOSE_SCHEMA)?;
     add_missing_columns(conn, "compose_drafts", DRAFT_REMOTE_COLUMNS)?;
     add_missing_columns(conn, "compose_outbox", OUTBOX_DRAFT_COLUMNS)?;
+    add_missing_columns(conn, "compose_outbox", OUTBOX_RETRY_COLUMNS)?;
     add_missing_columns(conn, "compose_retired_drafts", RETIRED_DRAFT_COLUMNS)?;
     add_missing_columns(conn, "compose_attachments", ATTACHMENT_INLINE_COLUMNS)?;
     ensure_one_mirror_per_draft(conn)?;

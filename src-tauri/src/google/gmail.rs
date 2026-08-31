@@ -215,6 +215,29 @@ impl GmailClient {
         self.rest.base_url()
     }
 
+    /// The same client, told not to re-issue a request it never got an answer
+    /// to.
+    ///
+    /// [`RestClient::send_as`] retries on [`GoogleError::Network`], which is
+    /// right for a `GET` and wrong for a send. A `POST` that times out may
+    /// already have been processed: Gmail delivered the message and the
+    /// response was lost on the way back. Re-issuing it is then a second
+    /// delivery — and for `drafts.send` it is worse than that, because the
+    /// first attempt consumed the draft, so the retry comes back **404** and
+    /// looks exactly like a draft that was never there. That ambiguity is the
+    /// one thing [`Outbox::send_one`](crate::compose::Outbox) cannot afford: it
+    /// falls back to `messages.send` on a 404 precisely because a 404 is
+    /// supposed to mean nothing was delivered.
+    ///
+    /// So the draft-send calls make exactly one request. A network failure
+    /// surfaces as `Network` rather than as a 404, the outbox classifies it as
+    /// retriable, and the retry happens a layer up where the attempt is
+    /// counted and durable. Nothing is lost by dropping the wire retry — a 429
+    /// or a 503 comes back through the same outbox backoff.
+    fn once(&self) -> RestClient {
+        self.rest.clone().with_retry_policy(RetryPolicy::none())
+    }
+
     // ------------------------------------------------------------- messages
 
     /// `users.messages.list`, one page.
@@ -601,7 +624,7 @@ impl GmailClient {
     ) -> Result<Message, GoogleError> {
         let url = self.rest.endpoint(&["users", user_id, "drafts", "send"])?;
         let body = json!({ "id": draft_id, "message": draft_message(rfc822, thread_id) });
-        self.rest
+        self.once()
             .send_json(HttpMethod::Post, url, Some(body.to_string().into_bytes()))
             .await
     }
@@ -630,7 +653,7 @@ impl GmailClient {
         }
         let metadata = json!({ "id": draft_id, "message": message }).to_string();
         let (content_type, body) = multipart_related(&metadata, rfc822);
-        self.rest
+        self.once()
             .send_as(HttpMethod::Post, url, Some(body), Some(&content_type))
             .await
             .and_then(json_body)
