@@ -846,6 +846,20 @@ export function replySubject(subject: string): string {
   return base === "" ? "Re:" : `Re: ${base}`;
 }
 
+/**
+ * A subject with the reply and forward prefixes taken off the front.
+ *
+ * For *naming* a draft, never for building a header — `replySubject` and
+ * `forwardSubject` are the two that have to agree with Rust, and they disagree
+ * with this one on purpose: a reply to "Fwd: Invoice" keeps the Fwd, because
+ * dropping it renames somebody else's thread. Nothing is being renamed here.
+ * "Fwd: Your Deposit Receipt" is four fifths boilerplate, and boilerplate is
+ * what a twenty-character label spends itself on.
+ */
+export function subjectStem(subject: string): string {
+  return stripPrefixes(subject, ["re", "fwd", "fw"]);
+}
+
 /** `Fwd: ` without stacking, by the same rule. */
 export function forwardSubject(subject: string): string {
   const base = stripPrefixes(subject, ["fwd", "fw"]);

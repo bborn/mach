@@ -14,6 +14,8 @@ import { swapHtmlSignature, withHtmlSignature } from "@/lib/email-html";
 import { Kbd } from "@/components/ui/kbd";
 import { Overlay } from "@/components/ui/dialog";
 import { RESIZE_STEP, Resizer } from "@/components/ui/split";
+import { TabStrip } from "@/components/ui/tabs";
+import { composerTabs } from "./composer-tabs";
 import { Composer, type ComposerPresentation } from "./Composer";
 import type { RichTextEditorHandle } from "./RichTextEditor";
 import {
@@ -85,11 +87,25 @@ import {
  * message being answered is the other half of the screen and it does not get to
  * shrink because a second draft exists.
  *
- * The strip appears at two and disappears at one, so a person who never writes
- * two messages at once never sees it. `⌥1`…`⌥9` switch. Switching to a reply
- * navigates to its conversation, which is what puts it back in the dock where a
- * reply belongs; a draft whose conversation is not the one on screen keeps its
- * tab and its text and simply is not rendered.
+ * The strip is drawn whenever a composer is open, one draft included. It used
+ * to appear at two and vanish at one, on the reasoning that somebody who never
+ * writes two messages at once should never have to look at it. What that
+ * bought was a control nobody had ever seen turning up at the exact moment
+ * there was something to lose: the owner met it three weeks after writing it,
+ * in his own app, and asked what it was. Drawn always, it is learned before it
+ * is needed, for the price of one row of chrome under every composer.
+ * `SessionPane` draws its own strip at one session for a related reason — a row
+ * that comes and goes moves everything under it by its own height.
+ *
+ * `⌥1`…`⌥9` switch, and `composer-tabs.ts` is the single list both the strip
+ * and those bindings are built from — including what each tab says, which
+ * leads with the recipient rather than the subject; that file has the why.
+ * Arrow keys walk the strip once ⇥ has reached it — one stop for the whole
+ * row, not one per draft; see `ui/tabs.tsx`.
+ *
+ * Switching to a reply navigates to its conversation, which is what puts it
+ * back in the dock where a reply belongs; a draft whose conversation is not the
+ * one on screen keeps its tab and its text and simply is not rendered.
  *
  * # How big it is, and where
  *
@@ -1160,18 +1176,32 @@ export function ComposerDock() {
     },
   ]);
 
-  // ⌥1…⌥9 — the tab strip's keys. Registered from data so the strip and the
-  // keys cannot disagree about which composer is which.
+  /**
+   * The strip, as data: one entry per open composer, each carrying the key
+   * that reaches it.
+   *
+   * Both the row below and the bindings below that are built from this one
+   * list, so the tab labelled ⌥2 and the composer ⌥2 switches to are the same
+   * draft by construction. They used to be a `slice(0, 9)` next to a `map()`,
+   * which agreed only because the two expressions happened to match.
+   */
+  const tabs = useMemo(() => composerTabs(drafts), [drafts]);
+
+  // ⌥1…⌥9. Live whenever their tabs are drawn, which is whenever a composer is
+  // open — the strip no longer waits for a second draft, so neither do these.
+  // A tenth composer has a tab and no key, because there is no ⌥10.
   useKeyBindings(
-    drafts.slice(0, 9).map((entry, index) => ({
-      keys: `alt+${index + 1}`,
-      group: "Write",
-      description: `Composer ${index + 1}`,
-      allowInInput: true,
-      priority: 110,
-      when: () => active && drafts.length > 1,
-      handler: () => switchTo(entry.id),
-    })),
+    tabs
+      .filter((tab) => tab.keys !== null)
+      .map((tab, index) => ({
+        keys: tab.keys!,
+        group: "Write",
+        description: `Composer ${index + 1}`,
+        allowInInput: true,
+        priority: 110,
+        when: () => active,
+        handler: () => switchTo(tab.id),
+      })),
   );
 
   /* --------------------------------------------------------------- sending */
@@ -1448,27 +1478,80 @@ export function ComposerDock() {
     );
   }
 
-  const strip = drafts.length > 1 && (
-    <div className="shrink-0 border-t border-border bg-surface">
-      <div className="mx-auto flex max-w-[72ch] items-center gap-1 overflow-x-auto px-5 py-1.5">
-        {drafts.map((entry, index) => (
-          <button
-            key={entry.id}
-            type="button"
-            onClick={() => switchTo(entry.id)}
-            className={cn(
-              "inline-flex max-w-[24ch] shrink-0 items-center gap-1.5 rounded-[var(--radius)]",
-              "px-2 py-0.5 text-micro",
-              entry.id === activeId
-                ? "bg-hover text-foreground"
-                : "text-faint-foreground hover:text-foreground",
-            )}
-          >
-            <Kbd keys={`alt+${index + 1}`} className="border-none bg-transparent px-0" />
-            <span className="min-w-0 truncate">{title(entry)}</span>
-          </button>
-        ))}
-      </div>
+  /*
+   * The strip.
+   *
+   * It used to be faint text in a grey band between the message and the
+   * composer's own grey band, which is a description of a divider. So the tabs
+   * are chips on the window's paper colour, outlined, each carrying a real key
+   * badge — the same `Kbd` the footer and the status bar use — sitting on the
+   * chrome the composer is already made of. Nothing else in the app draws that
+   * shape, and a divider certainly does not.
+   */
+  const strip = drafts.length > 0 && (
+    <div
+      // The strip counts as inside a composer for the shell's ⇥, which is bound
+      // to "sidebar or list" and stands down only there. Without this, one ⇥
+      // off a tab would throw the keyboard into the rail rather than into the
+      // message the tab just selected. See `keyboardInComposer`.
+      data-mach-composer=""
+      className="shrink-0 border-t border-border bg-surface"
+    >
+      <TabStrip
+        label="Open drafts"
+        activeId={activeId}
+        onSelect={switchTo}
+        /*
+         * More tabs than fit scroll sideways, and two things have to survive
+         * that. The chord can select one off the end, so `scroll-px-5` keeps
+         * the strip's own padding around a tab that is brought back. And this
+         * app's scrollbar is a permanent 10px track, which under a row of tabs
+         * would be the grey band this change took out — so it is hidden, and
+         * the keys and the arrows are how the row is crossed.
+         */
+        className={cn(
+          "mx-auto flex max-w-[72ch] items-stretch gap-1.5 px-5 py-1.5",
+          "overflow-x-auto scroll-px-5 [&::-webkit-scrollbar]:hidden",
+        )}
+        /*
+         * They share the row and stop at 16rem, so two drafts are two chips
+         * rather than two halves of the pane. The floor is set where five of
+         * them still fit the composer's own measure without the row scrolling:
+         * how many drafts are open is the first thing the strip has to say,
+         * and it cannot say it about the ones off the end. Below the floor they
+         * scroll rather than shrink into a row of key badges with nothing
+         * beside them.
+         */
+        tabClassName={cn(
+          "flex min-w-[6rem] max-w-[16rem] flex-1 items-center gap-1.5",
+          "rounded-[var(--radius)] px-2 py-1 text-left text-micro",
+          "text-muted-foreground ring-1 ring-inset ring-border hover:text-foreground",
+          "aria-selected:bg-background aria-selected:text-foreground",
+          "aria-selected:ring-border-strong",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent",
+        )}
+        items={tabs.map((tab) => ({
+          id: tab.id,
+          label: tab.label,
+          keyshortcuts: tab.ariaKeys ?? undefined,
+          children: (
+            <>
+              {tab.keys !== null && <Kbd keys={tab.keys} className="shrink-0" />}
+              {/*
+               * One truncating line, not two, so what falls off the end is the
+               * subject — the half that repeats across drafts — and never the
+               * name, which is the half that tells them apart.
+               */}
+              <span className="min-w-0 truncate">
+                {tab.lead}
+                {tab.trail !== null && (
+                  <span className="text-faint-foreground"> · {tab.trail}</span>
+                )}
+              </span>
+            </>
+          ),
+        }))}
+      />
     </div>
   );
 
@@ -1698,30 +1781,6 @@ export function ComposerDock() {
       {editor("dock")}
     </>
   );
-}
-
-/**
- * What a composer's tab says.
- *
- * The subject, because that is what the message is; then the first recipient,
- * because a message with no subject still has somebody it is going to; then the
- * kind, so a reply whose subject has not loaded yet does not sit in the strip
- * calling itself a new message.
- */
-function title(draft: Draft): string {
-  if (draft.subject.trim()) return draft.subject;
-  const first = draft.to[0];
-  if (first) return first.name?.trim() || first.email;
-  switch (draft.kind) {
-    case "reply":
-    case "replyAll":
-    case "adopted":
-      return "Reply";
-    case "forward":
-      return "Forward";
-    default:
-      return "New message";
-  }
 }
 
 function errorMessage(error: unknown): string {
