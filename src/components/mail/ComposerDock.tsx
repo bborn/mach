@@ -48,7 +48,6 @@ import {
   createAutosave,
   discardDraft,
   flushOutbox,
-  hasWrittenBody,
   inlineImageDataUrl,
   inlineImageMarkup,
   inlineImages as loadInlineImages,
@@ -479,10 +478,27 @@ export function ComposerDock() {
     (kind: DraftKind, replyToId?: number | null) => {
       if (threadId === null) return;
       void (async () => {
-        // A half-written reply wins over a freshly prepared one: reopening a
-        // conversation must not throw away what you already typed.
+        /*
+         * The draft this conversation already has wins over a freshly prepared
+         * one — whatever is or is not written in it.
+         *
+         * The half-written case is the obvious one: reopening a conversation
+         * must not throw away what you already typed. The *untouched* case is
+         * the one that cost trust. A reply composer that is opened and closed
+         * without a word typed still has its recipients filled in, so it is
+         * not empty, so autosave writes the row, mirrors it into the
+         * conversation and pushes it to Gmail. Preparing a second draft here
+         * left that one behind with nothing that would ever take it out again:
+         * sending removes the mirror of the draft that was sent, and the
+         * abandoned one stayed in the thread as a red `DRAFT` row above the
+         * reply it was a copy of. "I sent a reply but still showing draft?"
+         *
+         * So `r`, `a` and `f` all resume it, which is what the strip below
+         * already says they do — while a draft exists it offers `edit draft`
+         * and nothing else.
+         */
         const existing = await loadDraftForThread(threadId).catch(() => null);
-        if (existing && hasWrittenBody(existing)) {
+        if (existing) {
           openDraft(signed(existing));
           return;
         }
