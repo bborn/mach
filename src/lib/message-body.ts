@@ -504,7 +504,16 @@ function frameStyles(tokens: FrameTokens, format: BodyFormat, scheme: FrameSchem
    */
   const light = ground === "light";
   return `:root{${tokenBlock(light ? LIGHT_GROUND : tokens)};color-scheme:${light ? "light" : scheme}}
-html,body{margin:0;padding:0;background:${light ? "var(--background,#fff)" : "transparent"}}
+html,body{margin:0;background:${light ? "var(--background,#fff)" : "transparent"}}
+/* A sender's page gets a margin of its own. Without one the first word sits
+   against the edge of a slab that has a hard boundary against the pane, and the
+   message reads as a cut-out rather than as a page. The padding is on the body
+   while the ground is on both, so a full-bleed band in a marketing template is
+   inset rather than being surrounded by a different colour.
+   Plain text keeps padding:0 — that document is ours, and [TEXT_MEASURE]
+   already gives it a column. */
+body{padding:${light ? "1rem 1.125rem" : "0"}}
+html{padding:0}
 /* Nothing nests. A message grows to its natural height and the reading pane is
    the only thing that scrolls, so the frame's own viewport must never have
    anything to scroll:

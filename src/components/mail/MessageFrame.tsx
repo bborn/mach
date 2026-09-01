@@ -95,7 +95,14 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
    * the app's own ground and must not be touched, and in light mode there is
    * nothing to turn down.
    */
-  const dimmed = scheme === "dark" && frameGround(format) === "light";
+  /*
+   * A body on its own ground is a page sitting on the pane, and rounding the
+   * corners is what says so — square ones read as a hole cut in the window,
+   * which is half of what the glare complaint was about. A plain-text body has
+   * no ground of its own to round: it is already the pane.
+   */
+  const sheet = frameGround(format) === "light";
+  const dimmed = scheme === "dark" && sheet;
 
   const srcDoc = useMemo(
     () => frameDocument({ html, allowRemoteImages, format, tokens, scheme }),
@@ -327,7 +334,7 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
       srcDoc={srcDoc}
       referrerPolicy="no-referrer"
       onLoad={onLoad}
-      className="block w-full border-0 bg-transparent"
+      className={`block w-full border-0 bg-transparent${sheet ? " rounded-lg" : ""}`}
       style={{ height: size.height, filter: dimmed ? FRAME_DIM : undefined }}
     />
   );
