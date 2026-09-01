@@ -9,6 +9,7 @@ import {
   humanSize,
   hasSubject,
   isDraftEmpty,
+  isUntouched,
   formatRecipients,
   isLocalOnly,
   newDraft,
@@ -793,5 +794,69 @@ describe("the composer a reply key is asking about", () => {
   it("is nothing when no composer is open", () => {
     expect(visibleComposer(null, 28594)).toBeNull();
     expect(replyKeyAim(null)).toBe("open");
+  });
+});
+
+/**
+ * The predicate that decides whether an open composer is worth a row.
+ *
+ * This is the bug it exists for: he replied, typed nothing, closed the window,
+ * replied again, typed the real reply and sent it — and the untouched first
+ * composer had by then been saved, mirrored into the conversation and pushed to
+ * Gmail, so the thread carried a red `DRAFT` row above the reply that had gone.
+ * `isDraftEmpty` could never have stopped it, because a reply with recipients
+ * in it is not empty.
+ */
+describe("isUntouched", () => {
+  const prepared = (over: Partial<Draft> = {}): Draft => ({
+    ...newDraft(1),
+    kind: "replyAll",
+    to: [{ email: "candi@example.test" }],
+    cc: [{ email: "sean@example.test" }],
+    subject: "Re: Documents Required",
+    body: "<div><br></div>",
+    bodyFormat: "html",
+    ...over,
+  });
+
+  it("knows a reply composer that was opened and never typed in", () => {
+    const draft = prepared();
+    expect(isUntouched(draft, prepared())).toBe(true);
+    // And that `isDraftEmpty` never could: the recipients are prefilled.
+    expect(isDraftEmpty(draft)).toBe(false);
+  });
+
+  it("does not count the signature the composer put there itself", () => {
+    const signed = prepared({ body: withHtmlSignature("<div><br></div>", "Bruno\nMach") });
+    expect(isUntouched(signed, prepared())).toBe(true);
+  });
+
+  it("counts a word, a file, an edited subject or an added recipient", () => {
+    const base = prepared();
+    expect(isUntouched(prepared({ body: "<div>ok</div>" }), base)).toBe(false);
+    expect(isUntouched(prepared({ subject: "Re: Documents Required (2)" }), base)).toBe(false);
+    expect(
+      isUntouched(prepared({ cc: [...base.cc, { email: "kim@example.test" }] }), base),
+    ).toBe(false);
+    expect(
+      isUntouched(
+        prepared({
+          attachments: [
+            { id: "a1", draftId: "d1", filename: "q3.csv", mimeType: "text/csv", sizeBytes: 12 },
+          ],
+        }),
+        base,
+      ),
+    ).toBe(false);
+  });
+
+  it("counts a recipient the writer took *off* the reply", () => {
+    expect(isUntouched(prepared({ cc: [] }), prepared())).toBe(false);
+  });
+
+  it("does not mind the order the recipients come back in", () => {
+    const base = prepared({ to: [{ email: "a@x.test" }, { email: "b@x.test" }] });
+    const swapped = prepared({ to: [{ email: "B@x.test" }, { email: "a@x.test" }] });
+    expect(isUntouched(swapped, base)).toBe(true);
   });
 });

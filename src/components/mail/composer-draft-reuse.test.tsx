@@ -44,6 +44,8 @@ declare global {
 const state = vi.hoisted(() => ({
   existing: null as Draft | null,
   prepared: [] as string[],
+  saved: [] as string[],
+  discarded: [] as string[],
 }));
 
 vi.mock("@/lib/compose", async (importOriginal) => {
@@ -67,8 +69,14 @@ vi.mock("@/lib/compose", async (importOriginal) => {
         updatedAt: 0,
       } as Draft;
     },
-    saveDraft: async (draft: Draft) => draft,
-    discardDraft: async () => ({ ok: true, remote: "none" as const }),
+    saveDraft: async (draft: Draft) => {
+      state.saved.push(draft.id);
+      return draft;
+    },
+    discardDraft: async (draftId: string) => {
+      state.discarded.push(draftId);
+      return { ok: true, remote: "none" as const };
+    },
     flushOutbox: async () => ({ pending: [], sent: [] }),
   };
 });
@@ -125,6 +133,8 @@ beforeEach(() => {
   }
   state.existing = null;
   state.prepared = [];
+  state.saved = [];
+  state.discarded = [];
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -188,5 +198,26 @@ describe("replying to a conversation that already holds a draft", () => {
     await press("a");
     await press("f");
     expect(state.prepared).toEqual([]);
+  });
+});
+
+/**
+ * The other half, and the one that made the phantom in the first place.
+ *
+ * A reply composer opened and closed without a word typed used to leave a row
+ * behind: `prepare` fills in the recipients, so `isDraftEmpty` said no, so
+ * autosave wrote it, mirrored it into the conversation and pushed it to Gmail.
+ * A conversation he had only glanced at replying to then carried `Draft`.
+ */
+describe("a reply composer that was opened and never typed in", () => {
+  it("leaves nothing behind when it is closed", async () => {
+    await openThread(1);
+    await press("r");
+    expect(state.prepared).toEqual(["reply"]);
+
+    await press("Escape");
+
+    expect(state.saved).toEqual([]);
+    expect(state.discarded).toEqual(["draft-fresh-1"]);
   });
 });

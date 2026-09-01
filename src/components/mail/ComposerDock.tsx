@@ -52,6 +52,7 @@ import {
   inlineImageMarkup,
   inlineImages as loadInlineImages,
   isDraftEmpty,
+  isUntouched,
   loadDraft,
   loadDraftForThread,
   moveDraftAccount,
@@ -282,20 +283,48 @@ export function ComposerDock() {
    * queued last and the save is keyed by the draft's own id.
    */
   const autosaves = useRef(new Map<string, Autosave>());
+
+  /**
+   * What each composer was handed when it opened, so "has anything been put in
+   * this?" can be asked of a reply at all.
+   *
+   * A reply is never *empty*: `prepare` fills in the recipients and the `Re:`
+   * subject before it draws. The prefill is knowable because we wrote it, and
+   * this is where it is kept — see [[untouched]] and `isUntouched`.
+   *
+   * A ref rather than state: nothing renders from it, and a baseline changing
+   * is not an edit. Entries are dropped with the composer they belong to.
+   */
+  const prefill = useRef(new Map<string, Draft>());
+
+  /**
+   * Is this composer still exactly what it was handed?
+   *
+   * A draft with no baseline is one this session did not open — resumed from
+   * SQLite, or handed over by the agent — and it is not ours to call untouched:
+   * whatever is in it was written by somebody, somewhere. `isDraftEmpty` is
+   * still asked, because a genuinely blank one is still worth nothing.
+   */
+  const untouched = useCallback((draft: Draft): boolean => {
+    const opened = prefill.current.get(draft.id);
+    return opened ? isUntouched(draft, opened) : isDraftEmpty(draft);
+  }, []);
   const autosaveFor = useCallback((id: string): Autosave => {
     const existing = autosaves.current.get(id);
     if (existing) return existing;
     const created = createAutosave((next) => {
-      // A draft with nothing in it is not worth a row; it would also
-      // resurrect an empty composer every time the thread is reopened.
-      if (isDraftEmpty(next)) return;
+      // A draft nobody has written in is not worth a row. It would resurrect
+      // an empty composer every time the thread is reopened — and, for a reply,
+      // put a `DRAFT` row in the conversation and a draft in Gmail for a
+      // message that was never written.
+      if (untouched(next)) return;
       void saveDraft(next).catch(() => {
         /* the editor must not lose focus because a write failed */
       });
     });
     autosaves.current.set(id, created);
     return created;
-  }, []);
+  }, [untouched]);
 
   const flushAll = useCallback(() => {
     for (const autosave of autosaves.current.values()) autosave.flush();
@@ -411,6 +440,7 @@ export function ComposerDock() {
     (id: string) => {
       autosaves.current.get(id)?.flush();
       autosaves.current.delete(id);
+      prefill.current.delete(id);
       // A composer that has gone is not popped out; leaving the id behind
       // would reopen the next one over the window without being asked.
       setPopped((current) => forgetPopOut(current, id));
@@ -510,6 +540,9 @@ export function ComposerDock() {
         // References header — and comes back with an empty body. The signature
         // is the one thing it cannot know, because it is not in the thread.
         if (!prepared) return;
+        // What this composer was handed, before the signature and before the
+        // writer. Everything it holds beyond this is theirs.
+        prefill.current.set(prepared.id, prepared);
         openDraft(signed(prepared));
 
         /*
@@ -572,6 +605,7 @@ export function ComposerDock() {
         return;
       }
       const blank = signed(newDraft(accountId));
+      prefill.current.set(blank.id, blank);
       // ⌘K's "write to this person" arrives here with an address already in
       // hand; `c` arrives with none, and the composer puts the cursor in the
       // To field for exactly that case.
@@ -683,7 +717,7 @@ export function ComposerDock() {
     (id: string) => {
       const target = drafts.find((entry) => entry.id === id);
       if (!target) return;
-      if (!isDraftEmpty(target) && confirming !== id) {
+      if (!untouched(target) && confirming !== id) {
         setConfirming(id);
         // One question in the footer at a time. This one is about whether the
         // draft should go on existing, so it takes the row from a question
@@ -1644,12 +1678,15 @@ export function ComposerDock() {
   }
 
   const dismiss = () => {
+    // Asked before the close, because closing forgets what the composer was
+    // handed and the question is about the difference from it.
+    const nothingWritten = untouched(visible);
     close(visible.id);
     // Closing an untouched composer should not leave a row behind, or
     // reopening the thread offers an empty reply for ever. It may also have
     // written one already — autosave declines to, but `attach` saves on
     // purpose — so this is a discard rather than a local forget.
-    if (isDraftEmpty(visible)) void discardDraft(visible.id).catch(() => {});
+    if (nothingWritten) void discardDraft(visible.id).catch(() => {});
   };
 
   const editor = (presentation: ComposerPresentation) => (

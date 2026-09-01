@@ -166,6 +166,40 @@ export function hasSubject(draft: Pick<Draft, "subject">): boolean {
   return draft.subject.trim() !== "";
 }
 
+/**
+ * Has the writer put anything into this draft that `prepare` did not?
+ *
+ * # Why `isDraftEmpty` is not this question
+ *
+ * A reply is never empty. `prepare` fills in the recipients and the `Re:`
+ * subject before the composer has drawn a single pixel, so a composer that
+ * opened and was closed again without a word typed still answered "yes, there
+ * is something in me" — and was saved, mirrored into the conversation, and
+ * pushed to Gmail as a real draft. The conversation then carried a red `DRAFT`
+ * row for a reply nobody had written.
+ *
+ * The prefill is knowable, because we are the ones who wrote it: `prepared` is
+ * exactly what came back from `prepare`. Anything the draft holds that its own
+ * prefill did not is the writer's, and the moment there is any of it the draft
+ * is worth a row.
+ *
+ * Recipients are compared as a set of addresses rather than a list, because
+ * whose reply this is does not change when the order does.
+ */
+export function isUntouched(draft: Draft, prepared: Draft): boolean {
+  const addresses = (list: Mailbox[]) =>
+    [...new Set(list.map((box) => box.email.trim().toLowerCase()))].sort().join(",");
+  const same = (a: Mailbox[], b: Mailbox[]) => addresses(a) === addresses(b);
+  return (
+    !hasWrittenBody(draft) &&
+    (draft.attachments?.length ?? 0) === 0 &&
+    draft.subject.trim() === prepared.subject.trim() &&
+    same(draft.to, prepared.to) &&
+    same(draft.cc, prepared.cc) &&
+    same(draft.bcc, prepared.bcc)
+  );
+}
+
 export function isDraftEmpty(draft: Draft): boolean {
   return (
     !hasWrittenBody(draft) &&
