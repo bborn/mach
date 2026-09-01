@@ -24,7 +24,8 @@ use super::events;
 use super::reads;
 use super::state::{self, AppState};
 use super::types::{
-    Calendar, PendingAuthorizationHandle, SyncStatusPayload, ThreadDetail, ThreadPage, ThreadQuery,
+    Calendar, MailboxCounts, PendingAuthorizationHandle, SyncStatusPayload, ThreadDetail,
+    ThreadPage, ThreadQuery,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,12 @@ pub fn list_threads(
     query: ThreadQuery,
 ) -> Result<ThreadPage, IpcError> {
     reads::list_threads(&state.db, &query)
+}
+
+/// Drafts and Snoozed, as numbers for the rail.
+#[tauri::command]
+pub fn mailbox_counts(state: State<'_, AppState>) -> Result<MailboxCounts, IpcError> {
+    reads::mailbox_counts(&state.db)
 }
 
 #[tauri::command]

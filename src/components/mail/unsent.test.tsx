@@ -86,6 +86,7 @@ function rail(unsent: number, on: RailHandlers = HANDLERS) {
     labelId: "INBOX",
     threadId: null,
     unread: { byAccount: new Map(), total: 0, capped: false },
+    counts: { drafts: 0, snoozed: 0 },
     unsent,
     collapsed: [],
   };

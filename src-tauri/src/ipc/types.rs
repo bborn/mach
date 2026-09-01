@@ -101,6 +101,21 @@ impl ThreadPage {
     }
 }
 
+/// What the rail puts a number on.
+///
+/// Two mailboxes, and only two. Both are totals rather than unread counts,
+/// because in neither place does a read state mean anything: a draft is never
+/// unread — its existence is the signal — and a snooze is a queue of
+/// conversations coming back. Spam and Trash are the counts left out on
+/// purpose; 354 of the owner's 384 spam threads are unread, because nobody
+/// reads spam, and neither number is something he can act on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailboxCounts {
+    pub drafts: i64,
+    pub snoozed: i64,
+}
+
 // ---------------------------------------------------------------------------
 // calendars
 // ---------------------------------------------------------------------------

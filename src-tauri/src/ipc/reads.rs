@@ -16,7 +16,7 @@ use crate::db::models::{Account, Calendar as StoredCalendar, Contact, Event, Lab
 use crate::db::{queries, Db};
 
 use super::error::IpcError;
-use super::types::{Calendar, ThreadDetail, ThreadPage, ThreadQuery};
+use super::types::{Calendar, MailboxCounts, ThreadDetail, ThreadPage, ThreadQuery};
 
 /// Every authorized account, in rail order.
 pub fn list_accounts(db: &Db) -> Result<Vec<Account>, IpcError> {
@@ -68,6 +68,21 @@ pub fn list_threads(db: &Db, query: &ThreadQuery) -> Result<ThreadPage, IpcError
     let store_query = query.to_store_query();
     let items = db.read(|conn| queries::list_threads(conn, &store_query))?;
     Ok(ThreadPage::paged(items, limit))
+}
+
+/// The two mailbox totals the rail draws.
+///
+/// One transaction for both, so the rail never paints a Drafts count from
+/// before a write beside a Snoozed count from after it. Each is the same
+/// predicate the mailbox itself is listed by — see `queries::count_mailbox` —
+/// which is what stops the number and the list from disagreeing.
+pub fn mailbox_counts(db: &Db) -> Result<MailboxCounts, IpcError> {
+    Ok(db.read(|conn| {
+        Ok(MailboxCounts {
+            drafts: queries::count_mailbox(conn, queries::DRAFT_LABEL)?,
+            snoozed: queries::count_mailbox(conn, queries::SNOOZED_MAILBOX)?,
+        })
+    })?)
 }
 
 /// A thread and its whole conversation.

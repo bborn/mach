@@ -35,6 +35,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { Account, AccountId, Label, LabelId, ThreadId } from "@/types";
+import type { MailboxCounts } from "@/lib/data";
 import type { Favorite } from "@/lib/favorites";
 import { favoriteKey } from "@/lib/favorites";
 import type { InboxUnread } from "./use-inbox-unread";
@@ -49,6 +50,25 @@ const SYSTEM_ICONS: Record<string, LucideIcon> = {
   SPAM: TriangleAlert,
   TRASH: Trash2,
   CATEGORY_PROMOTIONS: Megaphone,
+};
+
+/**
+ * The two mailbox rows that carry a number, and where each number comes from.
+ *
+ * Both are **totals**, not unread counts, and the list is closed on purpose.
+ * A draft has no read state — the owner's Drafts mailbox is one thread and
+ * zero unread — so its existence is the whole signal. Snoozed is a queue of
+ * conversations coming back, and a small number that prompts something.
+ *
+ * Spam and Trash are the two most likely to be added back, and they are the
+ * two the owner named as the thing he does not want: 354 of his 384 spam
+ * threads are unread, because nobody reads spam, and neither the total nor the
+ * unread count is actionable. Sent, Starred, All, Archive and Promotions are
+ * archives of finished things whose numbers only grow.
+ */
+const MAILBOX_TOTALS: Record<string, (counts: MailboxCounts) => number> = {
+  DRAFT: (counts) => counts.drafts,
+  SNOOZED: (counts) => counts.snoozed,
 };
 
 /** The Gmail jump keys, on the rows they land on. */
@@ -118,6 +138,11 @@ export interface RailInput {
   inboxId?: LabelId;
   threadId: ThreadId | null;
   unread: InboxUnread;
+  /**
+   * Totals for Drafts and Snoozed, the only two mailbox rows with a number.
+   * Zero draws nothing; see {@link MAILBOX_TOTALS}.
+   */
+  counts: MailboxCounts;
   /** How many messages did not send. Zero means the row is not there. */
   unsent: number;
   collapsed: readonly string[];
@@ -173,6 +198,10 @@ export function railItems(input: RailInput, on: RailHandlers): RailItem[] {
       activate: () => on.openLabel(label.id),
       leading: <Icon size={13} strokeWidth={1.75} className="text-faint-foreground" />,
       label: label.name,
+      // Zero is left undefined rather than passed through: the row renders its
+      // count only when there is one, so an empty Drafts looks exactly as it
+      // did before there were counts at all.
+      count: MAILBOX_TOTALS[label.id]?.(input.counts) || undefined,
       shortcut: MAILBOX_SHORTCUTS[label.id],
     };
   });

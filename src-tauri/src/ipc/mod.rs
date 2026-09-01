@@ -8,6 +8,7 @@
 //! | `list_labels` | `accountId?` | `Label[]` |
 //! | `list_contacts` | — | `Contact[]` |
 //! | `list_threads` | `query: ThreadQuery` | `ThreadPage` |
+//! | `mailbox_counts` | — | `MailboxCounts` |
 //! | `get_thread` | `threadId` | `ThreadDetail` |
 //! | `search_threads` | `query`, `limit?` | `ThreadPage` |
 //! | `list_calendars` | — | `Calendar[]` |

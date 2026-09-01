@@ -50,6 +50,7 @@ commands.allow = [
   "list_labels",
   "list_contacts",
   "list_threads",
+  "mailbox_counts",
   "get_thread",
   "search_threads",
   # Calendar.

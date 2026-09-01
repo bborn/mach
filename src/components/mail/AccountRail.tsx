@@ -14,6 +14,7 @@ import { RESIZE_STEP, Resizer } from "@/components/ui/split";
 import { DEFAULT_RAIL_WIDTH, clampRailWidth } from "./rail-layout";
 import { railItems, railStep, type RailItem, type RailSection } from "./rail-model";
 import { useInboxUnread } from "./use-inbox-unread";
+import { useMailboxCounts } from "./use-mailbox-counts";
 import { useUnsent } from "./use-unsent";
 
 /**
@@ -116,6 +117,7 @@ export function AccountRail() {
   );
   const inboxId = inboxLabelId();
   const unread = useInboxUnread(suppressed, inboxId);
+  const counts = useMailboxCounts();
   const { failed } = useUnsent();
 
   // The rail carries the mailboxes you navigate to, not every label Gmail has.
@@ -139,6 +141,7 @@ export function AccountRail() {
           inboxId,
           threadId: ui.threadId,
           unread,
+          counts,
           unsent: failed.length,
           collapsed,
         },
@@ -162,6 +165,7 @@ export function AccountRail() {
       mailboxes,
       favorites,
       unread,
+      counts,
       failed.length,
       collapsed,
       ui.accountId,

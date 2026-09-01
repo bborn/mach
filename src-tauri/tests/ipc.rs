@@ -453,6 +453,101 @@ fn listing_the_archive_answers_over_the_same_ipc_shape_as_a_label() {
     );
 }
 
+/// The rail's two numbers, and the promise that neither can disagree with the
+/// mailbox it labels: both come from the predicate `list_threads` pages over.
+///
+/// Drafts is the interesting half. The mailbox is "carries `DRAFT`, **or** has
+/// a message with `is_draft`", because `thread_labels` is derived and a locally
+/// mirrored draft's `DRAFT` row is dropped by the next sync pass — so counting
+/// the label alone would under-count exactly the drafts the owner just wrote.
+#[test]
+fn the_rail_counts_drafts_and_snoozed_the_way_their_mailboxes_are_listed() {
+    let db = TempDb::new("mailbox-counts");
+    let a = account(&db, "a@example.com", 0);
+
+    let empty = reads::mailbox_counts(&db).expect("counts");
+    assert_eq!((empty.drafts, empty.snoozed), (0, 0));
+
+    // Gmail's label, and nothing else.
+    let labelled = thread(&db, a, "t1", "From Gmail", 100);
+    db.write(|conn| q::set_thread_labels(conn, labelled, &["DRAFT".to_string()]))
+        .expect("label it");
+
+    // A draft Mach mirrored locally, whose `DRAFT` row the next sync would drop.
+    let mirrored = thread(&db, a, "t2", "Written here", 200);
+    db.write(|conn| {
+        q::upsert_message(
+            conn,
+            &NewMessage {
+                thread_id: mirrored,
+                account_id: a,
+                gmail_message_id: "m-draft".into(),
+                from: Participant::new("a@example.com"),
+                subject: "Written here".into(),
+                snippet: String::new(),
+                internal_date: 200,
+                is_draft: true,
+                ..Default::default()
+            },
+        )
+    })
+    .expect("mirror a draft");
+
+    // Both spellings at once, which must count as one conversation.
+    let both = thread(&db, a, "t3", "Adopted", 300);
+    db.write(|conn| q::set_thread_labels(conn, both, &["DRAFT".to_string()]))
+        .expect("label it");
+    db.write(|conn| {
+        q::upsert_message(
+            conn,
+            &NewMessage {
+                thread_id: both,
+                account_id: a,
+                gmail_message_id: "m-both".into(),
+                from: Participant::new("a@example.com"),
+                subject: "Adopted".into(),
+                snippet: String::new(),
+                internal_date: 300,
+                is_draft: true,
+                ..Default::default()
+            },
+        )
+    })
+    .expect("mirror the adopted draft");
+
+    let snoozed = thread(&db, a, "t4", "Back on Monday", 400);
+    db.write(|conn| {
+        command_queries::upsert_snooze(
+            conn,
+            &command_queries::SnoozeRow {
+                thread_id: snoozed,
+                wake_at: 9_000,
+                snoozed_at: 400,
+                prior_label_ids: vec!["INBOX".into()],
+                prior_is_unread: true,
+            },
+        )
+    })
+    .expect("snooze it");
+
+    let counts = reads::mailbox_counts(&db).expect("counts");
+    assert_eq!(counts.drafts, 3, "the two spellings are one mailbox");
+    assert_eq!(counts.snoozed, 1);
+
+    // The claim that matters: the number is the length of the list.
+    for (label, count) in [("DRAFT", counts.drafts), ("SNOOZED", counts.snoozed)] {
+        let page = reads::list_threads(
+            &db,
+            &ThreadQuery {
+                label_id: Some(label.into()),
+                ..Default::default()
+            },
+        )
+        .expect("list threads");
+        assert_eq!(page.items.len() as i64, count, "{label} count matches its list");
+    }
+}
+
 #[test]
 fn searching_returns_fts_matches_ranked_and_hydrated() {
     let db = TempDb::new("search");

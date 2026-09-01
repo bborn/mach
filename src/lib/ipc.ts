@@ -53,6 +53,7 @@ import {
   type CommandResult,
   type CommandSpec,
   type MachDataSource,
+  type MailboxCounts,
   type Unsubscribe,
   type SendFailure,
   type WakeFailure,
@@ -938,6 +939,13 @@ export function createIpcSource(transport: IpcTransport): MachDataSource {
 
     async listThreads(query: ThreadQuery) {
       return mapThreadPage(await call<WireThreadPage>("list_threads", { query: wireQuery(query) }));
+    },
+
+    async mailboxCounts(): Promise<MailboxCounts> {
+      const counts = await call<Partial<MailboxCounts>>("mailbox_counts");
+      // A backend that skipped a zero field must not leave the rail with `NaN`
+      // where a number belongs.
+      return { drafts: counts.drafts ?? 0, snoozed: counts.snoozed ?? 0 };
     },
 
     async getThread(threadId: ThreadId): Promise<ThreadDetail | null> {

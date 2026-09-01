@@ -485,6 +485,20 @@ export interface SearchOptions {
   cursor?: ThreadCursor | null;
 }
 
+/**
+ * The mailbox totals the rail draws, as `ipc::types::MailboxCounts` sends them.
+ *
+ * Two, and only two. Drafts and Snoozed are the mailboxes where the number of
+ * things in them is the point — a draft has no read state, and a snooze is a
+ * queue of conversations coming back. Spam, Trash, Sent, Starred, All, Archive
+ * and Promotions get nothing: they are archives of finished things, and their
+ * numbers only ever grow.
+ */
+export interface MailboxCounts {
+  drafts: number;
+  snoozed: number;
+}
+
 export interface MachDataSource {
   /** Which implementation this is. The UI uses it to say so, honestly. */
   readonly kind: "tauri" | "fixture";
@@ -493,6 +507,8 @@ export interface MachDataSource {
   listLabels(accountId?: AccountId | null): Promise<Label[]>;
   listCalendars(): Promise<Calendar[]>;
   listThreads(query: ThreadQuery): Promise<ThreadPage>;
+  /** Totals for the two mailboxes the rail puts a number on. */
+  mailboxCounts(): Promise<MailboxCounts>;
   getThread(threadId: ThreadId): Promise<ThreadDetail | null>;
   /**
    * Search.
@@ -735,6 +751,12 @@ export const fixtureSource: MachDataSource = {
   },
   async listThreads(query) {
     return page(fixtures.threads.filter((t) => matchesQuery(t, query)).sort(byRecency), query);
+  },
+  async mailboxCounts() {
+    return {
+      drafts: fixtures.threads.filter((t) => inMailbox(t, "DRAFT")).length,
+      snoozed: fixtures.threads.filter((t) => inMailbox(t, "SNOOZED")).length,
+    };
   },
   async getThread(threadId) {
     const thread = fixtures.threads.find((t) => t.id === threadId);

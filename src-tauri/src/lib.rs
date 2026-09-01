@@ -330,6 +330,7 @@ pub fn run() {
             ipc::commands::list_labels,
             ipc::commands::list_contacts,
             ipc::commands::list_threads,
+            ipc::commands::mailbox_counts,
             ipc::commands::get_thread,
             ipc::commands::open_unsubscribe_page,
             ipc::commands::search_threads,

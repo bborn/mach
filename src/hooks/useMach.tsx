@@ -38,6 +38,7 @@ import {
   type MailCommand,
 } from "@/lib/data";
 import { unsubscribeAction } from "@/components/mail/unsubscribe-offer";
+import { mailboxCountsChanged } from "@/components/mail/use-mailbox-counts";
 import {
   applyEventGuesses,
   applyGuess,
@@ -2643,6 +2644,12 @@ export function MachProvider({ children }: { children: ReactNode }) {
       reload: () => {
         setReloadKey((k) => k + 1);
         streamRef.current.refresh();
+        // The composer's writes are what this is for. Saving or discarding a
+        // draft changes what the Drafts mailbox holds without emitting
+        // `threads-changed` — an autosave is not a mailbox event, and making it
+        // one would refetch every list on every keystroke — so the rail's count
+        // follows the same signal the list already follows.
+        mailboxCountsChanged();
       },
       draftSent: (draftId) =>
         setSentDrafts((current) => (current.has(draftId) ? current : new Set(current).add(draftId))),

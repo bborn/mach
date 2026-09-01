@@ -89,6 +89,7 @@ function build(over: Partial<Parameters<typeof railItems>[0]> = {}): RailItem[] 
       labelId: "INBOX",
       threadId: null,
       unread: unread(),
+      counts: { drafts: 0, snoozed: 0 },
       unsent: 0,
       collapsed: [],
       ...over,
