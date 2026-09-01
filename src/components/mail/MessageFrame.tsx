@@ -6,6 +6,7 @@ import {
   CLAIM_ATTR,
   type AnchorCandidate,
   frameDocument,
+  frameGround,
   nextFrameSize,
   openExternal,
   readFrameScheme,
@@ -25,6 +26,16 @@ import {
   type WideCandidate,
 } from "@/lib/message-body";
 import { useKeymap } from "@/hooks/useKeymap";
+
+/**
+ * How far a sender's white page is turned down in dark mode.
+ *
+ * Chosen by looking at it: at 0.9 the slab still glares, and below about 0.75
+ * the message starts reading as disabled rather than as paper. This keeps
+ * white at roughly the lightness of the app's own raised surfaces, so the
+ * reading pane looks like it contains a page rather than a hole.
+ */
+const FRAME_DIM = "brightness(0.82)";
 
 export interface MessageFrameProps {
   /** Sanitizer output. Never raw sender HTML — see `ipc::render`. */
@@ -66,6 +77,25 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
   // last line of a message; [`nextFrameSize`] has the measurement.
   const [size, setSize] = useState(INITIAL_FRAME_SIZE);
   const { tokens, scheme } = useAppTheme();
+  /*
+   * A sender's HTML keeps its white page — see [frameGround] for why it is not
+   * ours to re-theme, and what happened the last time half a theme was injected
+   * into one. In dark mode that leaves a lit rectangle in an unlit window, and
+   * the complaint that brought this here was about the glare rather than about
+   * the colours being wrong.
+   *
+   * So the frame is turned down as a whole rather than restyled. `brightness`
+   * scales every channel, so the sender's white ground, a white a table cell
+   * sets for itself and a photograph all come down together — a per-element
+   * change would tone the ground and leave the cell, which is the patchwork
+   * this is trying to avoid. Black text multiplies to black, so the contrast
+   * inside the message is very slightly better rather than worse.
+   *
+   * It applies only where both halves are true. A plain-text body already has
+   * the app's own ground and must not be touched, and in light mode there is
+   * nothing to turn down.
+   */
+  const dimmed = scheme === "dark" && frameGround(format) === "light";
 
   const srcDoc = useMemo(
     () => frameDocument({ html, allowRemoteImages, format, tokens, scheme }),
@@ -298,7 +328,7 @@ export function MessageFrame({ html, allowRemoteImages, format, title }: Message
       referrerPolicy="no-referrer"
       onLoad={onLoad}
       className="block w-full border-0 bg-transparent"
-      style={{ height: size.height }}
+      style={{ height: size.height, filter: dimmed ? FRAME_DIM : undefined }}
     />
   );
 }
