@@ -61,6 +61,25 @@ if ((globalThis as Record<string, unknown>).__MACH_PLUGIN_PROBE__) {
     void import("@/lib/scroll-phase").then((phase) => phase.connectScrollPhase());
   }
 
+  /*
+   * React's development build measures every render and never clears them up.
+   *
+   * Unbounded, and this window is not reloaded for hours at a time — see
+   * `lib/user-timing.ts` for what that costs and why a timer is the answer.
+   *
+   * Not gated on `isTauri`: a `bun run dev` browser tab runs the same React
+   * build and accumulates the same entries. It is gated on `DEV` here as well
+   * as inside the module so a production build drops the import entirely, the
+   * way the QA bridge is — and a production React never calls `measure` at all.
+   *
+   * Started and never stopped, like the scroll-phase listener above: it is one
+   * timer for the life of the window. `trimUserTiming` returns a disposer for
+   * the console, if you are profiling and need it to stop.
+   */
+  if (import.meta.env.DEV) {
+    void import("@/lib/user-timing").then((timing) => timing.trimUserTiming());
+  }
+
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
       {/*
