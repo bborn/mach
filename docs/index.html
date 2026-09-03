@@ -451,7 +451,7 @@
       }
 
       /* The long version, for the one reader who wants it. Collapsed, because
-         the twelve lines above are the answer for everybody else. */
+         the list above is the answer for everybody else. */
       details.long {
         margin-top: 2.5rem;
         border-top: 1px solid var(--border);
@@ -777,6 +777,11 @@
             <span>Day, week and month. Drag to make an event, or to move one.</span>
           </li>
           <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4l10.5-10.5a2.1 2.1 0 0 0-3-3L5 17v3Z"/><path d="M14 6.5 17.5 10"/></svg>
+            <b>Writing</b>
+            <span>Drafts save themselves, several at a time. Ten seconds to change your mind.</span>
+          </li>
+          <li>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11.5 12.5 19a5 5 0 0 1-7-7l7.5-7.5a3.5 3.5 0 0 1 5 5L10.5 17"/></svg>
             <b>Attachments</b>
             <span>Drag a file in to send it. The type comes from the bytes.</span>
@@ -790,6 +795,11 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 16.5 19.7 18.3 21.5 19 19.7 19.7 19 21.5 18.3 19.7 16.5 19 18.3 18.3Z"/></svg>
             <b>The agent</b>
             <span>Runs on your Claude Code CLI. Stops before anything leaves.</span>
+          </li>
+          <li>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="4" width="19" height="16" rx="2"/><path d="m7 10 3 2.5L7 15"/><path d="M13 15h4"/></svg>
+            <b>From a shell</b>
+            <span><code>mach</code> has every verb ⌘K has. Searching works with the app shut.</span>
           </li>
           <li>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="m3 7 9 6 9-6"/><path d="M15 17h5"/></svg>
@@ -861,6 +871,19 @@
             </dd>
           </div>
           <div>
+            <dt>Writing</dt>
+            <dd>
+              Drafts save themselves and go up to Gmail, so one started here can
+              be finished on your phone. Several can be open at once, as tabs
+              along the bottom, and any of them can be popped out into its own
+              window. The body is plain text with a bit of markdown in it, sent
+              as HTML. A send sits in the outbox for ten seconds before it
+              leaves — longer or shorter in preferences — and <kbd>⌃S</kbd>
+              schedules it for three hours' time, tomorrow morning or Monday
+              instead.
+            </dd>
+          </div>
+          <div>
             <dt>Attachments</dt>
             <dd>
               Drag a file onto a composer to send it, or press <kbd>⇧⌘A</kbd>. Incoming
@@ -890,6 +913,20 @@
               you to say yes. Everything else is undoable and shows up in the
               same log as the things you did yourself. <kbd>⌘K</kbd> will also
               hand a thread off to an agent running somewhere else.
+            </dd>
+          </div>
+          <div>
+            <dt>From a shell</dt>
+            <dd>
+              <code>mach</code> is the same list of commands the agent gets,
+              from a terminal. The verbs aren't written down anywhere in the CLI
+              — it reads them off the app at runtime, so it can't fall behind
+              what the app can do. <code>mach search invoice</code> and the
+              other reads open the SQLite file directly and work whether or not
+              Mach is running. Anything that writes goes over a loopback socket
+              to the running app, which is the only process holding the tokens,
+              the outbox and the undo stack; with the app shut, a write fails
+              and says so rather than queueing.
             </dd>
           </div>
           <div>
@@ -1113,7 +1150,7 @@
               >
               to a coding agent that can drive a browser and it'll click through
               the console with you: the project, the two APIs, the consent
-              screen, a Desktop app client, the six scopes, publishing, and
+              screen, a Desktop app client, the seven scopes, publishing, and
               writing <code>.env.local</code>. It gives the keyboard back when
               it hits your password and the User Data Policy. If you'd rather do
               it by hand, the same file reads as a checklist.
@@ -1146,6 +1183,12 @@ bun run tauri dev</code></pre>
               Then <kbd>⌘K</kbd> → <strong>Add account</strong>. If you got the
               credentials wrong it still boots and the window still paints — it
               just tells you it can't add an account.
+            </p>
+            <p style="margin-top: 0.85rem">
+              The command line is a second binary, <code>mach-cli</code>, since
+              <code>mach</code> is the application. <code>scripts/mach</code>
+              builds it if it's missing and runs it; symlink that onto your
+              <code>PATH</code> as <code>mach</code> for the short name.
             </p>
           </li>
         </ol>
