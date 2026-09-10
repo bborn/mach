@@ -557,9 +557,19 @@ export function ComposerDock() {
          * Forwarding used to send the words and silently leave the files
          * behind, which is the kind of failure you find out about from the
          * other end.
+         *
+         * **Which message's files**, when the caller named none: `f` from a
+         * conversation nobody has stepped into passes no id, and neither does
+         * the Forward button under the thread. `prepare` answers that the
+         * way every other reply route does — the newest message — and hands the
+         * parent it settled on back as `replyToId`. Reading the argument here
+         * instead meant the *text* came from the newest message and the files
+         * came from nowhere: the forward went out with the body reproduced and
+         * the invoice silently missing.
          */
-        if (kind !== "forward" || replyToId == null) return;
-        const brought = await forwardAttachments(prepared.id, replyToId).catch(
+        const source = replyToId ?? prepared.replyToId ?? null;
+        if (kind !== "forward" || source == null) return;
+        const brought = await forwardAttachments(prepared.id, source).catch(
           (error: unknown) => {
             actions.setStatus(errorMessage(error), "error");
             return null;
