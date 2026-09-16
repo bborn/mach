@@ -776,6 +776,12 @@ export interface FailedSend {
   body: string;
   /** Names only — the bytes stay in the queue. */
   attachments: string[];
+  /**
+   * Still queued, a minute or more past when it should have left. Google was
+   * never asked, so the row offers "send now" rather than "retry".
+   * `compose::outbox::STUCK_AFTER_MS`.
+   */
+  stuck?: boolean;
 }
 
 /** Everything that stopped trying, newest first. */

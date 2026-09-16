@@ -123,6 +123,15 @@ export interface Message {
    */
   machDraftId?: string;
   /**
+   * Written by the outbox and not yet accepted by Gmail.
+   *
+   * The optimistic copy `compose::outbox` puts in the conversation the moment
+   * a reply is queued, filed under a `mach-outbox:` id until Google answers
+   * with a real one. It used to be drawn exactly like a delivered message, so
+   * seven replies that never left looked sent for a day.
+   */
+  inOutbox?: boolean;
+  /**
    * The meeting this message is an invitation to, when it is one.
    *
    * Present only for a message whose `text/calendar` part said `METHOD:REQUEST`

@@ -174,6 +174,9 @@ interface WireAttachment {
   sizeBytes?: Nullable<number>;
 }
 
+/** `db::models::OUTBOX_ID_PREFIX`: the id a queued reply's local copy is filed under. */
+const OUTBOX_MESSAGE_PREFIX = "mach-outbox:";
+
 interface WireMessage {
   id: number;
   threadId: number;
@@ -189,6 +192,8 @@ interface WireMessage {
   isDraft?: Nullable<boolean>;
   /** `db::models::Message.mach_draft_id` — which composer draft that mirror is. */
   machDraftId?: Nullable<string>;
+  /** `db::models::Message.gmail_message_id` — `mach-outbox:…` until Gmail has it. */
+  gmailMessageId?: Nullable<string>;
   attachments?: Nullable<WireAttachment[]>;
   /** `db::models::MessageInvitation` — absent on every message that is not one. */
   invitation?: Nullable<WireInvitation>;
@@ -595,6 +600,7 @@ export function mapMessage(wire: WireMessage): Message {
     // and all of migration 5 — see the tripwires in `ipc.test.ts`.
     isDraft: wire.isDraft === true,
     machDraftId: optional(wire.machDraftId),
+    inOutbox: wire.gmailMessageId?.startsWith(OUTBOX_MESSAGE_PREFIX) === true,
     attachments: (wire.attachments ?? []).map(mapAttachment),
     invitation: wire.invitation ? mapInvitation(wire.invitation) : undefined,
     unsubscribe: mapUnsubscribe(wire.unsubscribe),

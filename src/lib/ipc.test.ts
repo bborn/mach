@@ -629,6 +629,40 @@ describe("requests", () => {
     expect(detail?.messages[1]?.isDraft).toBe(true);
   });
 
+  it("marks a reply still in the outbox, so it is not drawn as delivered", async () => {
+    // Seven replies sat in the queue for a day looking exactly like sent mail.
+    // The optimistic copy is filed under `mach-outbox:<entry>` until Gmail
+    // answers with a real id; that prefix is the whole signal.
+    const { transport } = fakeTransport({
+      get_thread: {
+        thread: WIRE_THREAD,
+        messages: [
+          {
+            id: 900,
+            threadId: 41,
+            accountId: 2,
+            from: { email: "marcus@lumen.example" },
+            internalDate: 1_700_000_000_000,
+            gmailMessageId: "18c2f0a1b2c3d4e5",
+          },
+          {
+            id: 901,
+            threadId: 41,
+            accountId: 2,
+            from: { email: "alex@lumen.example" },
+            internalDate: 1_700_000_100_000,
+            gmailMessageId: "mach-outbox:ob-1a0ab3c55f7-ffa51c9246da44c3",
+          },
+        ],
+      },
+    });
+
+    const detail = await createIpcSource(transport).getThread(41);
+
+    expect(detail?.messages[0]?.inOutbox).toBe(false);
+    expect(detail?.messages[1]?.inOutbox).toBe(true);
+  });
+
   /*
    * The wire is the sender's word for the header and Rust's word for what may
    * be done about it, and only the second is trustworthy. An `offer` this build

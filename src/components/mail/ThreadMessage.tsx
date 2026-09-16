@@ -176,6 +176,11 @@ export function ThreadMessage({
               Draft
             </span>
           )}
+          {!draft && message.inOutbox && (
+            <span className="shrink-0 self-center rounded-[3px] border border-warning px-1 font-medium text-micro uppercase tracking-wide text-warning">
+              Outbox
+            </span>
+          )}
           {/*
             The same tile the thread list draws, one step down.
 

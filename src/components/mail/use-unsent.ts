@@ -1,5 +1,6 @@
 /**
- * The messages that did not go, kept current.
+ * The messages that did not go, kept current — refused by Google, or still
+ * sitting in the queue well past when they should have left.
  *
  * # Why a hook and not a piece of app state
  *
@@ -16,19 +17,26 @@
  * frame. The pattern is `subscribeLinkFailures`', for the same reason — the
  * thing that knows is never the thing that can say so.
  *
- * # Why it is not polled
+ * # Why it is pushed *and* polled
  *
  * `send-failed` is pushed from Rust the moment a message stops trying, from
  * whichever process ran the flush: the window's own timer, `mach send` from a
- * shell, an agent's reply. The list is re-read on that push and on mount, and
- * mount is the half that matters after a restart — the four failures in the
- * owner's store are eighteen days old, and no event was ever going to arrive
- * for them again.
+ * shell, an agent's reply. The same event is sent when the outbox loop finds a
+ * message stuck. The list is re-read on that push and on mount, and mount is
+ * the half that matters after a restart.
+ *
+ * The poll is for the failure that has no event: a Rust side that is not
+ * running its loop at all. Seven replies once sat unsent for a day because the
+ * thing that would have said so was the thing that had broken. Being late is a
+ * fact about the clock, so it is checked on one.
  */
 
 import { useEffect, useState } from "react";
 import { listFailedSends, type FailedSend } from "@/lib/compose";
 import { getDataSource, type Unsubscribe } from "@/lib/data";
+
+/** How often the list is re-read with nobody having asked. */
+const POLL_MS = 15_000;
 
 /** Everything currently listening. Module-level, so a write reaches all of it. */
 const listeners = new Set<() => void>();
@@ -65,6 +73,7 @@ export function useUnsent(): { failed: FailedSend[] } {
     };
 
     load();
+    const poll = window.setInterval(load, POLL_MS);
     listeners.add(load);
     void getDataSource()
       .onSendFailed(load)
@@ -76,6 +85,7 @@ export function useUnsent(): { failed: FailedSend[] } {
 
     return () => {
       live = false;
+      window.clearInterval(poll);
       listeners.delete(load);
       off?.();
     };

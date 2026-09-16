@@ -15,6 +15,7 @@ import { TitleBar } from "@/components/chrome/TitleBar";
 import { CalendarMode } from "@/components/calendar/CalendarMode";
 import { LinkFailures } from "@/components/mail/LinkFailures";
 import { MailMode } from "@/components/mail/MailMode";
+import { UnsentBanner } from "@/components/mail/UnsentBanner";
 import { UnsentPanel } from "@/components/mail/UnsentPanel";
 import { CommandPalette } from "@/components/palette/CommandPalette";
 import { ShortcutSheet } from "@/components/chrome/ShortcutSheet";
@@ -318,6 +319,8 @@ function Shell() {
   return (
     <div className="flex h-full w-full flex-col overflow-hidden bg-background text-foreground">
       <TitleBar />
+      {/* Renders nothing while every message he sent has gone. */}
+      <UnsentBanner />
 
       {/*
         Both modes stay mounted for the life of the window. Switching flips

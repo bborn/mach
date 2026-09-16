@@ -89,7 +89,25 @@ pub async fn send_message(
             .await
             .map_err(Into::into);
     }
-    dispatch(&state.db, &outbox, draft).await.map_err(Into::into)
+    // In a task of its own, so a panic comes back as an error. Tauri answers
+    // an async command from the task that runs it; a panic there means no
+    // answer at all, and the composer — already closed, its draft row already
+    // hidden — waited forever on a `send` that had died building the message.
+    // A reply to Bjork looked sent for two days that way and was never queued.
+    // An error reaches the composer's catch, which reopens the draft and says
+    // why.
+    let db = state.db.clone();
+    let op = payload_op(&draft).to_string();
+    match tokio::spawn(async move { dispatch(&db, &outbox, draft).await }).await {
+        Ok(result) => result.map_err(Into::into),
+        Err(join) => {
+            eprintln!("compose {op}: {join}");
+            Err(ComposeError::invalid(format!(
+                "Mach hit an internal error ({op}); nothing was sent"
+            ))
+            .into())
+        }
+    }
 }
 
 fn payload_op(payload: &Value) -> &str {
@@ -574,11 +592,15 @@ pub async fn dispatch(
             // Drafts written while the network was down are pushed here too.
             // The frontend flushes on mount, so "the app was offline yesterday"
             // resolves itself at launch rather than staying local for ever.
+            //
+            // Sends first. A draft push is a copy for his phone; a send is a
+            // promise already made on screen. When the push ran first, one draft
+            // it could not survive held every send behind it for a day.
+            let outcomes = outbox.flush_due(now).await?;
             let pushed = engine::remote::DraftRemoteSync::new(db.clone(), outbox.clients())
                 .push_pending(now)
                 .await
                 .unwrap_or(0);
-            let outcomes = outbox.flush_due(now).await?;
             // A day is long enough for "sent" to have been seen and short
             // enough that the table does not become a mail archive. The
             // tombstones go with them: they exist to beat an autosave by a few
@@ -599,7 +621,14 @@ pub async fn dispatch(
         // something. Its own op rather than a filter over `outbox` because it
         // answers a different question and costs more to answer: the recipients
         // and the words come out of the stored bytes, which is a parse per row.
-        "unsent" => Ok(json!({ "failed": outbox.failed()? })),
+        //
+        // Stuck rows ride in the same list, flagged, so every surface that
+        // counts failures counts a message that never left as well.
+        "unsent" => {
+            let mut rows = outbox.stuck(now)?;
+            rows.extend(outbox.failed()?);
+            Ok(json!({ "failed": rows }))
+        }
 
         "retry" => {
             let id = required_str(&payload, "outboxId")?;
@@ -670,6 +699,82 @@ fn required_str(payload: &Value, key: &str) -> Result<String, ComposeError> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| ComposeError::invalid(format!("{key} is required")))
+}
+
+// ---------------------------------------------------------------------------
+// the background drain
+// ---------------------------------------------------------------------------
+
+/// How often [`run_outbox`] looks for due mail.
+pub const OUTBOX_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send what is due, for the life of the app, whatever the window is doing.
+///
+/// Until this existed, the only things that flushed the queue were the window's
+/// mount and the timer each composer set for the end of its own undo window.
+/// Neither retries, and both swallowed a flush that went wrong — so when every
+/// flush panicked, nothing sent and nothing said so, for a day. The window's
+/// timer is still the fast path; this is the one that does not depend on it.
+///
+/// It also says when a message has gone stale in the queue. A row past
+/// [`STUCK_AFTER_MS`](engine::outbox::STUCK_AFTER_MS) is reported through the
+/// same `send-failed` event a refusal uses, once per row, so the window's
+/// Unsent surfaces pick it up without waiting to be asked.
+///
+/// Each tick runs in its own task, so a panic in one is logged and the next
+/// tick still happens.
+pub async fn run_outbox(app: tauri::AppHandle) {
+    use std::collections::HashSet;
+    use tauri::Manager;
+
+    let state = app.state::<AppState>();
+    let outbox = loop {
+        match Outbox::new(state.db.clone(), Arc::clone(&state.dispatcher.clients)) {
+            Ok(outbox) => {
+                break Arc::new(
+                    outbox.reporting_to(Arc::new(super::events::SendFailures::new(app.clone()))),
+                )
+            }
+            Err(error) => {
+                eprintln!("outbox: cannot open the queue, retrying: {error}");
+                tokio::time::sleep(OUTBOX_TICK).await;
+            }
+        }
+    };
+    let reported: Arc<std::sync::Mutex<HashSet<String>>> = Arc::default();
+
+    let mut ticker = tokio::time::interval(OUTBOX_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let outbox = Arc::clone(&outbox);
+        let reported = Arc::clone(&reported);
+        let sink = super::events::SendFailures::new(app.clone());
+        let tick = tokio::spawn(async move {
+            let now = now_ms();
+            if let Err(error) = outbox.flush_due(now).await {
+                eprintln!("outbox: flush: {error}");
+            }
+            let stuck = outbox.stuck(now)?;
+            let mut seen = reported.lock().unwrap_or_else(|e| e.into_inner());
+            seen.retain(|id| stuck.iter().any(|row| &row.id == id));
+            for row in stuck {
+                if seen.insert(row.id.clone()) {
+                    if let Some(entry) = outbox.get(&row.id)? {
+                        use engine::FailedSends as _;
+                        sink.send_failed(&entry, &row.error);
+                    }
+                }
+            }
+            Ok::<_, ComposeError>(())
+        })
+        .await;
+        match tick {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("outbox: {error}"),
+            Err(join) => eprintln!("outbox: tick did not finish: {join}"),
+        }
+    }
 }
 
 pub fn now_ms() -> i64 {

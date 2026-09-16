@@ -165,13 +165,36 @@ impl DraftRemoteSync {
 
     /// Push everything Gmail has not been told about. Runs at launch, so a
     /// draft written while the network was down is not stranded for ever.
+    ///
+    /// Each draft in its own task, and a failure in one is that draft's
+    /// problem. A draft whose body tripped a panic in `html::to_text` used to
+    /// end this loop — and, because the flush ran this first, every send behind
+    /// it — on every flush for a day. Now the draft is marked failed, which the
+    /// composer shows, and the sweep goes on to the next.
     pub async fn push_pending(&self, now_ms: i64) -> Result<usize> {
         let pending = draft::drafts_needing_push(&self.db)?;
         let mut pushed = 0;
         for draft in pending {
-            if self.push(&draft.id, now_ms).await? == RemoteState::Synced {
-                pushed += 1;
-            }
+            let sync = DraftRemoteSync {
+                db: self.db.clone(),
+                clients: Arc::clone(&self.clients),
+                user_id: self.user_id.clone(),
+            };
+            let id = draft.id.clone();
+            let problem = match tokio::spawn(async move { sync.push(&id, now_ms).await }).await {
+                Ok(Ok(RemoteState::Synced)) => {
+                    pushed += 1;
+                    continue;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(error)) => error.to_string(),
+                Err(join) if join.is_panic() => {
+                    "Mach hit an internal error saving this draft to Gmail".to_string()
+                }
+                Err(join) => join.to_string(),
+            };
+            eprintln!("draft push: {}: {problem}", draft.id);
+            let _ = self.record_failure(&draft, &problem, now_ms);
         }
         Ok(pushed)
     }

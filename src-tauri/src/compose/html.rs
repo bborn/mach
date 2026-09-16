@@ -506,9 +506,12 @@ impl<'a> Scanner<'a> {
                 return Some(Token::Open { name, attributes });
             }
         }
-        let end = self.rest[1..]
+        // Past the first *character*, not the first byte: a run that opens
+        // with `—` or a BOM put a byte index inside it and panicked.
+        let first = self.rest.chars().next().map_or(1, char::len_utf8);
+        let end = self.rest[first..]
             .find('<')
-            .map(|i| i + 1)
+            .map(|i| i + first)
             .unwrap_or(self.rest.len());
         let text = &self.rest[..end];
         self.rest = &self.rest[end..];
@@ -568,7 +571,9 @@ fn decode_entities(raw: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         let after = &rest[at..];
-        let Some(end) = after[..after.len().min(12)].find(';') else {
+        // An entity is ASCII, so looking for its `;` byte-wise cannot land
+        // inside a character the way slicing twelve bytes off could.
+        let Some(end) = after.bytes().take(12).position(|b| b == b';') else {
             out.push('&');
             rest = &after[1..];
             continue;

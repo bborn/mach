@@ -93,6 +93,23 @@ const REVIVAL_BACKOFF_MS: [i64; 3] = [5 * 60_000, 15 * 60_000, 45 * 60_000];
 /// The ceiling. A message revived this many times stops for good.
 const MAX_REVIVALS: i64 = REVIVAL_BACKOFF_MS.len() as i64;
 
+/// How far past its send time a message may still be sitting in `holding`
+/// before it counts as not sent.
+///
+/// A flush runs every few seconds from the background loop in `ipc::compose`,
+/// and a retriable failure puts the row back with `send_after` thirty seconds
+/// out, so a healthy queue never has a row this late. One that does is a queue
+/// nothing is draining — which is what a draft push panicking ahead of every
+/// flush looked like for a day, with seven replies drawn as sent in their
+/// conversations and none of them at Google.
+pub const STUCK_AFTER_MS: i64 = 60_000;
+
+/// The same question for a row claimed as `sending`. A send is one request, and
+/// an upload host request for a large attachment can take a while, so this is
+/// generous — but a claim that has outlived it belongs to a flush that is no
+/// longer running.
+pub const SENDING_STUCK_AFTER_MS: i64 = 10 * 60_000;
+
 /// Above this many raw bytes, a message goes to Gmail's upload host instead of
 /// being base64'd into a JSON field.
 ///
@@ -226,6 +243,11 @@ pub struct FailedSend {
     /// Names only. The bytes stay in the queue; this says what would go with it.
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// Still queued, well past the time it should have left. Not a refusal
+    /// from Google — nothing has asked Google anything — so it is offered
+    /// "send now" rather than "retry". See [`STUCK_AFTER_MS`].
+    #[serde(default)]
+    pub stuck: bool,
 }
 
 /// Told when a message stops trying.
@@ -242,6 +264,10 @@ pub trait FailedSends: Send + Sync {
 
 /// The queue. Holds the store and the per-account client factory, nothing else —
 /// no timer, no task, no channel, because the schedule lives in `send_after`.
+///
+/// `Clone` so a flush can hand each message to its own task: see
+/// [`Outbox::flush_due`].
+#[derive(Clone)]
 pub struct Outbox {
     db: Db,
     clients: Arc<dyn GoogleClients>,
@@ -524,14 +550,36 @@ impl Outbox {
     /// list that buries it under three from a fortnight ago has answered the
     /// wrong question.
     pub fn failed(&self) -> Result<Vec<FailedSend>> {
+        self.unsent_rows("state = 'failed'", [], false)
+    }
+
+    /// Everything still queued that should have left by now, newest first.
+    ///
+    /// The half of "what did not go" that [`Outbox::failed`] cannot see: a row
+    /// Google never refused because Google was never asked. See
+    /// [`STUCK_AFTER_MS`].
+    pub fn stuck(&self, now_ms: i64) -> Result<Vec<FailedSend>> {
+        self.unsent_rows(
+            "(state = 'holding' AND send_after <= ?1) OR (state = 'sending' AND send_after <= ?2)",
+            [now_ms - STUCK_AFTER_MS, now_ms - SENDING_STUCK_AFTER_MS],
+            true,
+        )
+    }
+
+    fn unsent_rows<P: rusqlite::Params>(
+        &self,
+        filter: &str,
+        params: P,
+        stuck: bool,
+    ) -> Result<Vec<FailedSend>> {
         Ok(self.db.read(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, account_id, thread_id, subject, last_error, created_at, \
                         attempts, rfc822 \
-                   FROM compose_outbox WHERE state = 'failed' \
-                  ORDER BY created_at DESC, id DESC",
-            )?;
-            let rows = stmt.query_map([], |row| {
+                   FROM compose_outbox WHERE {filter} \
+                  ORDER BY created_at DESC, id DESC"
+            ))?;
+            let rows = stmt.query_map(params, |row| {
                 let rfc822: Vec<u8> = row.get(7)?;
                 let parsed = ParsedMessage::of(&rfc822);
                 Ok(FailedSend {
@@ -548,11 +596,15 @@ impl Outbox {
                     error: row
                         .get::<_, Option<String>>(4)?
                         .filter(|text| !text.trim().is_empty())
-                        .unwrap_or_else(|| "Google refused the message".to_string()),
+                        .unwrap_or_else(|| {
+                            if stuck { "Not sent yet" } else { "Google refused the message" }
+                                .to_string()
+                        }),
                     created_at: row.get(5)?,
                     attempts: row.get(6)?,
                     body: parsed.body,
                     attachments: parsed.attachments,
+                    stuck,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -641,16 +693,89 @@ impl Outbox {
     /// a message queued in a window that then closed leaves on the next thing
     /// the app does. Nothing here reads the clock: `now_ms` is passed in, which
     /// is how the undo-window tests can move time without sleeping.
+    ///
+    /// # One message cannot hold up the next
+    ///
+    /// Each send runs in its own task. A panic there — the kind of bug that
+    /// once sat ahead of every flush for a day — is caught at the join, and so
+    /// is an ordinary error: either becomes that message's outcome and the loop
+    /// moves on to the next. A row that was claimed and then abandoned that way
+    /// is marked `failed` rather than left `sending`, where nothing would ever
+    /// look at it again. It is not retried automatically, because a request may
+    /// already have left.
     pub async fn flush_due(&self, now_ms: i64) -> Result<Vec<FlushOutcome>> {
-        self.revive_exhausted(now_ms)?;
+        if let Err(error) = self.revive_exhausted(now_ms) {
+            eprintln!("outbox: reviving failed sends: {error}");
+        }
         let due = self.due_ids(now_ms)?;
         let mut out = Vec::with_capacity(due.len());
         for id in due {
-            if let Some(outcome) = self.send_one(&id, now_ms).await? {
-                out.push(outcome);
-            }
+            let queue = self.clone();
+            let task_id = id.clone();
+            let joined =
+                tokio::spawn(async move { queue.send_one(&task_id, now_ms).await }).await;
+            let problem = match joined {
+                Ok(Ok(Some(outcome))) => {
+                    out.push(outcome);
+                    continue;
+                }
+                Ok(Ok(None)) => continue,
+                Ok(Err(error)) => error.to_string(),
+                Err(join) if join.is_panic() => {
+                    "Mach hit an internal error sending this message".to_string()
+                }
+                Err(join) => join.to_string(),
+            };
+            eprintln!("outbox: {id}: {problem}");
+            let abandoned = self.abandon(&id, &problem, now_ms).unwrap_or(false);
+            out.push(FlushOutcome {
+                id,
+                sent: false,
+                message_id: None,
+                error: Some(problem),
+                will_retry: !abandoned,
+            });
         }
         Ok(out)
+    }
+
+    /// A message whose send went wrong somewhere other than at Google.
+    ///
+    /// Only a row still claimed as `sending` is touched: that is the one no
+    /// flush will pick up again. It becomes `failed`, not retriable, because
+    /// the claim marked `send_issued` and a request may have left before
+    /// whatever broke — a person checks Gmail's Sent and decides. A row that
+    /// was never claimed is still `holding`; it keeps the reason on it, so the
+    /// Unsent panel can say why it is late, and the next flush tries again.
+    ///
+    /// Returns whether the row was moved to `failed`.
+    fn abandon(&self, id: &str, problem: &str, now_ms: i64) -> Result<bool> {
+        let Some(entry) = self.get(id)? else {
+            return Ok(false);
+        };
+        match entry.state {
+            OutboxState::Sending => {
+                self.record_failure(&entry, problem, false, now_ms, false)?;
+                Ok(true)
+            }
+            OutboxState::Holding => {
+                self.note_problem(id, problem)?;
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Why a row that is still waiting has not gone, without changing its state.
+    fn note_problem(&self, id: &str, problem: &str) -> Result<()> {
+        self.db.write(|conn| {
+            conn.execute(
+                "UPDATE compose_outbox SET last_error = ?2 WHERE id = ?1 AND state = 'holding'",
+                rusqlite::params![id, problem],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Pick back up the messages that stopped for a reason time can fix.
@@ -811,6 +936,22 @@ impl Outbox {
     /// that probe answers 404 for a message that was delivered perfectly, which
     /// is the exact direction a safety check must not fail in.
     async fn send_one(&self, id: &str, now_ms: i64) -> Result<Option<FlushOutcome>> {
+        // The account's client before the claim, not after. Credentials are
+        // restored on a thread of their own at launch, so a flush in the first
+        // seconds can find none; claiming first turned that into a row stuck in
+        // `sending` for good. Unclaimed, the row stays `holding` with the reason
+        // on it and the next flush tries again.
+        let Some(unclaimed) = self.get(id)? else {
+            return Ok(None);
+        };
+        let client = match self.clients.gmail(unclaimed.account_id) {
+            Ok(client) => client,
+            Err(error) => {
+                self.note_problem(id, &error.to_string())?;
+                return Err(error.into());
+            }
+        };
+
         // The read and the claim are one transaction on purpose: what is being
         // read is whether *this* claim is the first, and a second flush landing
         // between them would see zero twice.
@@ -849,7 +990,6 @@ impl Outbox {
             )?)
         })?;
 
-        let client = self.clients.gmail(entry.account_id)?;
         let thread = entry.gmail_thread_id.as_deref();
         // Two decisions, and they are independent.
         //
@@ -1067,6 +1207,17 @@ impl Outbox {
         now_ms: i64,
         retry: bool,
     ) -> Result<()> {
+        self.record_failure(entry, &error.to_string(), error.is_retriable(), now_ms, retry)
+    }
+
+    fn record_failure(
+        &self,
+        entry: &OutboxEntry,
+        message: &str,
+        retriable: bool,
+        now_ms: i64,
+        retry: bool,
+    ) -> Result<()> {
         let state = if retry {
             OutboxState::Holding
         } else {
@@ -1090,9 +1241,9 @@ impl Outbox {
                 rusqlite::params![
                     entry.id,
                     state.as_str(),
-                    error.to_string(),
+                    message,
                     send_after,
-                    error.is_retriable() as i64,
+                    retriable as i64,
                     now_ms,
                 ],
             )?;
@@ -1125,7 +1276,7 @@ impl Outbox {
         // queue reads it before the row says `failed`.
         if !retry {
             if let Some(sink) = self.sink.as_ref() {
-                sink.send_failed(entry, &error.to_string());
+                sink.send_failed(entry, message);
             }
         }
         Ok(())
@@ -1138,24 +1289,53 @@ impl Outbox {
     /// `send_issued` is the one thing this does **not** touch — see
     /// [`Outbox::send_one`], where the difference between the two is the
     /// difference between one copy of a message and two.
+    ///
+    /// A stuck row takes the same gesture — "send now" — and it means the same
+    /// thing: due immediately, with a fresh budget. That includes a claim that
+    /// has outlived [`SENDING_STUCK_AFTER_MS`], which the person is choosing
+    /// to send having been told it may already have gone.
     pub fn retry(&self, id: &str, now_ms: i64) -> Result<bool> {
         Ok(self.db.write(|conn| {
             Ok(conn.execute(
                 "UPDATE compose_outbox
                     SET state = 'holding', send_after = ?2, attempts = 0, revivals = 0
-                  WHERE id = ?1 AND state = 'failed'",
-                rusqlite::params![id, now_ms],
+                  WHERE id = ?1
+                    AND (state IN ('failed', 'holding')
+                         OR (state = 'sending' AND send_after <= ?3))",
+                rusqlite::params![id, now_ms, now_ms - SENDING_STUCK_AFTER_MS],
             )? > 0)
         })?)
     }
 
     /// Throw a failed message away, bytes and all.
+    ///
+    /// A failed row's copy in the conversation went when it failed. A stuck
+    /// one's is still there, drawn as sent, so it goes here — otherwise the
+    /// discarded reply would go on looking delivered.
     pub fn discard(&self, id: &str) -> Result<bool> {
         Ok(self.db.write(|conn| {
-            Ok(conn.execute(
+            let removed = conn.execute(
                 "DELETE FROM compose_outbox WHERE id = ?1 AND state != 'sending'",
                 [id],
-            )? > 0)
+            )? > 0;
+            if removed {
+                let placeholder = placeholder_message_id(id);
+                let thread_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT thread_id FROM messages WHERE gmail_message_id = ?1",
+                        [&placeholder],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(thread_id) = thread_id {
+                    conn.execute("DELETE FROM messages WHERE gmail_message_id = ?1", [&placeholder])?;
+                    conn.execute(
+                        "UPDATE threads SET message_count = MAX(message_count - 1, 0) WHERE id = ?1",
+                        [thread_id],
+                    )?;
+                }
+            }
+            Ok(removed)
         })?)
     }
 }

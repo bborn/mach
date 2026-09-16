@@ -153,6 +153,16 @@ function threadMessage(over: Partial<Message> = {}, expanded = false): string {
  * other in front of the owner is the failure; a colour swap would not have
  * fixed it.
  */
+describe("a reply still in the outbox", () => {
+  it("says so, because it has not reached anybody yet", () => {
+    expect(threadMessage({ inOutbox: true })).toContain(">Outbox<");
+  });
+
+  it("is not said of a delivered message", () => {
+    expect(threadMessage()).not.toContain(">Outbox<");
+  });
+});
+
 describe("a draft inside a conversation", () => {
   it("says the word, so it survives greyscale and a screen reader", () => {
     const html = threadMessage({ isDraft: true });

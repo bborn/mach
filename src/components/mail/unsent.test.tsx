@@ -47,6 +47,7 @@ vi.mock("@/lib/compose", async (importOriginal) => {
 });
 
 const { UnsentPanel } = await import("./UnsentPanel");
+const { UnsentBanner } = await import("./UnsentBanner");
 
 function failure(over: Partial<FailedSend> = {}): FailedSend {
   return {
@@ -240,6 +241,49 @@ describe("the panel", () => {
       (secondButtons[1] as HTMLButtonElement).click();
     });
     expect(discarded).toEqual(["ob-2"]);
+  });
+
+  it("offers to send a message that is stuck rather than refused", async () => {
+    rows = [failure({ id: "ob-3", stuck: true, error: "Not sent yet" })];
+    await open();
+    const row = host.querySelector('[data-unsent-id="ob-3"]');
+    const buttons = [...(row?.querySelectorAll("button") ?? [])];
+    expect(buttons.map((b) => b.textContent)).toEqual(["Send now", "Discard"]);
+    expect(row?.textContent).toContain("Not sent yet");
+  });
+
+  it("says so across the top of the window, and opens the list from there", async () => {
+    await act(async () => {
+      root.render(
+        <KeymapProvider>
+          <MachProvider>
+            <UnsentBanner />
+            <UnsentPanel />
+          </MachProvider>
+        </KeymapProvider>,
+      );
+    });
+    const banner = host.querySelector<HTMLButtonElement>("[data-unsent-banner]");
+    expect(banner?.textContent).toContain("2 messages not sent");
+    expect(host.querySelector("[data-unsent-id]")).toBeNull();
+    await act(async () => {
+      banner?.click();
+    });
+    expect(host.querySelector('[data-unsent-id="ob-1"]')).not.toBeNull();
+  });
+
+  it("has no banner while everything has gone", async () => {
+    rows = [];
+    await act(async () => {
+      root.render(
+        <KeymapProvider>
+          <MachProvider>
+            <UnsentBanner />
+          </MachProvider>
+        </KeymapProvider>,
+      );
+    });
+    expect(host.querySelector("[data-unsent-banner]")).toBeNull();
   });
 
   it("is not reachable when there is nothing to show", async () => {

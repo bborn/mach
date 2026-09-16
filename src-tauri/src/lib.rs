@@ -245,6 +245,11 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(ipc::events::run(handle, sync, start_sync));
 
+            // The outbox drain. Sends do not wait on the window to ask for
+            // them, and a message that has sat in the queue past its time is
+            // reported rather than left drawn as sent. See `run_outbox`.
+            tauri::async_runtime::spawn(ipc::compose::run_outbox(app.handle().clone()));
+
             // The snooze clock. Its first sweep is immediate, which is the only
             // thing that brings back a conversation whose wake time passed while
             // the app was closed — the wake time is a row, so there is nothing

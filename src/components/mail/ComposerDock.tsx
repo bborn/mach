@@ -37,6 +37,7 @@ import {
   type PendingAttachment,
 } from "./composer-attach";
 import { replyTarget } from "./thread-cursor";
+import { unsentChanged } from "./use-unsent";
 import { noteSent } from "@/lib/contacts";
 import { clockTime } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -71,6 +72,9 @@ import {
   type DraftKind,
   type OutboxEntry,
 } from "@/lib/compose";
+
+/** How long `⌘⏎` may wait on the queue write before it is reported as not sent. */
+const SEND_WATCHDOG_MS = 20_000;
 
 /**
  * Everything around the composers: when they open, what they do with their
@@ -1330,7 +1334,21 @@ export function ComposerDock() {
        * exists, so ⌘Z can be pressed against an id Rust has never heard of;
        * `recall` waits on this instead of reading `pending.id`.
        */
+      /*
+       * A send that has not queued after this long says so. Rust turns a panic
+       * into an error now, but a call that simply never answers would still
+       * look exactly like a message that went: the composer is closed and the
+       * draft row hidden. The draft is not reopened here — the queue write may
+       * yet land, and two copies is its own failure — it is only reported.
+       */
+      const watchdog = window.setTimeout(() => {
+        actions.setStatus(
+          `Not sent: “${draft.subject || "(no subject)"}” has not reached the outbox`,
+          "error",
+        );
+      }, SEND_WATCHDOG_MS);
       queued.current = sendDraft(draft, sendAfter)
+        .finally(() => window.clearTimeout(watchdog))
         .then((result) => {
           // Only if this send is still the one on screen — a second ⌘⏎ while
           // the first was in flight would otherwise be overwritten by it.
@@ -1395,13 +1413,18 @@ export function ComposerDock() {
 
   // Drain anything a previous session left behind. This is the half of the
   // durability claim that no timer can provide.
+  //
+  // A flush that throws says so. It used to be swallowed here and below, and a
+  // flush that threw on every call was what kept seven replies from leaving.
   useEffect(() => {
     void flushOutbox()
       .then(({ pending: rows }) => {
         const holding = rows.find((row) => row.state === "holding");
         if (holding) setPending(holding);
       })
-      .catch(() => {});
+      .catch((error: unknown) => {
+        actions.setStatus(`The outbox did not send: ${String(error)}`, "error");
+      });
   }, []);
 
   // When the window closes, ask Rust to send.
@@ -1422,11 +1445,16 @@ export function ComposerDock() {
       recalled.current = null;
       setPending(null);
       void (async () => {
-        const { outcomes } = await flushOutbox().catch(() => ({ outcomes: [] }));
-        const mine = outcomes.find((o) => o.id === pending.id);
-        if (mine && !mine.sent) {
-          actions.setStatus(mine.error ?? "That message could not be sent", "error");
+        try {
+          const { outcomes } = await flushOutbox();
+          const mine = outcomes.find((o) => o.id === pending.id);
+          if (mine && !mine.sent) {
+            actions.setStatus(mine.error ?? "That message could not be sent", "error");
+          }
+        } catch (error) {
+          actions.setStatus(`Not sent: ${String(error)}`, "error");
         }
+        unsentChanged();
         actions.reload();
       })();
     }, delay);

@@ -43,7 +43,7 @@ use compose::markdown;
 use compose::mime::{
     build_rfc822, forward_subject, references_for_reply, reply_subject, Mailbox, Outgoing,
 };
-use compose::outbox::{Outbox, OutboxState, UNDO_WINDOW_MS};
+use compose::outbox::{Outbox, OutboxState, STUCK_AFTER_MS, UNDO_WINDOW_MS};
 
 // ============================================================== test doubles
 
@@ -1609,6 +1609,151 @@ async fn the_unsent_op_answers_over_ipc() {
         .unwrap()
         .contains("Invalid To header"));
     assert!(failed[0]["to"].as_array().is_some_and(|to| !to.is_empty()));
+}
+
+// ------------------------------------------- what never left, and says so
+
+#[tokio::test]
+async fn a_message_nothing_sent_is_stuck_once_it_is_late() {
+    // Seven replies sat in `holding` for a day with nothing draining the queue,
+    // drawn as sent in their conversations. `failed()` could not see them:
+    // Google had never been asked.
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "<div>Any updates?</div>"), NOW, 1)
+        .unwrap();
+    let entry = out.queue(&built, NOW, NOW + UNDO_WINDOW_MS).unwrap();
+
+    let due = NOW + UNDO_WINDOW_MS;
+    assert!(out.stuck(due).unwrap().is_empty(), "inside its window is not late");
+    assert!(
+        out.stuck(due + STUCK_AFTER_MS - 1).unwrap().is_empty(),
+        "nor is a message a flush is about to reach"
+    );
+
+    let stuck = out.stuck(due + STUCK_AFTER_MS).unwrap();
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(stuck[0].id, entry.id);
+    assert!(stuck[0].stuck);
+    assert!(stuck[0].body.contains("Any updates?"));
+    assert!(!stuck[0].to.is_empty());
+    assert!(out.failed().unwrap().is_empty(), "stuck is not a refusal");
+}
+
+#[tokio::test]
+async fn discarding_a_stuck_message_stops_it_looking_sent() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    let entry = out.queue(&built, NOW, NOW).unwrap();
+    assert_eq!(messages_in(&db, thread).len(), 2);
+
+    assert!(out.discard(&entry.id).unwrap());
+    assert_eq!(
+        messages_in(&db, thread).len(),
+        1,
+        "the optimistic copy goes with the row"
+    );
+    assert!(out.stuck(NOW + STUCK_AFTER_MS * 10).unwrap().is_empty());
+    assert!(out.flush_due(NOW + 1).await.unwrap().is_empty(), "and nothing is sent");
+}
+
+/// Knows no accounts: what the window's clients look like in the seconds
+/// before credentials are restored at launch.
+struct NoAccounts;
+
+impl GoogleClients for NoAccounts {
+    fn gmail(&self, account_id: i64) -> Result<mach_lib::google::gmail::GmailClient, mach_lib::commands::CommandError> {
+        Err(mach_lib::commands::CommandError::UnknownAccount { account_id })
+    }
+    fn calendar(
+        &self,
+        account_id: i64,
+    ) -> Result<mach_lib::google::calendar::CalendarClient, mach_lib::commands::CommandError> {
+        Err(mach_lib::commands::CommandError::UnknownAccount { account_id })
+    }
+}
+
+#[tokio::test]
+async fn a_send_with_no_client_is_not_claimed_and_goes_when_there_is_one() {
+    // The claim used to come first, so this left the row `sending` for good:
+    // never flushed again, never listed anywhere.
+    let (db, _a, thread, _m) = seeded();
+    let early = Outbox::new(db.clone(), Arc::new(NoAccounts)).unwrap();
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    let entry = early.queue(&built, NOW, NOW).unwrap();
+
+    let outcomes = early.flush_due(NOW).await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(!outcomes[0].sent);
+    assert!(outcomes[0].will_retry);
+    let row = early.get(&entry.id).unwrap().unwrap();
+    assert_eq!(row.state, OutboxState::Holding, "still queued");
+    assert!(row.last_error.is_some(), "with the reason on it");
+
+    let transport = FakeTransport::always_ok();
+    let later = outbox(&db, Arc::clone(&transport));
+    let outcomes = later.flush_due(NOW + 5_000).await.unwrap();
+    assert!(outcomes[0].sent, "{outcomes:?}");
+}
+
+#[tokio::test]
+async fn one_message_that_cannot_send_does_not_hold_up_the_next() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let stranger = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "one"), NOW, 1).unwrap();
+    let first = out.queue(&stranger, NOW, NOW).unwrap();
+    // An account the client factory has never heard of.
+    db.write(|conn| {
+        conn.execute("UPDATE compose_outbox SET account_id = 99 WHERE id = ?1", [&first.id])?;
+        Ok(())
+    })
+    .unwrap();
+    let ordinary = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "two"), NOW + 1, 1).unwrap();
+    let second = out.queue(&ordinary, NOW + 1, NOW + 1).unwrap();
+
+    let outcomes = out.flush_due(NOW + 2).await.unwrap();
+    let sent: Vec<_> = outcomes.iter().filter(|o| o.sent).map(|o| o.id.clone()).collect();
+    assert_eq!(sent, vec![second.id]);
+}
+
+#[tokio::test]
+async fn the_unsent_op_lists_a_stuck_message_beside_the_failures() {
+    let (db, _a, thread, _m) = seeded();
+    let out = outbox(&db, FakeTransport::always_ok());
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    let entry = out.queue(&built, NOW, NOW).unwrap();
+
+    // `dispatch` reads the real clock, and NOW is months before it.
+    let answer = dispatch(&db, &out, json!({ "op": "unsent" })).await.unwrap();
+    let rows = answer["failed"].as_array().expect("a list");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], entry.id);
+    assert_eq!(rows[0]["stuck"], true);
+
+    // Send now: due immediately, and the next flush takes it.
+    assert!(out.retry(&entry.id, NOW + 1).unwrap());
+    assert!(out.flush_due(NOW + 1).await.unwrap()[0].sent);
+}
+
+#[tokio::test]
+async fn a_draft_opening_with_an_em_dash_does_not_stop_the_flush() {
+    // The incident itself: the push of this draft panicked ahead of every send
+    // for a day, and the flush that carried seven replies never got to them.
+    let (db, _a, thread, _m) = seeded();
+    let transport = FakeTransport::always_ok();
+    let out = outbox(&db, Arc::clone(&transport));
+    let built = draft::build(&db, &reply_draft(&db, thread, DraftKind::Reply, "hi"), NOW, 1).unwrap();
+    let entry = out.queue(&built, NOW, NOW).unwrap();
+    let pending = reply_draft(&db, thread, DraftKind::Reply, "<div>— Bruno</div>");
+    draft::save_draft(&db, &pending, NOW).unwrap();
+
+    let answer = dispatch(&db, &out, json!({ "op": "flush" })).await.unwrap();
+    let outcomes = answer["outcomes"].as_array().unwrap();
+    assert!(
+        outcomes.iter().any(|o| o["id"] == entry.id && o["sent"] == true),
+        "{answer}"
+    );
 }
 
 #[tokio::test]
@@ -3203,6 +3348,27 @@ const TEXT_CASES: &[(&str, &str)] = &[
 fn the_plain_text_twin_renders_exactly_these_cases() {
     for (html_source, expected) in TEXT_CASES {
         assert_eq!(html::to_text(html_source), *expected, "input: {html_source:?}");
+    }
+}
+
+/// The scanner sliced text runs by byte, so a run that opened with a character
+/// wider than one byte panicked. A draft with a line starting `— ` did that on
+/// every flush for a day, and because the draft push runs ahead of the outbox,
+/// seven replies sat unsent behind it. A pasted BOM did the same.
+#[test]
+fn text_opening_with_a_wide_character_is_not_a_panic() {
+    for wide in ["—", "\u{feff}", "é", "日本", "👍🏽"] {
+        for source in [
+            format!("<div>{wide} Bruno</div>"),
+            format!("{wide}"),
+            format!("<div>a</div>{wide}<div>b</div>"),
+            format!("<div>&amp;{wide}{wide}{wide}{wide}{wide}{wide}</div>"),
+            format!("<div>&{wide}{wide}{wide}{wide}{wide}{wide};</div>"),
+            format!("<a href=\"x\">{wide}</a>"),
+        ] {
+            let text = html::to_text(&source);
+            assert!(text.contains(wide), "input {source:?} gave {text:?}");
+        }
     }
 }
 

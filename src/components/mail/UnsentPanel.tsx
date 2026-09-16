@@ -110,10 +110,14 @@ export function UnsentPanel() {
            * whole message, and Rust says the other thing itself — a second
            * refusal comes back through `send-failed` with Google's reason.
            */
-          await flushOutbox().catch(() => undefined);
+          const { outcomes } = await flushOutbox();
+          const mine = outcomes.find((outcome) => outcome.id === row.id);
+          if (mine && !mine.sent) {
+            actions.setStatus(mine.error ?? "Not sent", "error");
+          }
         }
-      } catch {
-        actions.setStatus("Could not reach the queue", "error");
+      } catch (error) {
+        actions.setStatus(`Could not reach the outbox: ${String(error)}`, "error");
       } finally {
         setBusy((ids) => ids.filter((id) => id !== row.id));
         // Every surface showing the queue re-reads, this one included.
@@ -249,7 +253,7 @@ function UnsentRow({
 
       <div className="flex gap-1 pt-1.5">
         <Button ref={retryRef} size="sm" variant="subtle" disabled={busy} onClick={onRetry}>
-          Retry
+          {row.stuck ? "Send now" : "Retry"}
         </Button>
         <Button size="sm" variant="danger" disabled={busy} onClick={onDiscard}>
           Discard
