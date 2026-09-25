@@ -70,6 +70,21 @@ describe("the markdown-ish grammar", () => {
     expect(markdownToHtml(source)).toBe(expected);
   });
 
+  // A numbered list written with blank lines between the items went out to a
+  // real recipient as "1. 1. 1.": each blank line closed the <ol>, and the next
+  // item opened a fresh one, starting again at one.
+  it("keeps counting when a numbered list is written with air between the items", () => {
+    const html = markdownToHtml("1. Coverage\n\n2. Open vs closed\n\n3. Fields");
+
+    expect(html).toBe(
+      '<ol><li>Coverage</li></ol><ol start="2"><li>Open vs closed</li></ol><ol start="3"><li>Fields</li></ol>',
+    );
+  });
+
+  it("leaves a tight numbered list starting at one alone", () => {
+    expect(markdownToHtml("1. one\n2. two")).toBe("<ol><li>one</li><li>two</li></ol>");
+  });
+
   it("never emits markup the user did not type", () => {
     const html = markdownToHtml('<img src=x onerror=alert(1)> <a href="javascript:x">hi</a>');
     expect(html).not.toContain("<img");

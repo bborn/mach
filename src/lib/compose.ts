@@ -1117,12 +1117,17 @@ export function markdownToHtml(source: string): string {
       continue;
     }
 
-    if (orderedBody(line) !== null) {
-      out += "<ol>";
+    const first = orderedItem(line);
+    if (first) {
+      // A blank line between items ends the list, so "1. / 2. / 3." written with
+      // air between them used to come out as three lists, each starting at 1 —
+      // which is how a numbered list reached a real recipient as "1. 1. 1.".
+      // The number the person typed is the one that shows.
+      out += first.number === 1 ? "<ol>" : `<ol start="${first.number}">`;
       while (i < lines.length) {
-        const text = orderedBody(lines[i]);
-        if (text === null) break;
-        out += `<li>${inline(text)}</li>`;
+        const item = orderedItem(lines[i]);
+        if (item === null) break;
+        out += `<li>${inline(item.text)}</li>`;
         i += 1;
       }
       out += "</ol>";
@@ -1167,8 +1172,13 @@ function bulletBody(line: string): string | null {
 }
 
 function orderedBody(line: string): string | null {
-  const match = /^\s*\d+[.)] (.*)$/.exec(line);
-  return match ? match[1].trim() : null;
+  return orderedItem(line)?.text ?? null;
+}
+
+/** The number as well as the text, so a list broken by blank lines can resume. */
+function orderedItem(line: string): { number: number; text: string } | null {
+  const match = /^\s*(\d+)[.)] (.*)$/.exec(line);
+  return match ? { number: Number(match[1]), text: match[2].trim() } : null;
 }
 
 function paragraph(body: string): string {
