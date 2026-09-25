@@ -1444,7 +1444,13 @@ async fn draft_reply(ctx: &ToolContext, input: &Value) -> Result<ToolOutcome, Ag
         .cloned()
         .ok_or_else(|| AgentError::invalid("the composer returned no draft"))?;
 
+    // `prepare` answers `Html`, because the draft it builds is about to open in
+    // the rich-text editor and the first keystroke there is HTML. This body did
+    // not come from that editor: the tool asks for markdown-ish text, and
+    // leaving the format alone filed it as HTML, where blank lines mean
+    // nothing. A reply written as eight paragraphs reached the composer as one.
     draft["body"] = json!(body);
+    draft["bodyFormat"] = json!("markdown");
     if let Some(to) = input.get("to").and_then(Value::as_array) {
         let recipients: Vec<Value> = to
             .iter()

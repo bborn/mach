@@ -1073,6 +1073,45 @@ async fn seed_draft(harness: &Harness, thread_id: i64) -> String {
     outcome.payload["draft"]["id"].as_str().unwrap().to_string()
 }
 
+/// A reply the tool wrote is markdown, whatever `prepare` said.
+///
+/// `prepare` answers `Html` for the editor that is about to open. This body
+/// never goes near that editor, and filed as HTML its blank lines meant
+/// nothing: a reply written as several paragraphs arrived in the composer as a
+/// single run-on block, which is how it reached a real recipient.
+#[tokio::test]
+async fn a_drafted_reply_keeps_its_paragraphs() {
+    let harness = Harness::new("paragraphs");
+    let (_account_id, thread_id) = seed(&harness.db);
+
+    let outcome = tools::execute(
+        &harness.tool_context(),
+        "draft_reply",
+        &json!({ "threadId": thread_id, "body": "First paragraph.\n\nSecond paragraph." }),
+    )
+    .await
+    .expect("drafted");
+
+    assert_eq!(
+        outcome.payload["draft"]["bodyFormat"],
+        json!("markdown"),
+        "the tool's body is markdown-ish, so the draft must say so: {}",
+        outcome.payload["draft"]
+    );
+
+    // And the blank line survives the round trip through the store, since that
+    // is the character the paragraph break is made of.
+    let saved =
+        mach_lib::ipc::compose::engine::draft::load_draft_for_thread(&harness.db.db, thread_id)
+            .expect("loaded")
+            .expect("a draft");
+    assert!(
+        saved.body.contains("First paragraph.\n\nSecond paragraph."),
+        "{:?}",
+        saved.body
+    );
+}
+
 #[tokio::test]
 async fn the_approval_gate_holds_an_outbound_action() {
     let harness = Harness::new("approval");
