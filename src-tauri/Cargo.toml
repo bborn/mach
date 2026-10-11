@@ -74,7 +74,7 @@ thiserror = "2.0.19"
 chrono = "0.4.45"
 base64 = "0.23.1"
 ammonia = "4.1.4"
-mail-builder = "0.4.4"
+mail-builder = "0.5.0"
 mail-parser = "0.11.5"
 # The system save panel, for "Save attachment as…". Registered at runtime from
 # `ipc::attachments` rather than in the builder chain — see `save_panel`.
