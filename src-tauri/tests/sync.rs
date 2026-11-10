@@ -533,14 +533,25 @@ impl FakeGoogle {
                     .filter(|(id, _)| *id > start)
                     .map(|(_, record)| record.clone())
                     .collect();
-                HttpResponse::json(
-                    200,
-                    json!({
-                        "history": records,
-                        "historyId": mailbox.current_history_id().to_string(),
-                    })
-                    .to_string(),
-                )
+                // Paged the way Gmail pages it: `maxResults` records at a time,
+                // with an opaque token for the rest.
+                let offset: usize = query
+                    .get("pageToken")
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(0);
+                let size: usize = query
+                    .get("maxResults")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(usize::MAX);
+                let end = offset.saturating_add(size).min(records.len());
+                let mut body = json!({
+                    "history": records[offset.min(end)..end],
+                    "historyId": mailbox.current_history_id().to_string(),
+                });
+                if end < records.len() {
+                    body["nextPageToken"] = json!(end.to_string());
+                }
+                HttpResponse::json(200, body.to_string())
             }
 
             other => HttpResponse::json(
@@ -1404,6 +1415,65 @@ async fn incremental_sync_applies_every_history_record_type() {
     let watermark_after = history_id(&db, account_id).unwrap();
     assert_ne!(watermark_before, watermark_after);
 
+    assert_store_is_consistent(&db);
+}
+
+/// The owner's personal account went five days without mail. Every pass
+/// re-read the whole backlog, ran into Gmail's per-user quota partway through,
+/// threw everything away and started again. A failure on one page must not
+/// cost the pages before it.
+#[tokio::test]
+async fn a_failure_partway_through_history_keeps_the_pages_already_applied() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+    let account_id = synced_account(&db, &google, vec![FakeMessage::new("m0", "t0").at(500)]).await;
+    let token = format!("tok-{account_id}");
+
+    google.with(&token, |mailbox| {
+        for n in 1..=6 {
+            mailbox.deliver(FakeMessage::new(&format!("m{n}"), &format!("t{n}")).at(1_000 * n));
+        }
+    });
+    let watermark_before: u64 = history_id(&db, account_id).unwrap().parse().unwrap();
+
+    // Two records a page, so six deliveries are three pages. The fourth fetch
+    // fails: the first page from Gmail's quota's point of view went through,
+    // the second did not.
+    let config = SyncConfig {
+        history_page_size: 2,
+        ..mail_config()
+    };
+    let served = google.gets_served();
+    google.hooks(|h| h.fail_gets_after = Some(served + 2));
+
+    let engine = new_engine(&db, Arc::clone(&google), config.clone());
+    let pass = engine.sync_once().await;
+    assert!(!pass.account(account_id).unwrap().is_ok(), "the injected failure must surface");
+
+    assert_eq!(message_count(&db), 3, "the first page's two messages must have landed");
+    let partial: u64 = history_id(&db, account_id).unwrap().parse().unwrap();
+    assert!(
+        partial > watermark_before,
+        "the watermark must move past the page that landed"
+    );
+
+    // The next pass resumes from there rather than from the old watermark.
+    google.hooks(|h| h.fail_gets_after = None);
+    let history_before = google.requests_matching("/history?").len();
+    let pass = new_engine(&db, Arc::clone(&google), config).sync_once().await;
+    assert!(pass.account(account_id).unwrap().is_ok());
+    let resumed = &google.requests_matching("/history?")[history_before];
+    assert!(
+        resumed.contains(&format!("startHistoryId={partial}")),
+        "must resume from the partial watermark, got {resumed}"
+    );
+
+    assert_eq!(message_count(&db), 7);
+    let final_watermark = history_id(&db, account_id).unwrap();
+    assert_eq!(
+        final_watermark,
+        google.with(&token, |m| m.current_history_id()).to_string()
+    );
     assert_store_is_consistent(&db);
 }
 

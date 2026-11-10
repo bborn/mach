@@ -602,22 +602,98 @@ impl MailSync {
 
     // ------------------------------------------------------------ incremental
 
-    /// Replay `users.history.list` from `start` and persist the new watermark
-    /// only once the whole sweep is durably applied.
+    /// Replay `users.history.list` from `start`, one page at a time, moving the
+    /// watermark as each page is durably applied.
+    ///
+    /// # Why page by page
+    ///
+    /// This used to read the entire sweep, fetch every message it named, and
+    /// only then write anything. That made the sweep all-or-nothing, and the
+    /// cost of "nothing" grows with the backlog. On 2026-11-09 the owner's
+    /// personal account had been stuck for five days: each pass re-read five
+    /// days of history and re-fetched every message in it, ran into Gmail's
+    /// per-user, per-minute quota ("Units per minute per user") partway
+    /// through, discarded all of it, and tried again a minute later with the
+    /// quota already spent. The backlog only grew, so it never got through.
+    ///
+    /// Now each page carries its own watermark: the id of its last record, or,
+    /// on the final page, the mailbox's `historyId`. Gmail accepts any history
+    /// id as `startHistoryId`, so a pass that fails on page seven resumes from
+    /// the end of page six, and a backlog of any size drains a page at a time
+    /// however tight the quota is.
     ///
     /// `voice` decides whether the messages this sweep stores are treated as
     /// mail *arriving* or merely as mail being *found*. See [`Voice`].
     async fn incremental(&self, start: &str, voice: Voice) -> Result<u64, SyncError> {
         self.report.phase(SyncPhase::Incremental);
-        let account_id = self.account_id;
 
         let query = HistoryListQuery::new(start)
             .history_types(HistoryType::all())
             .max_results(self.config.history_page_size);
-        // No limit: truncating a sweep while keeping its watermark would skip
-        // records permanently.
-        let sweep = self.gmail.history_list_all("me", &query, None).await?;
-        self.cancel.check()?;
+
+        let mut written = 0u64;
+        let mut arrived: Vec<String> = Vec::new();
+        let mut page_token: Option<String> = None;
+        let outcome: Result<(), SyncError> = async {
+            loop {
+                let page = self
+                    .gmail
+                    .history_list("me", &query, page_token.as_deref())
+                    .await?;
+                self.cancel.check()?;
+                let next = page.next_page_token.filter(|t| !t.is_empty());
+                let watermark = if next.is_none() {
+                    page.history_id
+                        .or_else(|| page.history.last().map(|r| r.id.clone()))
+                } else {
+                    page.history.last().map(|r| r.id.clone())
+                }
+                .filter(|id| !id.is_empty());
+
+                let (stored, mut page_arrived) =
+                    self.apply_history_page(page.history, watermark).await?;
+                written += stored;
+                arrived.append(&mut page_arrived);
+                self.report.add_messages(stored as i64);
+
+                match next {
+                    Some(token) => page_token = Some(token),
+                    None => return Ok(()),
+                }
+            }
+        }
+        .await;
+
+        // After the commits, never inside them: nothing is announced that a
+        // crash could take back, and `announce` opens its own short transaction
+        // to record what it said. Once per pass rather than per page, so a long
+        // catch-up is one banner and not one for every page; and on failure as
+        // well as success, because the pages before the failure did land.
+        //
+        // The gate is structural rather than a filter: a backfill stores a year
+        // of mail, every message of it an "arrival" as far as the store is
+        // concerned, and only an incremental pass on an account that already had
+        // a watermark reaches this. Without that, a new account's first sync
+        // would announce tens of thousands of messages.
+        if voice == Voice::Announce {
+            crate::notify::announce(&self.db, self.account_id, &arrived);
+        }
+
+        outcome.map(|()| written)
+    }
+
+    /// Apply one page of history and, in the same transaction as its last
+    /// change, move the watermark to `watermark`.
+    async fn apply_history_page(
+        &self,
+        records: Vec<g::HistoryRecord>,
+        watermark: Option<String>,
+    ) -> Result<(u64, Vec<String>), SyncError> {
+        let account_id = self.account_id;
+        let sweep = g::HistorySweep {
+            records,
+            history_id: watermark,
+        };
 
         // Which message bodies do we actually have to go and get? Anything
         // added, plus anything whose labels moved that we have never seen. Not
@@ -683,13 +759,12 @@ impl MailSync {
         let watermark = sweep.history_id.clone();
 
         // One transaction per `HISTORY_APPLY_CHUNK` records rather than one for
-        // the whole sweep.
+        // the whole page.
         //
-        // The sweep is unbounded: it is everything that happened since the
-        // watermark, so an app that was closed over a weekend replays tens of
-        // thousands of records, and as a single transaction that is a write lock
-        // held for as long as it takes — which is the one case where "a user
-        // command waits at most one batch" would have meant nothing.
+        // A page is `history_page_size` records (500 by default), and as a
+        // single transaction that is a write lock held for as long as the page
+        // takes, which is the one case where "a user command waits at most one
+        // batch" would have meant nothing.
         //
         // Chunking does not weaken either property this function owns.
         // Re-applying a record is a no-op by construction (per-message label
@@ -790,21 +865,7 @@ impl MailSync {
             arrived.append(&mut chunk_arrived);
         }
 
-        // After the commit, never inside it: nothing is announced that a crash
-        // could take back, and `announce` opens its own short transaction to
-        // record what it said.
-        //
-        // The gate is structural rather than a filter: a backfill stores a year
-        // of mail, every message of it an "arrival" as far as the store is
-        // concerned, and only an incremental pass on an account that already had
-        // a watermark reaches this. Without that, a new account's first sync
-        // would announce tens of thousands of messages.
-        if voice == Voice::Announce {
-            crate::notify::announce(&self.db, account_id, &arrived);
-        }
-
-        self.report.add_messages(written as i64);
-        Ok(written)
+        Ok((written, arrived))
     }
 
     // ------------------------------------------------------------- fetching
