@@ -294,6 +294,8 @@ fn mail_config() -> SyncConfig {
         poll_interval: Duration::from_secs(3600),
         sync_mail: true,
         sync_calendar: false,
+        // Pacing has its own tests; here it would only make the suite slow.
+        fetches_per_minute: 0,
         ..Default::default()
     }
 }

@@ -48,6 +48,8 @@ crate-type = ["cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
+# `sync::pace` tests the quota pacer on a paused clock.
+tokio = { version = "1.53.1", features = ["test-util"] }
 # `tests/bundle.rs` measures the shipped icons' opaque area, which needs their
 # alpha channel and nothing else. Already in the lock as a transitive
 # dependency, so this costs no download.

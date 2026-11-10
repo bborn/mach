@@ -146,6 +146,8 @@ pub struct MailSync {
     /// Shared across every account, so five accounts cannot together open fifty
     /// connections to Google.
     pub limiter: Arc<Semaphore>,
+    /// This account's `messages.get` budget. See [`super::pace`].
+    pub pacer: Arc<super::pace::Pacer>,
 }
 
 impl MailSync {
@@ -506,7 +508,9 @@ impl MailSync {
                 let Some(id) = lease.pop_front() else { break };
                 let gmail = self.gmail.clone();
                 let limiter = Arc::clone(&self.limiter);
+                let pacer = Arc::clone(&self.pacer);
                 inflight.spawn(async move {
+                    pacer.wait().await;
                     let _permit = limiter.acquire_owned().await;
                     let out = gmail.messages_get("me", &id, MessageFormat::Full).await;
                     (id, out)
@@ -886,8 +890,10 @@ impl MailSync {
         for id in ids {
             let gmail = self.gmail.clone();
             let limiter = Arc::clone(&self.limiter);
+            let pacer = Arc::clone(&self.pacer);
             let id = id.clone();
             set.spawn(async move {
+                pacer.wait().await;
                 let _permit = limiter.acquire_owned().await;
                 let out = gmail.messages_get("me", &id, MessageFormat::Full).await;
                 (id, out)

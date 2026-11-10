@@ -41,6 +41,7 @@ pub mod cancel;
 pub mod calendar;
 pub mod convert;
 pub mod mail;
+pub mod pace;
 pub mod status;
 
 use std::collections::HashSet;
@@ -217,14 +218,18 @@ pub struct SyncConfig {
     /// account together — going wider than the global bound would only park
     /// tasks on the shared semaphore.
     ///
-    /// Not paired with a rate limiter. The client's [`RetryPolicy`] already
-    /// backs off with jitter on a 429 and honours a `Retry-After`, so the
-    /// consequence of the round-trip estimate being optimistic is a retry, not
-    /// a stampede. The estimate is the weak part of this, and if it ever needs
-    /// to stop being a guess the answer is a token bucket metered in quota
-    /// units rather than a wider or narrower semaphore — concurrency cannot
-    /// express "four a second" at all when four a second is two requests.
+    /// Paired with [`SyncConfig::fetches_per_minute`], which is what actually
+    /// keeps an account inside its quota. This only decides how many of the
+    /// paced requests may overlap.
     pub backfill_fetch_concurrency: usize,
+    /// `messages.get` calls one account may start per minute, backfill and
+    /// history replay alike. `0` is unpaced.
+    ///
+    /// Concurrency alone was not a rate: when Gmail answered faster than the
+    /// 400 ms estimate, two requests in flight spent the account's whole
+    /// minute in seconds, and a five-day backlog hit the limit on every pass.
+    /// See [`pace`].
+    pub fetches_per_minute: u32,
     pub calendar_past_days: i64,
     pub calendar_future_days: i64,
     pub calendar_page_size: u32,
@@ -251,6 +256,7 @@ impl Default for SyncConfig {
             // case — every account also fetching attachments and drafts at once.
             request_concurrency: 32,
             backfill_fetch_concurrency: default_backfill_fetch_concurrency(),
+            fetches_per_minute: backfill_fetches_per_minute(),
             calendar_past_days: 90,
             calendar_future_days: 365,
             calendar_page_size: 250,
@@ -928,6 +934,7 @@ async fn sync_account(inner: Arc<Inner>, account: Account, trigger: Trigger) -> 
                     cancel: inner.cancel.clone(),
                     report: report.clone(),
                     limiter: Arc::clone(&inner.limiter),
+                    pacer: Arc::new(pace::Pacer::per_minute(inner.config.fetches_per_minute)),
                 };
                 match sync.run().await {
                     Ok(n) => outcome.messages_written = n,
