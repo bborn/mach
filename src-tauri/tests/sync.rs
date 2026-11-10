@@ -275,6 +275,9 @@ struct Hooks {
     gets_served: usize,
     /// Fail every `messages.get` from the Nth onwards, simulating a crash.
     fail_gets_after: Option<usize>,
+    /// Refuse the next N `messages.get` calls for quota, the way Gmail does
+    /// when the account's per-minute budget is spent.
+    quota_refusals: usize,
     /// `(after N gets, token, message)` — deliver into a mailbox mid-backfill.
     deliver_after_gets: Vec<(usize, String, FakeMessage)>,
     /// Cancel the engine once N gets have been served.
@@ -476,6 +479,10 @@ impl FakeGoogle {
                     h.gets_served += 1;
                     let n = h.gets_served;
                     let fail = h.fail_gets_after.is_some_and(|after| n > after);
+                    let refused = h.quota_refusals > 0;
+                    if refused {
+                        h.quota_refusals -= 1;
+                    }
                     let deliver: Vec<(String, FakeMessage)> = h
                         .deliver_after_gets
                         .iter()
@@ -487,9 +494,15 @@ impl FakeGoogle {
                         .as_ref()
                         .filter(|(at, _)| *at == n)
                         .map(|(_, c)| c.clone());
-                    (fail, deliver, cancel)
+                    (fail, deliver, cancel, refused)
                 });
-                let (fail, deliver, cancel) = effect;
+                let (fail, deliver, cancel, refused) = effect;
+                if refused {
+                    return HttpResponse::json(
+                        429,
+                        r#"{"error":{"message":"Quota exceeded for quota metric 'Total Query Cost'"}}"#,
+                    );
+                }
 
                 for (target, message) in deliver {
                     if target == token {
@@ -1477,6 +1490,32 @@ async fn a_failure_partway_through_history_keeps_the_pages_already_applied() {
         google.with(&token, |m| m.current_history_id()).to_string()
     );
     assert_store_is_consistent(&db);
+}
+
+/// Even paced, the personal account kept being refused for quota: something
+/// else was drawing on the same budget. A refused fetch waits for the next
+/// quota minute and asks again instead of failing the page.
+#[tokio::test(start_paused = true)]
+async fn a_fetch_refused_for_quota_waits_and_the_page_still_lands() {
+    let db = Db::open_in_memory().unwrap();
+    let google = FakeGoogle::new();
+    let account_id = synced_account(&db, &google, vec![FakeMessage::new("m0", "t0").at(500)]).await;
+    let token = format!("tok-{account_id}");
+    google.with(&token, |mailbox| {
+        for n in 1..=3 {
+            mailbox.deliver(FakeMessage::new(&format!("m{n}"), &format!("t{n}")).at(1_000 * n));
+        }
+    });
+
+    google.hooks(|h| h.quota_refusals = 3);
+    let pass = new_engine(&db, Arc::clone(&google), mail_config()).sync_once().await;
+
+    assert!(pass.account(account_id).unwrap().is_ok(), "quota refusals must be waited out");
+    assert_eq!(message_count(&db), 4);
+    assert_eq!(
+        history_id(&db, account_id).unwrap(),
+        google.with(&token, |m| m.current_history_id()).to_string()
+    );
 }
 
 #[tokio::test]

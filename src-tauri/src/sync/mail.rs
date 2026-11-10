@@ -135,6 +135,44 @@ pub enum Voice {
     Silent,
 }
 
+/// How long a fetch refused for quota waits before asking again, and how many
+/// times it does so. Gmail's limit is per user per minute, so a minute is the
+/// wait that is sure to land in a fresh window.
+const QUOTA_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+const QUOTA_WAITS: u32 = 5;
+
+/// `messages.get` at this account's pace, waiting out a quota refusal rather
+/// than failing the page.
+///
+/// The client's own retry gives up within about fifteen seconds, which is
+/// inside the same quota minute, so it cannot outlast a spent budget. When
+/// something else is also drawing on the account's quota (on 2026-11-09 the
+/// personal account stayed refused even with the engine paced to 80% of it),
+/// failing the page meant the page never landed. Waiting a minute and asking
+/// again turns a contended quota into slow progress instead of none.
+async fn get_within_quota(
+    gmail: &GmailClient,
+    limiter: &Semaphore,
+    pacer: &super::pace::Pacer,
+    id: &str,
+) -> Result<g::Message, GoogleError> {
+    let mut waits = 0;
+    loop {
+        pacer.wait().await;
+        let out = {
+            let _permit = limiter.acquire().await;
+            gmail.messages_get("me", id, MessageFormat::Full).await
+        };
+        match out {
+            Err(e) if e.is_rate_limited() && waits < QUOTA_WAITS => {
+                waits += 1;
+                tokio::time::sleep(QUOTA_WAIT).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Everything one account's Gmail sync needs. Cheap to construct per pass.
 pub struct MailSync {
     pub db: Db,
@@ -510,9 +548,7 @@ impl MailSync {
                 let limiter = Arc::clone(&self.limiter);
                 let pacer = Arc::clone(&self.pacer);
                 inflight.spawn(async move {
-                    pacer.wait().await;
-                    let _permit = limiter.acquire_owned().await;
-                    let out = gmail.messages_get("me", &id, MessageFormat::Full).await;
+                    let out = get_within_quota(&gmail, &limiter, &pacer, &id).await;
                     (id, out)
                 });
             }
@@ -893,9 +929,7 @@ impl MailSync {
             let pacer = Arc::clone(&self.pacer);
             let id = id.clone();
             set.spawn(async move {
-                pacer.wait().await;
-                let _permit = limiter.acquire_owned().await;
-                let out = gmail.messages_get("me", &id, MessageFormat::Full).await;
+                let out = get_within_quota(&gmail, &limiter, &pacer, &id).await;
                 (id, out)
             });
         }

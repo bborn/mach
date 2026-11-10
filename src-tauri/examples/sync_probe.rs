@@ -90,9 +90,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) if e.is_not_found() => {}
             Err(e) => {
                 failures += 1;
-                println!("messages.get {id} FAILED: {e:?}");
+                println!("messages.get {id} FAILED after {i} ok: {e:?}");
+                break;
             }
         }
+        // The same pace the engine keeps, so the probe does not spend the
+        // account's quota out from under the app.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if i % 200 == 199 {
             println!("  fetched {}/{}", i + 1, ids.len());
         }

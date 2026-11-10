@@ -296,6 +296,11 @@ impl AccountReporter {
     /// credential came back. Only a success is.
     pub fn failed(&self, message: impl Into<String>) {
         let message = message.into();
+        // The status bar clears this as soon as the next pass starts, so a
+        // failure that recurs every pass was visible only in the second or two
+        // between passes. On 2026-11-09 an account went five days without mail
+        // and there was no record anywhere of what Google had said.
+        eprintln!("sync: account {} failed: {message}", self.account_id);
         self.sink.update(self.account_id, |a| {
             a.phase = SyncPhase::Failed;
             a.last_error = Some(message);
@@ -310,6 +315,7 @@ impl AccountReporter {
     /// again" next to it.
     pub fn credential_rejected(&self, message: impl Into<String>) {
         let message = message.into();
+        eprintln!("sync: account {} credential rejected: {message}", self.account_id);
         self.sink.update(self.account_id, |a| {
             a.phase = SyncPhase::Failed;
             a.last_error = Some(message);
